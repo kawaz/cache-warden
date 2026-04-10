@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/cache-warden", "crates/cache-warden-cli"]
+resolver = "2"

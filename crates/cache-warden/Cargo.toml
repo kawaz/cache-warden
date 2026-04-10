@@ -1,0 +1,11 @@
+[package]
+name = "cache-warden"
+version = "0.1.0"
+edition = "2024"
+description = "Manage and protect cache socket paths"
+license = "MIT"
+repository = "https://github.com/kawaz/cache-warden"
+readme = "../../README.md"
+
+[dev-dependencies]
+tempfile = "3"
