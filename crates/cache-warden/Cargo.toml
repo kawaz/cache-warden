@@ -11,6 +11,11 @@ readme = "../../README.md"
 # Reliable secret zeroization. See docs/decisions/DR-0005-core-security-dependencies.md
 # for why this is an intentional exception to the "std only" dependency goal (DR-0002).
 zeroize = "1"
+# Process inspection (pid -> exe path / parent pid / start time) via OS APIs.
+# macOS: proc_pidpath / proc_pidinfo; Linux: sysconf(_SC_CLK_TCK) for the /proc starttime unit.
+# See docs/decisions/DR-0006-process-inspection-dependencies.md for the rationale and the
+# sysinfo / raw-syscall / zero-dependency alternatives that were rejected.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

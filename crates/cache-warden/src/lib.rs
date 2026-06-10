@@ -30,6 +30,11 @@
 //! - [`Authenticator`] / [`AuthContext`]: the re-authentication boundary. The
 //!   real (TouchID) implementation lands later; fakes ([`AllowAll`],
 //!   [`DenyAll`], [`RecordingAuthenticator`]) drive tests.
+//! - [`ProcessInspector`] / [`ProcessInfo`]: generic process authentication —
+//!   inspecting a pid and walking its ancestry toward init/launchd.
+//!   [`SystemInspector`] is OS-backed; [`FakeInspector`] builds arbitrary trees
+//!   for tests. Policy interpretation (which chain may touch what) is left to an
+//!   adapter (DR-0004).
 //! - [`Store`]: a key → [`CacheEntry`] in-memory store with TTL-gated reads.
 //!   The auth gates ([`Store::extend_authenticated`], [`Store::regenerate`])
 //!   live here, not on [`CacheEntry`].
@@ -52,6 +57,7 @@
 mod auth;
 mod clock;
 mod entry;
+mod process;
 mod secret;
 mod source;
 mod store;
@@ -61,6 +67,7 @@ pub use auth::{
 };
 pub use clock::{Clock, FakeClock, Monotonic, SystemClock};
 pub use entry::{CacheEntry, EntryState, ExtendError, Ttl, TtlError};
+pub use process::{FakeInspector, InspectError, ProcessInfo, ProcessInspector, SystemInspector};
 pub use secret::SecretBytes;
 pub use source::{CommandRunner, RunError, SourceRunner, TrailingNewline, ValueSource};
 pub use store::{ExtendAuthOutcome, ExtendOutcome, RegenerateOutcome, Store};

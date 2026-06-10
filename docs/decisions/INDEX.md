@@ -6,6 +6,7 @@
 - [DR-0003](./DR-0003-secure-kv-core-and-adapters.md) — コアドメインを「秘密値のセキュア KV キャッシュ」と定める（TTL / プロセス認証 / 再認証 / メモリ保護）。SSH 鍵管理はその上のプロトコルアダプタ。authsock-warden DR-018 構想の別プロジェクト化。命名 `cache-warden` 維持。DR-0001 全体を Supersede
 - [DR-0004](./DR-0004-authsock-warden-succession.md) — authsock-warden 後継・吸収方針。warden 機能を「authsock アダプタ」として移植 / 移植対象資産の整理（コア vs アダプタ）/ 並走 → パリティ → 切替 → 引退の移行パス
 - [DR-0005](./DR-0005-core-security-dependencies.md) — コアの秘密値ゼロ化に `zeroize` crate を例外採用（DR-0002 の依存最小原則に対する意図的例外）。自作 volatile write 案・secrecy 案の却下理由つき
+- [DR-0006](./DR-0006-process-inspection-dependencies.md) — プロセス検査（pid → path / ppid / 開始時刻）に `libc` を最小依存として採用（DR-0002 への 2 つ目の意図的例外）。sysinfo 案・raw syscall 案・依存ゼロ案の却下理由つき。authsock-warden の libc 直叩き前例を踏襲
 
 ## Archived
 
