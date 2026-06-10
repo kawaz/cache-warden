@@ -1,0 +1,29 @@
+# secret reference injection (`cache-warden://KEY` 置換)
+
+- Status: idea
+- Date: 2026-06-11
+
+## 構想
+
+`cache-warden://KEY` 参照を reveal 値に置換する機能。op run / op inject 相当。
+
+- **`cache-warden run -- cmd`**: env や引数中の `cache-warden://KEY` 参照を解決し、reveal 値を
+  env 注入して子コマンドを実行（op run 相当）。CLI 再構成でトップレベル `run` が空いたので、その動詞を充てる。
+- **`cache-warden inject`**: 設定ファイル / テンプレ中の `cache-warden://KEY` 参照を reveal 値に
+  置換して出力（op inject 相当）。
+
+## 位置づけ
+
+- control socket クライアントとして実装できる（既存 `kv get` と同じ経路）。コアと並列に進められる
+  （アダプタ移植や authsock 着手をブロックしない）。
+- 秘密値はプロセス内で解決し、子プロセスへの env 注入時のみ外に出る（注入経路の安全性は設計時に詰める）。
+
+## TODO
+
+- [ ] 設計（参照構文 / 解決経路 / env 注入の安全性 / `run` と `inject` の責務分担）→ 未着手（要設計）
+- [ ] 実装
+
+## 関連
+
+- [docs/DESIGN-ja.md](../DESIGN-ja.md) 「将来検討」節（トップレベル `run` の op run 用途）
+- CLI 再構成（`run` → `daemon run` 移動、2026-06-11）でトップレベル `run` を空けた

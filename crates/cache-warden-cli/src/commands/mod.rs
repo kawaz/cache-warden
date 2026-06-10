@@ -1,5 +1,5 @@
-//! CLI subcommands: the daemon (`run`) and the management client (`kv`,
-//! `status`, `ping`).
+//! CLI subcommands: the daemon group (`daemon run`) and the management client
+//! (`kv`, `status`, `ping`).
 //!
 //! Argument parsing is hand-rolled (DR-0002 keeps the dependency surface small;
 //! no clap). The parse step is a pure function ([`parse_kv_set`] etc. and the
@@ -7,6 +7,7 @@
 
 pub mod client;
 pub mod config_cmd;
+pub mod daemon_cmd;
 
 use std::path::PathBuf;
 

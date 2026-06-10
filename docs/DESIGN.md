@@ -70,10 +70,10 @@ cache-warden core (secure KV cache)
 
 ### Daemon Composition (Single-Process Direct Hosting, DR-0008)
 
-`cache-warden run` is a single process (tokio runtime) that hosts all adapters directly within the same process.
+`cache-warden daemon run` is a single process (tokio runtime) that hosts all adapters directly within the same process.
 
 ```
-cache-warden run (single process / tokio runtime)
+cache-warden daemon run (single process / tokio runtime)
   ├─ Core (secret / clock / source / entry / store / auth / process) wired at the center
   ├─ listener task: authsock adapter (SSH agent socket)
   ├─ listener task: KV adapter
@@ -88,9 +88,10 @@ cache-warden run (single process / tokio runtime)
   as `kv get / set / del` / `status` / `refresh` go through this socket. The path for other processes to access the
   KV programmatically (the KV socket API) is unified into the same protocol. The protocol is finalized in DR-0009
   (see "Control Socket Protocol v1" below).
-- **The core is wired at the center of the daemon**. The (already-implemented) core sits at the center of the `run`
-  path, with adapters layered thinly on top.
-- **Service registration (launchd / systemd) uses the single binary + a `run` argument**.
+- **The core is wired at the center of the daemon**. The (already-implemented) core sits at the center of the
+  `daemon run` path, with adapters layered thinly on top.
+- **Service registration (launchd / systemd) uses the single binary + a `daemon run` argument** (later wrapped by
+  `daemon register` / `daemon unregister`).
 - **Synchronous work (e.g. op CLI invocations) is isolated via `spawn_blocking`**.
 
 ### Control Socket Protocol v1 (DR-0009)
@@ -118,8 +119,19 @@ The management CLI ↔ daemon protocol. Full details and alternatives are in
   (delegating to an external command, exit 0 = approved); otherwise `AllowAll`. A built-in TouchID
   authenticator lands in a later iteration (slotting in beside it behind the same `Authenticator` trait).
 
-The CLI subcommand layout v1 is settled accordingly: `run` / `ping` / `status` /
+The CLI subcommand layout v1: `daemon run` / `ping` / `status` /
 `kv set|get|del|list` / `config show|path|edit` (no-args shows help; long options).
+
+- **The `daemon` group** isolates daemon lifecycle operations. Only `daemon run` (foreground start) is
+  implemented; `daemon register` / `daemon unregister` (launchd/systemd service registration) and
+  `daemon status` (process/registration state) are future commands and are not listed in the group help
+  until implemented. `run` is kept off the top level so that, while using the CLI as an everyday client
+  (`kv get`, etc.), the daemon-start command cannot be triggered by mistake (an accidental double start).
+- **`status` contrast**: top-level `status` lists the cache entries (user-facing, value-free); the future
+  `daemon status` will report process/service-registration state (operations-facing). Same word, different
+  concern, so they are split.
+- **Future `run`**: the freed top-level `run` is reserved for an op-run equivalent (inject secret values
+  into the environment and exec a child command); see "Future Considerations".
 
 ### Configuration (TOML config + re-auth command, DR-0010)
 
@@ -214,6 +226,9 @@ See DR-0004 for the core/adapter assignment of assets being ported.
   to interact with the KV programmatically into a single Unix domain socket protocol (DR-0008; design is the next step).
 - **Native TouchID**: cache-warden itself issues re-authentication via LocalAuthentication, without relying on an upstream (op). Can also be repurposed as a gate for SSH key signing.
 - **Additional adapters**: Adapters for secret value protocols beyond SSH / KV.
+- **Top-level `run` (op-run equivalent)**: Moving daemon startup to `daemon run` frees the top-level `run`
+  to inject secret values into the environment and exec a child command (`cache-warden run -- cmd`).
+  Together with `cache-warden://KEY` reference substitution, it can be implemented as a control socket client.
 
 See [ROADMAP.md](./ROADMAP.md) for details.
 

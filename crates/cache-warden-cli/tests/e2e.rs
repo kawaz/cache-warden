@@ -74,6 +74,7 @@ fn full_lifecycle_over_control_socket() {
     let socket = dir.path().join("control.sock");
 
     let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
         .arg("run")
         .arg("--socket")
         .arg(&socket)
@@ -202,6 +203,7 @@ fn spawn_with_config(dir: &Path, config_toml: &str) -> (Daemon, std::path::PathB
     std::fs::write(&config_path, full).expect("write config");
 
     let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
         .arg("run")
         .env("CACHE_WARDEN_CONFIG", &config_path)
         .spawn()
@@ -301,6 +303,7 @@ fn config_rejects_inline_static_value() {
     std::fs::write(&config_path, "[kv.SECRET]\nvalue = \"hunter2\"\n").unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
         .arg("run")
         .arg("--socket")
         .arg(dir.path().join("control.sock"))
@@ -324,6 +327,7 @@ fn double_start_is_refused() {
     let socket = dir.path().join("control.sock");
 
     let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
         .arg("run")
         .arg("--socket")
         .arg(&socket)
@@ -337,6 +341,7 @@ fn double_start_is_refused() {
 
     // Second daemon on the same socket must exit non-zero (AddrInUse).
     let out = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
         .arg("run")
         .arg("--socket")
         .arg(&socket)

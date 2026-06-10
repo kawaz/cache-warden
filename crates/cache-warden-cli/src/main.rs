@@ -1,8 +1,8 @@
-//! cache-warden CLI: the daemon (`run`) and its management client.
+//! cache-warden CLI: the daemon group (`daemon run`) and its management client.
 //!
 //! Hand-rolled argument dispatch (no clap; DR-0002 keeps dependencies small).
-//! `run` starts the in-process daemon (DR-0008); the other subcommands are
-//! one-shot control-socket clients (see [`commands::client`]).
+//! `daemon run` starts the in-process daemon (DR-0008); the other subcommands
+//! are one-shot control-socket clients (see [`commands::client`]).
 
 use std::io::Read as _;
 use std::process;
@@ -28,7 +28,7 @@ Usage:
     {NAME} <COMMAND> [OPTIONS]
 
 Commands:
-    run                Start the daemon in the foreground
+    daemon run         Start the daemon in the foreground
     ping               Check that the daemon is alive
     status             Show daemon info and the (value-free) entry list
     kv set <KEY> ...   Cache a value (static or command source)
@@ -168,22 +168,12 @@ fn run() -> Result<(), String> {
     let (cli_socket, rest) = commands::take_socket_flag(tail)?;
 
     // Load the config (or defaults) up front: every command needs the resolved
-    // socket, and `run` / `config` need the rest of it (DR-0010).
+    // socket, and `daemon run` / `config` need the rest of it (DR-0010).
     let loaded = config::load().map_err(|e| e.to_string())?;
     let socket = commands::resolve_socket(cli_socket, loaded.config.socket_path());
 
     match command.as_str() {
-        "run" => {
-            if !rest.is_empty() {
-                return Err(format!("`run` takes no positional arguments: {:?}", rest));
-            }
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("failed to start runtime: {e}"))?;
-            rt.block_on(daemon::server::run(socket, loaded.config))
-                .map_err(|e| format!("daemon error: {e}"))
-        }
+        "daemon" => commands::daemon_cmd::run(&rest, socket, loaded.config),
         "config" => commands::config_cmd::run(rest, &loaded),
         "ping" => run_client(&socket, &protocol::wire::Request::Ping),
         "status" => run_client(&socket, &protocol::wire::Request::Status),

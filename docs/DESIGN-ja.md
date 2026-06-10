@@ -76,10 +76,10 @@ cache-warden コア（セキュア KV キャッシュ）
 
 ### デーモン構成（単一プロセス直担型、DR-0008）
 
-`cache-warden run` は 1 プロセス（tokio ランタイム）であり、全アダプタを同一プロセス内で直接担う。
+`cache-warden daemon run` は 1 プロセス（tokio ランタイム）であり、全アダプタを同一プロセス内で直接担う。
 
 ```
-cache-warden run（単一プロセス / tokio ランタイム）
+cache-warden daemon run（単一プロセス / tokio ランタイム）
   ├─ コア（secret / clock / source / entry / store / auth / process）を中心に配線
   ├─ listener task: authsock アダプタ（SSH agent socket）
   ├─ listener task: KV アダプタ
@@ -96,7 +96,8 @@ cache-warden run（単一プロセス / tokio ランタイム）
   （下記「control socket プロトコル v1」節）。
 - **コアをデーモンの中心に配線する**。コア（実装済み）を run 経路の中心に置き、アダプタはその上に
   薄く乗せる。
-- **サービス登録（launchd / systemd）は単一バイナリ + `run` 引数**で行う。
+- **サービス登録（launchd / systemd）は単一バイナリ + `daemon run` 引数**で行う（将来は
+  `daemon register` / `daemon unregister` でラップ）。
 - **同期処理（op CLI 呼び出し等）は `spawn_blocking` で隔離**する。
 
 ### control socket プロトコル v1（DR-0009）
@@ -124,8 +125,18 @@ cache-warden run（単一プロセス / tokio ランタイム）
   （外部コマンドに委譲、exit 0 = 承認）、未設定時は `AllowAll`。ビルトイン TouchID は将来
   iteration（同じ `Authenticator` trait の別実装として差し込む）。
 
-CLI サブコマンド体系 v1 もこれで確定: `run` / `ping` / `status` /
+CLI サブコマンド体系 v1: `daemon run` / `ping` / `status` /
 `kv set|get|del|list` / `config show|path|edit`（引数なしは help、ロングオプション）。
+
+- **`daemon` グループ**: デーモンのライフサイクル操作を隔離する。`daemon run`（フォアグラウンド起動）
+  のみ実装済み。`daemon register` / `daemon unregister`（launchd/systemd サービス登録）/
+  `daemon status`（プロセス・登録状態）は将来実装で、未実装のうちはグループ help に出さない。
+  トップレベルに `run` を出さないのは、`kv get` 等を日常的に叩くクライアントとして使う中で、
+  デーモン起動コマンドを誤操作（意図しない二重起動）する事故を避けるため。
+- **`status` の対比**: トップレベル `status` = キャッシュエントリ一覧（ユーザ向け、値は含めない）。
+  将来の `daemon status` = プロセス・サービス登録状態（運用向け）。同じ語で関心が違うので分ける。
+- **将来 `run`**: 空けたトップレベル `run` は op run 相当（秘密値を env 注入して子コマンドを実行）に
+  充てる予定（「将来検討」節参照）。
 
 ### 設定（TOML config・再認証コマンド、DR-0010）
 
@@ -224,6 +235,9 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
 - **自前 TouchID**: 上流（op）に頼らず cache-warden 自身が LocalAuthentication で再認証を発行する。
   SSH 鍵署名のゲートにも転用できる。
 - **アダプタの追加**: SSH / KV 以外の秘密値プロトコルを扱うアダプタ。
+- **トップレベル `run`（op run 相当）**: デーモン起動を `daemon run` へ移したことで空いたトップレベル
+  `run` を、秘密値を env 注入して子コマンドを実行する用途（`cache-warden run -- cmd`）に充てる。
+  `cache-warden://KEY` 参照の置換機能とあわせて control socket クライアントとして実装できる。
 
 詳細は [ROADMAP.md](./ROADMAP.md) を参照。
 
