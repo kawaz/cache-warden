@@ -292,10 +292,12 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
    - 互換にする利点: 切替時に設定移行不要、並走で同一設定を使え突き合わせが楽。
    - 互換にしない利点: cache-warden の設計（`[auth].command` は argv 配列 vs warden は string）に揃えられる。
      実際 warden `[auth].command` は文字列 1 個、cache-warden は `Vec<String>`。`[auth].method` も warden のみ。
-   - 推し = **新スキーマ（cache-warden 流）に寄せ、移行ガイドを書く**。warden config は別物として並走。要 DR。
+   - **確定 (2026-06-11 kawaz)**: 新スキーマ（cache-warden 流）に寄せ、移行ガイドを書く。
+     warden config は別物として並走。互換レイヤは持たない。DR 化は実装 iteration で。
 3. **アイドルタイムアウト（`last_used` touch）を残すか捨てるか**（§1.3 ギャップ 1）: コアは絶対 TTL。
-   署名ごとの window 延命を `Store::extend` 呼びで再現する（残す）か、絶対 TTL に仕様変更するか。
-   warden 実機がアイドルを使っているか不明なので、**実機確認 → kawaz 判断**。
+   **確定 (2026-06-11 kawaz)**: まず絶対 TTL で開始する（soft 切れは再認証で延長できるため頻用鍵も運用可能）。
+   idle 延命（署名ごと touch）は使用感を見て後で検討。warden 実機がアイドルを使っているかの
+   実機確認は iteration 1 着手前タスクのまま。
 4. **NotLoaded（公開鍵だけ先出し）のコア非対応をアダプタ吸収で許容するか**（§1.3 ギャップ 3）:
    コアに「値なし公開鍵エントリ」概念を足さず、アダプタの公開鍵レジストリで吸収する案を推す。
    コアを汚さない方針の確認。
