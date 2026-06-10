@@ -28,13 +28,15 @@ TDD で iteration 1〜6 を消化して v0.1.7 まで到達した。
 
 - **現象**: justfile の `check-version-bumped` gate で `$N` が空になり、guard ロジックが壊れた。
 - **原因**: `bump-semver get -qq` は `-q` が 1 個だと値を出力するが、`-qq` だと値の出力まで抑制する仕様。
-- **解決**: `bump-semver get -q` (シングル `-q`) に戻す。ヒントメッセージのみ抑制、値は出力される。
+- **解決**: `-qq` を外し (`-q` も付けない)、`2>/dev/null` + `[ -n "$ref" ]` の空チェックで対応。
+- **上流に起票済み**: kawaz/bump-semver `docs/issue/2026-06-10-get-qq-suppresses-stdout-value.md`
 
 ### 複数 `Cargo.toml` を一括 bump しようとして失敗
 
 - **現象**: workspace 構成で複数 `Cargo.toml` を bump-semver に渡したところ、package name が一致しないためエラー停止。
 - **原因**: bump-semver は複数ファイル一括 bump の場合、全ファイルで package name が同一であることを要求する仕様。
 - **解決**: `workspace.package.version` 継承に正攻法化。`[package] version.workspace = true` で子クレートが workspace バージョンを継承する構造にし、bump 対象は workspace root の `Cargo.toml` 1 ファイルのみにした。
+- **上流に起票済み**: kawaz/bump-semver `docs/issue/2026-06-10-name-mismatch-workspace-hint.md` (エラーメッセージへの workspace 運用ヒント追加を提案)
 
 ### 翻訳ガードで `$N` capture TO が必須だと気づいた
 
