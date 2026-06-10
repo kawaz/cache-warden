@@ -15,7 +15,8 @@
 //! # Core concepts
 //!
 //! - [`SecretBytes`]: an in-memory secret value, zeroized on drop and redacted
-//!   in `Debug` / `Display`.
+//!   in `Debug` / `Display`, and pinned in memory with `mlock` (fail-open;
+//!   query [`SecretBytes::is_locked`]) to keep plaintext off swap.
 //! - [`Clock`] / [`SystemClock`] / [`FakeClock`]: a monotonic time source used
 //!   for TTL evaluation (injectable for tests).
 //! - [`ValueSource`]: where a value comes from — [`ValueSource::Static`] (not
@@ -23,7 +24,8 @@
 //!   a [`SourceRunner`]).
 //! - [`CommandRunner`]: the [`SourceRunner`] that runs a `command` source with
 //!   [`std::process::Command`] and captures stdout (honoring a
-//!   [`TrailingNewline`] policy).
+//!   [`TrailingNewline`] policy, with an opt-in
+//!   [`CommandRunner::with_timeout`]).
 //! - [`CacheEntry`] / [`EntryState`] / [`Ttl`]: the two-stage TTL state machine
 //!   (Active → SoftExpired → HardExpired) with re-authentication
 //!   ([`CacheEntry::extend`]).
@@ -50,9 +52,11 @@
 //!
 //! # Scope of this iteration
 //!
-//! The real re-authentication mechanism (TouchID / process authentication),
-//! `mlock`, command timeouts, the daemon/socket boundary, and the CLI are
-//! intentionally out of scope here and live in later iterations / the CLI crate.
+//! The real re-authentication mechanism (TouchID — turning an [`AuthContext`]
+//! and its requester chain into an actual biometric prompt), the daemon/socket
+//! boundary, and the CLI are intentionally out of scope here and live in later
+//! iterations / the CLI crate. Swap-protection (`mlock`) and command timeouts
+//! are implemented (see [`SecretBytes`] and [`CommandRunner::with_timeout`]).
 
 mod auth;
 mod clock;

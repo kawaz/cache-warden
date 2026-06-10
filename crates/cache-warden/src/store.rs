@@ -12,11 +12,27 @@
 
 use std::collections::BTreeMap;
 
-use crate::auth::{AuthContext, AuthError, Authenticator};
+use crate::auth::{AuthContext, AuthError, AuthOperation, Authenticator};
 use crate::clock::Clock;
 use crate::entry::{CacheEntry, EntryState, ExtendError, Ttl};
+use crate::process::ProcessInfo;
 use crate::secret::SecretBytes;
 use crate::source::{RunError, SourceRunner, ValueSource};
+
+/// Build an [`AuthContext`] for `key`/`op`, attaching `requester` if present.
+///
+/// Centralizes the "`None` requester ⇒ in-process / unattributed" convention so
+/// every gated path expresses it the same way.
+fn auth_context(key: &str, op: AuthOperation, requester: Option<&[ProcessInfo]>) -> AuthContext {
+    let ctx = match op {
+        AuthOperation::Extend => AuthContext::extend(key),
+        AuthOperation::Regenerate => AuthContext::regenerate(key),
+    };
+    match requester {
+        Some(chain) => ctx.with_requester(chain.to_vec()),
+        None => ctx,
+    }
+}
 
 /// In-memory secure key/value cache.
 #[derive(Debug, Default)]
@@ -87,10 +103,17 @@ impl Store {
     /// already Active, this is a no-op refresh and authentication is *not*
     /// requested — there is nothing to unlock. A denied or unavailable
     /// authenticator leaves the entry untouched.
+    ///
+    /// `requester` is the ancestry chain of the process asking for the unlock
+    /// (from [`crate::ProcessInspector::ancestry`]), forwarded into the
+    /// [`AuthContext`] so the [`Authenticator`] can name who is asking. Pass
+    /// `None` for an in-process / unattributed call. The core does not interpret
+    /// the chain as policy (DR-0004); it only carries it to the prompt.
     pub fn extend_authenticated(
         &mut self,
         key: &str,
         auth: &impl Authenticator,
+        requester: Option<&[ProcessInfo]>,
         clock: &impl Clock,
     ) -> Result<(), ExtendAuthOutcome> {
         let entry = self
@@ -105,7 +128,7 @@ impl Store {
                     .map_err(|ExtendError::HardExpired| ExtendAuthOutcome::HardExpired)
             }
             EntryState::SoftExpired => {
-                auth.authenticate(&AuthContext::extend(key))
+                auth.authenticate(&auth_context(key, AuthOperation::Extend, requester))
                     .map_err(ExtendAuthOutcome::AuthFailed)?;
                 entry
                     .extend(clock)
@@ -139,11 +162,15 @@ impl Store {
     /// a [`SecretBytes`] across the auth step and dropped (zeroized) if auth is
     /// denied, so a rejected regeneration leaves no plaintext behind and does
     /// not mutate the stored entry.
+    /// `requester` is forwarded into the regeneration [`AuthContext`] exactly as
+    /// in [`Store::extend_authenticated`]: the requesting process's ancestry
+    /// chain, or `None` for an in-process / unattributed call.
     pub fn regenerate(
         &mut self,
         key: &str,
         runner: &impl SourceRunner,
         auth: &impl Authenticator,
+        requester: Option<&[ProcessInfo]>,
         clock: &impl Clock,
     ) -> Result<(), RegenerateOutcome> {
         let entry = self
@@ -168,7 +195,7 @@ impl Store {
         let value = runner.run(&argv).map_err(RegenerateOutcome::RunFailed)?;
 
         // 3. Re-authenticate. `value` is dropped (zeroized) on the error path.
-        auth.authenticate(&AuthContext::regenerate(key))
+        auth.authenticate(&auth_context(key, AuthOperation::Regenerate, requester))
             .map_err(RegenerateOutcome::AuthFailed)?;
 
         // 4. Replace with a fresh Active entry (overwrite zeroizes the old one).
@@ -554,16 +581,71 @@ mod tests {
         let auth = RecordingAuthenticator::allowing();
 
         // Active: no prompt, just a window refresh.
-        s.extend_authenticated("K", &auth, &clock).unwrap();
+        s.extend_authenticated("K", &auth, None, &clock).unwrap();
         assert_eq!(auth.call_count(), 0, "Active extend must not prompt");
 
         // Soft-expired: prompts exactly once.
         clock.advance(Duration::from_secs(15));
-        s.extend_authenticated("K", &auth, &clock).unwrap();
+        s.extend_authenticated("K", &auth, None, &clock).unwrap();
         assert_eq!(auth.call_count(), 1);
         assert_eq!(auth.calls()[0], AuthContext::extend("K"));
         // Refreshed to Active and readable.
         assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"original");
+    }
+
+    #[test]
+    fn extend_authenticated_forwards_requester_into_context() {
+        use crate::process::ProcessInfo;
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        cmd_entry(&mut s, "K", &clock);
+        clock.advance(Duration::from_secs(15));
+
+        let chain = vec![ProcessInfo {
+            pid: 7,
+            ppid: Some(1),
+            path: Some(std::path::PathBuf::from("/usr/bin/ssh")),
+            start_time: None,
+        }];
+        let auth = RecordingAuthenticator::allowing();
+        s.extend_authenticated("K", &auth, Some(&chain), &clock)
+            .unwrap();
+        // The recorded context carries the requester so an Authenticator could
+        // name who is asking.
+        assert_eq!(auth.calls()[0].requester.as_deref(), Some(chain.as_slice()));
+    }
+
+    #[test]
+    fn regenerate_forwards_requester_into_context() {
+        use crate::process::ProcessInfo;
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        cmd_entry(&mut s, "K", &clock);
+        clock.advance(HARD);
+
+        let chain = vec![ProcessInfo {
+            pid: 9,
+            ppid: None,
+            path: Some(std::path::PathBuf::from("/bin/git")),
+            start_time: None,
+        }];
+        let runner = CountingRunner::new(b"fresh");
+        let auth = RecordingAuthenticator::allowing();
+        s.regenerate("K", &runner, &auth, Some(&chain), &clock)
+            .unwrap();
+        assert_eq!(auth.calls()[0].requester.as_deref(), Some(chain.as_slice()));
+    }
+
+    #[test]
+    fn in_process_call_records_no_requester() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        cmd_entry(&mut s, "K", &clock);
+        clock.advance(Duration::from_secs(15));
+        let auth = RecordingAuthenticator::allowing();
+        // None requester == in-process / unattributed.
+        s.extend_authenticated("K", &auth, None, &clock).unwrap();
+        assert_eq!(auth.calls()[0].requester, None);
     }
 
     #[test]
@@ -572,7 +654,9 @@ mod tests {
         let mut s = Store::new();
         cmd_entry(&mut s, "K", &clock);
         clock.advance(Duration::from_secs(15));
-        let err = s.extend_authenticated("K", &DenyAll, &clock).unwrap_err();
+        let err = s
+            .extend_authenticated("K", &DenyAll, None, &clock)
+            .unwrap_err();
         assert_eq!(err, ExtendAuthOutcome::AuthFailed(AuthError::Denied));
         // Still gated (unchanged).
         assert!(s.get("K", &clock).is_none());
@@ -584,7 +668,7 @@ mod tests {
         let clock = FakeClock::new();
         let mut s = Store::new();
         assert_eq!(
-            s.extend_authenticated("ghost", &AllowAll, &clock),
+            s.extend_authenticated("ghost", &AllowAll, None, &clock),
             Err(ExtendAuthOutcome::NotFound)
         );
     }
@@ -597,7 +681,7 @@ mod tests {
         clock.advance(HARD);
         let auth = RecordingAuthenticator::allowing();
         assert_eq!(
-            s.extend_authenticated("K", &auth, &clock),
+            s.extend_authenticated("K", &auth, None, &clock),
             Err(ExtendAuthOutcome::HardExpired)
         );
         assert_eq!(auth.call_count(), 0, "no prompt for destroyed value");
@@ -618,7 +702,7 @@ mod tests {
 
         let runner = CountingRunner::new(b"fresh-token");
         let auth = RecordingAuthenticator::allowing();
-        s.regenerate("K", &runner, &auth, &clock).unwrap();
+        s.regenerate("K", &runner, &auth, None, &clock).unwrap();
 
         assert_eq!(runner.runs(), 1);
         assert_eq!(auth.call_count(), 1);
@@ -635,7 +719,7 @@ mod tests {
         cmd_entry(&mut s, "K", &clock);
         clock.advance(HARD);
         let runner = CountingRunner::new(b"fresh");
-        s.regenerate("K", &runner, &AllowAll, &clock).unwrap();
+        s.regenerate("K", &runner, &AllowAll, None, &clock).unwrap();
         // The soft window restarts from regeneration time.
         clock.advance(Duration::from_secs(9));
         assert_eq!(s.state_of("K", &clock), Some(EntryState::Active));
@@ -656,7 +740,9 @@ mod tests {
         );
         clock.advance(HARD);
         let runner = CountingRunner::new(b"x");
-        let err = s.regenerate("K", &runner, &AllowAll, &clock).unwrap_err();
+        let err = s
+            .regenerate("K", &runner, &AllowAll, None, &clock)
+            .unwrap_err();
         assert_eq!(err, RegenerateOutcome::NotRegenerable);
         assert_eq!(runner.runs(), 0, "must not run for a static source");
     }
@@ -669,14 +755,14 @@ mod tests {
         // Active: nothing to regenerate.
         let runner = CountingRunner::new(b"x");
         assert_eq!(
-            s.regenerate("K", &runner, &AllowAll, &clock),
+            s.regenerate("K", &runner, &AllowAll, None, &clock),
             Err(RegenerateOutcome::NotHardExpired)
         );
         assert_eq!(runner.runs(), 0);
         // Soft-expired: also rejected (value still resident; extend instead).
         clock.advance(Duration::from_secs(15));
         assert_eq!(
-            s.regenerate("K", &runner, &AllowAll, &clock),
+            s.regenerate("K", &runner, &AllowAll, None, &clock),
             Err(RegenerateOutcome::NotHardExpired)
         );
         assert_eq!(runner.runs(), 0);
@@ -688,7 +774,7 @@ mod tests {
         let mut s = Store::new();
         let runner = CountingRunner::new(b"x");
         assert_eq!(
-            s.regenerate("ghost", &runner, &AllowAll, &clock),
+            s.regenerate("ghost", &runner, &AllowAll, None, &clock),
             Err(RegenerateOutcome::NotFound)
         );
     }
@@ -700,7 +786,9 @@ mod tests {
         cmd_entry(&mut s, "K", &clock);
         clock.advance(HARD);
         let runner = CountingRunner::new(b"fresh");
-        let err = s.regenerate("K", &runner, &DenyAll, &clock).unwrap_err();
+        let err = s
+            .regenerate("K", &runner, &DenyAll, None, &clock)
+            .unwrap_err();
         assert_eq!(err, RegenerateOutcome::AuthFailed(AuthError::Denied));
         // Command ran (fetch happens before auth), but the value was discarded.
         assert_eq!(runner.runs(), 1);
@@ -716,7 +804,7 @@ mod tests {
         clock.advance(HARD);
         let auth = RecordingAuthenticator::allowing();
         let err = s
-            .regenerate("K", &FailingRunner, &auth, &clock)
+            .regenerate("K", &FailingRunner, &auth, None, &clock)
             .unwrap_err();
         assert_eq!(err, RegenerateOutcome::RunFailed(RunError::EmptyOutput));
         assert_eq!(auth.call_count(), 0, "auth must not run if fetch failed");

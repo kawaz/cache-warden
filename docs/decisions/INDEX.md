@@ -7,6 +7,7 @@
 - [DR-0004](./DR-0004-authsock-warden-succession.md) — authsock-warden 後継・吸収方針。warden 機能を「authsock アダプタ」として移植 / 移植対象資産の整理（コア vs アダプタ）/ 並走 → パリティ → 切替 → 引退の移行パス
 - [DR-0005](./DR-0005-core-security-dependencies.md) — コアの秘密値ゼロ化に `zeroize` crate を例外採用（DR-0002 の依存最小原則に対する意図的例外）。自作 volatile write 案・secrecy 案の却下理由つき
 - [DR-0006](./DR-0006-process-inspection-dependencies.md) — プロセス検査（pid → path / ppid / 開始時刻）に `libc` を最小依存として採用（DR-0002 への 2 つ目の意図的例外）。sysinfo 案・raw syscall 案・依存ゼロ案の却下理由つき。authsock-warden の libc 直叩き前例を踏襲
+- [DR-0007](./DR-0007-mlock-memory-pinning.md) — 秘密値ページを `mlock` で常時ピン留めしスワップ漏洩を抑止。失敗は fail-open（`is_locked()` で検知可能）/ munlock→zeroize 順 / 不変バッファ設計で Vec 再確保問題を構造的に回避 / feature gate にせず常時有効。追加依存なし（libc は DR-0006 で導入済み）。DR-0005 が「別 DR で判断」とした mlock 採用の決定
 
 ## Archived
 

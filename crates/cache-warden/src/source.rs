@@ -13,7 +13,11 @@
 //! substitute a fake in tests and so the policy of *where* a process is spawned
 //! stays explicit. The production runner is [`CommandRunner`].
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use zeroize::Zeroize;
 
@@ -129,6 +133,13 @@ pub enum RunError {
     EmptyOutput,
     /// An empty argv was supplied; there is no program to run.
     NoProgram,
+    /// The command did not finish within the configured timeout and was killed.
+    ///
+    /// Any partial stdout captured before the kill has already been zeroized.
+    Timeout {
+        /// How long the runner waited before killing the process.
+        elapsed: Duration,
+    },
 }
 
 impl std::fmt::Display for RunError {
@@ -149,6 +160,10 @@ impl std::fmt::Display for RunError {
             },
             RunError::EmptyOutput => write!(f, "source command produced no output"),
             RunError::NoProgram => write!(f, "source command has no program (empty argv)"),
+            RunError::Timeout { elapsed } => write!(
+                f,
+                "source command timed out after {elapsed:?} and was killed"
+            ),
         }
     }
 }
@@ -179,32 +194,180 @@ pub trait SourceRunner {
 ///
 /// # Secret hygiene
 ///
-/// `Command::output()` necessarily materializes the full stdout in an owned
-/// `Vec<u8>` (there is no zero-copy capture in std). We copy those bytes into a
-/// [`SecretBytes`] as the very next step and then [`Zeroize`] the intermediate
-/// buffer — on the success path *and* every error path where stdout was read —
-/// to minimize how long plaintext lingers in a non-zeroizing buffer.
+/// Stdout is read into an owned `Vec<u8>` (there is no zero-copy capture in
+/// std). We move those bytes into a [`SecretBytes`] as the very next step on the
+/// success path and [`Zeroize`] the intermediate buffer on every error path
+/// where stdout was read (non-zero exit, timeout) — so plaintext never lingers
+/// in a non-zeroizing buffer.
 ///
-/// # Out of scope (this iteration)
+/// # Timeout policy (default: unlimited)
 ///
-/// **Timeouts are not implemented.** A hung source command will block the
-/// caller indefinitely. A correct timeout in std alone requires a reader thread
-/// plus `kill`, which is enough complexity to defer; it is intended for a later
-/// iteration. Until then, callers must trust their source commands to terminate.
+/// A timeout is **opt-in** via [`CommandRunner::with_timeout`]; the default
+/// runner waits indefinitely.
+///
+/// Design rationale: a secret-fetch command often *legitimately* blocks for a
+/// long time on user interaction — a TouchID / `op` prompt waits for the human
+/// to authenticate, and there is no upper bound on how long that takes. A hard
+/// default timeout would kill exactly the prompts we depend on, so the safe
+/// default is "no timeout". Deployments that drive non-interactive sources (and
+/// therefore *can* bound the runtime) opt in to a timeout to defend against a
+/// genuinely hung command.
+///
+/// When a timeout is set and exceeded, the child is killed (and reaped to avoid
+/// a zombie), any partial stdout is zeroized, and [`RunError::Timeout`] is
+/// returned.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CommandRunner {
     newline: TrailingNewline,
+    /// Maximum wall-clock time to wait for the command, or `None` for unlimited.
+    timeout: Option<Duration>,
 }
 
 impl CommandRunner {
-    /// A runner using the default newline policy ([`TrailingNewline::TrimOne`]).
+    /// A runner using the default newline policy ([`TrailingNewline::TrimOne`])
+    /// and no timeout.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A runner with an explicit trailing-newline policy.
+    /// A runner with an explicit trailing-newline policy (no timeout).
     pub fn with_newline_policy(newline: TrailingNewline) -> Self {
-        Self { newline }
+        Self {
+            newline,
+            timeout: None,
+        }
+    }
+
+    /// Return a runner that kills the command if it runs longer than `timeout`.
+    ///
+    /// See the type-level "Timeout policy" note for why this is opt-in. Combine
+    /// with [`CommandRunner::with_newline_policy`] via the builder style:
+    /// `CommandRunner::new().with_timeout(d)`.
+    pub fn with_timeout(self, timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+            ..self
+        }
+    }
+
+    /// Spawn the child and collect stdout + stderr, enforcing a timeout if set.
+    ///
+    /// Both streams are drained on dedicated threads so a child that fills an OS
+    /// pipe buffer cannot deadlock us, and so the timeout can fire even while
+    /// output is pending. Returns `(stdout, stderr_len, status)`; stderr
+    /// *contents* are never surfaced (see [`RunError`]), only its byte length.
+    fn collect(
+        &self,
+        program: &str,
+        args: &[String],
+    ) -> Result<(Vec<u8>, usize, std::process::ExitStatus), RunError> {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| RunError::SpawnFailed {
+                program: program.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        // Drain both pipes on reader threads: a full pipe must never block us,
+        // and the threads let the main path poll the child for the timeout.
+        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+        let (out_tx, out_rx) = mpsc::channel();
+        let out_reader = thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf);
+            let _ = out_tx.send(buf);
+        });
+        let (err_tx, err_rx) = mpsc::channel();
+        let err_reader = thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf);
+            let _ = err_tx.send(buf.len());
+        });
+        let drains = Drains {
+            out_rx,
+            out_reader,
+            err_rx,
+            err_reader,
+        };
+
+        match self.timeout {
+            None => {
+                let status = child.wait().map_err(|e| RunError::SpawnFailed {
+                    program: program.to_string(),
+                    reason: e.to_string(),
+                })?;
+                let (stdout, stderr_len) = drains.collect();
+                Ok((stdout, stderr_len, status))
+            }
+            Some(limit) => self.wait_with_timeout(child, drains, limit, program),
+        }
+    }
+
+    /// Poll the child until it exits or `limit` elapses, killing on timeout.
+    fn wait_with_timeout(
+        &self,
+        mut child: std::process::Child,
+        drains: Drains,
+        limit: Duration,
+        program: &str,
+    ) -> Result<(Vec<u8>, usize, std::process::ExitStatus), RunError> {
+        let start = Instant::now();
+        // Poll with a short, bounded interval: responsive without busy-spinning.
+        let poll = Duration::from_millis(10).min(limit);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let (stdout, stderr_len) = drains.collect();
+                    return Ok((stdout, stderr_len, status));
+                }
+                Ok(None) => {
+                    if start.elapsed() >= limit {
+                        // Kill, then reap so we do not leave a zombie.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        // Wipe any partial stdout the reader managed to collect.
+                        let (mut partial, _) = drains.collect();
+                        partial.zeroize();
+                        return Err(RunError::Timeout {
+                            elapsed: start.elapsed(),
+                        });
+                    }
+                    thread::sleep(poll);
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RunError::SpawnFailed {
+                        program: program.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The drain channels + reader threads for a spawned child's stdout/stderr.
+struct Drains {
+    out_rx: mpsc::Receiver<Vec<u8>>,
+    out_reader: thread::JoinHandle<()>,
+    err_rx: mpsc::Receiver<usize>,
+    err_reader: thread::JoinHandle<()>,
+}
+
+impl Drains {
+    /// Receive the drained stdout bytes + stderr length and join both threads.
+    fn collect(self) -> (Vec<u8>, usize) {
+        let stdout = self.out_rx.recv().unwrap_or_default();
+        let stderr_len = self.err_rx.recv().unwrap_or(0);
+        let _ = self.out_reader.join();
+        let _ = self.err_reader.join();
+        (stdout, stderr_len)
     }
 }
 
@@ -212,24 +375,14 @@ impl SourceRunner for CommandRunner {
     fn run(&self, argv: &[String]) -> Result<SecretBytes, RunError> {
         let (program, args) = argv.split_first().ok_or(RunError::NoProgram)?;
 
-        let output =
-            Command::new(program)
-                .args(args)
-                .output()
-                .map_err(|e| RunError::SpawnFailed {
-                    program: program.clone(),
-                    reason: e.to_string(),
-                })?;
+        let (mut stdout, stderr_len, status) = self.collect(program, args)?;
 
-        // Take ownership of stdout so we can zeroize it on every exit path.
-        let mut stdout = output.stdout;
-
-        if !output.status.success() {
+        if !status.success() {
             // stdout may hold partial secret material even on failure — wipe it.
             stdout.zeroize();
             return Err(RunError::NonZeroExit {
-                code: output.status.code(),
-                stderr_len: output.stderr.len(),
+                code: status.code(),
+                stderr_len,
             });
         }
 
@@ -437,5 +590,72 @@ mod tests {
         let r = CommandRunner::new();
         let out = r.run(&argv(&["printf", "line1\nline2\n"])).unwrap();
         assert_eq!(out.expose_secret(), b"line1\nline2");
+    }
+
+    // ---- timeout ----
+
+    #[test]
+    fn run_error_timeout_displays_elapsed_and_redacts() {
+        let e = RunError::Timeout {
+            elapsed: Duration::from_millis(250),
+        };
+        let s = e.to_string();
+        assert!(s.contains("timed out"));
+        assert!(s.contains("killed"));
+    }
+
+    #[test]
+    fn command_runner_kills_command_that_exceeds_timeout() {
+        // `sleep 5` would normally block the caller for 5s; with a 200ms timeout
+        // the runner kills it and reports Timeout well before then.
+        let r = CommandRunner::new().with_timeout(Duration::from_millis(200));
+        let start = Instant::now();
+        let err = r.run(&argv(&["sleep", "5"])).unwrap_err();
+        let waited = start.elapsed();
+        match err {
+            RunError::Timeout { elapsed } => {
+                assert!(elapsed >= Duration::from_millis(200));
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        // We must not have waited anywhere near the full 5s.
+        assert!(
+            waited < Duration::from_secs(2),
+            "runner should return shortly after the timeout, waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn command_runner_fast_command_succeeds_under_timeout() {
+        // A command that finishes well within the timeout returns its value
+        // normally — the timeout only fires on genuinely slow commands.
+        let r = CommandRunner::new().with_timeout(Duration::from_secs(5));
+        let out = r.run(&argv(&["echo", "quick"])).unwrap();
+        assert_eq!(out.expose_secret(), b"quick");
+    }
+
+    #[test]
+    fn command_runner_no_timeout_still_works() {
+        // The default (unlimited) runner is unchanged by the timeout plumbing.
+        let r = CommandRunner::new();
+        let out = r.run(&argv(&["echo", "ok"])).unwrap();
+        assert_eq!(out.expose_secret(), b"ok");
+    }
+
+    #[test]
+    fn command_runner_captures_large_stdout_without_pipe_deadlock() {
+        // A large payload would deadlock a naive "wait then read" implementation
+        // because the OS pipe buffer fills before the child exits. The reader
+        // thread drains it concurrently. `head -c` caps the stream at 256 KiB,
+        // far larger than any pipe buffer (typically 64 KiB).
+        let r = CommandRunner::new().with_timeout(Duration::from_secs(10));
+        let out = r
+            .run(&argv(&[
+                "sh",
+                "-c",
+                "head -c 262144 /dev/zero | tr '\\0' x",
+            ]))
+            .unwrap();
+        assert_eq!(out.len(), 262144);
     }
 }

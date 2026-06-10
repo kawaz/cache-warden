@@ -28,29 +28,65 @@
 /// Carries the human-meaningful reason for the prompt so a real implementation
 /// (e.g. a TouchID dialog) can show *why* the user is being asked. It never
 /// carries the secret value itself.
+///
+/// # Requester (who is asking)
+///
+/// [`AuthContext::requester`] optionally carries the process ancestry chain of
+/// the process that triggered the unlock (as produced by
+/// [`crate::ProcessInspector::ancestry`]: index 0 is the immediate requester,
+/// then each successive parent toward `init`/`launchd`). A real
+/// [`Authenticator`] can fold this into the prompt — e.g. "Allow **ssh** (via
+/// git) to use key `GITHUB_TOKEN`?" — so the human sees *who* wants the secret,
+/// not just *which* secret.
+///
+/// `None` means the requester is unknown: the call originated **in-process**
+/// (the embedding daemon asked on its own behalf, with no external peer), or the
+/// adapter chose not to attach process facts. This is distinct from "an empty
+/// chain": there is no `Some(vec![])` convention — absence of a requester is
+/// always `None`.
+///
+/// This is descriptive context only. Whether a given chain is *allowed* to touch
+/// a key (policy interpretation) stays in the adapter layer (DR-0004); the core
+/// neither matches nor enforces process identity here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthContext {
     /// The key whose value is being unlocked.
     pub key: String,
     /// The operation that triggered the prompt.
     pub operation: AuthOperation,
+    /// The requesting process's ancestry chain, or `None` for an in-process /
+    /// unattributed call. See the type-level "Requester" note.
+    pub requester: Option<Vec<crate::process::ProcessInfo>>,
 }
 
 impl AuthContext {
-    /// Re-auth to extend a soft-expired entry under `key`.
+    /// Re-auth to extend a soft-expired entry under `key`, requester unknown.
     pub fn extend(key: impl Into<String>) -> Self {
         Self {
             key: key.into(),
             operation: AuthOperation::Extend,
+            requester: None,
         }
     }
 
-    /// Re-auth to regenerate a hard-expired command entry under `key`.
+    /// Re-auth to regenerate a hard-expired command entry under `key`,
+    /// requester unknown.
     pub fn regenerate(key: impl Into<String>) -> Self {
         Self {
             key: key.into(),
             operation: AuthOperation::Regenerate,
+            requester: None,
         }
+    }
+
+    /// Attach the requesting process's ancestry chain.
+    ///
+    /// Builder style: `AuthContext::extend("K").with_requester(chain)`. Passing
+    /// the chain produced by [`crate::ProcessInspector::ancestry`] lets an
+    /// [`Authenticator`] name the requester in its prompt.
+    pub fn with_requester(mut self, requester: Vec<crate::process::ProcessInfo>) -> Self {
+        self.requester = Some(requester);
+        self
     }
 }
 
@@ -233,5 +269,26 @@ mod tests {
         assert!(AuthError::Denied.to_string().contains("denied"));
         let u = AuthError::unavailable("no biometric hardware");
         assert!(u.to_string().contains("no biometric hardware"));
+    }
+
+    #[test]
+    fn auth_context_requester_defaults_to_none() {
+        assert_eq!(AuthContext::extend("k").requester, None);
+        assert_eq!(AuthContext::regenerate("k").requester, None);
+    }
+
+    #[test]
+    fn auth_context_with_requester_attaches_chain() {
+        use crate::process::ProcessInfo;
+        let chain = vec![ProcessInfo {
+            pid: 42,
+            ppid: Some(1),
+            path: Some(std::path::PathBuf::from("/usr/bin/ssh")),
+            start_time: None,
+        }];
+        let ctx = AuthContext::extend("GITHUB_TOKEN").with_requester(chain.clone());
+        assert_eq!(ctx.requester.as_deref(), Some(chain.as_slice()));
+        // The immediate requester is at index 0; an Authenticator can name it.
+        assert_eq!(ctx.requester.unwrap()[0].name(), Some("ssh"));
     }
 }
