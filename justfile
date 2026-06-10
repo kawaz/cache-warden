@@ -4,8 +4,8 @@
 # 鮮度チェックは kawaz/bump-semver の `vcs` サブコマンドに委譲する
 # (canonical = kawaz/bump-semver の justfile)。
 #
-# version file は Rust workspace の 2 つの crate Cargo.toml。bump-semver は
-# basename で形式判定するので `crates/*/Cargo.toml` を一括で書き換えられる。
+# version の正本は workspace root の Cargo.toml ([workspace.package].version)。
+# 各 crate は version.workspace = true で継承する。
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -70,17 +70,22 @@ check-version-bumped: (_check-version-bumped "crates/")
 [script]
 _check-version-bumped *target_paths:
     if ! bump-semver vcs diff -q main@origin -- "$@" --excludes 'glob:crates/**/tests/**' 'glob:crates/**/*_test.rs'; then
-        bump-semver compare gt crates/cache-warden/Cargo.toml vcs:main@origin
+        # origin 側に version が読めない場合 (version 管理方式の導入前) は比較不能なのでスキップ
+        if ref=$(bump-semver get vcs:main@origin:Cargo.toml -qq 2>/dev/null); then
+            bump-semver compare gt Cargo.toml "$ref"
+        else
+            echo "[check-version-bumped] origin/main の Cargo.toml に version が無いため比較をスキップ"
+        fi
     fi
 
 # ---------- release flow ----------
 
 # bump version (default: patch) and create a release commit
-# 2 つの crate Cargo.toml を同時に書き換え、Cargo.lock を再生成してから commit
+# workspace root の Cargo.toml を書き換え、Cargo.lock を再生成してから commit
 bump-version level="patch": ensure-clean
-    bump-semver "$1" crates/cache-warden/Cargo.toml crates/cache-warden-cli/Cargo.toml --write --quiet
+    bump-semver "$1" Cargo.toml --write --quiet
     cargo check --quiet
-    bump-semver vcs commit -m "Release v$(bump-semver get crates/cache-warden/Cargo.toml)" crates/cache-warden/Cargo.toml crates/cache-warden-cli/Cargo.toml Cargo.lock
+    bump-semver vcs commit -m "Release v$(bump-semver get Cargo.toml)" Cargo.toml Cargo.lock
 
 # push to origin/main with gates
 push: ci check-outdated-translations check-version-bumped
@@ -91,5 +96,5 @@ push: ci check-outdated-translations check-version-bumped
 
 # display crate version + binary --version output
 version:
-    echo "crate version: $(bump-semver get crates/cache-warden/Cargo.toml)"
+    echo "crate version: $(bump-semver get Cargo.toml)"
     if [ -x ./target/release/cache-warden ]; then echo "binary: $(./target/release/cache-warden --version)"; fi
