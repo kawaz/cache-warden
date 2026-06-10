@@ -332,7 +332,6 @@ mod platform {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{InspectError, ProcessInfo};
-    use std::path::PathBuf;
     use std::time::Duration;
 
     pub(super) fn inspect(pid: u32) -> Result<ProcessInfo, InspectError> {
