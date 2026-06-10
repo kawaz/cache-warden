@@ -10,6 +10,7 @@
 - [DR-0007](./DR-0007-mlock-memory-pinning.md) — 秘密値ページを `mlock` で常時ピン留めしスワップ漏洩を抑止。失敗は fail-open（`is_locked()` で検知可能）/ munlock→zeroize 順 / 不変バッファ設計で Vec 再確保問題を構造的に回避 / feature gate にせず常時有効。追加依存なし（libc は DR-0006 で導入済み）。DR-0005 が「別 DR で判断」とした mlock 採用の決定
 - [DR-0008](./DR-0008-single-daemon-hosting.md) — 単一デーモンプロセス直担型。`cache-warden run` = 1 プロセス（tokio）で全アダプタを listener task として in-process 直担（決定打は秘密値の 1 プロセス閉じ込め）。管理 CLI ↔ デーモンは control socket（KV socket API と統合、プロトコル詳細は次ステップ）。サービス登録は単一バイナリ + `run`。内部サブコマンド方式・アダプタ別デーモンを却下。DR-0003 / DR-0004 が残したホスティング形態・デーモン境界を確定
 - [DR-0009](./DR-0009-control-socket-protocol-v1.md) — control socket プロトコル v1。transport = UDS（0600 / stale 検知 / 二重起動拒否）、framing = JSON Lines、秘密値は base64（`*_b64`）。コマンド = `ping` / `status`（値非露出）/ `kv.set` / `kv.get` / `kv.del` / `kv.list`。peer 認証 = LOCAL_PEERPID / SO_PEERCRED → ancestry を requester として渡す（解釈はまだしない）。Authenticator は AllowAll 暫定配線。length-prefixed バイナリ・gRPC/CBOR・素 JSON 文字列を却下。DR-0008 が残したプロトコル設計を確定
+- [DR-0010](./DR-0010-config-and-reauth-command.md) — TOML config と再認証コマンド方式。実 Authenticator = `CommandAuthenticator`（lib、exit 0=承認/非ゼロ=拒否/spawn失敗=Unavailable、AuthContext を env で渡し秘密値は渡さない、timeout なし、warden DR-009 踏襲）。TOML config（CLI、`deny_unknown_fields`、`$CACHE_WARDEN_CONFIG`→`$XDG_CONFIG_HOME`→`~/.config` 探索、`[daemon].socket`/`[auth].command`/`[kv.*]` 起動時プリロード）。**static を config に書けない設計**（平文秘密値の流出防止、書いたら設定エラー）、auth 省略時=AllowAll、socket 優先順位 CLI>config>default、`config show|path|edit` 追加。ビルトイン TouchID 先行・config への static 値許可・config 必須化を却下。DR-0009 の AllowAll 暫定配線を置換
 
 ## Archived
 

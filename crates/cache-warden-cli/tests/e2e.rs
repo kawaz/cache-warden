@@ -190,6 +190,134 @@ fn wait_for_exit(daemon: &mut Daemon, timeout: Duration) -> std::process::ExitSt
     }
 }
 
+/// Spawn a daemon driven by a config file (via `$CACHE_WARDEN_CONFIG`), with the
+/// control socket also pinned by config (no `--socket`). Returns the daemon
+/// handle and the resolved socket path.
+fn spawn_with_config(dir: &Path, config_toml: &str) -> (Daemon, std::path::PathBuf) {
+    let socket = dir.join("control.sock");
+    let config_path = dir.join("config.toml");
+    // The config pins the socket so we exercise the config -> socket precedence
+    // path (no --socket on the CLI).
+    let full = format!("[daemon]\nsocket = \"{}\"\n{config_toml}", socket.display());
+    std::fs::write(&config_path, full).expect("write config");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("run")
+        .env("CACHE_WARDEN_CONFIG", &config_path)
+        .spawn()
+        .expect("spawn daemon");
+    (Daemon { child }, socket)
+}
+
+#[test]
+fn config_preload_and_reauth_command_allow() {
+    let dir = tempfile::tempdir().unwrap();
+    // Preload TOK (no TTL => always Active) to verify startup preload, and EXT
+    // with a 1s soft TTL so it soft-expires and triggers the re-auth command.
+    // `[auth].command = ["true"]` approves, so the extend succeeds.
+    let cfg = r#"
+[auth]
+command = ["true"]
+
+[kv.TOK]
+command = ["printf", "preloaded-tok"]
+
+[kv.EXT]
+command = ["printf", "ext-value"]
+soft-ttl = "1s"
+"#;
+    let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
+
+    // Preload populated TOK: a get is an immediate hit.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    assert_eq!(resp["ok"], true, "preloaded TOK get: {resp}");
+    let got = resp["value_b64"].as_str().expect("value_b64");
+    assert_eq!(B64.decode(got).unwrap(), b"preloaded-tok");
+
+    // EXT is initially Active too.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"EXT"}"#);
+    assert_eq!(resp["ok"], true);
+
+    // Let EXT soft-expire (1s), then get: the daemon runs the re-auth command
+    // (`true` => approved) and extends, returning the value.
+    std::thread::sleep(Duration::from_millis(2500));
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"EXT"}"#);
+    assert_eq!(
+        resp["ok"], true,
+        "extend should be approved by `true`: {resp}"
+    );
+    let got = resp["value_b64"].as_str().expect("value_b64");
+    assert_eq!(B64.decode(got).unwrap(), b"ext-value");
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
+fn config_reauth_command_deny_blocks_extend() {
+    let dir = tempfile::tempdir().unwrap();
+    // `[auth].command = ["false"]` denies, so a soft-expired extend fails.
+    let cfg = r#"
+[auth]
+command = ["false"]
+
+[kv.EXT]
+command = ["printf", "ext-value"]
+soft-ttl = "1s"
+"#;
+    let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
+
+    // Confirm the daemon is up (avoid a get here so timing cannot turn the
+    // "Active" probe into an early soft-expiry).
+    let resp = request(&socket, r#"{"cmd":"ping"}"#);
+    assert_eq!(resp["ok"], true);
+
+    // After soft expiry, the get triggers the re-auth command (`false` =>
+    // denied), so the daemon refuses with auth_failed.
+    std::thread::sleep(Duration::from_millis(2500));
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"EXT"}"#);
+    assert_eq!(
+        resp["ok"], false,
+        "extend must be denied by `false`: {resp}"
+    );
+    assert_eq!(resp["error"]["kind"], "auth_failed");
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
+fn config_rejects_inline_static_value() {
+    // A `[kv.*]` with an inline `value` must make `run` exit non-zero (secrets
+    // may not be persisted in config, DR-0010).
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "[kv.SECRET]\nvalue = \"hunter2\"\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("run")
+        .arg("--socket")
+        .arg(dir.path().join("control.sock"))
+        .env("CACHE_WARDEN_CONFIG", &config_path)
+        .output()
+        .expect("spawn daemon");
+    assert!(
+        !out.status.success(),
+        "daemon must refuse a config with an inline value"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("hunter2"),
+        "error must not echo the secret: {stderr}"
+    );
+}
+
 #[test]
 fn double_start_is_refused() {
     let dir = tempfile::tempdir().unwrap();

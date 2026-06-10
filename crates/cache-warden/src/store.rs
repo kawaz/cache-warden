@@ -112,7 +112,7 @@ impl Store {
     pub fn extend_authenticated(
         &mut self,
         key: &str,
-        auth: &impl Authenticator,
+        auth: &(impl Authenticator + ?Sized),
         requester: Option<&[ProcessInfo]>,
         clock: &impl Clock,
     ) -> Result<(), ExtendAuthOutcome> {
@@ -169,7 +169,7 @@ impl Store {
         &mut self,
         key: &str,
         runner: &impl SourceRunner,
-        auth: &impl Authenticator,
+        auth: &(impl Authenticator + ?Sized),
         requester: Option<&[ProcessInfo]>,
         clock: &impl Clock,
     ) -> Result<(), RegenerateOutcome> {

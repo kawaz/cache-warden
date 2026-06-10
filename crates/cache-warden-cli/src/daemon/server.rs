@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cache_warden::{
-    AllowAll, CommandRunner, ProcessInfo, ProcessInspector, Store, SystemClock, SystemInspector,
+    AllowAll, Authenticator, CommandAuthenticator, CommandRunner, ProcessInfo, ProcessInspector,
+    SourceRunner, Store, SystemClock, SystemInspector, Ttl, ValueSource,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -23,6 +24,7 @@ use tokio::sync::watch;
 
 use super::handler::{self, HandlerCtx};
 use super::peer::peer_pid;
+use crate::config::{Config, PreloadEntry};
 use crate::protocol::wire::{ErrorKind, Request, Response};
 use crate::protocol::{decode_request, encode_response};
 
@@ -87,24 +89,62 @@ pub fn bind_control_socket(path: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// The re-authentication boundary wired from config (DR-0010).
+///
+/// A `[auth].command` in the config produces a [`CommandAuthenticator`]; its
+/// absence produces [`AllowAll`] (no re-auth). Boxed behind the trait so the
+/// single `run_request` wiring point is config-driven, not hard-coded.
+type Auth = Box<dyn Authenticator + Send + Sync>;
+
+/// Build the authenticator from the resolved config (DR-0010).
+///
+/// `[auth].command` => a [`CommandAuthenticator`] that runs that argv on every
+/// TTL-gated unlock; absent => [`AllowAll`] (cache fast, never prompt).
+fn build_authenticator(config: &Config) -> Auth {
+    match config.auth_command() {
+        Some(argv) => Box::new(CommandAuthenticator::new(argv.to_vec())),
+        None => Box::new(AllowAll),
+    }
+}
+
 /// Shared daemon state handed to each connection task.
 struct Shared {
     store: Mutex<Store>,
     runner: Runner,
+    auth: Auth,
+    /// One process-lifetime monotonic clock. It must be shared across preload
+    /// and every request: a fresh `SystemClock::new()` rebases its origin to
+    /// "now", so per-request clocks would make every entry look freshly
+    /// activated and defeat TTL evaluation entirely.
+    clock: SystemClock,
     socket_path: String,
     pid: u32,
 }
 
-/// Run the daemon in the foreground until SIGINT / SIGTERM.
+/// Run the daemon in the foreground until SIGINT / SIGTERM, using `config`.
 ///
-/// Binds `socket_path`, serves the control socket, and removes the socket file
-/// on clean shutdown.
-pub async fn run(socket_path: PathBuf) -> io::Result<()> {
+/// Binds `socket_path`, preloads the config's `[kv.*]` command entries, serves
+/// the control socket, and removes the socket file on clean shutdown.
+///
+/// `socket_path` is already resolved by the caller (CLI `--socket` > env >
+/// `[daemon].socket` > built-in default); the daemon does not re-derive it.
+pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
     let listener = bind_control_socket(&socket_path)?;
 
+    let runner = CommandRunner::new();
+    let clock = SystemClock::new();
+    let mut store = Store::new();
+
+    // Preload `[kv.*]` command entries before serving. A failed preload is a
+    // warning, not fatal: the daemon stays up and the entry is simply absent
+    // until a later `kv set` (DR-0010).
+    preload_entries(&mut store, &runner, &clock, &config.preload_entries());
+
     let shared = Arc::new(Shared {
-        store: Mutex::new(Store::new()),
-        runner: CommandRunner::new(),
+        store: Mutex::new(store),
+        runner,
+        auth: build_authenticator(&config),
+        clock,
         socket_path: socket_path.display().to_string(),
         pid: std::process::id(),
     });
@@ -125,6 +165,42 @@ pub async fn run(socket_path: PathBuf) -> io::Result<()> {
     // Clean up the socket file (best effort).
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
+}
+
+/// Preload command-source entries into `store` at startup (DR-0010).
+///
+/// Each entry's command is run once now so the first `get` is a cache hit. A
+/// failure (spawn error, non-zero exit, bad TTL bounds) is reported as a single
+/// stderr warning line — **never** including the command's output, and never
+/// fatal: the entry is left unregistered and can be set later via `kv set`. The
+/// daemon must come up even if an upstream secret source is temporarily down.
+fn preload_entries<R, C>(store: &mut Store, runner: &R, clock: &C, entries: &[PreloadEntry])
+where
+    R: SourceRunner,
+    C: cache_warden::Clock,
+{
+    for entry in entries {
+        let ttl = match Ttl::new(
+            entry.soft_ttl_secs.map(std::time::Duration::from_secs),
+            entry.hard_ttl_secs.map(std::time::Duration::from_secs),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("cache-warden: preload `{}` skipped: {e}", entry.name);
+                continue;
+            }
+        };
+        match runner.run(&entry.command) {
+            Ok(value) => {
+                let source = ValueSource::command(entry.command.clone());
+                store.set(entry.name.clone(), source, value, ttl, clock);
+            }
+            Err(e) => {
+                // The RunError Display is already secret-free (stderr redacted).
+                eprintln!("cache-warden: preload `{}` failed: {e}", entry.name);
+            }
+        }
+    }
 }
 
 /// The accept loop: serve connections until the shutdown signal flips.
@@ -221,8 +297,9 @@ fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Respons
         inspector.ancestry(pid).ok()
     });
 
-    let clock = SystemClock::new();
-    let auth = AllowAll; // DR-0009: AllowAll wired now; TouchID in a later iteration.
+    // DR-0010: the authenticator is wired from config (CommandAuthenticator when
+    // `[auth].command` is set, else AllowAll), built once at startup.
+    let auth: &dyn Authenticator = shared.auth.as_ref();
 
     let mut store = match shared.store.lock() {
         Ok(g) => g,
@@ -230,9 +307,9 @@ fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Respons
     };
 
     let ctx = HandlerCtx {
-        auth: &auth,
+        auth,
         runner: &shared.runner,
-        clock: &clock,
+        clock: &shared.clock,
         pid: shared.pid,
         version: VERSION,
         socket: &shared.socket_path,
@@ -276,6 +353,8 @@ mod tests {
         Arc::new(Shared {
             store: Mutex::new(Store::new()),
             runner: CommandRunner::new(),
+            auth: Box::new(AllowAll),
+            clock: SystemClock::new(),
             socket_path: "/tmp/test.sock".into(),
             pid: std::process::id(),
         })
@@ -311,6 +390,88 @@ mod tests {
             Response::Err(e) => assert_eq!(e.error.kind, ErrorKind::BadRequest),
             _ => panic!("expected error"),
         }
+    }
+
+    // ---- build_authenticator (config -> Authenticator) ----
+
+    #[test]
+    fn build_authenticator_without_command_allows() {
+        let cfg = Config::parse("").unwrap();
+        let auth = build_authenticator(&cfg);
+        assert!(
+            auth.authenticate(&cache_warden::AuthContext::extend("K"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn build_authenticator_with_failing_command_denies() {
+        // `[auth].command = ["false"]` => CommandAuthenticator that always denies.
+        let cfg = Config::parse("[auth]\ncommand = [\"false\"]\n").unwrap();
+        let auth = build_authenticator(&cfg);
+        assert_eq!(
+            auth.authenticate(&cache_warden::AuthContext::extend("K")),
+            Err(cache_warden::AuthError::Denied)
+        );
+    }
+
+    #[test]
+    fn build_authenticator_with_passing_command_allows() {
+        let cfg = Config::parse("[auth]\ncommand = [\"true\"]\n").unwrap();
+        let auth = build_authenticator(&cfg);
+        assert!(
+            auth.authenticate(&cache_warden::AuthContext::extend("K"))
+                .is_ok()
+        );
+    }
+
+    // ---- preload_entries ----
+
+    #[test]
+    fn preload_populates_command_entries() {
+        use cache_warden::FakeClock;
+        let runner = CommandRunner::new();
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let entries = vec![PreloadEntry {
+            name: "TOK".into(),
+            command: vec!["printf".into(), "tok-value".into()],
+            soft_ttl_secs: Some(3600),
+            hard_ttl_secs: Some(86400),
+        }];
+        preload_entries(&mut store, &runner, &clock, &entries);
+        let secret = store.get("TOK", &clock).expect("entry preloaded");
+        assert_eq!(secret.expose_secret(), b"tok-value");
+    }
+
+    #[test]
+    fn preload_failure_is_non_fatal_and_leaves_entry_absent() {
+        use cache_warden::FakeClock;
+        let runner = CommandRunner::new();
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let entries = vec![
+            PreloadEntry {
+                name: "BAD".into(),
+                command: vec!["this-binary-does-not-exist-cw-preload".into()],
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+            },
+            PreloadEntry {
+                name: "GOOD".into(),
+                command: vec!["printf".into(), "ok".into()],
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+            },
+        ];
+        // Must not panic; the bad entry is skipped, the good one still loads.
+        preload_entries(&mut store, &runner, &clock, &entries);
+        assert!(store.get("BAD", &clock).is_none(), "failed preload absent");
+        assert_eq!(
+            store.get("GOOD", &clock).unwrap().expose_secret(),
+            b"ok",
+            "subsequent preload still runs"
+        );
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 //! socket resolver) so it can be unit-tested without touching a socket.
 
 pub mod client;
+pub mod config_cmd;
 
 use std::path::PathBuf;
 
@@ -28,8 +29,13 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 /// Extract `--socket PATH` (or `--socket=PATH`) from `args`, returning the
-/// resolved socket path and the remaining args with the flag removed.
-pub fn take_socket_flag(args: &[String]) -> Result<(PathBuf, Vec<String>), String> {
+/// explicitly-requested socket path (if the flag was given) and the remaining
+/// args with the flag removed.
+///
+/// Returning `Option` (rather than eagerly falling back to the default) lets the
+/// caller apply the full precedence chain — CLI `--socket` > `[daemon].socket`
+/// in config > the built-in default (DR-0010). See [`resolve_socket`].
+pub fn take_socket_flag(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String> {
     let mut socket: Option<PathBuf> = None;
     let mut rest = Vec::new();
     let mut i = 0;
@@ -49,7 +55,19 @@ pub fn take_socket_flag(args: &[String]) -> Result<(PathBuf, Vec<String>), Strin
             i += 1;
         }
     }
-    Ok((socket.unwrap_or_else(default_socket_path), rest))
+    Ok((socket, rest))
+}
+
+/// Resolve the control socket path by precedence (DR-0010):
+///
+/// 1. `cli_socket` — an explicit `--socket PATH` (highest priority).
+/// 2. `config_socket` — `[daemon].socket` from the config file.
+/// 3. [`default_socket_path`] — `$XDG_STATE_HOME/cache-warden/control.sock`
+///    (with the `~/.local/state` fallback).
+pub fn resolve_socket(cli_socket: Option<PathBuf>, config_socket: Option<PathBuf>) -> PathBuf {
+    cli_socket
+        .or(config_socket)
+        .unwrap_or_else(default_socket_path)
 }
 
 /// Parse the arguments to `kv set <KEY> ...` into a [`Request::KvSet`].
@@ -219,17 +237,43 @@ mod tests {
     fn socket_flag_space_and_equals_forms() {
         let (p, rest) =
             take_socket_flag(&["--socket".into(), "/x.sock".into(), "ping".into()]).unwrap();
-        assert_eq!(p, PathBuf::from("/x.sock"));
+        assert_eq!(p, Some(PathBuf::from("/x.sock")));
         assert_eq!(rest, vec!["ping".to_string()]);
 
         let (p, rest) = take_socket_flag(&["--socket=/y.sock".into(), "status".into()]).unwrap();
-        assert_eq!(p, PathBuf::from("/y.sock"));
+        assert_eq!(p, Some(PathBuf::from("/y.sock")));
         assert_eq!(rest, vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn socket_flag_absent_is_none() {
+        let (p, rest) = take_socket_flag(&["ping".into()]).unwrap();
+        assert_eq!(p, None);
+        assert_eq!(rest, vec!["ping".to_string()]);
     }
 
     #[test]
     fn socket_flag_missing_value_errors() {
         assert!(take_socket_flag(&["--socket".into()]).is_err());
+    }
+
+    #[test]
+    fn resolve_socket_precedence_cli_over_config_over_default() {
+        // CLI wins outright.
+        assert_eq!(
+            resolve_socket(
+                Some(PathBuf::from("/cli.sock")),
+                Some(PathBuf::from("/cfg.sock"))
+            ),
+            PathBuf::from("/cli.sock")
+        );
+        // No CLI -> config.
+        assert_eq!(
+            resolve_socket(None, Some(PathBuf::from("/cfg.sock"))),
+            PathBuf::from("/cfg.sock")
+        );
+        // Neither -> the built-in default.
+        assert_eq!(resolve_socket(None, None), default_socket_path());
     }
 
     #[test]

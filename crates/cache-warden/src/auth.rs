@@ -215,6 +215,142 @@ impl Authenticator for RecordingAuthenticator {
     }
 }
 
+/// An [`Authenticator`] that re-authenticates by running an external command.
+///
+/// This is the production re-authentication mechanism for this iteration
+/// (cache-warden DR-0010, mirroring authsock-warden DR-009's "re-auth command
+/// first" decision). The configured command (an argv vector, program first) is
+/// run on every [`Authenticator::authenticate`] call; its exit status is the
+/// verdict:
+///
+/// - exit `0` → **approved** (`Ok(())`).
+/// - non-zero exit / killed by signal → **denied** ([`AuthError::Denied`]).
+/// - the program could not be spawned at all → **unavailable**
+///   ([`AuthError::Unavailable`]); the daemon could not even ask the user.
+///
+/// # Why a command (not a built-in TouchID prompt)
+///
+/// Delegating to an external command lets the user assemble any
+/// re-authentication flow — a local TouchID CLI, an `osascript` dialog, a push
+/// notification, a remote passkey check — without cache-warden depending on any
+/// platform framework. A built-in `LocalAuthentication`/TouchID authenticator
+/// is deliberately a later iteration; it would slot in beside this type behind
+/// the same [`Authenticator`] trait.
+///
+/// # What the command sees, and what it must not
+///
+/// The command is told *what* is being authorized via environment variables so
+/// it can render a meaningful prompt, but it is **never** given the secret
+/// value:
+///
+/// - `CACHE_WARDEN_AUTH_KEY` — the key name being unlocked.
+/// - `CACHE_WARDEN_AUTH_OPERATION` — `extend` or `regenerate`.
+/// - `CACHE_WARDEN_AUTH_REQUESTER` — the requesting process ancestry, rendered
+///   as a `pid:name` chain joined by ` <- ` (immediate requester first), only
+///   when [`AuthContext::requester`] is present.
+///
+/// The command's own stdin/stdout/stderr are routed to the null device: the
+/// prompting UI is the command's responsibility (e.g. it opens its own dialog),
+/// and we keep the daemon's streams clean and free of any text the command might
+/// emit.
+///
+/// # Timeout
+///
+/// There is intentionally **no** timeout: waiting on the user is the normal,
+/// expected case (a person taking their time at a TouchID prompt), so bounding
+/// it would kill exactly the interaction we depend on. This matches
+/// [`crate::CommandRunner`]'s default-unlimited policy.
+#[derive(Debug, Clone)]
+pub struct CommandAuthenticator {
+    argv: Vec<String>,
+}
+
+impl CommandAuthenticator {
+    /// Build a command authenticator from an argv vector (program first).
+    ///
+    /// An empty argv is accepted here but every `authenticate` call will then
+    /// fail with [`AuthError::Unavailable`] (there is no program to run); the
+    /// configuration layer is expected to reject an empty command earlier.
+    pub fn new(argv: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            argv: argv.into_iter().collect(),
+        }
+    }
+
+    /// The argv this authenticator runs (program first). Mostly for inspection.
+    pub fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    /// Render the requester ancestry chain as a `pid:name <- pid:name` string.
+    ///
+    /// The immediate requester is first. A process whose name is unknown is
+    /// rendered as `pid:?`. Returns `None` for an empty chain so the env var is
+    /// simply not set.
+    fn render_requester(chain: &[crate::process::ProcessInfo]) -> Option<String> {
+        if chain.is_empty() {
+            return None;
+        }
+        let rendered = chain
+            .iter()
+            .map(|p| format!("{}:{}", p.pid, p.name().unwrap_or("?")))
+            .collect::<Vec<_>>()
+            .join(" <- ");
+        Some(rendered)
+    }
+}
+
+impl Authenticator for CommandAuthenticator {
+    fn authenticate(&self, ctx: &AuthContext) -> Result<(), AuthError> {
+        let (program, args) = self
+            .argv
+            .split_first()
+            .ok_or_else(|| AuthError::unavailable("no re-auth command configured (empty argv)"))?;
+
+        let operation = match ctx.operation {
+            AuthOperation::Extend => "extend",
+            AuthOperation::Regenerate => "regenerate",
+        };
+
+        let mut command = std::process::Command::new(program);
+        command
+            .args(args)
+            // The prompting UI is the command's responsibility; keep the daemon's
+            // own streams clean and never relay command chatter to our parent.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // Descriptive context for the prompt — never the secret value.
+            .env("CACHE_WARDEN_AUTH_KEY", &ctx.key)
+            .env("CACHE_WARDEN_AUTH_OPERATION", operation);
+
+        match ctx.requester.as_deref() {
+            Some(chain) => match Self::render_requester(chain) {
+                Some(rendered) => {
+                    command.env("CACHE_WARDEN_AUTH_REQUESTER", rendered);
+                }
+                None => {
+                    command.env_remove("CACHE_WARDEN_AUTH_REQUESTER");
+                }
+            },
+            None => {
+                command.env_remove("CACHE_WARDEN_AUTH_REQUESTER");
+            }
+        }
+
+        let status = command.status().map_err(|e| {
+            AuthError::unavailable(format!("failed to run re-auth command `{program}`: {e}"))
+        })?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            // Non-zero exit or signal: the user (or the command) declined.
+            Err(AuthError::Denied)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +426,121 @@ mod tests {
         assert_eq!(ctx.requester.as_deref(), Some(chain.as_slice()));
         // The immediate requester is at index 0; an Authenticator can name it.
         assert_eq!(ctx.requester.unwrap()[0].name(), Some("ssh"));
+    }
+
+    // ---- CommandAuthenticator (real-process tests via true/false) ----
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn command_authenticator_exit_zero_approves() {
+        // `true` exits 0 = approved.
+        let a = CommandAuthenticator::new(argv(&["true"]));
+        assert!(a.authenticate(&AuthContext::extend("K")).is_ok());
+    }
+
+    #[test]
+    fn command_authenticator_nonzero_exit_is_denied() {
+        // `false` exits 1 = denied.
+        let a = CommandAuthenticator::new(argv(&["false"]));
+        assert_eq!(
+            a.authenticate(&AuthContext::regenerate("K")),
+            Err(AuthError::Denied)
+        );
+    }
+
+    #[test]
+    fn command_authenticator_spawn_failure_is_unavailable() {
+        let a = CommandAuthenticator::new(argv(&["this-binary-does-not-exist-cw-auth"]));
+        match a.authenticate(&AuthContext::extend("K")) {
+            Err(AuthError::Unavailable { message }) => {
+                assert!(message.contains("this-binary-does-not-exist-cw-auth"));
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_authenticator_empty_argv_is_unavailable() {
+        let a = CommandAuthenticator::new(Vec::<String>::new());
+        assert!(matches!(
+            a.authenticate(&AuthContext::extend("K")),
+            Err(AuthError::Unavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn command_authenticator_passes_key_and_operation_via_env() {
+        // The command asserts on its own environment and encodes the result in
+        // its exit code: exit 0 iff the env carries the expected key+operation.
+        let a = CommandAuthenticator::new(argv(&[
+            "sh",
+            "-c",
+            r#"[ "$CACHE_WARDEN_AUTH_KEY" = "DB_PASSWORD" ] && [ "$CACHE_WARDEN_AUTH_OPERATION" = "extend" ]"#,
+        ]));
+        assert!(
+            a.authenticate(&AuthContext::extend("DB_PASSWORD")).is_ok(),
+            "command should see KEY=DB_PASSWORD OPERATION=extend"
+        );
+        // A regenerate context flips the operation, so the same check now fails.
+        assert_eq!(
+            a.authenticate(&AuthContext::regenerate("DB_PASSWORD")),
+            Err(AuthError::Denied)
+        );
+    }
+
+    #[test]
+    fn command_authenticator_passes_requester_chain_via_env() {
+        use crate::process::ProcessInfo;
+        let chain = vec![
+            ProcessInfo {
+                pid: 42,
+                ppid: Some(7),
+                path: Some(std::path::PathBuf::from("/usr/bin/ssh")),
+                start_time: None,
+            },
+            ProcessInfo {
+                pid: 7,
+                ppid: Some(1),
+                path: Some(std::path::PathBuf::from("/usr/bin/git")),
+                start_time: None,
+            },
+        ];
+        // The command passes (exit 0) only if REQUESTER renders the chain as
+        // "42:ssh <- 7:git".
+        let a = CommandAuthenticator::new(argv(&[
+            "sh",
+            "-c",
+            r#"[ "$CACHE_WARDEN_AUTH_REQUESTER" = "42:ssh <- 7:git" ]"#,
+        ]));
+        let ctx = AuthContext::extend("K").with_requester(chain);
+        assert!(a.authenticate(&ctx).is_ok());
+    }
+
+    #[test]
+    fn command_authenticator_omits_requester_env_when_absent() {
+        // With no requester, the env var must be unset: the command passes only
+        // if CACHE_WARDEN_AUTH_REQUESTER is empty/unset.
+        let a = CommandAuthenticator::new(argv(&[
+            "sh",
+            "-c",
+            r#"[ -z "$CACHE_WARDEN_AUTH_REQUESTER" ]"#,
+        ]));
+        assert!(a.authenticate(&AuthContext::extend("K")).is_ok());
+    }
+
+    #[test]
+    fn command_authenticator_does_not_leak_command_output() {
+        // The command writes to stdout/stderr; with Stdio::null routing, the
+        // daemon's own streams are untouched. We can at least assert the verdict
+        // is still computed from the exit code (it printed but still exits 0).
+        let a = CommandAuthenticator::new(argv(&[
+            "sh",
+            "-c",
+            "echo to-stdout; echo to-stderr >&2; exit 0",
+        ]));
+        assert!(a.authenticate(&AuthContext::extend("K")).is_ok());
     }
 }

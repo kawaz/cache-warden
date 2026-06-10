@@ -8,6 +8,7 @@ use std::io::Read as _;
 use std::process;
 
 mod commands;
+mod config;
 mod daemon;
 mod protocol;
 
@@ -34,6 +35,9 @@ Commands:
     kv get <KEY>       Fetch a cached value
     kv del <KEY>       Delete a cached value
     kv list            List cached key names
+    config show        Show the effective configuration
+    config path        Show the config file path (or the search order)
+    config edit        Open the config in $EDITOR
 
 `kv set` options:
     --value V          Use the literal string V as the value
@@ -43,13 +47,18 @@ Commands:
     --hard-ttl DUR     Hard TTL (value zeroized at expiry)
 
 Global options:
-    --socket PATH      Control socket path
-                       (default: $XDG_STATE_HOME/cache-warden/control.sock)
+    --socket PATH      Control socket path. Precedence:
+                       --socket > [daemon].socket in config >
+                       $XDG_STATE_HOME/cache-warden/control.sock
     --help             Show this help message
     --version          Show version
 
 Environment:
-    XDG_STATE_HOME     Base dir for the default control socket path"
+    CACHE_WARDEN_CONFIG  Explicit config file path (highest config priority)
+    XDG_CONFIG_HOME      Base dir for the config file
+                         ($XDG_CONFIG_HOME/cache-warden/config.toml)
+    XDG_STATE_HOME       Base dir for the default control socket path
+    EDITOR / VISUAL      Editor launched by `config edit`"
     );
     if to_stderr {
         eprintln!("{help_text}");
@@ -155,8 +164,13 @@ fn run() -> Result<(), String> {
     let command = args[0].clone();
     let tail = &args[1..];
 
-    // Resolve --socket (anywhere in the tail) once.
-    let (socket, rest) = commands::take_socket_flag(tail)?;
+    // Resolve --socket (anywhere in the tail) once; None means "not on the CLI".
+    let (cli_socket, rest) = commands::take_socket_flag(tail)?;
+
+    // Load the config (or defaults) up front: every command needs the resolved
+    // socket, and `run` / `config` need the rest of it (DR-0010).
+    let loaded = config::load().map_err(|e| e.to_string())?;
+    let socket = commands::resolve_socket(cli_socket, loaded.config.socket_path());
 
     match command.as_str() {
         "run" => {
@@ -167,9 +181,10 @@ fn run() -> Result<(), String> {
                 .enable_all()
                 .build()
                 .map_err(|e| format!("failed to start runtime: {e}"))?;
-            rt.block_on(daemon::server::run(socket))
+            rt.block_on(daemon::server::run(socket, loaded.config))
                 .map_err(|e| format!("daemon error: {e}"))
         }
+        "config" => commands::config_cmd::run(rest, &loaded),
         "ping" => run_client(&socket, &protocol::wire::Request::Ping),
         "status" => run_client(&socket, &protocol::wire::Request::Status),
         "kv" => {

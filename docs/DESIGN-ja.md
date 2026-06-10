@@ -120,11 +120,40 @@ cache-warden run（単一プロセス / tokio ランタイム）
   取得し、`SystemInspector::ancestry` で祖先チェーンを得て Store の auth ゲートに
   requester として渡す。UDS 0600 + 同一 uid が第一防壁、ancestry は監査・将来ポリシーの
   材料（**ポリシー判定はまだしない**）。
-- **再認証**: 本フェーズは `AllowAll` を暫定配線（TouchID は将来 iteration、配線 1 箇所の
-  差し替えで切替）。
+- **再認証**: config 由来（DR-0010）。`[auth].command` 設定時は `CommandAuthenticator`
+  （外部コマンドに委譲、exit 0 = 承認）、未設定時は `AllowAll`。ビルトイン TouchID は将来
+  iteration（同じ `Authenticator` trait の別実装として差し込む）。
 
 CLI サブコマンド体系 v1 もこれで確定: `run` / `ping` / `status` /
-`kv set|get|del|list`（引数なしは help、ロングオプション）。
+`kv set|get|del|list` / `config show|path|edit`（引数なしは help、ロングオプション）。
+
+### 設定（TOML config・再認証コマンド、DR-0010）
+
+デーモンの設定は TOML（`#[serde(deny_unknown_fields)]`）。config 無しでも全デフォルトで
+起動する。探索順（高優先順位が先）: `$CACHE_WARDEN_CONFIG` → `$XDG_CONFIG_HOME/cache-warden/config.toml`
+→ `~/.config/cache-warden/config.toml`。詳細・代替案は [DR-0010](./decisions/DR-0010-config-and-reauth-command.md)。
+
+```toml
+[daemon]
+socket = "~/.local/state/cache-warden/control.sock"  # CLI --socket > [daemon].socket > デフォルト
+
+[auth]
+command = ["/path/to/reauth-prompt"]  # 省略時は AllowAll（再認証なし）
+
+[kv.DB_PASSWORD]                       # 起動時プリロード（command ソースのみ）
+command = ["op", "read", "op://vault/item/password"]
+soft-ttl = "1h"
+hard-ttl = "24h"
+```
+
+- **再認証コマンド**: `CommandAuthenticator`（ライブラリ）が `[auth].command` の argv を実行し、
+  exit 0 = 承認 / 非ゼロ = 拒否 / spawn 失敗 = 利用不能。`AuthContext` の情報（key・operation・
+  requester チェーン）を環境変数で渡すが**秘密値は渡さない**。timeout なし（ユーザ入力待ちが正常系）。
+- **起動時プリロード**: `[kv.*]` の command エントリを起動時に実行してキャッシュ投入。失敗しても
+  fatal でなく、stderr に 1 行警告（値なし）を出してエントリ未登録のまま起動継続。
+- **static を config に書けない**: `[kv.*]` は command ソースのみ。リテラル値（`value` 等）を
+  書くと設定エラー（平文秘密値が config に残る漏洩を構造的に防ぐ）。リテラル値は実行時に
+  `cache-warden kv set --value-stdin` で投入する。
 
 ### Workspace 構成（DR-0002）
 
@@ -158,7 +187,9 @@ set ──> [キャッシュ保持] ──soft TTL 切れ──> 再認証(Touch
 - **コア / アダプタの層の精密な切り方**: 特に「プロセス認識アクセス制御」をコア（汎用プロセス認証）と
   アダプタ（ソケット / 鍵ごとのポリシー解釈）にどう分けるか（DR-0004 で初期方針のみ）。
 - **サービス登録（launchd / systemd）の所属**: コア（サーバ起動）側かアダプタ側か。
-- **TouchID 実装方式**: security-framework / objc2 のどちらを使うか（authsock-warden DR-018 でも未決）。
+- **ビルトイン TouchID 実装方式**: security-framework / objc2 のどちらを使うか（authsock-warden
+  DR-018 でも未決）。**ビルトイン化する iteration で決める**（現フェーズは再認証コマンド方式
+  `CommandAuthenticator` で充足、DR-0010）。
 - **static 型の hard TTL 切れ時のユーザ通知方法**。
 
 ## authsock-warden との関係・移行パス
@@ -203,5 +234,7 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
 - [DR-0003-secure-kv-core-and-adapters](./decisions/DR-0003-secure-kv-core-and-adapters.md) — コアドメインとアダプタ構造
 - [DR-0004-authsock-warden-succession](./decisions/DR-0004-authsock-warden-succession.md) — authsock-warden 後継・吸収方針
 - [DR-0008-single-daemon-hosting](./decisions/DR-0008-single-daemon-hosting.md) — 単一デーモンプロセス直担型のホスティング形態
+- [DR-0009-control-socket-protocol-v1](./decisions/DR-0009-control-socket-protocol-v1.md) — control socket プロトコル v1
+- [DR-0010-config-and-reauth-command](./decisions/DR-0010-config-and-reauth-command.md) — TOML config と再認証コマンド方式
 - [STRUCTURE.md](./STRUCTURE.md) — 物理構造
 - [ROADMAP.md](./ROADMAP.md) — 将来検討

@@ -29,9 +29,12 @@
 //! - [`CacheEntry`] / [`EntryState`] / [`Ttl`]: the two-stage TTL state machine
 //!   (Active → SoftExpired → HardExpired) with re-authentication
 //!   ([`CacheEntry::extend`]).
-//! - [`Authenticator`] / [`AuthContext`]: the re-authentication boundary. The
-//!   real (TouchID) implementation lands later; fakes ([`AllowAll`],
-//!   [`DenyAll`], [`RecordingAuthenticator`]) drive tests.
+//! - [`Authenticator`] / [`AuthContext`]: the re-authentication boundary.
+//!   [`CommandAuthenticator`] is the production mechanism — it delegates the
+//!   prompt to an external command (DR-0010, mirroring authsock-warden's
+//!   "re-auth command first"); a built-in TouchID authenticator is a later
+//!   iteration. Fakes ([`AllowAll`], [`DenyAll`], [`RecordingAuthenticator`])
+//!   drive tests.
 //! - [`ProcessInspector`] / [`ProcessInfo`]: generic process authentication —
 //!   inspecting a pid and walking its ancestry toward init/launchd.
 //!   [`SystemInspector`] is OS-backed; [`FakeInspector`] builds arbitrary trees
@@ -67,7 +70,8 @@ mod source;
 mod store;
 
 pub use auth::{
-    AllowAll, AuthContext, AuthError, AuthOperation, Authenticator, DenyAll, RecordingAuthenticator,
+    AllowAll, AuthContext, AuthError, AuthOperation, Authenticator, CommandAuthenticator, DenyAll,
+    RecordingAuthenticator,
 };
 pub use clock::{Clock, FakeClock, Monotonic, SystemClock};
 pub use entry::{CacheEntry, EntryState, ExtendError, Ttl, TtlError};

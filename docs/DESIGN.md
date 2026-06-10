@@ -114,10 +114,44 @@ The management CLI ↔ daemon protocol. Full details and alternatives are in
   and its ancestry chain (`SystemInspector::ancestry`) is forwarded to the store's auth gate as the requester. The
   UDS 0600 + same-uid check is the primary defense; the ancestry is carried for audit and future policy (**no policy
   interpretation yet**).
-- **Re-authentication**: this phase wires `AllowAll` (TouchID lands in a later iteration, swappable at one wiring site).
+- **Re-authentication**: config-driven (DR-0010). When `[auth].command` is set, a `CommandAuthenticator`
+  (delegating to an external command, exit 0 = approved); otherwise `AllowAll`. A built-in TouchID
+  authenticator lands in a later iteration (slotting in beside it behind the same `Authenticator` trait).
 
 The CLI subcommand layout v1 is settled accordingly: `run` / `ping` / `status` /
-`kv set|get|del|list` (no-args shows help; long options).
+`kv set|get|del|list` / `config show|path|edit` (no-args shows help; long options).
+
+### Configuration (TOML config + re-auth command, DR-0010)
+
+The daemon is configured via TOML (`#[serde(deny_unknown_fields)]`). It runs with all defaults
+when no config is present. Search order (highest priority first): `$CACHE_WARDEN_CONFIG` →
+`$XDG_CONFIG_HOME/cache-warden/config.toml` → `~/.config/cache-warden/config.toml`. See
+[DR-0010](./decisions/DR-0010-config-and-reauth-command.md) for details and alternatives.
+
+```toml
+[daemon]
+socket = "~/.local/state/cache-warden/control.sock"  # CLI --socket > [daemon].socket > default
+
+[auth]
+command = ["/path/to/reauth-prompt"]  # omitted => AllowAll (no re-auth)
+
+[kv.DB_PASSWORD]                       # preloaded at startup (command sources only)
+command = ["op", "read", "op://vault/item/password"]
+soft-ttl = "1h"
+hard-ttl = "24h"
+```
+
+- **Re-auth command**: `CommandAuthenticator` (library) runs `[auth].command`'s argv; exit 0 =
+  approved / non-zero = denied / spawn failure = unavailable. It passes the `AuthContext` facts
+  (key, operation, requester chain) via environment variables but **never the secret value**. No
+  timeout (waiting on the user is the normal case).
+- **Startup preload**: `[kv.*]` command entries are run at startup to populate the cache. A failure
+  is non-fatal: the daemon stays up, prints a one-line (value-free) stderr warning, and leaves the
+  entry unregistered.
+- **No inline static values**: a `[kv.*]` entry may only declare a `command` source. Writing a
+  literal value (`value`, etc.) is a configuration error — this structurally prevents a plaintext
+  secret from being persisted in config. Literal values are injected at runtime via
+  `cache-warden kv set --value-stdin`.
 
 ### Workspace Structure (DR-0002)
 
@@ -149,7 +183,7 @@ Listed honestly. These are intentionally left open to be resolved during the imp
 
 - **Precise boundary between the core and adapter layers**: In particular, how to divide "process-aware access control" between the core (general-purpose process authentication) and adapters (per-socket / per-key policy interpretation) (DR-0004 covers only the initial policy).
 - **Service registration (launchd / systemd) ownership**: Whether this belongs to the core (server startup) side or the adapter side.
-- **TouchID implementation approach**: Whether to use security-framework or objc2 (also unresolved in authsock-warden DR-018).
+- **Built-in TouchID implementation approach**: Whether to use security-framework or objc2 (also unresolved in authsock-warden DR-018). **To be decided in the iteration that builds TouchID in** (the current phase is served by the re-auth command mechanism, `CommandAuthenticator`, DR-0010).
 - **How to notify users when a `static`-type entry's hard TTL expires**.
 
 ## Relationship with authsock-warden and Migration Path
@@ -190,5 +224,7 @@ See [ROADMAP.md](./ROADMAP.md) for details.
 - [DR-0003-secure-kv-core-and-adapters](./decisions/DR-0003-secure-kv-core-and-adapters.md) — Core domain and adapter structure
 - [DR-0004-authsock-warden-succession](./decisions/DR-0004-authsock-warden-succession.md) — authsock-warden succession and absorption policy
 - [DR-0008-single-daemon-hosting](./decisions/DR-0008-single-daemon-hosting.md) — Single-process direct hosting model
+- [DR-0009-control-socket-protocol-v1](./decisions/DR-0009-control-socket-protocol-v1.md) — Control socket protocol v1
+- [DR-0010-config-and-reauth-command](./decisions/DR-0010-config-and-reauth-command.md) — TOML config and re-auth command
 - [STRUCTURE.md](./STRUCTURE.md) — Physical structure
 - [ROADMAP.md](./ROADMAP.md) — Future considerations

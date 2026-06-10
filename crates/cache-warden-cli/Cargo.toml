@@ -17,6 +17,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 # base64 encoding of secret bytes on the control-socket wire (DR-0009).
 base64 = "0.22"
+# TOML configuration file parsing (DR-0010). Kept on the CLI side only; the
+# library stays dependency-minimal (DR-0002).
+toml = "0.8"
 # Peer credential lookup (LOCAL_PEERPID / SO_PEERCRED) on the control socket.
 libc = "0.2"
 

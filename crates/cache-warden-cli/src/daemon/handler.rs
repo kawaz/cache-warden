@@ -20,8 +20,10 @@ use crate::protocol::{decode_b64, encode_b64};
 /// Everything [`handle_request`] needs beyond the store: the authenticator, a
 /// source runner for regeneration, the clock, the daemon's identity for
 /// `status`, and the requester ancestry chain for auth attribution.
-pub struct HandlerCtx<'a, A, R, C> {
-    /// Re-authentication boundary (AllowAll in this iteration; TouchID later).
+pub struct HandlerCtx<'a, A: ?Sized, R, C> {
+    /// Re-authentication boundary, wired from config (DR-0010): a
+    /// `CommandAuthenticator` when `[auth].command` is set, else `AllowAll`.
+    /// `?Sized` so the server can pass a `&dyn Authenticator` trait object.
     pub auth: &'a A,
     /// Runs command sources during regeneration.
     pub runner: &'a R,
@@ -49,7 +51,7 @@ pub fn handle_request<A, R, C>(
     req: Request,
 ) -> Response
 where
-    A: Authenticator,
+    A: Authenticator + ?Sized,
     R: SourceRunner,
     C: Clock,
 {
@@ -78,6 +80,7 @@ fn state_str(state: EntryState) -> &'static str {
 
 fn handle_status<A, R, C>(store: &mut Store, ctx: &HandlerCtx<'_, A, R, C>) -> Response
 where
+    A: ?Sized,
     C: Clock,
 {
     // Collect names first to avoid holding an immutable borrow across the
@@ -115,6 +118,7 @@ fn handle_set<A, R, C>(
     hard_ttl_secs: Option<u64>,
 ) -> Response
 where
+    A: ?Sized,
     R: SourceRunner,
     C: Clock,
 {
@@ -156,7 +160,7 @@ where
 
 fn handle_get<A, R, C>(store: &mut Store, ctx: &HandlerCtx<'_, A, R, C>, key: String) -> Response
 where
-    A: Authenticator,
+    A: Authenticator + ?Sized,
     R: SourceRunner,
     C: Clock,
 {
