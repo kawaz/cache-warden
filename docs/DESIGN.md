@@ -44,7 +44,7 @@ cache-warden kv get DB_PASSWORD
 ```
 
 > The CLI syntax above is illustrative for explaining the domain and is not the formal subcommand specification
-> (the adapter hosting model is not yet finalized; see open questions below).
+> (it will be finalized together with the control socket protocol design; see open questions below).
 
 ## Architecture
 
@@ -67,6 +67,31 @@ cache-warden core (secure KV cache)
 - The foundation of the secret-value domain (TTL / process authentication / re-authentication / memory protection) is **concentrated in the core** and shared across multiple adapters.
 - SSH key management is positioned as an **adapter** that handles SSH keys as a specific kind of secret value.
 - **The socket is created by cache-warden itself (the server side)**. Rather than hooking into a socket created by an external program after the fact, cache-warden owns and provides the endpoint.
+
+### Daemon Composition (Single-Process Direct Hosting, DR-0008)
+
+`cache-warden run` is a single process (tokio runtime) that hosts all adapters directly within the same process.
+
+```
+cache-warden run (single process / tokio runtime)
+  ├─ Core (secret / clock / source / entry / store / auth / process) wired at the center
+  ├─ listener task: authsock adapter (SSH agent socket)
+  ├─ listener task: KV adapter
+  └─ listener task: control socket (management CLI ↔ daemon)
+```
+
+- **All adapters are hosted directly as listener tasks within the same process**, never split into subprocesses.
+  The deciding factor is **confining secrets to a single process**: making adapters child processes would force
+  secrets across IPC, scattering the mlock / zeroize / process-authentication protection boundary across processes.
+  In-process, the core's memory protection applies uniformly to every adapter.
+- **The management CLI ↔ daemon communicate over a control socket (Unix domain socket)**. Management operations such
+  as `kv get / set / del` / `status` / `refresh` go through this socket. The path for other processes to access the
+  KV programmatically (the KV socket API) is unified into the same protocol. The protocol details and message format
+  will be decided in the next design step.
+- **The core is wired at the center of the daemon**. The (already-implemented) core sits at the center of the `run`
+  path, with adapters layered thinly on top.
+- **Service registration (launchd / systemd) uses the single binary + a `run` argument**.
+- **Synchronous work (e.g. op CLI invocations) is isolated via `spawn_blocking`**.
 
 ### Workspace Structure (DR-0002)
 
@@ -96,13 +121,14 @@ set ──> [cached] ──soft TTL expiry──> re-authentication (TouchID)
 
 Listed honestly. These are intentionally left open to be resolved during the implementation phase.
 
-- **Adapter hosting model**: Whether adapters are co-located as internal subcommands of the core, whether the main server process acts as the adapter directly, or some other arrangement—not yet decided. Left as an open question in DR-0003 as well.
-- **Daemon / server process boundary**: The formal delineation of what each process listens on and where sockets are created.
 - **Precise boundary between the core and adapter layers**: In particular, how to divide "process-aware access control" between the core (general-purpose process authentication) and adapters (per-socket / per-key policy interpretation) (DR-0004 covers only the initial policy).
 - **Service registration (launchd / systemd) ownership**: Whether this belongs to the core (server startup) side or the adapter side.
 - **TouchID implementation approach**: Whether to use security-framework or objc2 (also unresolved in authsock-warden DR-018).
-- **KV socket API protocol design**: The design of the path for other processes to access the KV programmatically.
-- **Formal subcommand specification for the CLI**: To be finalized once the hosting model is decided.
+- **Control socket protocol design**: A single protocol unifying the management CLI ↔ daemon communication and the KV
+  socket API (message format / command set / how it connects to process authentication). Hosting is already decided
+  (DR-0008); this is the next major design item.
+- **Formal subcommand specification for the CLI**: Hosting is already decided (DR-0008). To be finalized together with
+  the control socket protocol design.
 - **How to notify users when a `static`-type entry's hard TTL expires**.
 
 ## Relationship with authsock-warden and Migration Path
@@ -129,7 +155,8 @@ See DR-0004 for the core/adapter assignment of assets being ported.
 
 ## Future Considerations
 
-- **KV socket API**: A path for other processes to interact with the KV programmatically.
+- **Control socket / KV socket API**: Unify the management CLI ↔ daemon communication and the path for other processes
+  to interact with the KV programmatically into a single Unix domain socket protocol (DR-0008; design is the next step).
 - **Native TouchID**: cache-warden itself issues re-authentication via LocalAuthentication, without relying on an upstream (op). Can also be repurposed as a gate for SSH key signing.
 - **Additional adapters**: Adapters for secret value protocols beyond SSH / KV.
 
@@ -141,5 +168,6 @@ See [ROADMAP.md](./ROADMAP.md) for details.
 - [DR-0002-workspace-structure](./decisions/DR-0002-workspace-structure.md) — Workspace structure
 - [DR-0003-secure-kv-core-and-adapters](./decisions/DR-0003-secure-kv-core-and-adapters.md) — Core domain and adapter structure
 - [DR-0004-authsock-warden-succession](./decisions/DR-0004-authsock-warden-succession.md) — authsock-warden succession and absorption policy
+- [DR-0008-single-daemon-hosting](./decisions/DR-0008-single-daemon-hosting.md) — Single-process direct hosting model
 - [STRUCTURE.md](./STRUCTURE.md) — Physical structure
 - [ROADMAP.md](./ROADMAP.md) — Future considerations

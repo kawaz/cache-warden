@@ -49,7 +49,7 @@ cache-warden kv get DB_PASSWORD
 ```
 
 > 上記の CLI 表記はドメインを説明するためのイメージであり、サブコマンド体系の正式仕様ではない
-> （アダプタのホスティング形態が未確定なため。下記 open question 参照）。
+> （control socket プロトコル設計とセットで確定する。下記 open question 参照）。
 
 ## アーキテクチャ
 
@@ -73,6 +73,31 @@ cache-warden コア（セキュア KV キャッシュ）
 - SSH 鍵管理は「SSH 鍵という秘密値の種別」を扱う**アダプタ**として位置づける。
 - **ソケットは cache-warden 自身（サーバ側）が作る**。外部プログラムが作ったソケットに後から
   関与するのではなく、cache-warden がエンドポイントを提供する。
+
+### デーモン構成（単一プロセス直担型、DR-0008）
+
+`cache-warden run` は 1 プロセス（tokio ランタイム）であり、全アダプタを同一プロセス内で直接担う。
+
+```
+cache-warden run（単一プロセス / tokio ランタイム）
+  ├─ コア（secret / clock / source / entry / store / auth / process）を中心に配線
+  ├─ listener task: authsock アダプタ（SSH agent socket）
+  ├─ listener task: KV アダプタ
+  └─ listener task: control socket（管理 CLI ↔ デーモン）
+```
+
+- **全アダプタは同一プロセス内の listener task として直担**し、サブプロセスに分割しない。
+  決定打は**秘密値の 1 プロセス閉じ込め**で、子プロセス化すると秘密値が IPC を渡り、
+  mlock / zeroize / プロセス認証の保護境界がプロセス間に分散して壊れる。in-process なら
+  コアのメモリ保護がそのまま全アダプタに効く。
+- **管理 CLI ↔ デーモンは control socket（Unix domain socket）経由**。`kv get / set / del` /
+  `status` / `refresh` 等の管理系はこのソケットで通信する。KV を他プロセスからプログラマティックに
+  叩く経路（KV socket API）も同じプロトコルに統合する。プロトコルの詳細・メッセージ形式は
+  次の設計ステップで決める。
+- **コアをデーモンの中心に配線する**。コア（実装済み）を run 経路の中心に置き、アダプタはその上に
+  薄く乗せる。
+- **サービス登録（launchd / systemd）は単一バイナリ + `run` 引数**で行う。
+- **同期処理（op CLI 呼び出し等）は `spawn_blocking` で隔離**する。
 
 ### Workspace 構成（DR-0002）
 
@@ -103,17 +128,15 @@ set ──> [キャッシュ保持] ──soft TTL 切れ──> 再認証(Touch
 
 正直に列挙する。決めすぎず、実装フェーズで詰める。
 
-- **アダプタのホスティング形態**: アダプタを「コアの内部サブコマンドとして同居させる」のか、
-  「本体サーバプロセスが直接アダプタを担う」のか、あるいは別の構成か、未確定。DR-0003 でも
-  open question として残している。
-- **デーモン / サーバプロセスの境界**: 何をどのプロセスが listen し、どこでソケットを作るかの
-  正式な切り分け。
 - **コア / アダプタの層の精密な切り方**: 特に「プロセス認識アクセス制御」をコア（汎用プロセス認証）と
   アダプタ（ソケット / 鍵ごとのポリシー解釈）にどう分けるか（DR-0004 で初期方針のみ）。
 - **サービス登録（launchd / systemd）の所属**: コア（サーバ起動）側かアダプタ側か。
 - **TouchID 実装方式**: security-framework / objc2 のどちらを使うか（authsock-warden DR-018 でも未決）。
-- **KV socket API のプロトコル設計**: 他プロセスからプログラマティックに KV を叩く経路の設計。
-- **CLI サブコマンド体系の正式仕様**: ホスティング形態が決まってから確定する。
+- **control socket のプロトコル設計**: 管理 CLI ↔ デーモンの通信と KV socket API を統合した
+  1 本のプロトコル（メッセージ形式・コマンド体系・プロセス認証との接続）。ホスティングは
+  確定済み（DR-0008）で、これが次の主要設計項目。
+- **CLI サブコマンド体系の正式仕様**: ホスティングは確定済み（DR-0008）。control socket
+  プロトコル設計とセットで確定する。
 - **static 型の hard TTL 切れ時のユーザ通知方法**。
 
 ## authsock-warden との関係・移行パス
@@ -143,7 +166,8 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
 
 ## 将来検討
 
-- **KV socket API**: 他プロセスからプログラマティックに KV を操作する経路。
+- **control socket / KV socket API**: 管理 CLI ↔ デーモンの通信と、他プロセスからプログラマティックに
+  KV を操作する経路を 1 本の Unix domain socket プロトコルに統合する（DR-0008、設計は次ステップ）。
 - **自前 TouchID**: 上流（op）に頼らず cache-warden 自身が LocalAuthentication で再認証を発行する。
   SSH 鍵署名のゲートにも転用できる。
 - **アダプタの追加**: SSH / KV 以外の秘密値プロトコルを扱うアダプタ。
@@ -156,5 +180,6 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
 - [DR-0002-workspace-structure](./decisions/DR-0002-workspace-structure.md) — Workspace 構成
 - [DR-0003-secure-kv-core-and-adapters](./decisions/DR-0003-secure-kv-core-and-adapters.md) — コアドメインとアダプタ構造
 - [DR-0004-authsock-warden-succession](./decisions/DR-0004-authsock-warden-succession.md) — authsock-warden 後継・吸収方針
+- [DR-0008-single-daemon-hosting](./decisions/DR-0008-single-daemon-hosting.md) — 単一デーモンプロセス直担型のホスティング形態
 - [STRUCTURE.md](./STRUCTURE.md) — 物理構造
 - [ROADMAP.md](./ROADMAP.md) — 将来検討
