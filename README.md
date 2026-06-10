@@ -1,19 +1,22 @@
 # cache-warden
 
-Manage and protect cache socket paths.
+> English | [日本語](./README-ja.md)
+
+A warden that caches secrets securely and fast.
 
 ## Problem
 
-Unix domain sockets used by services (SSH Agent, GPG Agent, 1Password, Docker) are placed in volatile directories (`$TMPDIR`, `/tmp`, `$XDG_RUNTIME_DIR`) that change on reboot or between user sessions. Clients lose track of socket paths.
+Secrets (API tokens, DB passwords, SSH keys) need to be both safe and fast. The op CLI is secure but slow (0.5-1s per item); environment variables are fast but leak from memory. cache-warden provides a cache that is "fast, secure, and re-extends via biometric auth when the TTL expires."
 
 ## How it works
 
-cache-warden provides stable symlinks to volatile socket paths and manages their lifecycle:
+cache-warden's core is a secure cache for secret values:
 
-1. Register a service's socket path
-2. Create a stable symlink under `~/.cache-warden/sockets/`
-3. Monitor socket health and update symlinks as needed
-4. Clean up stale sockets
+1. Register a secret as `static` (a direct value) or `command` (an upstream command such as `op read ...`)
+2. Manage the lifecycle with two-stage TTLs: a soft-TTL expiry re-extends via re-authentication (e.g. TouchID), a hard-TTL expiry zeroizes the value
+3. Authenticate the requester by walking the process tree, and protect the value in memory (mlock / zeroize)
+
+SSH key management (the former authsock-warden) is absorbed as one protocol adapter on top of this core (cache-warden succeeds authsock-warden).
 
 ## Install
 
@@ -21,6 +24,13 @@ cache-warden provides stable symlinks to volatile socket paths and manages their
 cargo build --release -p cache-warden-cli
 ```
 
+## Documentation
+
+- [DESIGN.md](./docs/DESIGN.md) — Current implementation (domain + architecture)
+- [STRUCTURE.md](./docs/STRUCTURE.md) — Repository physical structure
+- [ROADMAP.md](./docs/ROADMAP.md) — Future considerations
+- [decisions/INDEX.md](./docs/decisions/INDEX.md) — Design decisions (DR) index
+
 ## License
 
-MIT
+MIT License, Yoshiaki Kawazu (@kawaz)

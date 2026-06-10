@@ -1,4 +1,13 @@
-# DR-001: cache-warden コンセプト
+# DR-0001: cache-warden コンセプト
+
+- Status: Superseded by DR-0003
+- Date: 2026-04-10
+
+> **Superseded by DR-0003**: 本 DR は cache-warden を「外部プログラムが作る volatile な
+> ソケットパスへの安定 symlink を提供するツール」として構想していたが、2026-06-10 の kawaz
+> レビューでこの前提が否定された。cache-warden のコアは「秘密値のセキュアキャッシュ」へと
+> 転換し、SSH 鍵管理はその上のプロトコルアダプタと位置づけ直された（DR-0003）。本文は歴史記録
+> として保持する。
 
 ## 背景
 
@@ -41,6 +50,9 @@ cache-warden は以下を提供するツール/ライブラリとして設計す
 
 ### 安定パスの設計
 
+> **注記**: この「安定パスの設計」を含む symlink 路線全体が DR-0003 で Superseded された
+> （下記本文は当時の歴史記録）。
+
 ```
 ~/.cache-warden/
   sockets/
@@ -49,18 +61,18 @@ cache-warden は以下を提供するツール/ライブラリとして設計す
   config.toml
 ```
 
-- `~/.cache-warden/sockets/<name>` が安定パス（symlink）
+- 安定パス（symlink）を提供する方針自体は維持
 - 実際のソケットパスは環境に応じて動的に解決
 - 設定ファイルでサービスごとのソケットパス解決ルールを定義
 
 ## 関連プロジェクト
 
-- **authsock-warden**: SSH/GPG Agent のソケット管理に特化したツール。cache-warden はより汎用的な位置づけ
-- **stable-which**: バイナリパスの安定化。cache-warden はソケット/キャッシュパスの安定化
+- **authsock-warden**: SSH Agent protocol の proxy と鍵のセキュリティに特化したツール。後継・吸収方針は DR-0004 を参照
+- **stable-which**: バイナリパスの安定化（当初コンセプトでの比較対象）
 
-## 未決定事項
+## その後の確定状況
 
-- 設定ファイルの形式（TOML? YAML?）
-- サービスディスカバリの仕組み
-- launchd/systemd との統合方法
-- 暗号化ソケットのサポート
+本 DR の symlink 路線は DR-0003 で全面 Superseded された。当初ここに並べていた未決事項
+（設定ファイル形式・サービスディスカバリ・launchd/systemd 統合・暗号化ソケット対応）は、
+コンセプトが「セキュア KV キャッシュコア + プロトコルアダプタ」へ転換したことで前提ごと
+組み替わっている。現行の方針は DR-0003 / DR-0004 と DESIGN を参照。

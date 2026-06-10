@@ -1,4 +1,7 @@
-# DR-002: Workspace 構成
+# DR-0002: Workspace 構成
+
+- Status: Active
+- Date: 2026-04-10
 
 ## 決定
 
