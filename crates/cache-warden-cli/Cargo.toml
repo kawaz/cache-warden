@@ -13,3 +13,12 @@ path = "src/main.rs"
 cache-warden = { path = "../cache-warden" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Async runtime + Unix socket I/O for the daemon (DR-0008 single-process host).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
+# base64 encoding of secret bytes on the control-socket wire (DR-0009).
+base64 = "0.22"
+# Peer credential lookup (LOCAL_PEERPID / SO_PEERCRED) on the control socket.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -92,12 +92,39 @@ cache-warden run（単一プロセス / tokio ランタイム）
   コアのメモリ保護がそのまま全アダプタに効く。
 - **管理 CLI ↔ デーモンは control socket（Unix domain socket）経由**。`kv get / set / del` /
   `status` / `refresh` 等の管理系はこのソケットで通信する。KV を他プロセスからプログラマティックに
-  叩く経路（KV socket API）も同じプロトコルに統合する。プロトコルの詳細・メッセージ形式は
-  次の設計ステップで決める。
+  叩く経路（KV socket API）も同じプロトコルに統合する。プロトコル詳細は DR-0009 で確定済み
+  （下記「control socket プロトコル v1」節）。
 - **コアをデーモンの中心に配線する**。コア（実装済み）を run 経路の中心に置き、アダプタはその上に
   薄く乗せる。
 - **サービス登録（launchd / systemd）は単一バイナリ + `run` 引数**で行う。
 - **同期処理（op CLI 呼び出し等）は `spawn_blocking` で隔離**する。
+
+### control socket プロトコル v1（DR-0009）
+
+管理 CLI ↔ デーモンの通信プロトコル。詳細・代替案は
+[DR-0009](./decisions/DR-0009-control-socket-protocol-v1.md)。
+
+- **transport**: Unix domain socket。デフォルトパス
+  `$XDG_STATE_HOME/cache-warden/control.sock`（未設定時 `~/.local/state/...`）。
+  パーミッション 0600。起動時に既存 socket へ connect 試験 → 成功なら二重起動として
+  `AddrInUse` でエラー終了、失敗なら stale として除去して bind。
+- **framing**: JSON Lines（リクエスト 1 行 / レスポンス 1 行）。`nc` / `socat` で手で
+  叩けるデバッグ容易性を優先。
+- **値のエンコーディング**: 秘密値はバイナリ安全のため base64（`value_b64` のように
+  `_b64` サフィックスで明示）。エラーメッセージには秘密値を含めない。
+- **コマンド v1**: `ping` / `status`（デーモン情報 + エントリ一覧。**値は含めない**）/
+  `kv.set`（static + `value_b64` または command + `argv`、soft/hard TTL 秒）/
+  `kv.get`（SoftExpired は再認証で延長、HardExpired + regenerable は再生成して値を返す）/
+  `kv.del` / `kv.list`。レスポンスは `{"ok":true,...}` / `{"ok":false,"error":{"kind":...,"message":...}}`。
+- **peer 認証**: 接続ごとに LOCAL_PEERPID（macOS）/ SO_PEERCRED（Linux）で peer pid を
+  取得し、`SystemInspector::ancestry` で祖先チェーンを得て Store の auth ゲートに
+  requester として渡す。UDS 0600 + 同一 uid が第一防壁、ancestry は監査・将来ポリシーの
+  材料（**ポリシー判定はまだしない**）。
+- **再認証**: 本フェーズは `AllowAll` を暫定配線（TouchID は将来 iteration、配線 1 箇所の
+  差し替えで切替）。
+
+CLI サブコマンド体系 v1 もこれで確定: `run` / `ping` / `status` /
+`kv set|get|del|list`（引数なしは help、ロングオプション）。
 
 ### Workspace 構成（DR-0002）
 
@@ -132,11 +159,6 @@ set ──> [キャッシュ保持] ──soft TTL 切れ──> 再認証(Touch
   アダプタ（ソケット / 鍵ごとのポリシー解釈）にどう分けるか（DR-0004 で初期方針のみ）。
 - **サービス登録（launchd / systemd）の所属**: コア（サーバ起動）側かアダプタ側か。
 - **TouchID 実装方式**: security-framework / objc2 のどちらを使うか（authsock-warden DR-018 でも未決）。
-- **control socket のプロトコル設計**: 管理 CLI ↔ デーモンの通信と KV socket API を統合した
-  1 本のプロトコル（メッセージ形式・コマンド体系・プロセス認証との接続）。ホスティングは
-  確定済み（DR-0008）で、これが次の主要設計項目。
-- **CLI サブコマンド体系の正式仕様**: ホスティングは確定済み（DR-0008）。control socket
-  プロトコル設計とセットで確定する。
 - **static 型の hard TTL 切れ時のユーザ通知方法**。
 
 ## authsock-warden との関係・移行パス

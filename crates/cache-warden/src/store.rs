@@ -219,6 +219,16 @@ impl Store {
         self.entries.keys().map(String::as_str).collect()
     }
 
+    /// Borrow the [`ValueSource`] of `key`, or `None` if the key is absent.
+    ///
+    /// This is value-free metadata (the source describes *how* a value is
+    /// obtained, not the value itself), so it does not evaluate TTL or expose
+    /// any secret. An adapter uses it to report whether an entry is
+    /// regenerable without unlocking it.
+    pub fn source_of(&self, key: &str) -> Option<&ValueSource> {
+        self.entries.get(key).map(CacheEntry::source)
+    }
+
     /// Number of entries in the store (including not-yet-deleted expired ones).
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -522,6 +532,23 @@ mod tests {
         );
         assert_eq!(s.list(), vec!["a", "b", "c"]);
         assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn source_of_reports_kind_without_exposing_value() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set(
+            "stat",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &clock,
+        );
+        cmd_entry(&mut s, "cmd", &clock);
+        assert_eq!(s.source_of("stat"), Some(&ValueSource::Static));
+        assert!(s.source_of("cmd").unwrap().is_regenerable());
+        assert_eq!(s.source_of("ghost"), None);
     }
 
     #[test]

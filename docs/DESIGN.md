@@ -86,12 +86,38 @@ cache-warden run (single process / tokio runtime)
   In-process, the core's memory protection applies uniformly to every adapter.
 - **The management CLI ↔ daemon communicate over a control socket (Unix domain socket)**. Management operations such
   as `kv get / set / del` / `status` / `refresh` go through this socket. The path for other processes to access the
-  KV programmatically (the KV socket API) is unified into the same protocol. The protocol details and message format
-  will be decided in the next design step.
+  KV programmatically (the KV socket API) is unified into the same protocol. The protocol is finalized in DR-0009
+  (see "Control Socket Protocol v1" below).
 - **The core is wired at the center of the daemon**. The (already-implemented) core sits at the center of the `run`
   path, with adapters layered thinly on top.
 - **Service registration (launchd / systemd) uses the single binary + a `run` argument**.
 - **Synchronous work (e.g. op CLI invocations) is isolated via `spawn_blocking`**.
+
+### Control Socket Protocol v1 (DR-0009)
+
+The management CLI ↔ daemon protocol. Full details and alternatives are in
+[DR-0009](./decisions/DR-0009-control-socket-protocol-v1.md).
+
+- **Transport**: Unix domain socket. Default path `$XDG_STATE_HOME/cache-warden/control.sock`
+  (falling back to `~/.local/state/...`). Permission 0600. On startup, an existing socket path is probed with a
+  connect attempt: success means a daemon is already running, so we exit with `AddrInUse` (double-start refusal);
+  failure means a stale socket, which is removed before binding.
+- **Framing**: JSON Lines (one request line / one response line), chosen for debuggability (`nc` / `socat` can drive
+  it by hand).
+- **Value encoding**: secrets are carried base64-encoded for binary safety (fields named with a `_b64` suffix, e.g.
+  `value_b64`). Error messages never carry secret material.
+- **Commands v1**: `ping` / `status` (daemon info + entry list; **no values**) /
+  `kv.set` (static + `value_b64` or command + `argv`, soft/hard TTL seconds) /
+  `kv.get` (soft-expired extends via re-auth, hard-expired regenerable entries regenerate) / `kv.del` / `kv.list`.
+  Responses are `{"ok":true,...}` / `{"ok":false,"error":{"kind":...,"message":...}}`.
+- **Peer authentication**: per connection, the peer pid is obtained via LOCAL_PEERPID (macOS) / SO_PEERCRED (Linux),
+  and its ancestry chain (`SystemInspector::ancestry`) is forwarded to the store's auth gate as the requester. The
+  UDS 0600 + same-uid check is the primary defense; the ancestry is carried for audit and future policy (**no policy
+  interpretation yet**).
+- **Re-authentication**: this phase wires `AllowAll` (TouchID lands in a later iteration, swappable at one wiring site).
+
+The CLI subcommand layout v1 is settled accordingly: `run` / `ping` / `status` /
+`kv set|get|del|list` (no-args shows help; long options).
 
 ### Workspace Structure (DR-0002)
 
@@ -124,11 +150,6 @@ Listed honestly. These are intentionally left open to be resolved during the imp
 - **Precise boundary between the core and adapter layers**: In particular, how to divide "process-aware access control" between the core (general-purpose process authentication) and adapters (per-socket / per-key policy interpretation) (DR-0004 covers only the initial policy).
 - **Service registration (launchd / systemd) ownership**: Whether this belongs to the core (server startup) side or the adapter side.
 - **TouchID implementation approach**: Whether to use security-framework or objc2 (also unresolved in authsock-warden DR-018).
-- **Control socket protocol design**: A single protocol unifying the management CLI ↔ daemon communication and the KV
-  socket API (message format / command set / how it connects to process authentication). Hosting is already decided
-  (DR-0008); this is the next major design item.
-- **Formal subcommand specification for the CLI**: Hosting is already decided (DR-0008). To be finalized together with
-  the control socket protocol design.
 - **How to notify users when a `static`-type entry's hard TTL expires**.
 
 ## Relationship with authsock-warden and Migration Path
