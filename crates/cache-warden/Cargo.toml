@@ -2,10 +2,15 @@
 name = "cache-warden"
 version = "0.1.0"
 edition = "2024"
-description = "Manage and protect cache socket paths"
+description = "Secure secret cache core: TTL-managed in-memory secret store with zeroize-backed protection"
 license = "MIT"
 repository = "https://github.com/kawaz/cache-warden"
 readme = "../../README.md"
+
+[dependencies]
+# Reliable secret zeroization. See docs/decisions/DR-0005-core-security-dependencies.md
+# for why this is an intentional exception to the "std only" dependency goal (DR-0002).
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

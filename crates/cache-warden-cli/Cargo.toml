@@ -2,6 +2,7 @@
 name = "cache-warden-cli"
 version = "0.1.0"
 edition = "2024"
+description = "CLI for cache-warden, the secure secret cache"
 publish = false
 
 [[bin]]
