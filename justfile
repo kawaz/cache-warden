@@ -71,7 +71,7 @@ check-version-bumped: (_check-version-bumped "crates/")
 _check-version-bumped *target_paths:
     if ! bump-semver vcs diff -q main@origin -- "$@" --excludes 'glob:crates/**/tests/**' 'glob:crates/**/*_test.rs'; then
         # origin 側に version が読めない場合 (version 管理方式の導入前) は比較不能なのでスキップ
-        if ref=$(bump-semver get vcs:main@origin:Cargo.toml 2>/dev/null) && [ -n "$ref" ]; then
+        if ref=$(bump-semver get vcs:main@origin:Cargo.toml -qq 2>/dev/null) && [ -n "$ref" ]; then
             bump-semver compare gt Cargo.toml "$ref"
         else
             echo "[check-version-bumped] origin/main の Cargo.toml に version が無いため比較をスキップ"
