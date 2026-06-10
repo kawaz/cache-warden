@@ -21,25 +21,46 @@
 //! - [`ValueSource`]: where a value comes from — [`ValueSource::Static`] (not
 //!   regenerable after hard expiry) or [`ValueSource::Command`] (regenerable via
 //!   a [`SourceRunner`]).
+//! - [`CommandRunner`]: the [`SourceRunner`] that runs a `command` source with
+//!   [`std::process::Command`] and captures stdout (honoring a
+//!   [`TrailingNewline`] policy).
 //! - [`CacheEntry`] / [`EntryState`] / [`Ttl`]: the two-stage TTL state machine
 //!   (Active → SoftExpired → HardExpired) with re-authentication
 //!   ([`CacheEntry::extend`]).
+//! - [`Authenticator`] / [`AuthContext`]: the re-authentication boundary. The
+//!   real (TouchID) implementation lands later; fakes ([`AllowAll`],
+//!   [`DenyAll`], [`RecordingAuthenticator`]) drive tests.
 //! - [`Store`]: a key → [`CacheEntry`] in-memory store with TTL-gated reads.
+//!   The auth gates ([`Store::extend_authenticated`], [`Store::regenerate`])
+//!   live here, not on [`CacheEntry`].
+//!
+//! # Layering: where authentication lives
+//!
+//! [`CacheEntry::extend`] is intentionally **auth-free** — it only advances the
+//! state machine. The [`Store`] layer is the single place that demands
+//! re-authentication: [`Store::extend_authenticated`] gates soft-expiry
+//! extension and [`Store::regenerate`] gates command re-generation after hard
+//! expiry. This keeps the state machine independently testable and concentrates
+//! re-auth policy in one place.
 //!
 //! # Scope of this iteration
 //!
-//! Process authentication, re-authentication (TouchID), `mlock`, the
-//! daemon/socket boundary, and the CLI are intentionally out of scope here and
-//! live in later iterations / the CLI crate.
+//! The real re-authentication mechanism (TouchID / process authentication),
+//! `mlock`, command timeouts, the daemon/socket boundary, and the CLI are
+//! intentionally out of scope here and live in later iterations / the CLI crate.
 
+mod auth;
 mod clock;
 mod entry;
 mod secret;
 mod source;
 mod store;
 
+pub use auth::{
+    AllowAll, AuthContext, AuthError, AuthOperation, Authenticator, DenyAll, RecordingAuthenticator,
+};
 pub use clock::{Clock, FakeClock, Monotonic, SystemClock};
 pub use entry::{CacheEntry, EntryState, ExtendError, Ttl, TtlError};
 pub use secret::SecretBytes;
-pub use source::{RunError, SourceRunner, ValueSource};
-pub use store::{ExtendOutcome, Store};
+pub use source::{CommandRunner, RunError, SourceRunner, TrailingNewline, ValueSource};
+pub use store::{ExtendAuthOutcome, ExtendOutcome, RegenerateOutcome, Store};
