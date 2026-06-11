@@ -1,0 +1,33 @@
+[package]
+name = "cache-warden-authsock"
+version.workspace = true
+edition.workspace = true
+description = "SSH agent protocol adapter for cache-warden, the secure secret cache"
+license = "MIT"
+repository = "https://github.com/kawaz/cache-warden"
+# Not published to crates.io for now. Unlike the core `cache-warden` library
+# (which is publish-target), the adapter's crates.io distribution is deferred
+# until the authsock feature set stabilizes; revisit when the adapter is ready.
+publish = false
+
+[dependencies]
+# SSH agent wire format: length-prefixed binary fields. `bytes` mirrors the
+# upstream authsock-warden codec (zero-copy `Bytes` / `BytesMut`).
+bytes = "1"
+# SSH public-key parsing (key blob -> fingerprint / algorithm / OpenSSH form).
+# Signing / private-key crates (rsa, ed25519-dalek, ...) are intentionally
+# deferred to a later iteration; this iteration only needs the codec.
+ssh-key = { version = "0.6", features = ["std", "ed25519", "rsa"] }
+# Local error enum for this crate. The core library stays std-only; the adapter
+# may take an ergonomic error dependency.
+thiserror = "2"
+# Async framing of agent messages over a connection. Only the `io-util` traits
+# (AsyncRead / AsyncWrite) are needed here; the listener wiring (net / runtime)
+# lives on the CLI side (DR-0008) and is added in a later iteration.
+tokio = { version = "1", features = ["io-util"] }
+
+[dev-dependencies]
+# Drive the async codec tests (in-memory cursors + #[tokio::test]).
+tokio = { version = "1", features = ["rt", "io-util", "macros"] }
+# Build canonical wire vectors in integration tests.
+bytes = "1"

@@ -11,6 +11,13 @@ cache-warden/
     cache-warden/             ライブラリ本体 (コアロジック: セキュア KV キャッシュ。依存最小・crates.io 配布想定)
       Cargo.toml              version の正本 (bump-semver の bump 対象)
       src/lib.rs
+    cache-warden-authsock/    authsock アダプタ lib (SSH agent protocol。ssh-key 等の重い依存を隔離、publish = false)
+      Cargo.toml
+      src/lib.rs              crate doc + 再エクスポート
+      src/error.rs            アダプタローカルの最小 Error/Result
+      src/message.rs          AgentMessage / MessageType / Identity / SignRequestFields (codec の純粋部)
+      src/codec.rs            AgentCodec (length-prefixed async framing)
+      tests/wire_vectors.rs   wire 形式の固定バイトベクタ (warden との互換性証明)
     cache-warden-cli/         CLI (Homebrew 配布想定、publish = false)
       Cargo.toml
       src/main.rs
@@ -30,9 +37,16 @@ cache-warden/
 
 ## Workspace 構成の意図
 
-lib (`cache-warden`) と cli (`cache-warden-cli`) を分離 (DR-0002)。lib は依存最小で
-crates.io 配布を想定、cli は Homebrew 配布を想定 (`publish = false`)。version は両 crate
-Cargo.toml に存在し、`just bump-version` が bump-semver で一括更新する。
+3 crate 構成 (DR-0002 / 移植計画 §1.1): コア lib (`cache-warden`) / authsock アダプタ lib
+(`cache-warden-authsock`) / cli バイナリ (`cache-warden-cli`)。
+
+- `cache-warden`: コア (セキュア KV)。依存最小 (zeroize + libc) で crates.io 配布を想定。
+- `cache-warden-authsock`: SSH agent protocol アダプタ。`ssh-key` 等の重い依存をここに隔離し
+  コアの依存最小ポリシーを守る (DR-0003/0004)。当面 `publish = false`。
+- `cache-warden-cli`: Homebrew 配布想定 (`publish = false`)。両 lib を結線する単一デーモン (DR-0008)。
+
+version は workspace root の `[workspace.package].version` が正本で、各 crate は
+`version.workspace = true` で継承する。`just bump-version` が bump-semver で一括更新する。
 
 ## 関連
 

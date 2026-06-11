@@ -225,13 +225,22 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
   pin 期限ちょうど / pin 中に本来の hard 超過 → pin 切れで即 HardExpired / HardExpired への pin 拒否 /
   再 pin / unpin を単体・handler・E2E で確認。`just ci` 全通過。
 
-### Iteration 0: アダプタ crate の骨格 + SSH agent protocol codec
+### Iteration 0: アダプタ crate の骨格 + SSH agent protocol codec ✅ 完了（2026-06-11）
 
 - スコープ: 新規 crate `cache-warden-authsock` を切り、`protocol/message.rs` + `codec.rs` を移植。
-  `AgentMessage` / `MessageType` / `Identity` / encode/decode / `AgentCodec` read/write。
-- 依存: `ssh-key`, `bytes`。
-- 検証: warden の protocol テスト（roundtrip / truncated / oversized / max_count）を移植して green。
+  `AgentMessage` / `MessageType` / `Identity` / `SignRequestFields` / encode/decode / `AgentCodec` read/write。
+- 依存: `ssh-key`(0.6), `bytes`, `thiserror`, `tokio`(io-util のみ)。署名系 (rsa / ed25519-dalek 等) は次 iteration へ。
+- 検証: warden の protocol テスト（roundtrip / truncated / oversized / max_count）を移植 + 境界テスト追加
+  （未知 message type / 不正長 / 途中切断 / flags 既定値 / wire 固定バイトベクタ）。`just ci` 全通過。
 - 依存関係: なし（先頭）。
+- 実績:
+  - 純粋部（`message.rs`）と async I/O（`codec.rs`）を分離。純粋部は同期テスト、codec は `#[tokio::test]`。
+  - エラー型は warden の巨大共通 Error を本 iteration で使う 2 バリアント（`InvalidMessage` / `Io`）に縮小。
+  - `parse_identities` / `parse_sign_request_key` のインライン読込を既存 `read_size_prefixed` に統一
+    （ロジック互換のリファクタ。エラー文言が "too short" → "length missing" に変わる箇所はテストも追従）。
+  - `tests/wire_vectors.rs` で REQUEST_IDENTITIES / IdentitiesAnswer / SIGN_REQUEST / SIGN_RESPONSE の
+    wire 固定バイト列を pin（warden が実装する draft-miller-ssh-agent framing との一致を証明）。
+  - テスト: authsock 37（unit 32 + wire ベクタ 5）、いずれも green。コア側既存テストにも回帰なし。
 
 ### Iteration 1: 最初の動く milestone — 「socket 1 本 listen + KV の秘密鍵で署名」
 
