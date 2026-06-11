@@ -55,8 +55,13 @@ v0.8.1 時点の KV 動詞には 3 つの構造的な不満があった:
 - `--command ARGV...`: 従来どおりの生 argv。
 - `--source URI`: scheme → コマンドテンプレートのマッピングによる糖衣。
   v1 は `op://` のみビルトイン（`op read <URI>` に展開）。
-  - op の field によっては `--reveal` 等のフラグが必要なケースがあり、テンプレート固定では
-    表現できない。その場合は `--command` に逃げる（v1 の明示的な制限）。
+  - `op read` は常に実値を返す（masked 出力にする `--reveal` のようなフラグは存在しない。
+    表示系の `op item get` とは別物）。保管庫間の移送では常に生値を取り、管理責任は
+    取得時点で op → cache-warden に移る。
+  - op 側の取得バリエーション（`?attribute=otp` / `?ssh-format=openssh` 等）は
+    **URI クエリパラメータ**として `op read` が解釈するため、`--source` の URI に
+    そのまま書けば透過する。テンプレートで表現できない別 CLI / 特殊フラグは
+    `--command` に逃げる。
   - scheme テーブルの config 拡張（KeePassXC / Bitwarden 等のベンダ CLI 追加、
     port plan §3 判断 8 の受け皿）は follow-up。機構としては「scheme → argv テンプレート」
     の表を config に持つだけで、コア変更を要しない。

@@ -177,7 +177,7 @@ points at one of these sockets (`ssh` / `ssh-add` / git, ...), it behaves like a
 
 ```toml
 [kv.GITHUB_KEY]                              # preload the private-key PEM via a command source
-command = ["op", "read", "op://vault/github/private_key", "--reveal"]
+command = ["op", "read", "op://vault/github/private_key"]
 soft-ttl = "1h"
 hard-ttl = "24h"
 

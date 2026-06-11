@@ -185,7 +185,7 @@ cache-warden は config で宣言した SSH agent socket を自ら listen し、
 
 ```toml
 [kv.GITHUB_KEY]                              # 秘密鍵 PEM を command でプリロード
-command = ["op", "read", "op://vault/github/private_key", "--reveal"]
+command = ["op", "read", "op://vault/github/private_key"]
 soft-ttl = "1h"
 hard-ttl = "24h"
 

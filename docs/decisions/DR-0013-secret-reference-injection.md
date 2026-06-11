@@ -127,6 +127,7 @@ cache-warden inject [--socket PATH] [--in FILE] [--out FILE]
 ## 関連
 
 - [DR-0014-kv-definition-model](./DR-0014-kv-definition-model.md) — 事前定義経路（`--defs` / `kv define`）と参照クエリ拡張（インライン define、opt-in 後送り）の確定。本 DR の「参照は値のみ・読み取り専用」原則は維持される
+- [DR-0015-dry-run-verification-mode](./DR-0015-dry-run-verification-mode.md) — `run` / `inject` への `--dry-run` / `--reveal` の追加（デフォルト実値、マスク検証モード、極性の config / env 切替）
 - [DR-0009-control-socket-protocol-v1](./DR-0009-control-socket-protocol-v1.md) — 解決経路（`kv.get` / peer 認証 / 再認証・再生成の委譲先）
 - [DR-0011-ttl-base-separation-and-pin](./DR-0011-ttl-base-separation-and-pin.md) — 解決時の TTL ステートマシン（extend / regenerate）
 - [DR-0002-workspace-structure](./DR-0002-workspace-structure.md) — 実装を CLI crate に閉じる根拠
