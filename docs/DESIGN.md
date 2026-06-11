@@ -169,12 +169,52 @@ hard-ttl = "24h"
   secret from being persisted in config. Literal values are injected at runtime via
   `cache-warden kv set --value-stdin`.
 
+### authsock Adapter (SSH agent socket, port plan Iteration 1)
+
+cache-warden listens on the SSH agent sockets declared in config and answers an SSH client's
+signing requests with private-key PEMs cached in the KV core. To a client whose `SSH_AUTH_SOCK`
+points at one of these sockets (`ssh` / `ssh-add` / git, ...), it behaves like an ordinary SSH agent.
+
+```toml
+[kv.GITHUB_KEY]                              # preload the private-key PEM via a command source
+command = ["op", "read", "op://vault/github/private_key", "--reveal"]
+soft-ttl = "1h"
+hard-ttl = "24h"
+
+[authsock.sockets.default]
+path = "~/.ssh/cache-warden.sock"            # agent socket (leading ~/ is expanded)
+keys = ["GITHUB_KEY"]                        # core KV key names this socket can sign with
+```
+
+- **cache-warden creates the socket**: one listener task per `[authsock.sockets.NAME]` (DR-0008,
+  single process). Same 0600 / stale recovery / double-start refusal / shared shutdown as the control
+  socket. A client connects via `SSH_AUTH_SOCK=<path>`.
+- **Public-key registry**: at startup the public half of each `keys` KV entry's PEM is derived once
+  into a registry. REQUEST_IDENTITIES (`ssh-add -l`) answers from this registry and **never touches a
+  secret**. The public key is always enumerable; the secret value's residency is governed entirely by
+  the core's TTL state (the adapter absorbs authsock-warden's "NotLoaded", DR-0004).
+- **Signing**: on SIGN_REQUEST the key blob maps back to a core KV key, whose value is fetched through
+  the **same auth gate as the control socket** (re-auth + extend on soft expiry; regenerate for a
+  command source on hard expiry; the peer pid → ancestry chain is passed as the requester). The PEM is
+  borrowed via `expose_secret()` only for the in-process signing call, and **a successful sign calls
+  extend to refresh the idle window** (a frequently-used key stays alive without re-auth, DR-0011).
+- **Failures leak nothing**: an unknown key, denied re-auth, hard-expired static key, malformed
+  request, or signing error all return `SSH_AGENT_FAILURE` (empty payload). No error detail reaches
+  the agent protocol.
+- **Isolation**: the connection handler runs on the blocking pool just like the control socket (a
+  re-auth command can block on a prompt for minutes and must not pin an async worker).
+
+> The current state (Iteration 1) covers signing with a single static / command-preloaded key.
+> Upstream agent forwarding, key filters, op key discovery, and the three-layer policy are later
+> iterations (port plan §2).
+
 ### Workspace Structure (DR-0002)
 
 | Crate | Role | Dependencies | Publish |
 |---|---|---|---|
 | `cache-warden` | Library (core logic) | Minimal (std-only target) | crates.io |
-| `cache-warden-cli` | CLI binary | cache-warden, serde, etc. | No (distributed via Homebrew) |
+| `cache-warden-authsock` | authsock adapter (SSH agent protocol / signer / public-key registry) | ssh-key, ed25519-dalek, rsa, pkcs8, etc. | No (deferred until stable) |
+| `cache-warden-cli` | CLI binary | both libraries, serde, etc. | No (distributed via Homebrew) |
 
 Design principles:
 

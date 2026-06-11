@@ -65,6 +65,47 @@ pub struct Config {
     /// deterministic (sorted) preload order for predictable startup logging.
     #[serde(default)]
     pub kv: BTreeMap<String, KvEntryConfig>,
+    /// SSH agent adapter settings (the authsock adapter; port plan Iteration 1).
+    #[serde(default)]
+    pub authsock: AuthsockConfig,
+}
+
+/// `[authsock]` section: SSH agent sockets the daemon serves.
+///
+/// Each `[authsock.sockets.NAME]` declares one agent socket and the core KV
+/// keys whose private-key PEMs answer its SIGN_REQUESTs. The private keys
+/// themselves live in `[kv.*]` (command-preloaded) or are injected at runtime
+/// with `cache-warden kv set` — they are never written here.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthsockConfig {
+    /// Agent sockets keyed by name. `BTreeMap` keeps a deterministic bind order.
+    #[serde(default)]
+    pub sockets: BTreeMap<String, AuthsockSocketConfig>,
+}
+
+/// One `[authsock.sockets.NAME]` agent socket.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthsockSocketConfig {
+    /// Filesystem path of the SSH agent socket (a leading `~/` is expanded).
+    pub path: String,
+    /// Core KV key names whose private-key PEMs this socket can sign with. Each
+    /// is enumerated (public key) in REQUEST_IDENTITIES and looked up on a
+    /// matching SIGN_REQUEST.
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+/// One validated agent socket ready to bind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthsockSocket {
+    /// The socket name (the `[authsock.sockets.NAME]` key).
+    pub name: String,
+    /// The resolved socket path (leading `~/` expanded).
+    pub path: PathBuf,
+    /// Core KV key names this socket signs with.
+    pub keys: Vec<String>,
 }
 
 /// `[daemon]` section.
@@ -211,6 +252,31 @@ impl KvEntryConfig {
     }
 }
 
+impl AuthsockSocketConfig {
+    /// Validate this socket against the schema rules and produce an
+    /// [`AuthsockSocket`].
+    ///
+    /// Rejects an empty `path` and an empty `keys` list (a socket with no keys
+    /// would answer REQUEST_IDENTITIES with nothing and could never sign).
+    fn validate(&self, name: &str) -> Result<AuthsockSocket, ConfigError> {
+        if self.path.trim().is_empty() {
+            return Err(ConfigError::new(format!(
+                "[authsock.sockets.{name}]: `path` must not be empty"
+            )));
+        }
+        if self.keys.is_empty() {
+            return Err(ConfigError::new(format!(
+                "[authsock.sockets.{name}]: `keys` must list at least one KV key name"
+            )));
+        }
+        Ok(AuthsockSocket {
+            name: name.to_string(),
+            path: expand_tilde(&self.path),
+            keys: self.keys.clone(),
+        })
+    }
+}
+
 impl Config {
     /// Parse a config from TOML text and validate its content.
     ///
@@ -223,6 +289,10 @@ impl Config {
         // startup rather than at first `get`.
         for (name, entry) in &cfg.kv {
             entry.validate(name).map_err(ConfigParseError::Content)?;
+        }
+        // Validate authsock sockets too (empty path / keys fail fast at startup).
+        for (name, sock) in &cfg.authsock.sockets {
+            sock.validate(name).map_err(ConfigParseError::Content)?;
         }
         // An empty (or omitted) auth command is treated as "no command", not as
         // a configured-but-empty command; reject the misleading empty form.
@@ -255,6 +325,16 @@ impl Config {
     /// The configured socket path with a leading `~/` expanded, if set.
     pub fn socket_path(&self) -> Option<PathBuf> {
         self.daemon.socket.as_deref().map(expand_tilde)
+    }
+
+    /// The validated authsock agent sockets, in deterministic (name-sorted)
+    /// order. Pre-validated by [`Config::parse`], so this cannot fail.
+    pub fn authsock_sockets(&self) -> Vec<AuthsockSocket> {
+        self.authsock
+            .sockets
+            .iter()
+            .filter_map(|(name, sock)| sock.validate(name).ok())
+            .collect()
     }
 }
 
@@ -613,5 +693,124 @@ bogus = 1
     #[test]
     fn expand_tilde_leaves_absolute_paths() {
         assert_eq!(expand_tilde("/tmp/x.sock"), PathBuf::from("/tmp/x.sock"));
+    }
+
+    // ---- authsock sockets ----
+
+    #[test]
+    fn empty_config_has_no_authsock_sockets() {
+        let cfg = Config::parse("").unwrap();
+        assert!(cfg.authsock_sockets().is_empty());
+    }
+
+    #[test]
+    fn authsock_socket_is_read_and_validated() {
+        let cfg = Config::parse(
+            r#"[authsock.sockets.default]
+path = "/tmp/cache-warden.sock"
+keys = ["GITHUB_KEY", "OTHER_KEY"]
+"#,
+        )
+        .unwrap();
+        let socks = cfg.authsock_sockets();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].name, "default");
+        assert_eq!(socks[0].path, PathBuf::from("/tmp/cache-warden.sock"));
+        assert_eq!(socks[0].keys, vec!["GITHUB_KEY", "OTHER_KEY"]);
+    }
+
+    #[test]
+    fn authsock_socket_path_tilde_is_expanded() {
+        let cfg = Config::parse(
+            r#"[authsock.sockets.s]
+path = "~/.ssh/cache-warden.sock"
+keys = ["K"]
+"#,
+        )
+        .unwrap();
+        // SAFETY: single-threaded test.
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+        let socks = cfg.authsock_sockets();
+        assert_eq!(
+            socks[0].path,
+            PathBuf::from("/home/tester/.ssh/cache-warden.sock")
+        );
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn authsock_sockets_are_sorted_by_name() {
+        let cfg = Config::parse(
+            r#"[authsock.sockets.bbb]
+path = "/tmp/b.sock"
+keys = ["K"]
+
+[authsock.sockets.aaa]
+path = "/tmp/a.sock"
+keys = ["K"]
+"#,
+        )
+        .unwrap();
+        let names: Vec<_> = cfg.authsock_sockets().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["aaa", "bbb"]);
+    }
+
+    #[test]
+    fn authsock_socket_without_path_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.sockets.s]
+path = ""
+keys = ["K"]
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => assert!(e.message.contains("`path` must not be empty")),
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authsock_socket_with_empty_keys_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+keys = []
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => assert!(e.message.contains("at least one KV key")),
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authsock_socket_missing_path_field_is_toml_error() {
+        // `path` has no default, so omitting it is a TOML deserialization error.
+        let err = Config::parse(
+            r#"[authsock.sockets.s]
+keys = ["K"]
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigParseError::Toml(_)));
+    }
+
+    #[test]
+    fn unknown_field_in_authsock_socket_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+keys = ["K"]
+bogus = 1
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigParseError::Toml(_)));
     }
 }

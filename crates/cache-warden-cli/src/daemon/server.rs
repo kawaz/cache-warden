@@ -108,15 +108,19 @@ fn build_authenticator(config: &Config) -> Auth {
 }
 
 /// Shared daemon state handed to each connection task.
-struct Shared {
-    store: Mutex<Store>,
-    runner: Runner,
-    auth: Auth,
+///
+/// `pub(crate)` so the authsock listener (see [`crate::daemon::authsock`]) can
+/// share the same `Store` / authenticator / runner / clock as the control
+/// socket — both adapters sit in one process around one core (DR-0008).
+pub(crate) struct Shared {
+    pub(crate) store: Mutex<Store>,
+    pub(crate) runner: Runner,
+    pub(crate) auth: Auth,
     /// One process-lifetime monotonic clock. It must be shared across preload
     /// and every request: a fresh `SystemClock::new()` rebases its origin to
     /// "now", so per-request clocks would make every entry look freshly
     /// activated and defeat TTL evaluation entirely.
-    clock: SystemClock,
+    pub(crate) clock: SystemClock,
     socket_path: String,
     pid: u32,
 }
@@ -151,18 +155,34 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let server = tokio::spawn(serve(listener, Arc::clone(&shared), shutdown_rx));
+    let server = tokio::spawn(serve(listener, Arc::clone(&shared), shutdown_rx.clone()));
 
     println!(
         "cache-warden daemon listening on {} (pid {}). Press Ctrl+C to stop.",
         shared.socket_path, shared.pid
     );
 
+    // Start one SSH agent listener per `[authsock.sockets.*]` (port Iteration 1).
+    // Each binds its own socket (same 0600 / stale-recovery / double-start guard
+    // as the control socket) and shares this process's Store / auth / runner /
+    // clock (DR-0008). A bind failure for one socket is logged and skipped; the
+    // daemon and the other sockets stay up.
+    let authsock_handles = super::authsock::spawn_listeners(
+        &config.authsock_sockets(),
+        Arc::clone(&shared),
+        shutdown_rx,
+    );
+
     wait_for_shutdown().await;
     let _ = shutdown_tx.send(true);
     let _ = server.await;
+    for (path, handle) in authsock_handles {
+        let _ = handle.await;
+        // Clean up each agent socket file (best effort).
+        let _ = std::fs::remove_file(&path);
+    }
 
-    // Clean up the socket file (best effort).
+    // Clean up the control socket file (best effort).
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }

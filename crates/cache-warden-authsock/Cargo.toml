@@ -14,17 +14,39 @@ publish = false
 # SSH agent wire format: length-prefixed binary fields. `bytes` mirrors the
 # upstream authsock-warden codec (zero-copy `Bytes` / `BytesMut`).
 bytes = "1"
-# SSH public-key parsing (key blob -> fingerprint / algorithm / OpenSSH form).
-# Signing / private-key crates (rsa, ed25519-dalek, ...) are intentionally
-# deferred to a later iteration; this iteration only needs the codec.
+# SSH key handling: public-key blob parsing/encoding (codec + registry) and
+# private-key PEM parsing (OpenSSH + PKCS#8) for the signer. `ssh_encoding::Encode`
+# (re-exported by ssh-key) builds the wire public-key blob in the registry.
 ssh-key = { version = "0.6", features = ["std", "ed25519", "rsa"] }
+ssh-encoding = "0.2"
 # Local error enum for this crate. The core library stays std-only; the adapter
 # may take an ergonomic error dependency.
 thiserror = "2"
 # Async framing of agent messages over a connection. Only the `io-util` traits
 # (AsyncRead / AsyncWrite) are needed here; the listener wiring (net / runtime)
-# lives on the CLI side (DR-0008) and is added in a later iteration.
+# lives on the CLI side (DR-0008).
 tokio = { version = "1", features = ["io-util"] }
+
+# --- Signer (local 1Password-style signing; ported from authsock-warden) ---
+# Native signing-crate types kept end-to-end to avoid lossy intermediate
+# conversions (see signer.rs design rationale). Versions/features follow the
+# authsock-warden selection.
+# Ed25519 signing + PKCS#8 decode (1Password Ed25519 keys).
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+# RSA signing (ssh-rsa / rsa-sha2-256 / rsa-sha2-512) with CRT precomputation.
+rsa = { version = "0.9", features = ["std"] }
+# PKCS#8 PEM/DER decoding + OID dispatch for strict private-key parsing.
+pkcs8 = { version = "0.10", features = ["pem", "std"] }
+# SHA-1 hash for legacy ssh-rsa signatures (deprecated remote servers).
+sha1 = { version = "0.10", features = ["oid"] }
+# SHA-2 hashes for rsa-sha2-256 / rsa-sha2-512 (DR-015 flag dispatch).
+sha2 = { version = "0.10", features = ["oid"] }
+# `signature::Signer` / `Verifier` traits used by the RSA signing path.
+signature = "2"
+# Decode the base64 PEM body in the lenient 1Password Ed25519 PKCS#8 fallback.
+base64 = "0.22"
+# Zeroize transient key-material buffers (PEM body / DER / seed) in the signer.
+zeroize = "1"
 
 [dev-dependencies]
 # Drive the async codec tests (in-memory cursors + #[tokio::test]).

@@ -177,12 +177,50 @@ hard-ttl = "24h"
   書くと設定エラー（平文秘密値が config に残る漏洩を構造的に防ぐ）。リテラル値は実行時に
   `cache-warden kv set --value-stdin` で投入する。
 
+### authsock アダプタ（SSH agent socket、port plan Iteration 1）
+
+cache-warden は config で宣言した SSH agent socket を自ら listen し、KV にキャッシュした
+秘密鍵 PEM で SSH クライアントの署名要求に応える。`SSH_AUTH_SOCK` をこの socket に向けた
+クライアント（`ssh` / `ssh-add` / git 等）から見ると、通常の SSH agent として振る舞う。
+
+```toml
+[kv.GITHUB_KEY]                              # 秘密鍵 PEM を command でプリロード
+command = ["op", "read", "op://vault/github/private_key", "--reveal"]
+soft-ttl = "1h"
+hard-ttl = "24h"
+
+[authsock.sockets.default]
+path = "~/.ssh/cache-warden.sock"            # agent socket（leading ~/ 展開）
+keys = ["GITHUB_KEY"]                        # この socket が署名に使う KV キー名のリスト
+```
+
+- **socket は cache-warden が作る**: `[authsock.sockets.NAME]` ごとに listener task を 1 本
+  起動（DR-0008 単一プロセス）。control socket と同じ 0600 / stale 復旧 / 二重起動拒否 /
+  shutdown 共有。`SSH_AUTH_SOCK=<path>` でクライアントが接続する。
+- **公開鍵レジストリ**: 起動時に `keys` の各 KV キーの PEM から公開鍵を一度導出してレジストリに
+  保持する。REQUEST_IDENTITIES（`ssh-add -l`）はこのレジストリから応答し、**秘密値に触れない**。
+  公開鍵は常に列挙でき、秘密値の在否は完全にコアの TTL 状態に委ねられる（warden の NotLoaded を
+  アダプタ側で吸収、DR-0004）。
+- **署名**: SIGN_REQUEST が来ると、key_blob からコアの KV キーを引き、**control socket と同じ
+  認証ゲート**で秘密値を取得する（SoftExpired は再認証して extend、command 型の HardExpired は
+  再生成、peer pid → 祖先チェーンを requester として渡す）。取得した PEM を `expose_secret()` で
+  短命に借りてプロセス内で署名し、**成功時は extend で idle 延命**する（使い続ける鍵は再認証なしで
+  生き続ける、DR-0011）。
+- **失敗は何も漏らさない**: 未知鍵 / 認証拒否 / hard 切れ static / 不正要求 / 署名失敗はすべて
+  `SSH_AGENT_FAILURE`（payload 空）。エラー詳細を agent protocol に出さない。
+- **隔離**: 接続ハンドラは control socket と同じく `spawn_blocking` で隔離する（再認証コマンドは
+  プロンプト待ちで分単位ブロックし得るため、async ワーカーを占有させない）。
+
+> 現状（Iteration 1）は static / command プリロードの鍵 1 本での署名まで。upstream agent への
+> 転送、鍵フィルタ、op 鍵発見、3 層ポリシーは後続 iteration（port plan §2）。
+
 ### Workspace 構成（DR-0002）
 
 | Crate | 役割 | 依存 | Publish |
 |---|---|---|---|
 | `cache-warden` | ライブラリ（コアロジック） | 最小（std のみ目標） | crates.io |
-| `cache-warden-cli` | CLI バイナリ | cache-warden, serde 等 | No（Homebrew 配布） |
+| `cache-warden-authsock` | authsock アダプタ（SSH agent protocol / signer / 公開鍵レジストリ） | ssh-key, ed25519-dalek, rsa, pkcs8 等 | No（安定化まで保留） |
+| `cache-warden-cli` | CLI バイナリ | 両ライブラリ, serde 等 | No（Homebrew 配布） |
 
 設計原則:
 

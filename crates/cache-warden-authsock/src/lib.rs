@@ -8,11 +8,12 @@
 //! (core vs adapter split) and `docs/decisions/DR-0004-authsock-warden-succession.md`
 //! (authsock-warden succession / port plan).
 //!
-//! It carries forward the SSH agent protocol message and codec assets from
-//! authsock-warden. Key sourcing, filters, 1Password local signing and the
-//! in-process listener wiring (DR-0008) are added in later port iterations.
+//! It carries forward the SSH agent protocol message / codec, the local signer,
+//! and the public-key registry from authsock-warden. Key sourcing (op discovery),
+//! filters, policy, and the in-process listener wiring (DR-0008, which lives in
+//! the CLI crate) are added in later port iterations.
 //!
-//! # This iteration (codec)
+//! # Currently ported
 //!
 //! - [`MessageType`]: SSH agent message-type byte ⇔ enum.
 //! - [`AgentMessage`]: a typed message ([`MessageType`] + payload bytes) with
@@ -20,11 +21,19 @@
 //! - [`Identity`]: a public key blob + comment, with `ssh-key`-backed parsing.
 //! - [`SignRequestFields`]: the parsed SIGN_REQUEST payload (key blob, data, flags).
 //! - [`AgentCodec`]: length-prefixed async framing over a connection.
+//! - [`sign`]: stateless local signing (Ed25519 / RSA) from a borrowed PEM,
+//!   producing an SSH wire signature blob.
+//! - [`PublicKeyRegistry`]: value-free map from a wire public-key blob to the
+//!   core KV key holding the private PEM (the REQUEST_IDENTITIES source).
 
 mod codec;
 mod error;
 mod message;
+mod registry;
+mod signer;
 
 pub use codec::AgentCodec;
 pub use error::{Error, Result};
 pub use message::{AgentMessage, Identity, MessageType, SignRequestFields};
+pub use registry::{PublicKeyRegistry, RegisteredKey};
+pub use signer::sign;

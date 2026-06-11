@@ -89,6 +89,21 @@ pub fn render_show(loaded: &LoadedConfig) -> String {
             ));
         }
     }
+
+    let sockets = loaded.config.authsock_sockets();
+    if sockets.is_empty() {
+        out.push_str("authsock sockets: (none)\n");
+    } else {
+        out.push_str("authsock sockets:\n");
+        for s in sockets {
+            out.push_str(&format!(
+                "  {}: path={} keys={:?}\n",
+                s.name,
+                s.path.display(),
+                s.keys
+            ));
+        }
+    }
     out
 }
 
@@ -166,7 +181,23 @@ mod tests {
         assert!(out.contains("config: (none found"));
         assert!(out.contains("auth command: (none"));
         assert!(out.contains("preload entries: (none)"));
+        assert!(out.contains("authsock sockets: (none)"));
         assert!(out.contains("(default)"));
+    }
+
+    #[test]
+    fn show_lists_authsock_sockets() {
+        let l = loaded(
+            r#"[authsock.sockets.default]
+path = "/run/cw-agent.sock"
+keys = ["GITHUB_KEY"]
+"#,
+            None,
+        );
+        let out = render_show(&l);
+        assert!(out.contains("authsock sockets:"));
+        assert!(out.contains("default: path=/run/cw-agent.sock"));
+        assert!(out.contains("GITHUB_KEY"));
     }
 
     #[test]

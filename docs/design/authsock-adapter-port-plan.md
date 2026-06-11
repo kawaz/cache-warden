@@ -242,7 +242,7 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
     wire 固定バイト列を pin（warden が実装する draft-miller-ssh-agent framing との一致を証明）。
   - テスト: authsock 37（unit 32 + wire ベクタ 5）、いずれも green。コア側既存テストにも回帰なし。
 
-### Iteration 1: 最初の動く milestone — 「socket 1 本 listen + KV の秘密鍵で署名」
+### Iteration 1: 最初の動く milestone — 「socket 1 本 listen + KV の秘密鍵で署名」✅ 完了（2026-06-11）
 
 - スコープ（プロンプト想定の milestone を採用、妥当性を §2 末尾で検討）:
   - `daemon run`（旧 `run`、CLI 再構成で `daemon` グループへ移動）に **authsock listener task** を
@@ -263,6 +263,32 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
   切り出せる。(3) この時点で「別ソケットで並走」の足場（listener task 化）が揃う。
   - 補足: static 鍵で始めるのは、op 発見（DR-011、TouchID / 並列 / キャッシュ）の複雑さを
     後段に隔離できるため。最初から op だと検証の不確実性が二重になる。
+- 実績（2026-06-11）:
+  - **signer 移植**（`cache-warden-authsock/src/signer.rs`）: warden の `keystore/signer.rs` を
+    そのまま移植（Ed25519 + RSA、PKCS#8 lenient、DR-015 の SHA2 フラグ分岐、1Password
+    non-canonical Ed25519 抽出）。`tracing` は外し cache-warden 流の最小ログ（ssh-rsa SHA1 警告のみ
+    `eprintln!` 1 回）。`sign(pem, data, flags)` は `&str` を借りて署名 blob を返すステートレス API。
+    エラー型に `KeyStore` バリアントを追加（秘密値を含まない固定文言）。
+  - **公開鍵レジストリ**（`registry.rs` + signer の `public_key_blob_from_pem`）: key_blob（wire 形式）
+    → `{ comment, kv_key }` の `BTreeMap`。公開鍵は秘密鍵 PEM から導出（signer の `KeyMaterial` を
+    再利用し 1Password lenient 経路も共有）。daemon 起動時に一度だけ導出して保持（秘密値はレジストリに
+    残さず公開鍵 blob のみ）。`identities()` が REQUEST_IDENTITIES 応答を返す。
+  - **config 新節**（`[authsock.sockets.NAME]` = `path` + `keys`）: `deny_unknown_fields`、起動時
+    バリデーション（空 path / 空 keys を拒否）。`Config::authsock_sockets()` で取得。
+  - **daemon 統合**（`cache-warden-cli/src/daemon/authsock.rs`）: socket ごとに listener task を追加
+    （control socket と同じ `bind_control_socket`= 0600 / stale 復旧 / 二重起動拒否 / shutdown watch 共有）。
+    接続処理は `AgentCodec` で読み、REQUEST_IDENTITIES → レジストリ応答 / SIGN_REQUEST → レジストリで
+    key_blob → kv_key 引き → `Store` から認証ゲート経由（SoftExpired は `extend_authenticated`、
+    HardExpired+command は `regenerate`、peer pid → ancestry を requester に）で PEM 取得 → signer 署名 →
+    **成功時 `extend` で idle 延命**（DR-0011）。失敗・拒否・未知鍵・不正要求はすべて SSH_AGENT_FAILURE
+    （payload 空 = 詳細を漏らさない）。ハンドラは control socket と同じく `spawn_blocking` 隔離。
+  - **検証**: 単体（signer 移植テスト + registry + daemon ハンドラ 9 件: identities / 署名検証 /
+    未知鍵 FAILURE / DenyAll FAILURE / soft extend / hard static FAILURE / idle 延命）+ E2E
+    （`tests/authsock_e2e.rs`: 実 `ssh-keygen` で Ed25519 生成 → config の command プリロードで KV 投入 →
+    daemon 起動 → `SSH_AUTH_SOCK=<sock> ssh-add -l` で公開鍵列挙 → 生 wire の SIGN_REQUEST → 署名を
+    `ssh-key` crate で verify / DenyAll 時 FAILURE + payload 空）。`just ci` 全通過、既存テスト回帰なし。
+  - **brief から変えた点**: なし（milestone 通り）。RSA は signer に移植済みだが、Ed25519 鍵で E2E を
+    回し署名パスを実証（RSA も単体テストで検証済み）。
 
 ### Iteration 2: upstream proxy member（agent 転送）
 

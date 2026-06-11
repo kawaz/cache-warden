@@ -7,7 +7,10 @@
 //!   accepted connection, feeding the requester ancestry chain.
 //! - [`server`]: the tokio control-socket listener — bind, accept loop, per-
 //!   connection task, watch-channel shutdown, SIGINT/SIGTERM.
+//! - [`authsock`]: the SSH agent listener(s) — one per `[authsock.sockets.*]`,
+//!   speaking the SSH agent protocol over the core Store (port Iteration 1).
 
+pub mod authsock;
 pub mod handler;
 pub mod peer;
 pub mod server;
