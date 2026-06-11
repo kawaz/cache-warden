@@ -57,9 +57,9 @@ use cache_warden::{
     RegenerateOutcome, SourceRunner, Store, SystemInspector, Ttl, ValueSource,
 };
 use cache_warden_authsock::{
-    AgentCodec, AgentMessage, DiscoveredKey, FilterEvaluator, Identity, KeySource, MessageType,
-    OpKeyCache, OpSource, PublicKeyRegistry, RealOpClient, RegisteredKey, Upstream, discover_keys,
-    private_key_argv, sign,
+    AgentCodec, AgentMessage, DiscoveredKey, FilterEvaluator, GithubFetcher, GithubMatcher,
+    Identity, KeySource, MessageType, OpKeyCache, OpSource, PublicKeyRegistry, RealGithubFetcher,
+    RealOpClient, RegisteredKey, Upstream, discover_keys, private_key_argv, sign,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
@@ -224,6 +224,7 @@ fn op_kv_key(item_id: &str) -> String {
 pub fn spawn_listeners(
     sockets: &[AuthsockSocket],
     sources: &[AuthsockSource],
+    github: GithubSettings,
     shared: Arc<Shared>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Vec<(PathBuf, JoinHandle<()>)> {
@@ -231,6 +232,12 @@ pub fn spawn_listeners(
     let discovered = discover_all_sources(sources);
     let source_by_name: BTreeMap<&str, &AuthsockSource> =
         sources.iter().map(|s| (s.name.as_str(), s)).collect();
+
+    // Collect every `github=<user>` matcher across all sockets so the refresh
+    // task can populate (and periodically re-fetch) their published key sets.
+    // Clones share each matcher's cache, so updates here reach the synchronous
+    // `matches()` on the hot path.
+    let mut github_matchers: Vec<GithubMatcher> = Vec::new();
 
     let mut handles = Vec::new();
     for socket in sockets {
@@ -296,6 +303,10 @@ pub fn spawn_listeners(
             }
         };
 
+        // Collect this socket's github matchers (clones share the cache the
+        // socket's filter reads). The refresh task fetches their keys.
+        github_matchers.extend(filter.github_matchers().into_iter().cloned());
+
         println!(
             "cache-warden: authsock `{}` listening on {} ({} key(s) incl. {} op, {} upstream(s), {} filter term(s))",
             socket.name,
@@ -318,7 +329,115 @@ pub fn spawn_listeners(
         let handle = tokio::spawn(serve(listener, state, rx));
         handles.push((path, handle));
     }
+
+    // Start the single github key-refresh task (no-op if no socket uses a github
+    // filter). It does the initial fetch and the periodic re-fetch; until it
+    // populates a matcher, that matcher is fail-closed (admits nothing).
+    if !github_matchers.is_empty() {
+        let task = tokio::spawn(spawn_github_refresh(
+            github_matchers,
+            github,
+            Arc::new(RealGithubFetcher::new()),
+            shutdown_rx,
+        ));
+        // The refresh task has no socket file; pair it with a throwaway path the
+        // caller's cleanup ignores (remove_file on a non-path is best-effort).
+        handles.push((PathBuf::new(), task));
+    }
     handles
+}
+
+/// Settings for the github key-refresh task: how long a fetched set is reused
+/// and how long one fetch may take.
+#[derive(Debug, Clone, Copy)]
+pub struct GithubSettings {
+    /// Reuse window before a background re-fetch (`[authsock.github].cache_ttl`).
+    pub cache_ttl: std::time::Duration,
+    /// Per-fetch timeout (`[authsock.github].timeout`, curl `--max-time`).
+    pub timeout: std::time::Duration,
+}
+
+/// The background github key-refresh task (one per daemon).
+///
+/// Does an initial fetch of every matcher's published key set, then re-fetches
+/// any matcher whose cache is due (`needs_refresh`) on each `cache_ttl` tick,
+/// until shutdown. Each fetch runs on the blocking pool (`curl` is blocking and
+/// must never run on an async worker — the load-bearing constraint). A fetch
+/// failure calls [`GithubMatcher::mark_failed`] (fail-closed) and logs a single
+/// stderr line; the daemon keeps running.
+///
+/// Generic over [`GithubFetcher`] so tests drive it with a fake fetcher (no real
+/// network / `curl` in CI).
+async fn spawn_github_refresh<F>(
+    matchers: Vec<GithubMatcher>,
+    settings: GithubSettings,
+    fetcher: Arc<F>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) where
+    F: GithubFetcher + Send + Sync + 'static,
+{
+    // Initial fetch: every matcher needs_refresh (never fetched) right now.
+    refresh_due_matchers(&matchers, &settings, &fetcher).await;
+
+    let mut ticker = tokio::time::interval(settings.cache_ttl);
+    // The first tick fires immediately; consume it (we just fetched above).
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                refresh_due_matchers(&matchers, &settings, &fetcher).await;
+            }
+        }
+    }
+}
+
+/// Re-fetch every matcher whose cache is due, on the blocking pool.
+///
+/// `needs_refresh` is checked against the wall clock so a not-yet-stale matcher
+/// is skipped (cheap when several sockets share a TTL). Duplicate users across
+/// matchers are fetched independently (cache dedup is left as a future
+/// optimisation, see the port plan).
+async fn refresh_due_matchers<F>(
+    matchers: &[GithubMatcher],
+    settings: &GithubSettings,
+    fetcher: &Arc<F>,
+) where
+    F: GithubFetcher + Send + Sync + 'static,
+{
+    let now = std::time::Instant::now();
+    for matcher in matchers {
+        if !matcher.needs_refresh(settings.cache_ttl, now) {
+            continue;
+        }
+        let user = matcher.user().to_string();
+        let timeout = settings.timeout;
+        let fetcher = Arc::clone(fetcher);
+        // `curl` is blocking: run it off the async worker pool.
+        let result = tokio::task::spawn_blocking(move || fetcher.fetch_keys(&user, timeout)).await;
+        match result {
+            Ok(Ok(keys)) => matcher.set_keys(keys, std::time::Instant::now()),
+            Ok(Err(e)) => {
+                eprintln!(
+                    "cache-warden: github filter: fetch failed for {} ({e}); serving no keys \
+                     from it until the next refresh",
+                    matcher.user()
+                );
+                matcher.mark_failed(std::time::Instant::now());
+            }
+            Err(e) => {
+                eprintln!(
+                    "cache-warden: github filter: refresh task panicked for {} ({e})",
+                    matcher.user()
+                );
+                matcher.mark_failed(std::time::Instant::now());
+            }
+        }
+    }
 }
 
 /// Accept loop for one agent socket: serve connections until shutdown.
@@ -1872,5 +1991,123 @@ mod tests {
         assert_eq!(resp.msg_type, MessageType::SignResponse);
         assert_eq!(resp.payload, upstream_sig.payload);
         std::fs::remove_file(&path).ok();
+    }
+
+    // ---- github filter refresh task (fake fetcher; no real network) ----
+
+    /// A fake [`GithubFetcher`] returning canned key bodies per user, or an error
+    /// for users registered as failing. No `curl`, no network — CI-safe.
+    struct FakeGithubFetcher {
+        bodies: std::collections::HashMap<String, String>,
+        failing: std::collections::HashSet<String>,
+    }
+
+    impl FakeGithubFetcher {
+        fn new() -> Self {
+            Self {
+                bodies: std::collections::HashMap::new(),
+                failing: std::collections::HashSet::new(),
+            }
+        }
+        fn with_body(mut self, user: &str, body: &str) -> Self {
+            self.bodies.insert(user.to_string(), body.to_string());
+            self
+        }
+        fn failing_for(mut self, user: &str) -> Self {
+            self.failing.insert(user.to_string());
+            self
+        }
+    }
+
+    impl GithubFetcher for FakeGithubFetcher {
+        fn fetch_keys(
+            &self,
+            user: &str,
+            _timeout: Duration,
+        ) -> cache_warden_authsock::Result<std::collections::HashSet<Vec<u8>>> {
+            if self.failing.contains(user) {
+                return Err(cache_warden_authsock::Error::Filter(format!(
+                    "fake fetch failure for {user}"
+                )));
+            }
+            let body = self.bodies.get(user).cloned().unwrap_or_default();
+            Ok(cache_warden_authsock::parse_keys(&body, user))
+        }
+    }
+
+    fn github_settings() -> GithubSettings {
+        GithubSettings {
+            cache_ttl: Duration::from_secs(3600),
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    fn github_identity(openssh: &str) -> Identity {
+        Identity::new(bytes::Bytes::from(blob_of(openssh)), String::new())
+    }
+
+    #[tokio::test]
+    async fn github_refresh_populates_matcher_so_it_admits_published_key() {
+        let matcher = GithubMatcher::new("kawaz");
+        // Before any fetch the matcher is fail-closed.
+        assert!(!matcher.matches(&github_identity(ED25519_PUB)));
+
+        let fetcher =
+            Arc::new(FakeGithubFetcher::new().with_body("kawaz", &format!("{ED25519_PUB}\n")));
+        refresh_due_matchers(&[matcher.clone()], &github_settings(), &fetcher).await;
+
+        // Now the published key is admitted, an unpublished one is not.
+        assert!(matcher.matches(&github_identity(ED25519_PUB)));
+        assert!(!matcher.matches(&github_identity(ED25519_PUB_2)));
+    }
+
+    #[tokio::test]
+    async fn github_refresh_failure_is_fail_closed() {
+        let matcher = GithubMatcher::new("kawaz");
+        let fetcher = Arc::new(FakeGithubFetcher::new().failing_for("kawaz"));
+        refresh_due_matchers(&[matcher.clone()], &github_settings(), &fetcher).await;
+        // A failed fetch must not admit anything.
+        assert!(!matcher.matches(&github_identity(ED25519_PUB)));
+    }
+
+    #[tokio::test]
+    async fn github_refresh_skips_matchers_not_yet_due() {
+        // A matcher freshly fetched (valid, within TTL) is not re-fetched even if
+        // the fetcher would now return a different (empty) set.
+        let matcher = GithubMatcher::new("kawaz");
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(blob_of(ED25519_PUB));
+        matcher.set_keys(keys, std::time::Instant::now());
+
+        // Fetcher returns empty for kawaz now; but the matcher isn't due, so the
+        // previously-admitted key stays admitted.
+        let fetcher = Arc::new(FakeGithubFetcher::new());
+        refresh_due_matchers(&[matcher.clone()], &github_settings(), &fetcher).await;
+        assert!(matcher.matches(&github_identity(ED25519_PUB)));
+    }
+
+    #[tokio::test]
+    async fn github_refresh_task_does_initial_fetch_then_exits_on_shutdown() {
+        let matcher = GithubMatcher::new("kawaz");
+        let fetcher =
+            Arc::new(FakeGithubFetcher::new().with_body("kawaz", &format!("{ED25519_PUB}\n")));
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(spawn_github_refresh(
+            vec![matcher.clone()],
+            github_settings(),
+            fetcher,
+            rx,
+        ));
+        // Yield so the task's initial fetch runs.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if matcher.matches(&github_identity(ED25519_PUB)) {
+                break;
+            }
+        }
+        assert!(matcher.matches(&github_identity(ED25519_PUB)));
+        // Shutdown stops the task cleanly.
+        tx.send(true).unwrap();
+        handle.await.unwrap();
     }
 }

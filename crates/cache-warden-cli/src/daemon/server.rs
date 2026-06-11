@@ -184,9 +184,21 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
     // as the control socket) and shares this process's Store / auth / runner /
     // clock (DR-0008). A bind failure for one socket is logged and skipped; the
     // daemon and the other sockets stay up.
+    // Resolve the github filter settings (durations pre-validated at parse).
+    let github_settings = super::authsock::GithubSettings {
+        cache_ttl: config
+            .authsock_github()
+            .cache_ttl_duration()
+            .unwrap_or_else(|_| std::time::Duration::from_secs(3600)),
+        timeout: config
+            .authsock_github()
+            .timeout_duration()
+            .unwrap_or_else(|_| std::time::Duration::from_secs(10)),
+    };
     let authsock_handles = super::authsock::spawn_listeners(
         &config.authsock_sockets(),
         &config.authsock_sources(),
+        github_settings,
         Arc::clone(&shared),
         shutdown_rx,
     );

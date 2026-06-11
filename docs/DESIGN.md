@@ -169,7 +169,7 @@ hard-ttl = "24h"
   secret from being persisted in config. Literal values are injected at runtime via
   `cache-warden kv set --value-stdin`.
 
-### authsock Adapter (SSH agent socket, port plan Iterations 1–3)
+### authsock Adapter (SSH agent socket, port plan Iterations 1–4)
 
 cache-warden listens on the SSH agent sockets declared in config and answers an SSH client's
 signing requests with private-key PEMs cached in the KV core. To a client whose `SSH_AUTH_SOCK`
@@ -181,11 +181,15 @@ command = ["op", "read", "op://vault/github/private_key", "--reveal"]
 soft-ttl = "1h"
 hard-ttl = "24h"
 
+[authsock.github]                            # shared settings for github= filters (optional)
+cache_ttl = "1h"                             # how often the fetched key list is refreshed (default 1h)
+timeout = "10s"                              # per-fetch timeout (curl --max-time, default 10s)
+
 [authsock.sockets.default]
 path = "~/.ssh/cache-warden.sock"            # agent socket (leading ~/ is expanded)
 keys = ["GITHUB_KEY"]                        # KV key names this socket signs with locally
 upstreams = ["~/.1password/agent.sock"]      # upstream agents to merge keys from / forward to (optional)
-filters = ["comment=github*"]                # restrict which keys this socket shows / signs (optional)
+filters = ["github=kawaz"]                   # restrict which keys this socket shows / signs (github= matches a published key list; optional)
 ```
 
 - **cache-warden creates the socket**: one listener task per `[authsock.sockets.NAME]` (DR-0008,
@@ -215,20 +219,27 @@ filters = ["comment=github*"]                # restrict which keys this socket s
   element is one **OR term**: a string is a single-rule term (`"comment=github*"`), an array is an AND
   group (`["comment=*@work*", "type=ed25519"]`). Terms are ORed, rules within a group are ANDed
   (OR-of-AND). An empty / omitted `filters` means no filtering (all keys). Rule forms are `comment=` /
-  `type=` / `fingerprint=` / `pubkey=` / `keyfile=` (each negatable with `not-`, authsock-warden
-  compatible); `comment` accepts exact / glob (`*` / `?`) / `~regex`. A filter reads **only the public
-  side** of a key (blob / comment / type / fingerprint) and never touches secret material.
+  `type=` / `fingerprint=` / `pubkey=` / `keyfile=` / `github=` (each negatable with `not-`,
+  authsock-warden compatible); `comment` accepts exact / glob (`*` / `?`) / `~regex`. A filter reads
+  **only the public side** of a key (blob / comment / type / fingerprint / github published key) and
+  never touches secret material.
   - **REQUEST_IDENTITIES**: the filter is applied after merging KV + upstream keys; only passing keys
     are enumerated. A filtered-out upstream key is not recorded for routing either.
   - **SIGN_REQUEST**: only filtered-in keys may sign — **a direct sign for a key the socket does not
     enumerate is also rejected**. Local keys are judged with their registry comment (so a comment
     filter holds on the direct-sign path); an upstream key is allowed only via a route recorded during
     enumeration (a comment-only filter therefore demands "enumerate, then sign"). Blob-derivable
-    `fingerprint` / `type` / `pubkey` filters are evaluated exactly even without a prior enumeration.
-  - **`github` filter is not ported this iteration**: authsock-warden's `github=<user>` (fetch
-    `github.com/<user>.keys` over HTTP) pulls in a heavy HTTP-client dependency (reqwest), so it is
-    deferred (allowed by port plan Iteration 3). The network-free `keyfile` (local authorized_keys) is
-    ported.
+    `fingerprint` / `type` / `pubkey` / `github` filters are evaluated exactly even without a prior
+    enumeration.
+  - **`github` filter (`github=<user>`)**: admits keys whose wire public-key blob appears in
+    `github.com/<user>.keys`. Fetched via a **`curl` shell-out** (no new HTTP-client dependency — same
+    "drive an external CLI" approach as op). Because `FilterEvaluator::matches()` is synchronous and on
+    the async hot path, the matcher holds an `Arc<RwLock<cache>>` and **matching only reads the cache**
+    (synchronous, no network). Fetching is done by the daemon's background refresh task (initial fetch
+    plus re-fetch every `[authsock.github].cache_ttl`, running `curl` on the blocking pool, stopped on
+    shutdown), which writes the cache back. **Fail-closed**: a fetch failure (network down / timeout /
+    non-2xx / parse error) or an unfetched cache admits *no* key (safe side). `[authsock.github]`
+    configures `cache_ttl` (default 1h) and `timeout` (default 10s); combinable with an op `source`.
 - **Failures leak nothing**: an unknown key, a filtered-out key, denied re-auth, hard-expired static
   key, malformed request, signing error, or all-upstreams-failed all return `SSH_AGENT_FAILURE` (empty
   payload). No error detail reaches the agent protocol.
@@ -236,9 +247,9 @@ filters = ["comment=github*"]                # restrict which keys this socket s
   re-auth command can block on a prompt for minutes and must not pin an async worker); upstream I/O is
   async (non-blocking sockets) on the runtime.
 
-> The current state (Iterations 1–3) covers signing with static / command-preloaded KV keys, merging
-> keys from / forwarding signatures to upstream agents, and per-socket key filters. op key discovery,
-> the three-layer policy, and the `github` filter are later iterations (port plan §2).
+> The current state covers signing with static / command-preloaded KV keys, merging keys from /
+> forwarding signatures to upstream agents, per-socket key filters (including `github=`), and op key
+> discovery. The three-layer policy is a later iteration (port plan §2).
 
 ### Workspace Structure (DR-0002)
 

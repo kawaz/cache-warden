@@ -353,14 +353,14 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
     `FilterEvaluator`（OR of AND）をそのまま移植。warden の各 matcher テストも移植して green。
     `pubkey` は wire blob を `key_data().encode()` で作り（registry / `Identity::new` と同じ符号化）、
     列挙 Identity と exact 一致することをテストで証明。`globset` / `regex` 依存を追加。
-  - **github filter は未移植（後送り、port plan 許容範囲内）**: warden の `github=<user>` は
-    `github.com/<user>.keys` を HTTP 取得し、重い HTTP クライアント依存（`reqwest` + TLS スタック）を
-    呼ぶ。本 iteration の他フィルタは全てネットワーク不要・依存軽量なので、github だけ後段（op 発見
-    iteration 以降 or hardening）に隔離した。`rule.rs` / `mod.rs` の doc に「deferred」と明記。
+  - **github filter は当初未移植 → 後日実装済み（curl shell-out）**: 当初は warden の `github=<user>` が
+    `github.com/<user>.keys` を HTTP 取得し重い HTTP クライアント依存（`reqwest` + TLS スタック）を呼ぶため
+    後送りにしていた。**後日 un-defer して実装済み**: 取得方式は `reqwest` ではなく **curl shell-out**
+    （op.rs と同じ「外部 CLI を叩く」哲学、新規 HTTP 依存ゼロ）。詳細は下の「Iteration 3.5」を参照。
     ネットワーク不要の `keyfile`（ローカル authorized_keys）は移植済み（warden の `shellexpand` 依存は
     避け、`~/` のみの最小展開に置換。`tracing::warn!` は cache-warden 流 `eprintln!` に）。
-    `evaluator` の `ensure_loaded`/`reload` は warden では github のため async だったが、github を外すと
-    keyfile のみ（sync）になるので `reload` を sync 化した。
+    `evaluator` の `reload` は github 実装後も sync のまま（github の再取得は同期 `reload` ではなく daemon の
+    async refresh task が担うため、`reload` に github を含めない）。
   - **config 拡張**（`[authsock.sockets.NAME].filters`）: warden の filter 文字列形式を踏襲しつつ新スキーマに
     馴染む形。warden の `deserialize_filters`（string = 単一ルール OR 項、配列 = AND グループ）を移植し、
     プロンプト例 `filters = ["comment=github*"]` がそのまま動く。`Vec<Vec<String>>`（OR of AND）。token の
@@ -389,6 +389,49 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
     評価し、allowed_keys_cache（列挙通過鍵）との OR で許可していた。cache-warden は allowed_keys_cache 相当を
     持たず、ローカルは registry の comment、upstream は `routes` を「列挙通過鍵の記録」として使う。意味論
     （列挙に出ない鍵への直接署名を拒否、blob 判定可能なフィルタは列挙なしでも評価）は warden と等価。
+
+### Iteration 3.5: github フィルタ（curl shell-out で実装）✅ 完了（2026-06-11）
+
+- スコープ: Iteration 3 で後送りした `github=<user>` フィルタを実装。`github.com/<user>.keys` の公開鍵
+  リストを取得し、提示鍵（wire 公開鍵 blob）がそのリストに含まれる鍵のみ通す。公開鍵のみ扱い、秘密値には触れない。
+- 取得方式: **curl shell-out**（`reqwest` を入れない。op.rs と同じ「外部 CLI を叩く」哲学で新規 HTTP 依存ゼロ）。
+  `curl -fsSL --max-time <timeout> https://github.com/<user>.keys` 相当を `std::process` で実行。
+- **最重要の設計制約と解法（同期照合 / 非同期取得の分離）**: `FilterEvaluator::matches()` は同期で、async な
+  `request_identities` / `sign_request` のホットパスから呼ばれる。同期 matches() 内で curl をブロッキング実行すると
+  tokio runtime を止めるため不可。→ `GithubMatcher` は内部に `Arc<RwLock<GithubCache>>`（blob 集合 + fetched_at +
+  valid フラグ）を持ち、`matches()` は **RwLock read でキャッシュ照合するだけ**（同期・ネットワークなし）。curl 取得は
+  daemon の **バックグラウンド refresh task**（初回 fetch + `cache_ttl` 間隔の再取得）が `spawn_blocking` 上で行い、
+  結果を `set_keys` / `mark_failed` で同じ cache に書き戻す。matcher は cheap clone でき cache を共有するので、
+  task の更新が即座にホットパスの `matches()` へ伝わる。
+- **fail-closed**: curl 失敗（ネット断 / timeout / 非ゼロ / パース不能）時はキャッシュを invalid にし、`matches()` は
+  全鍵を弾く（鍵を見せない安全側）。`mark_failed` は `fetched_at` も更新し、次 refresh まで間隔を空けて down 先を
+  叩き続けない。warden は「matcher リストが空 = 何も match しない」で実質 fail-closed だが、cache-warden は
+  `valid` フラグで明示し、stale だが失敗した refresh が窓を越えて鍵を通し続けないようにした。
+- 実装:
+  - `cache-warden-authsock/src/filter/github.rs`: `GithubMatcher`（user / cache、`matches` / `user` /
+    `needs_refresh` / `set_keys` / `mark_failed`）、`GithubFetcher` trait + `RealGithubFetcher`（curl）、
+    `parse_keys`（`.keys` 本文を 1 行ずつ ssh-key crate でパース → wire blob 集合、不能行はスキップ警告）。
+  - `rule.rs`: `Filter::Github` 追加、`github=<user>` parse（auto-detect なし、明示のみ）。username は
+    GitHub 文字種（英数 + `-`、先頭/末尾 `-` 不可、連続 `--` 不可、≤39 文字）に検証 = curl URL インジェクション防止。
+    `needs_comment()=false`（blob ベース）なので `is_blob_only()` を汚さない（列挙なし署名 fallback でも評価可能）。
+  - `evaluator.rs`: `github_matchers()` で全 github matcher を収集（daemon が起動時 / refresh で使う）。
+  - `cache-warden-cli` config: `[authsock.github]`（`cache_ttl` 既定 "1h" / `timeout` 既定 "10s"、`deny_unknown_fields`）。
+  - daemon 配線（`authsock.rs`）: spawn_listeners が全 socket の github matcher を集め、refresh task を 1 本 spawn
+    （初回 fetch + interval 再取得、`needs_refresh` で due のみ、shutdown watch で停止）。複数 socket が同じ user を
+    使う場合の重複取得は許容（user 単位 dedup は follow-up）。
+  - **op source + github 併用**: Iteration 3 では github 自体が parse エラーだったため併用も自然に弾かれていた。
+    github parse を実装した今、`source` 付き socket に `filters=["github=<user>"]` を併用可能（追加の解除コード不要）。
+    kawaz の実設定（op source + github フィルタ）が動く。
+- 検証: 単体（github.rs の照合 / キャッシュ / fail-closed / parse_keys / clone 共有、rule.rs の parse /
+  username 検証 / blob-only、evaluator.rs の github_matchers / is_blob_only、config の `[authsock.github]` /
+  op+github 併用、daemon の refresh task を **fake fetcher** で: 初回 fetch で鍵 admit / 失敗で fail-closed /
+  due でないものはスキップ / task の初回 fetch → shutdown）。**実 curl / 実 GitHub アクセスに依存するテストは書かない**。
+  `just ci` 全通過、既存テスト回帰なし。
+- **warden との差異**: 取得層を reqwest → curl shell-out に差し替え（依存削減）。照合ロジックは踏襲。fail-open/closed は
+  warden の実質 fail-closed を `valid` フラグで明示化（上記）。
+- **E2E について**: daemon バイナリは `RealGithubFetcher`（curl）固定で fake を注入する口が無く、github フィルタの
+  バイナリ E2E は実 GitHub アクセスを伴う。指示「実 GitHub アクセスを CI に入れない」を厳守し、refresh task の
+  振る舞いは上記 fake fetcher の tokio 統合テストで網羅、バイナリ E2E は追加しない。
 
 ### Iteration 4: op 鍵発見 + ローカル署名（DR-011 / DR-015）✅ 完了（2026-06-11）
 
@@ -436,8 +479,9 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
     起動時バリデーション（未対応 kind / 非 op:// member / 不正 TTL / 未宣言 source 参照を fail-fast、
     socket 名付き）。`members` 省略は `["op://"]`。`keys` / `upstreams` / `source` は併存可（1 socket が
     複数経路を束ねられる）。kawaz の実 warden 設定（`members=["op://"]` + `source="default"`）が動く。
-  - **github フィルタ併用**: Iteration 3 で未実装のため、op source の socket が github フィルタを使う設定は
-    config parse 時点で「未対応」として fail-fast（既存 github defer の扱いに合わせる。op 固有の追加対応なし）。
+  - **github フィルタ併用**: Iteration 4 時点では github 未実装のため op source + github は parse 時に弾かれていたが、
+    **Iteration 3.5 で github 実装済み → 併用解除済み**（op source 付き socket に `filters=["github=<user>"]` 可、
+    kawaz の実設定で必須）。
   - **検証**: 単体（op.rs 14 / op_cache.rs 7 / op_discovery.rs 6 / registry op 5 / daemon op-sign 8 +
     register 2 / config sources 13）+ E2E（`authsock_e2e.rs` に 2 件: **fake op スクリプトを PATH に置く**
     真の end-to-end。`op://` source で discovery → `ssh-add -l` に op 鍵列挙 → 初回 SIGN で遅延 fetch →
@@ -459,8 +503,8 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
     定常状態（warm restart）はディスクキャッシュで op item get ゼロになり、初回発見時のみ 1 鍵 1 回
     op item get を払うだけ。本 iteration の本丸（前例のないコア KV / TTL 配線）に集中するため follow-up に
     隔離。`op_discovery.rs` の doc に明記。**未配線だが既存 `Upstream` クライアントで実装可能**。
-  - **github フィルタ**: Iteration 3 同様未移植（HTTP 取得方式が別途決定待ち）。op source 併用は parse 時に
-    未対応エラー。
+  - **github フィルタ**: Iteration 4 では未移植だったが、**Iteration 3.5 で実装済み**（curl shell-out、上記）。
+    op source 併用も解除済み。
   - **DR / journal 起票**: 上記新規判断は本 plan の Iteration 4 実績に集約。独立 DR は kawaz 判断
     （config 新スキーマ / op 抽象置き場は DR-0004 判断 2・8 の具体化の範囲内で、設計方針の新規追加なし）。
 
@@ -483,7 +527,7 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
 ### Iteration 7+（パリティ / 後期、Phase 2 以降）
 
 - security（anti_debug 移植: §3 判断 5 の (a) core dump 抑制 / (b) ptrace 拒否 / (c) DYLD 検出を cli 側に）、
-  refresh フロー（DR-007）、idle check（policy）、github/keyfile フィルタ、
+  refresh フロー（DR-007）、idle check（policy）、
   launchd/systemd サービス登録（cli 側 `daemon register|unregister` として、§3 判断 5 で確定）。
 - これらは Phase 2（パリティ）に向けて積む。Phase 3（切替）・4（引退）は安定確認後。
 

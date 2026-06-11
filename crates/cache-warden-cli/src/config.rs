@@ -87,6 +87,60 @@ pub struct AuthsockConfig {
     /// Agent sockets keyed by name. `BTreeMap` keeps a deterministic bind order.
     #[serde(default)]
     pub sockets: BTreeMap<String, AuthsockSocketConfig>,
+    /// `github=<user>` filter settings (cache TTL / fetch timeout), shared by
+    /// every socket that uses a `github` filter.
+    #[serde(default)]
+    pub github: GithubConfig,
+}
+
+/// `[authsock.github]` section: settings for `github=<user>` filters.
+///
+/// A `github` filter fetches `github.com/<user>.keys` over the network. These
+/// settings cap how often the published key set is refreshed (`cache_ttl`) and
+/// how long a single fetch may take (`timeout`). They apply to every `github`
+/// filter the daemon serves.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubConfig {
+    /// How long a fetched key set is reused before a background refresh
+    /// re-fetches it. Parsed via [`parse_duration`]; defaults to `"1h"`.
+    #[serde(default = "default_github_cache_ttl")]
+    pub cache_ttl: String,
+    /// Maximum wall-clock time for one `.keys` fetch (passed to `curl
+    /// --max-time`). Parsed via [`parse_duration`]; defaults to `"10s"`.
+    #[serde(default = "default_github_timeout")]
+    pub timeout: String,
+}
+
+fn default_github_cache_ttl() -> String {
+    "1h".to_string()
+}
+
+fn default_github_timeout() -> String {
+    "10s".to_string()
+}
+
+impl Default for GithubConfig {
+    fn default() -> Self {
+        Self {
+            cache_ttl: default_github_cache_ttl(),
+            timeout: default_github_timeout(),
+        }
+    }
+}
+
+impl GithubConfig {
+    /// Parse `cache_ttl` into a [`std::time::Duration`].
+    pub fn cache_ttl_duration(&self) -> Result<std::time::Duration, ConfigError> {
+        parse_duration(&self.cache_ttl)
+            .map_err(|e| ConfigError::new(format!("[authsock.github]: cache_ttl: {e}")))
+    }
+
+    /// Parse `timeout` into a [`std::time::Duration`].
+    pub fn timeout_duration(&self) -> Result<std::time::Duration, ConfigError> {
+        parse_duration(&self.timeout)
+            .map_err(|e| ConfigError::new(format!("[authsock.github]: timeout: {e}")))
+    }
 }
 
 /// One `[authsock.sources.NAME]`: a key source (op vault discovery).
@@ -496,6 +550,16 @@ impl Config {
                 ))));
             }
         }
+        // Validate the github filter durations eagerly so a bad TTL / timeout
+        // fails at startup rather than at first fetch.
+        cfg.authsock
+            .github
+            .cache_ttl_duration()
+            .map_err(ConfigParseError::Content)?;
+        cfg.authsock
+            .github
+            .timeout_duration()
+            .map_err(ConfigParseError::Content)?;
         // An empty (or omitted) auth command is treated as "no command", not as
         // a configured-but-empty command; reject the misleading empty form.
         if let Some(argv) = &cfg.auth.command
@@ -537,6 +601,11 @@ impl Config {
             .iter()
             .filter_map(|(name, sock)| sock.validate(name).ok())
             .collect()
+    }
+
+    /// The `github` filter settings (cache TTL / fetch timeout).
+    pub fn authsock_github(&self) -> &GithubConfig {
+        &self.authsock.github
     }
 
     /// The validated authsock key sources, in deterministic (name-sorted) order.
@@ -1179,6 +1248,87 @@ filters = [42]
         )
         .unwrap_err();
         assert!(matches!(err, ConfigParseError::Toml(_)));
+    }
+
+    // ---- authsock github filter settings ----
+
+    #[test]
+    fn github_settings_default_to_1h_and_10s() {
+        let cfg = Config::parse("").unwrap();
+        let g = cfg.authsock_github();
+        assert_eq!(g.cache_ttl, "1h");
+        assert_eq!(g.timeout, "10s");
+        assert_eq!(g.cache_ttl_duration().unwrap().as_secs(), 3600);
+        assert_eq!(g.timeout_duration().unwrap().as_secs(), 10);
+    }
+
+    #[test]
+    fn github_settings_are_read_and_parsed() {
+        let cfg = Config::parse(
+            r#"[authsock.github]
+cache_ttl = "30m"
+timeout = "5s"
+"#,
+        )
+        .unwrap();
+        let g = cfg.authsock_github();
+        assert_eq!(g.cache_ttl_duration().unwrap().as_secs(), 1800);
+        assert_eq!(g.timeout_duration().unwrap().as_secs(), 5);
+    }
+
+    #[test]
+    fn github_bad_cache_ttl_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.github]
+cache_ttl = "1day"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => assert!(e.message.contains("cache_ttl")),
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn github_bad_timeout_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.github]
+timeout = "soon"
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigParseError::Content(_)));
+    }
+
+    #[test]
+    fn github_unknown_field_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.github]
+bogus = 1
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigParseError::Toml(_)));
+    }
+
+    #[test]
+    fn socket_can_combine_op_source_and_github_filter() {
+        // kawaz's real setup: an op-backed source socket also filtered by github.
+        let cfg = Config::parse(
+            r#"[authsock.sources.default]
+kind = "op"
+
+[authsock.sockets.kawaz]
+path = "/tmp/kawaz.sock"
+source = "default"
+filters = ["github=kawaz"]
+"#,
+        )
+        .unwrap();
+        let socks = cfg.authsock_sockets();
+        assert_eq!(socks[0].source.as_deref(), Some("default"));
+        assert_eq!(socks[0].filters, vec![vec!["github=kawaz".to_string()]]);
     }
 
     // ---- authsock sources (op discovery; port plan Iteration 4) ----

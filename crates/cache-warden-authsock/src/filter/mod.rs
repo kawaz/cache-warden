@@ -13,14 +13,16 @@
 //! - [`FilterEvaluator`] combines rules as OR-of-AND (groups ANDed within, ORed
 //!   across); an empty evaluator matches every key (an unfiltered socket).
 //!
-//! The upstream `github=<user>` filter is **not** ported in this iteration: it
-//! fetches keys over HTTP and would add a heavy network-client dependency. It is
-//! recorded as deferred (see `rule.rs`). `keyfile` (local file, no network) *is*
-//! ported.
+//! The `github=<user>` filter admits keys published at `github.com/<user>.keys`.
+//! Unlike the locally-evaluable forms it needs a network fetch, so fetch and
+//! match are split: [`GithubMatcher::matches`] only reads a cached blob set
+//! (synchronous, hot-path-safe) while an async caller refreshes the cache via a
+//! [`GithubFetcher`] (production: `curl` shell-out). See `github.rs`.
 
 mod comment;
 mod evaluator;
 mod fingerprint;
+mod github;
 mod keyfile;
 mod keytype;
 mod pubkey;
@@ -29,6 +31,7 @@ mod rule;
 pub use comment::CommentMatcher;
 pub use evaluator::{FilterEvaluator, FilterGroup};
 pub use fingerprint::FingerprintMatcher;
+pub use github::{GithubFetcher, GithubMatcher, RealGithubFetcher, parse_keys};
 pub use keyfile::KeyfileMatcher;
 pub use keytype::KeyTypeMatcher;
 pub use pubkey::PubkeyMatcher;

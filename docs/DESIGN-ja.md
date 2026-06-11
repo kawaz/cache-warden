@@ -177,7 +177,7 @@ hard-ttl = "24h"
   書くと設定エラー（平文秘密値が config に残る漏洩を構造的に防ぐ）。リテラル値は実行時に
   `cache-warden kv set --value-stdin` で投入する。
 
-### authsock アダプタ（SSH agent socket、port plan Iteration 1–3）
+### authsock アダプタ（SSH agent socket、port plan Iteration 1–4）
 
 cache-warden は config で宣言した SSH agent socket を自ら listen し、KV にキャッシュした
 秘密鍵 PEM で SSH クライアントの署名要求に応える。`SSH_AUTH_SOCK` をこの socket に向けた
@@ -189,11 +189,15 @@ command = ["op", "read", "op://vault/github/private_key", "--reveal"]
 soft-ttl = "1h"
 hard-ttl = "24h"
 
+[authsock.github]                            # github= フィルタ共通設定（省略可）
+cache_ttl = "1h"                             # 取得した鍵リストの再取得間隔（既定 1h）
+timeout = "10s"                              # 1 回の取得タイムアウト（curl --max-time、既定 10s）
+
 [authsock.sockets.default]
 path = "~/.ssh/cache-warden.sock"            # agent socket（leading ~/ 展開）
 keys = ["GITHUB_KEY"]                        # ローカル署名する KV キー名のリスト
 upstreams = ["~/.1password/agent.sock"]      # 鍵をマージし署名を転送する上流 agent（省略可）
-filters = ["comment=github*"]                # この socket が見せる/署名する鍵を絞る（省略可）
+filters = ["github=kawaz"]                   # 見せる/署名する鍵を絞る（github= は公開鍵リスト照合、省略可）
 ```
 
 - **socket は cache-warden が作る**: `[authsock.sockets.NAME]` ごとに listener task を 1 本
@@ -221,27 +225,31 @@ filters = ["comment=github*"]                # この socket が見せる/署名
   GitHub 用鍵だけ、socket B には全部、のような分離を実現する。各 TOML 要素は **OR 項**で、文字列は
   単一ルール項（`"comment=github*"`）、配列は AND グループ（`["comment=*@work*", "type=ed25519"]`）。
   項どうしは OR、グループ内のルールは AND（= OR of AND）。`filters` が空/省略なら絞り込みなし（全鍵）。
-  ルール形式は `comment=` / `type=` / `fingerprint=` / `pubkey=` / `keyfile=`（各 `not-` で否定可、
-  authsock-warden 互換）。`comment` は exact / glob（`*`/`?`）/ `~regex`。フィルタは**公開側のみ**
-  （blob / comment / type / fingerprint）を見て判定し、秘密値には触れない。
+  ルール形式は `comment=` / `type=` / `fingerprint=` / `pubkey=` / `keyfile=` / `github=`（各 `not-` で
+  否定可、authsock-warden 互換）。`comment` は exact / glob（`*`/`?`）/ `~regex`。フィルタは**公開側のみ**
+  （blob / comment / type / fingerprint / github 公開鍵）を見て判定し、秘密値には触れない。
   - **REQUEST_IDENTITIES**: KV 鍵 + upstream 鍵をマージした後にフィルタを適用し、通過した鍵だけを
     列挙する。フィルタで隠れた upstream 鍵は転送ルートにも記録しない。
   - **SIGN_REQUEST**: フィルタ通過鍵のみ署名を許可する。**列挙に出ない鍵への直接署名要求も拒否**する。
     ローカル鍵はレジストリの comment 込みで判定するので comment フィルタも直接署名経路で効く。upstream
     鍵は列挙で記録した転送ルート経由のみ許可（comment-only フィルタは「列挙してから署名」を要求する）。
-    blob から判定できる `fingerprint` / `type` / `pubkey` フィルタは列挙なしの署名でも正確に評価する。
-  - **github フィルタは本 iteration では未移植**: authsock-warden の `github=<user>`（`github.com/<user>.keys`
-    を HTTP 取得）はネットワーク取得で重い HTTP クライアント依存（reqwest）を呼ぶため後送り（port plan
-    Iteration 3 で許容）。ネットワークを使わない `keyfile`（ローカル authorized_keys）は移植済み。
+    blob から判定できる `fingerprint` / `type` / `pubkey` / `github` フィルタは列挙なしの署名でも正確に評価する。
+  - **github フィルタ（`github=<user>`）**: `github.com/<user>.keys` の公開鍵リストを取得し、提示鍵の wire
+    公開鍵 blob がそのリストに含まれる鍵のみ通す。取得は **curl shell-out**（新規 HTTP クライアント依存を入れず、
+    op と同じく外部 CLI を叩く）。`FilterEvaluator::matches()` は同期でホットパスから呼ばれるため、matcher は
+    `Arc<RwLock<キャッシュ>>` を持ち **照合はキャッシュ read のみ**（同期・ネットワークなし）。取得は daemon の
+    バックグラウンド refresh task（初回 fetch + `[authsock.github].cache_ttl` 間隔の再取得、`spawn_blocking` で
+    curl 実行、shutdown で停止）が担いキャッシュへ書き戻す。**fail-closed**: 取得失敗（ネット断 / timeout /
+    非ゼロ / パース不能）や未取得時はその鍵を一切通さない（安全側）。`[authsock.github]` で `cache_ttl`（既定 1h）/
+    `timeout`（既定 10s）を設定。`source`（op 発見）併用可。
 - **失敗は何も漏らさない**: 未知鍵 / フィルタ除外 / 認証拒否 / hard 切れ static / 不正要求 / 署名失敗 /
   全 upstream 失敗はすべて `SSH_AGENT_FAILURE`（payload 空）。エラー詳細を agent protocol に出さない。
 - **隔離**: KV ローカル署名のハンドラは control socket と同じく `spawn_blocking` で隔離する（再認証
   コマンドはプロンプト待ちで分単位ブロックし得るため、async ワーカーを占有させない）。upstream への
   I/O は async（non-blocking socket）でランタイム上。
 
-> 現状（Iteration 1–3）は static / command プリロードの鍵によるローカル署名 + upstream agent への
-> 鍵マージ・署名転送 + socket 単位の鍵フィルタまで。op 鍵発見、3 層ポリシー、github フィルタは
-> 後続 iteration（port plan §2）。
+> 現状は static / command プリロードの鍵によるローカル署名 + upstream agent への鍵マージ・署名転送 +
+> socket 単位の鍵フィルタ（github= 含む）+ op 鍵発見まで。3 層ポリシーは後続 iteration（port plan §2）。
 
 ### Workspace 構成（DR-0002）
 

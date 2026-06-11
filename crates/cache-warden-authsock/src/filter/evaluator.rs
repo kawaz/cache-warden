@@ -11,7 +11,7 @@
 //! is synchronous here.
 
 use crate::error::Result;
-use crate::filter::{Filter, FilterRule};
+use crate::filter::{Filter, FilterRule, GithubMatcher};
 use crate::message::Identity;
 
 /// A group of rules that are ANDed together.
@@ -111,7 +111,28 @@ impl FilterEvaluator {
             .all(|r| !r.filter.needs_comment())
     }
 
+    /// Every `github=<user>` matcher across all groups.
+    ///
+    /// The daemon collects these at startup and on each refresh tick to fetch /
+    /// re-fetch each user's published key set (the fetch is async; the matcher's
+    /// own [`GithubMatcher::matches`] stays synchronous on the hot path). Because
+    /// a matcher is cheaply cloneable and shares its cache, the daemon may keep a
+    /// clone and still update the same cache the evaluator reads from.
+    pub fn github_matchers(&self) -> Vec<&GithubMatcher> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.rules())
+            .filter_map(|r| match &r.filter {
+                Filter::Github(m) => Some(m),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Re-read every reloadable filter (currently only `keyfile`).
+    ///
+    /// `github` is **not** reloaded here: its key set is refreshed asynchronously
+    /// by the daemon (a blocking `curl` must not run on this synchronous path).
     pub fn reload(&self) -> Result<()> {
         for group in &self.groups {
             for rule in group.rules() {
@@ -207,6 +228,35 @@ mod tests {
             .unwrap()
             .is_blob_only()
         );
+    }
+
+    #[test]
+    fn github_filter_is_blob_only() {
+        // The github form judges by published-blob membership, never by comment,
+        // so a github-only socket stays blob-only (upstream sign fallback can
+        // still evaluate it from the blob alone).
+        let evaluator = FilterEvaluator::parse(&[vec!["github=kawaz".to_string()]]).unwrap();
+        assert!(evaluator.is_blob_only());
+    }
+
+    #[test]
+    fn github_matchers_are_collected_across_groups() {
+        let evaluator = FilterEvaluator::parse(&[
+            vec!["github=kawaz".to_string()],
+            vec!["type=ed25519".to_string(), "github=kawaz123".to_string()],
+        ])
+        .unwrap();
+        let matchers = evaluator.github_matchers();
+        assert_eq!(matchers.len(), 2);
+        let users: Vec<_> = matchers.iter().map(|m| m.user()).collect();
+        assert!(users.contains(&"kawaz"));
+        assert!(users.contains(&"kawaz123"));
+    }
+
+    #[test]
+    fn no_github_matchers_when_none_present() {
+        let evaluator = FilterEvaluator::parse(&[vec!["type=ed25519".to_string()]]).unwrap();
+        assert!(evaluator.github_matchers().is_empty());
     }
 
     #[test]

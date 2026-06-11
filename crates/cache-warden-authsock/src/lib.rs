@@ -30,7 +30,10 @@
 //!   decision 8 / port plan Iteration 2).
 //! - [`FilterEvaluator`] (+ [`Filter`] / [`FilterRule`] / the matchers): per-socket
 //!   key filters that restrict which public keys a socket exposes and signs with
-//!   (port plan Iteration 3). The `github` filter is deferred (network fetch).
+//!   (port plan Iteration 3). The `github=<user>` filter admits keys published at
+//!   `github.com/<user>.keys`; its blob set is refreshed asynchronously by a
+//!   [`GithubFetcher`] (production: `curl`) while [`GithubMatcher::matches`] reads
+//!   the cache synchronously on the hot path.
 //! - [`FilterEvaluator`] and the filter matchers: per-socket key visibility
 //!   (port plan Iteration 3). They restrict which public keys a socket enumerates
 //!   and can sign with, reading only the public side of a key.
@@ -57,7 +60,8 @@ pub use codec::AgentCodec;
 pub use error::{Error, Result};
 pub use filter::{
     CommentMatcher, Filter, FilterEvaluator, FilterGroup, FilterRule, FingerprintMatcher,
-    KeyTypeMatcher, KeyfileMatcher, PubkeyMatcher,
+    GithubFetcher, GithubMatcher, KeyTypeMatcher, KeyfileMatcher, PubkeyMatcher, RealGithubFetcher,
+    parse_keys,
 };
 pub use message::{AgentMessage, Identity, MessageType, SignRequestFields};
 pub use op::{OpClient, OpKeyInfo, OpSource, RealOpClient, private_key_argv, validate_item_id};
