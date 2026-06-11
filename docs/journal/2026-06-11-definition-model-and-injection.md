@@ -46,6 +46,23 @@ Opus サブエージェント委譲による実装、を 1 日で 4 周回した
   判断せよ」で引き継ぎ成功
 - **TOTP の独立検証**: 実装の正しさを RFC ベクタに加えて python 独立実装と実機突き合わせで確認
 
+## 追記（同日夜、kawaz リモート中の自律作業分）
+
+- **zsh 補完** (v0.12.0 後): `cache-warden.plugin.zsh` + `completions/_cache-warden` +
+  zpty 実補完テスト。sheldon (`~/.config/sheldon/plugins.toml`、compinit エントリより前) に登録済み
+- **key 層 allowed_processes** (v0.13.0): `[kv.NAME].allowed_processes`、config 専用
+  （define 自己申告を封じる）、socket 層と直列・fail-closed。DR-0012 に key 層節を補追
+- **パリティ検証準備**: `docs/runbooks/parity-verification.md`（[無人可]/[同席要] タグ付き）+
+  実値入り並走 config 案はリポ外 `~/.config/cache-warden/parity-draft.toml`
+- **重要訂正（kawaz 指摘）**: 準備エージェントが warden の `[auth] method=command` を
+  「op への署名都度委譲」と誤読 → 実際は**ユーザ定義認証フロー**（cache-warden の
+  `[auth].command` と同概念）で、署名モデルは両者とも「PEM fetch + ローカル署名」で同型。
+  実差は**キャッシュ寿命のみ**（warden は TTL 未配線で実質無期限）。TouchID 比較の期待値を
+  「キャッシュ生存中は両者 0 回、cache-warden の失効時認証増は設計どおり」に書き直した
+- **anti-debug (b)** (v0.14.0): PT_DENY_ATTACH (macOS) / PR_SET_DUMPABLE=0 (Linux、attach
+  防御目的)。`[daemon].allow-debug-attach` で opt-out 可、無効化時は警告。macOS 実機で
+  attach 拒否を手動確認済み。残る anti-debug は (c) DYLD 検出のみ（優先度低）
+
 ## 運用メモ（次セッション向け）
 
 - 体制: メイン Fable（設計・監査・統合）+ Opus サブエージェント（実装、TDD、commit しない）。
