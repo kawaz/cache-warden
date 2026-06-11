@@ -5,11 +5,13 @@
 //! are one-shot control-socket clients (see [`commands::client`]).
 
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::process;
 
 mod commands;
 mod config;
 mod daemon;
+mod help;
 mod protocol;
 
 use commands::client;
@@ -17,64 +19,6 @@ use protocol::wire::{OkPayload, Response};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const NAME: &str = "cache-warden";
-
-fn print_help(to_stderr: bool) {
-    let help_text = format!(
-        "\
-{NAME} {VERSION}
-Secure secret cache: a TTL-managed, zeroize-backed key/value cache for secrets.
-
-Usage:
-    {NAME} <COMMAND> [OPTIONS]
-
-Commands:
-    daemon run         Start the daemon in the foreground
-    ping               Check that the daemon is alive
-    status             Show daemon info and the (value-free) entry list
-    kv set <KEY> ...   Cache a value (static or command source)
-    kv get <KEY>       Fetch a cached value
-    kv del <KEY>       Delete a cached value
-    kv list            List cached key names
-    kv pin <KEY> <DUR> Hold a value Active for DUR, ignoring its TTL (re-auth)
-    kv unpin <KEY>     Drop a pin, returning the value to normal TTL evaluation
-    config show        Show the effective configuration
-    config path        Show the config file path (or the search order)
-    config edit        Open the config in $EDITOR
-
-`kv set` options:
-    --value V          Use the literal string V as the value
-    --value-stdin      Read the value from stdin (binary safe)
-    --command ARGV...  Run ARGV; its stdout is the value (regenerable)
-    --soft-ttl DUR     Soft TTL (re-auth to extend). e.g. 1h, 30m, 45s, 86400
-    --hard-ttl DUR     Hard TTL (value zeroized at expiry)
-
-`kv pin <KEY> <DUR>`:
-    Hold the value Active for DUR (e.g. 8h), suppressing both soft and hard
-    expiry until then. Useful before a long unattended run so an overnight hard
-    expiry can't interrupt it. Re-authentication is always required (pinning
-    relaxes the TTL). `kv unpin <KEY>` removes the pin (no re-auth).
-    DUR uses the same grammar as the TTL flags: 1h, 30m, 45s, or bare seconds.
-
-Global options:
-    --socket PATH      Control socket path. Precedence:
-                       --socket > [daemon].socket in config >
-                       $XDG_STATE_HOME/cache-warden/control.sock
-    --help             Show this help message
-    --version          Show version
-
-Environment:
-    CACHE_WARDEN_CONFIG  Explicit config file path (highest config priority)
-    XDG_CONFIG_HOME      Base dir for the config file
-                         ($XDG_CONFIG_HOME/cache-warden/config.toml)
-    XDG_STATE_HOME       Base dir for the default control socket path
-    EDITOR / VISUAL      Editor launched by `config edit`"
-    );
-    if to_stderr {
-        eprintln!("{help_text}");
-    } else {
-        println!("{help_text}");
-    }
-}
 
 /// Print a response for a client command, returning an exit code.
 ///
@@ -164,21 +108,55 @@ fn run_client(socket: &std::path::Path, req: &protocol::wire::Request) -> Result
     render_response(resp)
 }
 
-fn run() -> Result<(), String> {
+/// A CLI failure: either a plain message (printed as `cache-warden: <msg>`) or
+/// a usage error that should print the offending level's help to stderr.
+///
+/// Both exit non-zero. The distinction controls *what* is shown: a leaf command
+/// invoked without its required arguments is a usage error and prints that
+/// leaf's full help (so the user sees the accepted flags inline); other failures
+/// just print their message.
+enum CliError {
+    /// Plain message; rendered as `cache-warden: <msg>`.
+    Message(String),
+    /// `<msg>` followed by the given level's help, both to stderr. The help is
+    /// held as a constructor (not a built [`help::HelpSpec`]) so the error stays
+    /// small and is only rendered on the failure path.
+    Usage {
+        msg: String,
+        help: fn() -> help::HelpSpec,
+    },
+}
+
+impl From<String> for CliError {
+    fn from(msg: String) -> Self {
+        CliError::Message(msg)
+    }
+}
+
+/// A leaf-command parse result, lifting a `Result<_, String>` into a usage error
+/// carrying that leaf's help page.
+fn or_usage<T>(r: Result<T, String>, help: fn() -> help::HelpSpec) -> Result<T, CliError> {
+    r.map_err(|msg| CliError::Usage { msg, help })
+}
+
+fn run() -> Result<(), CliError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // No arguments at the top level: show help, exit 0 — the same contract as
+    // every other group level (kv / config / daemon).
     if args.is_empty() {
-        print_help(true);
-        process::exit(1);
-    }
-
-    // Top-level --help / --version take precedence.
-    if args[0] == "--help" {
-        print_help(false);
+        println!("{}", help::top().render());
         return Ok(());
     }
+
+    // Top-level --version takes precedence (a bare `--version` is not "help").
     if args[0] == "--version" {
         println!("{NAME} {VERSION}");
+        return Ok(());
+    }
+    // Top-level --help (only when it leads; deeper `--help` is handled per level).
+    if args[0] == "--help" {
+        println!("{}", help::top().render());
         return Ok(());
     }
 
@@ -194,46 +172,153 @@ fn run() -> Result<(), String> {
     let socket = commands::resolve_socket(cli_socket, loaded.config.socket_path());
 
     match command.as_str() {
-        "daemon" => commands::daemon_cmd::run(&rest, socket, loaded.config),
-        "config" => commands::config_cmd::run(rest, &loaded),
-        "ping" => run_client(&socket, &protocol::wire::Request::Ping),
-        "status" => run_client(&socket, &protocol::wire::Request::Status),
-        "kv" => {
-            let sub = rest
-                .first()
-                .cloned()
-                .ok_or("kv requires a subcommand: set | get | del | list | pin | unpin")?;
-            let kv_args = &rest[1..];
-            let req = match sub.as_str() {
-                "set" => commands::parse_kv_set(kv_args, || {
-                    let mut buf = Vec::new();
-                    std::io::stdin().read_to_end(&mut buf)?;
-                    Ok(buf)
-                })?,
-                "get" => commands::parse_kv_single_key("get", kv_args)?,
-                "del" => commands::parse_kv_single_key("del", kv_args)?,
-                "unpin" => commands::parse_kv_single_key("unpin", kv_args)?,
-                "pin" => commands::parse_kv_pin(kv_args)?,
-                "list" => {
-                    if !kv_args.is_empty() {
-                        return Err(format!("`kv list` takes no arguments: {kv_args:?}"));
-                    }
-                    protocol::wire::Request::KvList
-                }
-                other => return Err(format!("unknown kv subcommand: {other}")),
-            };
-            run_client(&socket, &req)
-        }
+        "daemon" => dispatch_daemon(&rest, socket, loaded.config),
+        "config" => dispatch_config(&rest, &loaded),
+        "ping" => Ok(run_client(&socket, &protocol::wire::Request::Ping)?),
+        "status" => Ok(run_client(&socket, &protocol::wire::Request::Status)?),
+        "kv" => dispatch_kv(&rest, &socket),
         "--help" | "--version" => unreachable!("handled above"),
-        other => Err(format!("unknown command: {other} (try `{NAME} --help`)")),
+        other => Err(CliError::Message(format!(
+            "unknown command: {other} (try `{NAME} --help`)"
+        ))),
     }
 }
 
-fn main() {
-    if let Err(e) = run() {
-        if !e.is_empty() {
-            eprintln!("{NAME}: {e}");
+/// Dispatch the `daemon` group.
+fn dispatch_daemon(
+    rest: &[String],
+    socket: PathBuf,
+    config: config::Config,
+) -> Result<(), CliError> {
+    // Group help: no subcommand, or a `--help` anywhere => stdout, exit 0.
+    if rest.is_empty() {
+        println!("{}", help::daemon().render());
+        return Ok(());
+    }
+    if rest[0] == "--help" {
+        println!("{}", help::daemon().render());
+        return Ok(());
+    }
+    match rest[0].as_str() {
+        "run" => {
+            let tail = &rest[1..];
+            if help::wants_help(tail) {
+                println!("{}", help::daemon_run().render());
+                return Ok(());
+            }
+            or_usage(
+                commands::daemon_cmd::run_foreground(tail, socket, config),
+                help::daemon_run,
+            )
         }
-        process::exit(1);
+        other => Err(CliError::Message(format!(
+            "unknown daemon subcommand: {other} (try `{NAME} daemon --help`)"
+        ))),
+    }
+}
+
+/// Dispatch the `config` group.
+fn dispatch_config(rest: &[String], loaded: &config::LoadedConfig) -> Result<(), CliError> {
+    if rest.is_empty() {
+        println!("{}", help::config().render());
+        return Ok(());
+    }
+    if rest[0] == "--help" {
+        println!("{}", help::config().render());
+        return Ok(());
+    }
+    let sub = rest[0].as_str();
+    let tail = &rest[1..];
+    let leaf_help: fn() -> help::HelpSpec = match sub {
+        "show" => help::config_show,
+        "path" => help::config_path,
+        "edit" => help::config_edit,
+        other => {
+            return Err(CliError::Message(format!(
+                "unknown config subcommand: {other} (try `{NAME} config --help`)"
+            )));
+        }
+    };
+    if help::wants_help(tail) {
+        println!("{}", leaf_help().render());
+        return Ok(());
+    }
+    or_usage(commands::config_cmd::run(sub, tail, loaded), leaf_help)
+}
+
+/// Dispatch the `kv` group.
+fn dispatch_kv(rest: &[String], socket: &std::path::Path) -> Result<(), CliError> {
+    if rest.is_empty() {
+        println!("{}", help::kv().render());
+        return Ok(());
+    }
+    if rest[0] == "--help" {
+        println!("{}", help::kv().render());
+        return Ok(());
+    }
+    let sub = rest[0].as_str();
+    let kv_args = &rest[1..];
+
+    let leaf_help: fn() -> help::HelpSpec = match sub {
+        "set" => help::kv_set,
+        "get" => help::kv_get,
+        "del" => help::kv_del,
+        "list" => help::kv_list,
+        "pin" => help::kv_pin,
+        "unpin" => help::kv_unpin,
+        other => {
+            return Err(CliError::Message(format!(
+                "unknown kv subcommand: {other} (try `{NAME} kv --help`)"
+            )));
+        }
+    };
+    if help::wants_help(kv_args) {
+        println!("{}", leaf_help().render());
+        return Ok(());
+    }
+
+    let req = match sub {
+        "set" => or_usage(
+            commands::parse_kv_set(kv_args, || {
+                let mut buf = Vec::new();
+                std::io::stdin().read_to_end(&mut buf)?;
+                Ok(buf)
+            }),
+            leaf_help,
+        )?,
+        "get" => or_usage(commands::parse_kv_single_key("get", kv_args), leaf_help)?,
+        "del" => or_usage(commands::parse_kv_single_key("del", kv_args), leaf_help)?,
+        "unpin" => or_usage(commands::parse_kv_single_key("unpin", kv_args), leaf_help)?,
+        "pin" => or_usage(commands::parse_kv_pin(kv_args), leaf_help)?,
+        "list" => {
+            if !kv_args.is_empty() {
+                return Err(CliError::Usage {
+                    msg: format!("`kv list` takes no arguments: {kv_args:?}"),
+                    help: help::kv_list,
+                });
+            }
+            protocol::wire::Request::KvList
+        }
+        _ => unreachable!("leaf_help match covers all known subcommands"),
+    };
+    Ok(run_client(socket, &req)?)
+}
+
+fn main() {
+    match run() {
+        Ok(()) => {}
+        Err(CliError::Message(e)) => {
+            if !e.is_empty() {
+                eprintln!("{NAME}: {e}");
+            }
+            process::exit(1);
+        }
+        Err(CliError::Usage { msg, help }) => {
+            if !msg.is_empty() {
+                eprintln!("{NAME}: {msg}");
+            }
+            eprintln!("{}", help().render());
+            process::exit(1);
+        }
     }
 }

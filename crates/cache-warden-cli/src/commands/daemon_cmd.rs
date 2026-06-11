@@ -7,7 +7,8 @@
 //!
 //! Implemented:
 //! - `daemon run [--socket PATH]` — start the in-process daemon in the
-//!   foreground (DR-0008).
+//!   foreground (DR-0008). Exposed as [`run_foreground`]; subcommand routing and
+//!   `--help` / no-arg handling live in the dispatcher (`main.rs`).
 //!
 //! Planned (not yet wired; see the design CLI taxonomy):
 //! - `daemon register` / `daemon unregister` — launchd/systemd service install.
@@ -18,63 +19,13 @@ use std::path::PathBuf;
 
 use crate::config::Config;
 
-const NAME: &str = "cache-warden";
-
-/// Print the `daemon` group help.
-fn print_help(to_stderr: bool) {
-    let help_text = format!(
-        "\
-{NAME} daemon
-Manage the cache-warden daemon process.
-
-Usage:
-    {NAME} daemon <COMMAND> [OPTIONS]
-
-Commands:
-    run                Start the daemon in the foreground
-
-`daemon run` options:
-    --socket PATH      Control socket path. Precedence:
-                       --socket > [daemon].socket in config >
-                       $XDG_STATE_HOME/cache-warden/control.sock
-
-Global options:
-    --help             Show this help message"
-    );
-    if to_stderr {
-        eprintln!("{help_text}");
-    } else {
-        println!("{help_text}");
-    }
-}
-
-/// Dispatch a `daemon` subcommand.
+/// Start the in-process daemon in the foreground (`daemon run`).
 ///
 /// `socket` is the already-resolved control socket path (DR-0010 precedence is
-/// applied by the caller); `config` is the loaded daemon configuration that
-/// `daemon run` needs to bind, preload, and serve.
-pub fn run(args: &[String], socket: PathBuf, config: Config) -> Result<(), String> {
-    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
-    let tail = if args.is_empty() { &[][..] } else { &args[1..] };
-    match sub {
-        "" => {
-            // No subcommand: show the group help (kawaz CLI preference).
-            print_help(false);
-            Ok(())
-        }
-        "--help" => {
-            print_help(false);
-            Ok(())
-        }
-        "run" => run_daemon(tail, socket, config),
-        other => Err(format!(
-            "unknown daemon subcommand: {other} (try `{NAME} daemon --help`)"
-        )),
-    }
-}
-
-/// Start the in-process daemon in the foreground (`daemon run`).
-fn run_daemon(args: &[String], socket: PathBuf, config: Config) -> Result<(), String> {
+/// applied by the caller); `config` is the loaded daemon configuration that the
+/// daemon needs to bind, preload, and serve. Subcommand routing and help/usage
+/// handling live in the dispatcher (`main.rs`); this function is the leaf action.
+pub fn run_foreground(args: &[String], socket: PathBuf, config: Config) -> Result<(), String> {
     if !args.is_empty() {
         return Err(format!(
             "`daemon run` takes no positional arguments: {args:?}"
@@ -97,25 +48,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_subcommand_errors() {
-        let err = run(&["bogus".into()], PathBuf::from("/x.sock"), cfg()).unwrap_err();
-        assert!(err.contains("unknown daemon subcommand"));
-    }
-
-    #[test]
-    fn run_rejects_positional_args() {
-        let err = run(
-            &["run".into(), "extra".into()],
-            PathBuf::from("/x.sock"),
-            cfg(),
-        )
-        .unwrap_err();
+    fn run_foreground_rejects_positional_args() {
+        let err = run_foreground(&["extra".into()], PathBuf::from("/x.sock"), cfg()).unwrap_err();
         assert!(err.contains("takes no positional arguments"));
-    }
-
-    #[test]
-    fn no_subcommand_prints_help_ok() {
-        // No subcommand resolves to help and succeeds (does not start a daemon).
-        assert!(run(&[], PathBuf::from("/x.sock"), cfg()).is_ok());
     }
 }

@@ -13,10 +13,12 @@ use std::process::Command;
 
 use crate::config::{self, LoadedConfig};
 
-/// Dispatch a `config` subcommand.
-pub fn run(args: Vec<String>, loaded: &LoadedConfig) -> Result<(), String> {
-    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
-    let tail = if args.is_empty() { &[][..] } else { &args[1..] };
+/// Run a known `config` leaf subcommand.
+///
+/// `sub` is one of `show` / `path` / `edit` (the dispatcher in `main.rs` has
+/// already routed the group, handled `--help`, and rejected unknown
+/// subcommands); `tail` is the remaining arguments for that leaf.
+pub fn run(sub: &str, tail: &[String], loaded: &LoadedConfig) -> Result<(), String> {
     match sub {
         "show" => {
             ensure_no_extra(tail, "config show")?;
@@ -32,7 +34,6 @@ pub fn run(args: Vec<String>, loaded: &LoadedConfig) -> Result<(), String> {
             ensure_no_extra(tail, "config edit")?;
             edit()
         }
-        "" => Err("config requires a subcommand: show | path | edit".to_string()),
         other => Err(format!("unknown config subcommand: {other}")),
     }
 }
@@ -237,18 +238,12 @@ hard-ttl = "24h"
     #[test]
     fn run_rejects_unknown_subcommand() {
         let l = loaded("", None);
-        assert!(run(vec!["bogus".into()], &l).is_err());
-    }
-
-    #[test]
-    fn run_requires_a_subcommand() {
-        let l = loaded("", None);
-        assert!(run(vec![], &l).is_err());
+        assert!(run("bogus", &[], &l).is_err());
     }
 
     #[test]
     fn show_rejects_extra_args() {
         let l = loaded("", None);
-        assert!(run(vec!["show".into(), "extra".into()], &l).is_err());
+        assert!(run("show", &["extra".into()], &l).is_err());
     }
 }
