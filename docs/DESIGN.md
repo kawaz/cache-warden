@@ -348,6 +348,14 @@ See DR-0004 for the core/adapter assignment of assets being ported.
   only with no argv substitution / exec after resolution / `inject` does substring substitution).
   Implementation has not started yet.
 
+- **KV definition model (`kv define` / definition layers / definition persistence)**: Split verb
+  responsibilities into define (registers the definition only; execution is lazy) / set (static only) /
+  get (read only), with a definition registry held separately from the value store. Includes defs files
+  (`--defs`), opt-in persistence of online definitions (values are never written), and `--source URI`
+  (op:// etc.). The design is settled in [DR-0014](./decisions/DR-0014-kv-definition-model.md).
+  Implementation has not started yet (the current implementation keeps `kv set --command` with eager
+  execution).
+
 See [ROADMAP.md](./ROADMAP.md) for details.
 
 ## Related Documents

@@ -349,6 +349,13 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
   設計は [DR-0013](./decisions/DR-0013-secret-reference-injection.md) で確定済み（参照構文 /
   env は whole-value のみ・argv 非置換 / 解決後 exec / `inject` は substring 置換）。実装は未着手。
 
+- **KV definition モデル（`kv define` / 定義レイヤ / 定義永続化）**: 動詞の責務を
+  define（定義登録のみ・lazy 実行）/ set（static 専用）/ get（読み専念）に分離し、
+  定義レジストリを値ストアと分けて持つ。defs ファイル（`--defs`）・オンライン定義の
+  永続化（opt-in、値は書かない）・`--source URI`（op:// 等）を含む。設計は
+  [DR-0014](./decisions/DR-0014-kv-definition-model.md) で確定済み。実装は未着手
+  （現実装は `kv set --command` の eager 実行のまま）。
+
 詳細は [ROADMAP.md](./ROADMAP.md) を参照。
 
 ## 関連ドキュメント
