@@ -225,6 +225,7 @@ points at one of these sockets (`ssh` / `ssh-add` / git, ...), it behaves like a
 command = ["op", "read", "op://vault/github/private_key"]
 soft-ttl = "1h"
 hard-ttl = "24h"
+allowed_processes = ["ssh"]                  # per-key process restriction (key layer, config-only, empty = unrestricted, optional)
 
 [authsock.github]                            # shared settings for github= filters (optional)
 cache_ttl = "1h"                             # how often the fetched key list is refreshed (default 1h)
@@ -303,6 +304,32 @@ allowed_processes = ["ssh"]                  # processes allowed to use this soc
   identified, a restricted socket refuses (DR-0012; authsock-warden fails *open* here, cache-warden
   deliberately fails *closed*). A socket with an empty `allowed_processes` never resolves ancestry at
   all, so an unidentifiable peer still passes through as before.
+- **Key-layer process access control (`[kv.NAME].allowed_processes`, DR-0012 key layer)**: an individual
+  KV key can also carry `allowed_processes` (executable basenames, same semantics as the socket layer)
+  to restrict **retrieval of its value**. **Empty / omitted = unrestricted** (the same invariant as the
+  socket layer). **Config-only** (not settable from defs files or the `kv define` CLI): policy belongs to
+  the secret's owner — the config author — and is not something a client self-declares at define time
+  (so it does not ride `KvDefinition`; the daemon builds a `key → list` policy table from the config and
+  holds it in shared state — never in the core `Store`, per DR-0004's adapter/handler responsibility).
+  The check stacks **in series** with the socket layer (the socket layer already judged the connection;
+  the key layer applies on top, so passing the socket does not guarantee passing the key). "Empty
+  intersection = deny all" is implemented as both layers having to pass independently; empty = allow-all
+  exists only as *omission*, and a restricted key never decays into an empty set mid-evaluation
+  (authsock-warden's trap, deliberately not inherited). Matching applies the shared `chain_gate_passes`
+  to the requester (the peer pid's ancestry chain, already resolved on both the control and signing
+  paths) — **ancestor OR + exact basename match**, **fail-closed when the requester is unknown**. Two
+  enforcement surfaces:
+  - **control socket `kv.get`** (including lazy generation / dry-run): gated **before** the retrieval
+    chain (a denied requester never triggers the source command or a re-auth prompt). Denial is
+    `auth_failed`. Key existence is already visible via `kv.list`, so only the value and details are
+    withheld. **Mutating verbs (`kv.del` / `kv.pin` / `kv.unpin`) are not gated** — the policy controls
+    value retrieval, not entry lifecycle management (a recorded design decision).
+  - **authsock SIGN_REQUEST**: when a KV local key is resolved for signing, its `allowed_processes` is
+    checked against the requester. Denial is `SSH_AGENT_FAILURE` (empty payload, the existing
+    leak-nothing convention). **REQUEST_IDENTITIES enumeration is not filtered** (matching
+    authsock-warden's per-key behaviour and cache-warden's "key existence may be listed, values and
+    details are withheld" principle: enumerate, then refuse at signing time). The internal op-key KV
+    names (`__authsock_op:*`) never appear in config `[kv.*]`, so they are naturally unrestricted.
 - **Failures leak nothing**: an unknown key, a filtered-out key, denied re-auth, hard-expired static
   key, malformed request, signing error, or all-upstreams-failed all return `SSH_AGENT_FAILURE` (empty
   payload). No error detail reaches the agent protocol.
@@ -312,8 +339,7 @@ allowed_processes = ["ssh"]                  # processes allowed to use this soc
 
 > The current state covers signing with static / command-defined KV keys (eagerly materialized at startup), merging keys from /
 > forwarding signatures to upstream agents, per-socket key filters (including `github=`), op key
-> discovery, and per-socket process access control (`allowed_processes`). Per-key `allowed_processes`
-> (the key layer) is a later iteration (port plan §2).
+> discovery, and process access control (`allowed_processes`) at both the socket and key layers.
 
 ### Secret reference injection (`run` / `inject` / dry-run, DR-0013 / DR-0015)
 

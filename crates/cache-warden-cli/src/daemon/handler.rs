@@ -49,9 +49,17 @@ pub struct HandlerCtx<'a, A: ?Sized, R, C> {
     /// Control socket path (for `status`).
     pub socket: &'a str,
     /// The requesting peer's process ancestry chain, or `None` when it could
-    /// not be determined. Forwarded into the core auth context (DR-0006/0008:
-    /// carried for audit, not interpreted as policy yet).
+    /// not be determined. Forwarded into the core auth context for audit, and —
+    /// for the key-level gate below — checked against `kv_process_policies`.
     pub requester: Option<&'a [ProcessInfo]>,
+    /// Key-level process-access policies (DR-0012 key layer): a map from key name
+    /// to its non-empty `allowed_processes` list, built from `[kv.*]` config at
+    /// startup. A key absent from the map has no restriction. When a key is
+    /// present, a `kv.get` is admitted only if the requester's ancestry passes
+    /// [`cache_warden_authsock::chain_gate_passes`] (fail-closed on an unknown
+    /// requester). Policy interpretation lives here in the handler/adapter layer,
+    /// never in the core [`Store`] (DR-0004).
+    pub kv_process_policies: &'a std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Handle one request against `store`, producing the response to send back.
@@ -287,6 +295,24 @@ where
     R: SourceRunner,
     C: Clock,
 {
+    // Key-level process-access gate (DR-0012 key layer). Applied *before* the
+    // retrieval chain so a denied requester never triggers the source command or
+    // a re-auth prompt. A key with no policy entry is unrestricted (the common
+    // case); a restricted key admits only a requester whose ancestry names an
+    // allowed basename, failing closed when the requester is unknown. The denial
+    // is `auth_failed` and reveals nothing about the value — the key's existence
+    // is already visible via `kv.list`, so it is not hidden. Only get is gated:
+    // del / pin / unpin manage the entry's lifecycle, not value retrieval, so the
+    // policy (which controls *reading the secret*) does not apply to them.
+    if let Some(allowed) = ctx.kv_process_policies.get(&key)
+        && !cache_warden_authsock::chain_gate_passes(ctx.requester, allowed)
+    {
+        return Response::error(
+            ErrorKind::AuthFailed,
+            "process not permitted to access this key",
+        );
+    }
+
     // Fast path: a live (Active) value.
     if store.get(&key, ctx.clock).is_some() {
         return finish_get(store, &key, dry_run, "active", ctx.clock);
@@ -530,6 +556,14 @@ mod tests {
         }
     }
 
+    /// A shared empty key-policy table. Most tests have no key-level
+    /// `allowed_processes`, so [`ctx`] points at this `&'static` map.
+    fn empty_policies() -> &'static std::collections::BTreeMap<String, Vec<String>> {
+        static EMPTY: std::sync::OnceLock<std::collections::BTreeMap<String, Vec<String>>> =
+            std::sync::OnceLock::new();
+        EMPTY.get_or_init(std::collections::BTreeMap::new)
+    }
+
     fn ctx<'a, A, R>(
         auth: &'a A,
         runner: &'a R,
@@ -543,6 +577,18 @@ mod tests {
             version: "test",
             socket: "/tmp/test.sock",
             requester: None,
+            kv_process_policies: empty_policies(),
+        }
+    }
+
+    /// A resolved `ProcessInfo` with a basename, for building a fake requester
+    /// ancestry chain in key-layer gate tests.
+    fn proc(pid: u32, name: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid: Some(1),
+            path: Some(std::path::PathBuf::from(format!("/usr/bin/{name}"))),
+            start_time: Some(Duration::from_secs(pid as u64)),
         }
     }
 
@@ -1390,5 +1436,213 @@ mod tests {
             },
         );
         assert_eq!(get_value(&resp), b"plain-secret");
+    }
+
+    // ---- key-level process-access gate (DR-0012 key layer) ----
+
+    /// Build a `ctx` with a key-policy table and a (possibly absent) requester
+    /// ancestry chain, for exercising the key-layer gate on `kv.get`.
+    fn ctx_gated<'a, A, R>(
+        auth: &'a A,
+        runner: &'a R,
+        clock: &'a FakeClock,
+        policies: &'a std::collections::BTreeMap<String, Vec<String>>,
+        requester: Option<&'a [ProcessInfo]>,
+    ) -> HandlerCtx<'a, A, R, FakeClock> {
+        HandlerCtx {
+            auth,
+            runner,
+            clock,
+            pid: 1234,
+            version: "test",
+            socket: "/tmp/test.sock",
+            requester,
+            kv_process_policies: policies,
+        }
+    }
+
+    fn policies(entries: &[(&str, &[&str])]) -> std::collections::BTreeMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn get_restricted_key_admits_matching_requester() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let pol = policies(&[("K", &["ssh"])]);
+        let chain = [proc(100, "ssh"), proc(50, "zsh")];
+
+        // Seed the value with an unrestricted ctx (set is not gated by the key
+        // layer — only get is), then read it through the restricted gate.
+        let c_set = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c_set, set_static(b"hunter2"));
+
+        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(get_value(&resp), b"hunter2");
+    }
+
+    #[test]
+    fn get_restricted_key_denies_non_matching_requester() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let pol = policies(&[("K", &["ssh"])]);
+        let chain = [proc(100, "git"), proc(50, "zsh")];
+
+        let c_set = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c_set, set_static(b"hunter2"));
+
+        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
+        // Denied: the requester's ancestry has no allowed basename. The value is
+        // not revealed; the key's existence is not hidden (it is visible via list).
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+    }
+
+    #[test]
+    fn get_restricted_key_with_unknown_requester_is_fail_closed() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let pol = policies(&[("K", &["ssh"])]);
+
+        let c_set = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c_set, set_static(b"hunter2"));
+
+        // requester == None + a real restriction => fail-closed (denied).
+        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, None);
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+    }
+
+    #[test]
+    fn get_unrestricted_key_admits_even_unknown_requester() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        // K has no policy entry => no restriction (the common case).
+        let pol = policies(&[("OTHER", &["ssh"])]);
+
+        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, None);
+        handle_request(&mut store, &c, set_static(b"hunter2"));
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(get_value(&resp), b"hunter2");
+    }
+
+    #[test]
+    fn dry_run_get_is_also_gated() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let pol = policies(&[("K", &["ssh"])]);
+        let chain = [proc(100, "git")];
+
+        let c_set = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c_set, set_static(b"hunter2"));
+
+        // A dry-run get of a restricted key by a non-matching requester is denied
+        // exactly like a reveal get (the gate is applied before the chain runs).
+        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: true,
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+    }
+
+    #[test]
+    fn restricted_key_get_denied_before_lazy_generation_runs() {
+        // The gate must precede the (re-auth / command) retrieval chain: a denied
+        // requester must not trigger the source command at all.
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"generated");
+        let pol = policies(&[("LAZY", &["ssh"])]);
+        let chain = [proc(100, "git")];
+
+        // Define LAZY (lazy: no value yet). A denied get must not run the command.
+        let c_set = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c_set, define_cmd("LAZY", &["echo", "x"]));
+
+        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "LAZY".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+        assert_eq!(
+            runner.runs(),
+            0,
+            "denied get must not run the source command"
+        );
+    }
+
+    #[test]
+    fn mutating_commands_are_not_gated_by_the_key_layer() {
+        // Only get is gated (取得制御が目的). del/pin/unpin are reachable even by a
+        // requester that the key's allowed_processes would reject for a get. This
+        // is a deliberate scope decision (DR-0012 key layer): the policy controls
+        // *value retrieval*, not lifecycle management of the entry.
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let pol = policies(&[("K", &["ssh"])]);
+        let chain = [proc(100, "git")]; // would be denied for a get
+
+        let c_set = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c_set, set_static(b"hunter2"));
+
+        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
+        // del succeeds (not gated): the entry is removed.
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvDel {
+                key: "K".into(),
+                with_define: false,
+            },
+        );
+        assert!(resp.is_ok(), "del is not gated by the key layer: {resp:?}");
     }
 }

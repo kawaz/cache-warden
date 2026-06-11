@@ -46,6 +46,37 @@ pub fn chain_allowed(chain: &[ProcessInfo], allowed: &[String]) -> bool {
     })
 }
 
+/// Whether a request whose requester ancestry is `requester` passes the `allowed`
+/// gate, **failing closed** when the requester is unidentifiable.
+///
+/// This is the chain-oriented gate used by both control-socket and authsock
+/// layers once the requester's ancestry has already been resolved (the
+/// pid-oriented socket-connect gate that resolves ancestry itself is layered on
+/// top of this). Semantics:
+///
+/// - `allowed` empty → admitted unconditionally (no restriction; the requester is
+///   not even consulted, so an unattributable caller is still admitted — the
+///   "no policy" behaviour is preserved exactly).
+/// - `allowed` non-empty + `requester == None` → **denied** (fail-closed): a
+///   restriction is set but we cannot identify who is asking, so we refuse
+///   (DR-0012). This is the load-bearing difference from authsock-warden, which
+///   failed *open* here.
+/// - `allowed` non-empty + `requester == Some(chain)` → [`chain_allowed`].
+///
+/// The "empty == unrestricted" branch is only reachable for the *omitted/empty*
+/// config case; a key with a real restriction always carries a non-empty list, so
+/// the gate never collapses to "allow all" mid-evaluation (the warden footgun
+/// where an empty intersection turned into `matches_any(&[]) == true`).
+pub fn chain_gate_passes(requester: Option<&[ProcessInfo]>, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    match requester {
+        Some(chain) => chain_allowed(chain, allowed),
+        None => false, // fail-closed: a restricted key with an unknown requester.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +179,41 @@ mod tests {
         // A restriction is set but the chain is empty (e.g. ancestry came back
         // empty): nothing can match, so it is denied (fail-closed at the caller).
         assert!(!chain_allowed(&[], &allow(&["ssh"])));
+    }
+
+    // ---- chain_gate_passes (DR-0012 key layer + socket layer share) ----
+
+    #[test]
+    fn gate_empty_list_admits_even_unknown_requester() {
+        // No restriction: an unattributable requester (None) is still admitted.
+        assert!(chain_gate_passes(None, &[]));
+        let chain = vec![named(100, Some(1), "evil")];
+        assert!(chain_gate_passes(Some(&chain), &[]));
+    }
+
+    #[test]
+    fn gate_nonempty_list_with_unknown_requester_is_fail_closed() {
+        // A restriction is set but the requester is unidentifiable: deny.
+        assert!(!chain_gate_passes(None, &allow(&["ssh"])));
+    }
+
+    #[test]
+    fn gate_nonempty_list_admits_when_ancestor_matches() {
+        let chain = vec![named(100, Some(50), "ssh"), named(50, Some(1), "zsh")];
+        assert!(chain_gate_passes(Some(&chain), &allow(&["ssh"])));
+        assert!(chain_gate_passes(Some(&chain), &allow(&["zsh"])));
+    }
+
+    #[test]
+    fn gate_nonempty_list_denies_when_no_ancestor_matches() {
+        let chain = vec![named(100, Some(50), "ssh"), named(50, Some(1), "zsh")];
+        assert!(!chain_gate_passes(Some(&chain), &allow(&["git", "jj"])));
+    }
+
+    #[test]
+    fn gate_nonempty_list_with_empty_chain_is_denied() {
+        // Requester resolved to an empty chain (degenerate): a real restriction
+        // can never match, so it is denied — never collapses to allow-all.
+        assert!(!chain_gate_passes(Some(&[]), &allow(&["ssh"])));
     }
 }

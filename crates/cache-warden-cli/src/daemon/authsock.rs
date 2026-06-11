@@ -59,7 +59,8 @@ use cache_warden::{
 use cache_warden_authsock::{
     AgentCodec, AgentMessage, DiscoveredKey, FilterEvaluator, GithubFetcher, GithubMatcher,
     Identity, KeySource, MessageType, OpKeyCache, OpSource, PublicKeyRegistry, RealGithubFetcher,
-    RealOpClient, RegisteredKey, Upstream, chain_allowed, discover_keys, private_key_argv, sign,
+    RealOpClient, RegisteredKey, Upstream, chain_gate_passes, discover_keys, private_key_argv,
+    sign,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
@@ -539,13 +540,16 @@ async fn handle_connection(stream: UnixStream, state: Arc<SocketState>) -> std::
 /// allowing by default"). On a socket whose operator explicitly restricted the
 /// callers, an unidentifiable peer is exactly the case to refuse — DR-0012.
 fn process_gate_passes(peer: Option<u32>, allowed: &[String]) -> bool {
-    if allowed.is_empty() {
-        return true;
-    }
-    match peer.and_then(|pid| SystemInspector::new().ancestry(pid).ok()) {
-        Some(chain) => chain_allowed(&chain, allowed),
-        None => false, // fail-closed: cannot identify the peer.
-    }
+    // Resolve the peer's ancestry (only needed when a restriction is set), then
+    // defer the admit/deny decision — including the fail-closed handling of an
+    // unidentifiable peer — to the shared `chain_gate_passes` (DR-0012). An empty
+    // list short-circuits inside the helper without resolving ancestry.
+    let chain = if allowed.is_empty() {
+        None
+    } else {
+        peer.and_then(|pid| SystemInspector::new().ancestry(pid).ok())
+    };
+    chain_gate_passes(chain.as_deref(), allowed)
 }
 
 /// Produce the agent response for one request message.
@@ -725,6 +729,7 @@ fn local_sign(state: &SocketState, peer: Option<u32>, msg: &AgentMessage) -> Age
         auth: state.shared.auth.as_ref(),
         runner: &state.shared.runner,
         clock: &state.shared.clock,
+        kv_process_policies: &state.shared.kv_process_policies,
     };
     sign_local_with_ctx(&ctx, requester.as_deref(), msg)
 }
@@ -763,6 +768,14 @@ struct LocalSignCtx<'a, A: ?Sized, R, C> {
     runner: &'a R,
     /// The monotonic clock for TTL evaluation.
     clock: &'a C,
+    /// Key-level process-access policies (DR-0012 key layer): KV key name → its
+    /// non-empty `allowed_processes` list. The same table the control socket
+    /// consults for `kv.get`. A SIGN_REQUEST resolving a restricted KV key is
+    /// admitted only when the requester's ancestry passes the gate (fail-closed on
+    /// an unknown requester); a key absent from the table is unrestricted. op-keys
+    /// carry an internal `__authsock_op:*` KV name that never appears in `[kv.*]`
+    /// config, so they are naturally unrestricted here.
+    kv_process_policies: &'a std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Pure local-sign dispatch for one SIGN_REQUEST against the core (no socket
@@ -796,6 +809,21 @@ where
     };
     let kv_key = registered.kv_key.clone();
     let source = registered.source.clone();
+
+    // Key-level process-access gate (DR-0012 key layer). When this KV key carries
+    // an `allowed_processes` restriction, the requester's ancestry must pass the
+    // shared gate (fail-closed on an unknown requester) before the PEM is fetched
+    // or signed with. A restricted key the requester is not permitted to use is
+    // refused with a plain SSH_AGENT_FAILURE — the same "leak nothing" response as
+    // an unknown or filtered-out key (the connection already enumerated this key,
+    // mirroring the socket layer's per-key warden behaviour: the key may be listed
+    // but cannot be signed with). An op-key's internal `__authsock_op:*` name never
+    // appears in `[kv.*]` config, so it is unrestricted here.
+    if let Some(allowed) = ctx.kv_process_policies.get(&kv_key)
+        && !chain_gate_passes(requester, allowed)
+    {
+        return AgentMessage::failure();
+    }
     let (auth, runner, clock) = (ctx.auth, ctx.runner, ctx.clock);
 
     let mut store = match ctx.store.lock() {
@@ -1006,6 +1034,7 @@ mod tests {
         R: SourceRunner,
         C: Clock,
     {
+        let no_policies = std::collections::BTreeMap::new();
         let ctx = LocalSignCtx {
             registry,
             filter,
@@ -1013,8 +1042,59 @@ mod tests {
             auth,
             runner,
             clock,
+            kv_process_policies: &no_policies,
         };
         sign_local_with_ctx(&ctx, requester, msg)
+    }
+
+    /// Like [`handle_local_sign`] but with a key-level process-access policy table
+    /// (DR-0012 key layer), for exercising the SIGN_REQUEST gate.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_local_sign_gated<A, R, C>(
+        registry: &PublicKeyRegistry,
+        filter: &FilterEvaluator,
+        store: &Mutex<Store>,
+        auth: &A,
+        runner: &R,
+        clock: &C,
+        requester: Option<&[ProcessInfo]>,
+        policies: &std::collections::BTreeMap<String, Vec<String>>,
+        msg: &AgentMessage,
+    ) -> AgentMessage
+    where
+        A: Authenticator + ?Sized,
+        R: SourceRunner,
+        C: Clock,
+    {
+        let ctx = LocalSignCtx {
+            registry,
+            filter,
+            store,
+            auth,
+            runner,
+            clock,
+            kv_process_policies: policies,
+        };
+        sign_local_with_ctx(&ctx, requester, msg)
+    }
+
+    /// A resolved `ProcessInfo` (basename present) for fake requester chains.
+    fn proc(pid: u32, name: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid: Some(1),
+            path: Some(std::path::PathBuf::from(format!("/usr/bin/{name}"))),
+            start_time: Some(Duration::from_secs(pid as u64)),
+        }
+    }
+
+    fn key_policies(
+        entries: &[(&str, &[&str])],
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+            .collect()
     }
 
     struct NoRunner;
@@ -1127,6 +1207,96 @@ mod tests {
         let pk = ssh_key::PublicKey::from_openssh(ED25519_PUB).unwrap();
         <ssh_key::PublicKey as signature::Verifier<ssh_key::Signature>>::verify(&pk, data, &sig)
             .unwrap();
+    }
+
+    #[test]
+    fn sign_request_restricted_key_admits_matching_requester() {
+        // GITHUB_KEY restricted to `ssh`; a requester whose ancestry includes ssh
+        // is admitted and the signature verifies.
+        let clock = FakeClock::new();
+        let (store, registry) = fixture(&clock);
+        let pol = key_policies(&[("GITHUB_KEY", &["ssh"])]);
+        let chain = [proc(100, "ssh"), proc(50, "zsh")];
+        let data = b"agent challenge";
+        let req = sign_request(&blob_of(ED25519_PUB), data, 0);
+        let resp = handle_local_sign_gated(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            Some(&chain),
+            &pol,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+    }
+
+    #[test]
+    fn sign_request_restricted_key_denies_non_matching_requester() {
+        // A requester whose ancestry has no allowed basename is refused with a
+        // bare FAILURE (leak nothing) — even though the key is registered/listed.
+        let clock = FakeClock::new();
+        let (store, registry) = fixture(&clock);
+        let pol = key_policies(&[("GITHUB_KEY", &["ssh"])]);
+        let chain = [proc(100, "git"), proc(50, "zsh")];
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let resp = handle_local_sign_gated(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            Some(&chain),
+            &pol,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+        assert!(resp.payload.is_empty(), "FAILURE must carry no detail");
+    }
+
+    #[test]
+    fn sign_request_restricted_key_with_unknown_requester_is_fail_closed() {
+        // requester == None + a real restriction => fail-closed (FAILURE).
+        let clock = FakeClock::new();
+        let (store, registry) = fixture(&clock);
+        let pol = key_policies(&[("GITHUB_KEY", &["ssh"])]);
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let resp = handle_local_sign_gated(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None,
+            &pol,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+    }
+
+    #[test]
+    fn sign_request_unrestricted_key_admits_even_unknown_requester() {
+        // GITHUB_KEY has no policy entry => unrestricted; a None requester signs.
+        let clock = FakeClock::new();
+        let (store, registry) = fixture(&clock);
+        let pol = key_policies(&[("OTHER", &["ssh"])]);
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let resp = handle_local_sign_gated(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None,
+            &pol,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
     }
 
     #[test]

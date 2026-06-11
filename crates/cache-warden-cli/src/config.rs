@@ -432,6 +432,19 @@ pub struct KvEntryConfig {
     /// OTP hash algorithm `sha1` / `sha256` / `sha512` (only with `type = "otp"`).
     #[serde(default, rename = "otp-algorithm")]
     pub otp_algorithm: Option<String>,
+    /// Executable basenames allowed to *get* this key (DR-0012 key layer). When
+    /// non-empty, a `kv.get` (and an authsock SIGN_REQUEST resolving this key's
+    /// PEM) is admitted only if some process in the requester's ancestry chain has
+    /// a matching basename; otherwise it is refused. An empty / omitted list means
+    /// **no restriction**. Matching is exact (no globs / regexes) — the same
+    /// semantics as the socket layer ([`cache_warden_authsock::chain_allowed`]).
+    ///
+    /// This is **config-only**: it is deliberately not part of [`KvDefinition`],
+    /// so it cannot be set via a defs file or the `kv define` CLI. The policy
+    /// belongs to the owner of the secret (the config administrator), not to a
+    /// client self-declaring it at define time (DR-0012 key layer).
+    #[serde(default)]
+    pub allowed_processes: Vec<String>,
 
     // --- Forbidden-on-purpose keys (see KvEntryConfig::validate) ---
     /// Present only to reject inline literal values with a clear error.
@@ -790,6 +803,26 @@ impl Config {
         self.kv
             .iter()
             .filter_map(|(name, entry)| entry.validate(name).ok())
+            .collect()
+    }
+
+    /// The key-level process-access policies declared in `[kv.*]` (DR-0012 key
+    /// layer): a map from key name to its non-empty `allowed_processes` list.
+    ///
+    /// Only keys with a **non-empty** list appear — an absent or empty list means
+    /// "no restriction" and is simply omitted (storing an empty list would be a
+    /// deny-all under the fail-closed key-layer semantics; not storing it keeps
+    /// the "empty == unrestricted" invariant without the warden footgun).
+    ///
+    /// The daemon builds this table at startup and holds it in [`crate::daemon`]'s
+    /// shared state; the core [`cache_warden::Store`] never sees it (policy
+    /// interpretation is an adapter/handler concern, DR-0004). `BTreeMap` keeps a
+    /// deterministic order for tests / diagnostics.
+    pub fn kv_process_policies(&self) -> BTreeMap<String, Vec<String>> {
+        self.kv
+            .iter()
+            .filter(|(_, entry)| !entry.allowed_processes.is_empty())
+            .map(|(name, entry)| (name.clone(), entry.allowed_processes.clone()))
             .collect()
     }
 
@@ -1461,6 +1494,72 @@ bogus = 1
         )
         .unwrap_err();
         assert!(matches!(err, ConfigParseError::Toml(_)));
+    }
+
+    // ---- kv key-level allowed_processes (DR-0012 key layer) ----
+
+    #[test]
+    fn kv_entry_omitting_allowed_processes_has_no_policy() {
+        // The common case: a `[kv.*]` with no `allowed_processes` carries no
+        // restriction and does not appear in the policy table at all.
+        let cfg = Config::parse(
+            r#"[kv.TOK]
+command = ["printf", "x"]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.kv_process_policies().is_empty());
+    }
+
+    #[test]
+    fn kv_entry_allowed_processes_are_read_into_the_policy_table() {
+        let cfg = Config::parse(
+            r#"[kv.TOK]
+command = ["printf", "x"]
+allowed_processes = ["ssh", "git"]
+"#,
+        )
+        .unwrap();
+        let policies = cfg.kv_process_policies();
+        assert_eq!(
+            policies.get("TOK"),
+            Some(&vec!["ssh".to_string(), "git".to_string()])
+        );
+    }
+
+    #[test]
+    fn kv_entry_empty_allowed_processes_list_is_no_policy() {
+        // An explicit empty list means "no restriction" (same as omitting it):
+        // it must NOT register an empty-list policy (an empty allow-list would be
+        // a deny-all under the key-layer's fail-closed semantics — the warden
+        // "empty == allow-all" footgun is avoided by simply not storing it).
+        let cfg = Config::parse(
+            r#"[kv.TOK]
+command = ["printf", "x"]
+allowed_processes = []
+"#,
+        )
+        .unwrap();
+        assert!(cfg.kv_process_policies().is_empty());
+    }
+
+    #[test]
+    fn kv_definition_does_not_carry_allowed_processes() {
+        // Policy is config-only (DR-0012 key layer): it must not ride along in the
+        // KvDefinition, which round-trips through defs files and the persisted
+        // state file. A client must never be able to self-declare its own policy.
+        let cfg = Config::parse(
+            r#"[kv.TOK]
+command = ["printf", "x"]
+allowed_processes = ["ssh"]
+"#,
+        )
+        .unwrap();
+        // The definition is unaffected; only the separate policy table holds it.
+        let defs = cfg.kv_definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "TOK");
+        // (KvDefinition has no allowed_processes field at all — compile-time proof.)
     }
 
     // ---- authsock allowed_processes (port plan Iteration 5) ----

@@ -130,6 +130,13 @@ pub(crate) struct Shared {
     persist: Option<PersistSettings>,
     socket_path: String,
     pid: u32,
+    /// Key-level process-access policies (DR-0012 key layer): key name → its
+    /// non-empty `allowed_processes` list, built from `[kv.*]` config at startup.
+    /// Held here (not in the core `Store`) because policy interpretation is an
+    /// adapter/handler concern (DR-0004); the control handler reads it for the
+    /// `kv.get` gate, and the authsock listener shares the same `Shared` so a
+    /// SIGN_REQUEST resolving a KV key consults the same table.
+    pub(crate) kv_process_policies: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Where and what to persist for online definitions (DR-0014 §4).
@@ -158,6 +165,7 @@ impl Shared {
             persist: None,
             socket_path: String::new(),
             pid: std::process::id(),
+            kv_process_policies: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -249,6 +257,7 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
         persist,
         socket_path: socket_path.display().to_string(),
         pid: std::process::id(),
+        kv_process_policies: config.kv_process_policies(),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -596,6 +605,7 @@ fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Respons
         version: VERSION,
         socket: &shared.socket_path,
         requester: requester.as_deref(),
+        kv_process_policies: &shared.kv_process_policies,
     };
     let response = handler::handle_request(&mut store, &ctx, req);
 
@@ -659,6 +669,7 @@ mod tests {
             persist: None,
             socket_path: "/tmp/test.sock".into(),
             pid: std::process::id(),
+            kv_process_policies: std::collections::BTreeMap::new(),
         })
     }
 

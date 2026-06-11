@@ -225,6 +225,102 @@ fn spawn_with_config(dir: &Path, config_toml: &str) -> (Daemon, std::path::PathB
     (Daemon { child }, socket)
 }
 
+/// A real executable basename from *this test process's* own ancestry chain.
+///
+/// The control-socket client in these tests is the test binary itself, so the
+/// daemon resolves its peer pid's ancestry to a chain that contains this name.
+/// Putting it in a key's `allowed_processes` must admit a `kv.get`; a bogus name
+/// must deny it. Resolved live (not hard-coded) so it works on any runner.
+fn a_real_ancestor_name() -> String {
+    use cache_warden::ProcessInspector;
+    let chain = cache_warden::SystemInspector::new()
+        .ancestry(std::process::id())
+        .expect("self ancestry resolves");
+    chain
+        .iter()
+        .find_map(|p| p.name().map(str::to_string))
+        .expect("our ancestry has at least one named process")
+}
+
+#[test]
+fn kv_get_allowed_processes_admits_matching_ancestor_and_denies_others() {
+    // DR-0012 key layer (end-to-end): a `[kv.NAME]` with `allowed_processes` is
+    // gettable only from a requester whose ancestry names an allowed basename.
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = a_real_ancestor_name();
+
+    // OPEN: no restriction (control). RESTRICT: only our real ancestor may get it.
+    // DENIED: a restriction that our ancestry can never satisfy.
+    let cfg = format!(
+        r#"
+[kv.OPEN]
+command = ["printf", "open-value"]
+preload = true
+
+[kv.RESTRICT]
+command = ["printf", "restricted-value"]
+preload = true
+allowed_processes = ["{allowed}"]
+
+[kv.DENIED]
+command = ["printf", "denied-value"]
+preload = true
+allowed_processes = ["no-such-process-name-xyz"]
+"#
+    );
+    let (mut daemon, socket) = spawn_with_config(dir.path(), &cfg);
+
+    // OPEN: unrestricted key gets normally.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"OPEN"}"#);
+    assert_eq!(resp["ok"], true, "open key get: {resp}");
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"open-value"
+    );
+
+    // RESTRICT: our real ancestor name is allowed, so the get succeeds and
+    // returns the value.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"RESTRICT"}"#);
+    assert_eq!(
+        resp["ok"], true,
+        "restricted key get from allowed ancestor: {resp}"
+    );
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"restricted-value"
+    );
+
+    // DENIED: no process in our ancestry matches, so the get is refused with
+    // auth_failed and no value is returned.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"DENIED"}"#);
+    assert_eq!(resp["ok"], false, "denied key get must fail: {resp}");
+    assert_eq!(resp["error"]["kind"], "auth_failed");
+    assert!(
+        resp.get("value_b64").is_none() || resp["value_b64"].is_null(),
+        "denied get must not carry a value: {resp}"
+    );
+
+    // The denied key is still visible in kv.list (existence is not hidden; only
+    // the value is gated).
+    let resp = request(&socket, r#"{"cmd":"kv.list"}"#);
+    let keys: Vec<String> = resp["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        keys.contains(&"DENIED".to_string()),
+        "list shows DENIED: {keys:?}"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
 #[test]
 fn config_preload_and_reauth_command_allow() {
     let dir = tempfile::tempdir().unwrap();

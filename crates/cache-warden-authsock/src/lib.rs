@@ -44,10 +44,12 @@
 //!   ([`private_key_argv`] as a [`cache_warden::ValueSource::Command`]); the
 //!   registry's [`KeySource::Op`] carries that fetch spec. The op CLI sits behind
 //!   the [`OpClient`] trait so discovery is tested with a fake (no `op` in CI).
-//! - [`chain_allowed`]: socket-level process access policy (port plan Iteration 5).
-//!   Decides whether a connecting peer's process ancestry is admitted by a socket's
-//!   `allowed_processes` list (empty = unrestricted; otherwise an OR over the chain
-//!   on exact executable basename). The generic ancestry walk lives in the core;
+//! - [`chain_allowed`] / [`chain_gate_passes`]: process access policy, shared by
+//!   the socket layer (port plan Iteration 5) and the key layer (DR-0012). Decide
+//!   whether a requester's process ancestry is admitted by an `allowed_processes`
+//!   list (empty = unrestricted; otherwise an OR over the chain on exact
+//!   executable basename). [`chain_gate_passes`] adds the fail-closed handling for
+//!   an unidentifiable requester. The generic ancestry walk lives in the core;
 //!   this is the policy interpretation half (DR-0004).
 
 mod codec;
@@ -73,7 +75,7 @@ pub use message::{AgentMessage, Identity, MessageType, SignRequestFields};
 pub use op::{OpClient, OpKeyInfo, OpSource, RealOpClient, private_key_argv, validate_item_id};
 pub use op_cache::{CachedKey, OpKeyCache, default_cache_path};
 pub use op_discovery::{DiscoveredKey, discover_keys};
-pub use process_policy::chain_allowed;
+pub use process_policy::{chain_allowed, chain_gate_passes};
 pub use registry::{KeySource, PublicKeyRegistry, RegisteredKey};
 pub use signer::sign;
 pub use upstream::{Upstream, UpstreamConnection};
