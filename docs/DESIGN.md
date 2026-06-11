@@ -342,7 +342,11 @@ See DR-0004 for the core/adapter assignment of assets being ported.
 - **Additional adapters**: Adapters for secret value protocols beyond SSH / KV.
 - **Top-level `run` (op-run equivalent)**: Moving daemon startup to `daemon run` frees the top-level `run`
   to inject secret values into the environment and exec a child command (`cache-warden run -- cmd`).
-  Together with `cache-warden://KEY` reference substitution, it can be implemented as a control socket client.
+  Together with `cache-warden://KEY` reference substitution (`inject`), it is implemented as a control
+  socket client. The design is settled in
+  [DR-0013](./decisions/DR-0013-secret-reference-injection.md) (reference syntax / env is whole-value
+  only with no argv substitution / exec after resolution / `inject` does substring substitution).
+  Implementation has not started yet.
 
 See [ROADMAP.md](./ROADMAP.md) for details.
 

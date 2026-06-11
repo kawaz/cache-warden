@@ -1,6 +1,6 @@
 # secret reference injection (`cache-warden://KEY` 置換)
 
-- Status: idea
+- Status: wip
 - Date: 2026-06-11
 
 ## 構想
@@ -20,10 +20,11 @@
 
 ## TODO
 
-- [ ] 設計（参照構文 / 解決経路 / env 注入の安全性 / `run` と `inject` の責務分担）→ 未着手（要設計）
-- [ ] 実装
+- [x] 設計（参照構文 / 解決経路 / env 注入の安全性 / `run` と `inject` の責務分担）→ [DR-0013](../decisions/DR-0013-secret-reference-injection.md) で確定
+- [ ] 実装（共有 `refs` モジュール / `run` / `inject`、help・補完更新含む）
 
 ## 関連
 
+- [docs/decisions/DR-0013-secret-reference-injection.md](../decisions/DR-0013-secret-reference-injection.md) — 設計の確定 DR
 - [docs/DESIGN-ja.md](../DESIGN-ja.md) 「将来検討」節（トップレベル `run` の op run 用途）
 - CLI 再構成（`run` → `daemon run` 移動、2026-06-11）でトップレベル `run` を空けた

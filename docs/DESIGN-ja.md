@@ -345,7 +345,9 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
 - **アダプタの追加**: SSH / KV 以外の秘密値プロトコルを扱うアダプタ。
 - **トップレベル `run`（op run 相当）**: デーモン起動を `daemon run` へ移したことで空いたトップレベル
   `run` を、秘密値を env 注入して子コマンドを実行する用途（`cache-warden run -- cmd`）に充てる。
-  `cache-warden://KEY` 参照の置換機能とあわせて control socket クライアントとして実装できる。
+  `cache-warden://KEY` 参照の置換機能（`inject`）とあわせて control socket クライアントとして実装する。
+  設計は [DR-0013](./decisions/DR-0013-secret-reference-injection.md) で確定済み（参照構文 /
+  env は whole-value のみ・argv 非置換 / 解決後 exec / `inject` は substring 置換）。実装は未着手。
 
 詳細は [ROADMAP.md](./ROADMAP.md) を参照。
 
