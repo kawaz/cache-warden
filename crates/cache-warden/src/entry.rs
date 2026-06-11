@@ -167,10 +167,17 @@ pub struct CacheEntry {
     /// Latched once the entry transitions to HardExpired, so the destroyed state
     /// is sticky even if `extend` resets timers afterwards on a command source.
     hard_expired: bool,
+    /// Opaque, core-uninterpreted metadata (a value-type label + params; DR-0016).
+    /// The core stores and hands it back but never reads its meaning. Empty for
+    /// an ordinary (opaque) value.
+    meta: crate::meta::ValueMeta,
 }
 
 impl CacheEntry {
     /// Create a new Active entry holding `value`, loaded at `clock.now()`.
+    ///
+    /// The entry carries no type metadata; attach some with
+    /// [`CacheEntry::with_meta`] (the core never interprets it; DR-0016).
     pub fn new(source: ValueSource, value: SecretBytes, ttl: Ttl, clock: &impl Clock) -> Self {
         let now = clock.now();
         Self {
@@ -181,7 +188,23 @@ impl CacheEntry {
             extended_at: now,
             pin_deadline: None,
             hard_expired: false,
+            meta: crate::meta::ValueMeta::new(),
         }
+    }
+
+    /// Attach opaque metadata to this entry (builder style; DR-0016).
+    ///
+    /// The core stores it verbatim and never interprets it; an adapter uses it to
+    /// tag the entry with a value type (e.g. `otp`) and its parameters.
+    pub fn with_meta(mut self, meta: crate::meta::ValueMeta) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    /// Borrow this entry's opaque metadata (DR-0016). Value-free: it carries a
+    /// type label and parameters, never the secret.
+    pub fn meta(&self) -> &crate::meta::ValueMeta {
+        &self.meta
     }
 
     /// The value source for this entry.

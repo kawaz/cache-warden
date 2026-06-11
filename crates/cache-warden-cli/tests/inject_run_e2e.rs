@@ -466,3 +466,67 @@ fn run_defs_registers_then_injects() {
 
     stop(daemon);
 }
+
+// ---- OTP value type via the CLI (DR-0016) -------------------------------
+
+/// `cache-warden kv set --type otp` then `kv get` prints a 6-digit CODE (not the
+/// seed), and a `run --env X=cache-warden://OTP` injects the same shape of code
+/// — the reference resolution naturally yields the derived code, never the seed.
+#[test]
+fn otp_set_get_and_run_inject_the_code_not_the_seed() {
+    // RFC 6238 SHA1 test seed (base32).
+    const SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, socket) = spawn_plain(dir.path());
+    assert_eq!(request(&socket, r#"{"cmd":"ping"}"#)["ok"], true);
+
+    // Cache the seed as an otp-typed static value via the CLI.
+    let out = run_cli(
+        &socket,
+        &["kv", "set", "OTP", "--type", "otp", "--value", SEED],
+    );
+    assert!(
+        out.status.success(),
+        "kv set --type otp failed: {}",
+        stderr(&out)
+    );
+
+    // `kv get` prints the derived code, never the seed.
+    let out = run_cli(&socket, &["kv", "get", "OTP"]);
+    assert!(out.status.success(), "kv get otp failed: {}", stderr(&out));
+    let code = stdout(&out);
+    assert_eq!(code.len(), 6, "default otp digits, got {code:?}");
+    assert!(code.chars().all(|c| c.is_ascii_digit()), "code: {code:?}");
+    assert_ne!(code, SEED, "must not print the seed");
+
+    // dry-run prints the mask, not the code.
+    let out = run_cli(&socket, &["kv", "get", "OTP", "--dry-run"]);
+    assert!(out.status.success(), "dry-run failed: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "<cache-warden:OTP:masked>");
+
+    // `run` injects the code into the child env (whole-value reference).
+    let out = run_cli(
+        &socket,
+        &[
+            "run",
+            "--env",
+            "TOKEN=cache-warden://OTP",
+            "--",
+            "sh",
+            "-c",
+            "printf %s \"$TOKEN\"",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "run with otp ref failed: {}",
+        stderr(&out)
+    );
+    let injected = stdout(&out);
+    assert_eq!(injected.len(), 6, "injected a 6-digit code: {injected:?}");
+    assert!(injected.chars().all(|c| c.is_ascii_digit()));
+    assert_ne!(injected, SEED, "run must inject the code, not the seed");
+
+    stop(daemon);
+}

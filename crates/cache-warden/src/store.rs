@@ -16,6 +16,7 @@ use crate::auth::{AuthContext, AuthError, AuthOperation, Authenticator};
 use crate::clock::{Clock, Monotonic};
 use crate::definition::{DefineError, Definition};
 use crate::entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl};
+use crate::meta::ValueMeta;
 use crate::process::ProcessInfo;
 use crate::secret::SecretBytes;
 use crate::source::{RunError, SourceRunner, ValueSource};
@@ -59,7 +60,8 @@ impl Store {
         Self::default()
     }
 
-    /// Insert or replace the entry under `key`, becoming Active now.
+    /// Insert or replace the entry under `key`, becoming Active now (no type
+    /// metadata).
     ///
     /// Any previous entry under the same key is dropped (and thus its secret
     /// zeroized) before the new one takes its place.
@@ -71,10 +73,34 @@ impl Store {
         ttl: Ttl,
         clock: &impl Clock,
     ) {
-        let entry = CacheEntry::new(source, value, ttl, clock);
+        self.set_with_meta(key, source, value, ttl, ValueMeta::new(), clock);
+    }
+
+    /// Insert or replace the entry under `key` with opaque type metadata
+    /// (DR-0016).
+    ///
+    /// Same as [`Store::set`] but tags the value with a core-uninterpreted
+    /// [`ValueMeta`] (e.g. an `otp` type + its parameters). A static seed for a
+    /// derived type is set this way, since it has no definition to carry the type.
+    pub fn set_with_meta(
+        &mut self,
+        key: impl Into<String>,
+        source: ValueSource,
+        value: SecretBytes,
+        ttl: Ttl,
+        meta: ValueMeta,
+        clock: &impl Clock,
+    ) {
+        let entry = CacheEntry::new(source, value, ttl, clock).with_meta(meta);
         // Inserting overwrites the old entry; the displaced CacheEntry is dropped
         // here, zeroizing its secret.
         self.entries.insert(key.into(), entry);
+    }
+
+    /// Borrow the opaque [`ValueMeta`] of `key`'s value entry, or `None` if the
+    /// key has no value entry. Value-free metadata (DR-0016).
+    pub fn meta_of(&self, key: &str) -> Option<&ValueMeta> {
+        self.entries.get(key).map(CacheEntry::meta)
     }
 
     /// Borrow the secret under `key` iff it exists and is currently Active.
@@ -203,6 +229,9 @@ impl Store {
 
         let ttl = entry.ttl();
         let source = entry.source().clone();
+        // Carry the value's opaque type metadata across regeneration (DR-0016):
+        // a regenerated otp seed stays otp-typed.
+        let meta = entry.meta().clone();
 
         // 2. Re-run upstream. On failure nothing is mutated.
         let value = runner.run(&argv).map_err(RegenerateOutcome::RunFailed)?;
@@ -212,8 +241,10 @@ impl Store {
             .map_err(RegenerateOutcome::AuthFailed)?;
 
         // 4. Replace with a fresh Active entry (overwrite zeroizes the old one).
-        self.entries
-            .insert(key.to_string(), CacheEntry::new(source, value, ttl, clock));
+        self.entries.insert(
+            key.to_string(),
+            CacheEntry::new(source, value, ttl, clock).with_meta(meta),
+        );
         Ok(())
     }
 
@@ -349,7 +380,23 @@ impl Store {
         source: ValueSource,
         ttl: Ttl,
     ) -> Result<(), DefineError> {
-        let candidate = Definition::new(source, ttl)?;
+        self.define_with_meta(key, source, ttl, ValueMeta::new())
+    }
+
+    /// Register a definition with opaque type metadata (DR-0016).
+    ///
+    /// Same idempotency rule as [`Store::define`], but the [`ValueMeta`] is part
+    /// of the definition's identity: a redefine that differs only in its type
+    /// metadata is a [`DefineError::Conflict`] (a key cannot quietly change type).
+    /// The metadata is copied onto each value produced from this definition.
+    pub fn define_with_meta(
+        &mut self,
+        key: impl Into<String>,
+        source: ValueSource,
+        ttl: Ttl,
+        meta: ValueMeta,
+    ) -> Result<(), DefineError> {
+        let candidate = Definition::new(source, ttl)?.with_meta(meta);
         let key = key.into();
         match self.definitions.get(&key) {
             Some(existing) if *existing == candidate => Ok(()), // idempotent no-op
@@ -457,6 +504,9 @@ impl Store {
         };
         let source = definition.source().clone();
         let ttl = definition.ttl();
+        // The definition's opaque type metadata is stamped onto the produced
+        // value (DR-0016): a value lazily made from an otp definition is otp.
+        let meta = definition.meta().clone();
 
         // 1. Re-run upstream. On failure nothing is mutated.
         let value = runner.run(&argv).map_err(RegenerateDefOutcome::RunFailed)?;
@@ -466,8 +516,10 @@ impl Store {
             .map_err(RegenerateDefOutcome::AuthFailed)?;
 
         // 3. Install a fresh Active entry (overwriting any destroyed husk).
-        self.entries
-            .insert(key.to_string(), CacheEntry::new(source, value, ttl, clock));
+        self.entries.insert(
+            key.to_string(),
+            CacheEntry::new(source, value, ttl, clock).with_meta(meta),
+        );
         Ok(())
     }
 
@@ -1535,6 +1587,104 @@ mod tests {
         s.get_or_regenerate("K", &CountingRunner::new(b"v"), &auth, Some(&chain), &clock)
             .unwrap();
         assert_eq!(auth.calls()[0].requester.as_deref(), Some(chain.as_slice()));
+    }
+
+    // ---- opaque value metadata (DR-0016) ----
+
+    fn otp_meta() -> ValueMeta {
+        ValueMeta::with_type(
+            "otp",
+            [
+                ("digits".to_string(), "6".to_string()),
+                ("period".to_string(), "30".to_string()),
+            ],
+        )
+    }
+
+    #[test]
+    fn set_with_meta_tags_the_value_entry() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set_with_meta(
+            "OTP",
+            ValueSource::Static,
+            SecretBytes::from("seed"),
+            ttl(),
+            otp_meta(),
+            &clock,
+        );
+        assert_eq!(s.meta_of("OTP"), Some(&otp_meta()));
+        // The opaque label and a param are readable, but the core never
+        // interprets them.
+        assert_eq!(s.meta_of("OTP").unwrap().type_label(), Some("otp"));
+        assert_eq!(s.meta_of("OTP").unwrap().param("digits"), Some("6"));
+    }
+
+    #[test]
+    fn plain_set_carries_empty_meta() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &clock,
+        );
+        assert!(s.meta_of("K").unwrap().is_empty());
+    }
+
+    #[test]
+    fn definition_meta_is_stamped_onto_lazily_produced_value() {
+        // A definition tagged otp produces an otp-tagged value (DR-0016).
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.define_with_meta("K", cmd_source(), ttl(), otp_meta())
+            .unwrap();
+        let runner = CountingRunner::new(b"seed-bytes");
+        s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
+            .unwrap();
+        assert_eq!(s.meta_of("K"), Some(&otp_meta()), "value inherits def meta");
+    }
+
+    #[test]
+    fn regenerate_preserves_value_meta() {
+        // A value's opaque type survives hard-expiry regeneration (DR-0016).
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set_with_meta(
+            "K",
+            ValueSource::command(["echo".into(), "v".into()]),
+            SecretBytes::from("orig"),
+            ttl(),
+            otp_meta(),
+            &clock,
+        );
+        clock.advance(HARD);
+        let runner = CountingRunner::new(b"fresh");
+        s.regenerate("K", &runner, &AllowAll, None, &clock).unwrap();
+        assert_eq!(
+            s.meta_of("K"),
+            Some(&otp_meta()),
+            "meta survives regenerate"
+        );
+    }
+
+    #[test]
+    fn define_meta_participates_in_idempotency_conflict() {
+        // A redefine that only changes the type metadata conflicts (a key cannot
+        // silently change type; DR-0016).
+        let mut s = Store::new();
+        s.define_with_meta("K", cmd_source(), ttl(), otp_meta())
+            .unwrap();
+        // Same definition + same meta: idempotent no-op.
+        s.define_with_meta("K", cmd_source(), ttl(), otp_meta())
+            .unwrap();
+        // Same source/ttl but no meta: a different definition -> conflict.
+        assert_eq!(
+            s.define("K", cmd_source(), ttl()),
+            Err(DefineError::Conflict)
+        );
     }
 
     // ---- delete: value-only vs value+definition (DR-0014 §2) ----

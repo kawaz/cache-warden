@@ -30,27 +30,48 @@
 //! definition, then re-define).
 
 use crate::entry::Ttl;
+use crate::meta::ValueMeta;
 use crate::source::ValueSource;
 
 /// A key's value-source definition: how to (re)produce its value, plus the TTL
 /// freshly produced values are loaded with. Holds no secret value.
+///
+/// A definition may also carry opaque [`ValueMeta`] (a value-type label +
+/// parameters; DR-0016): the core stores it and copies it onto each freshly
+/// produced value, but never interprets it. The metadata participates in the
+/// exact-match idempotency rule (a definition that differs only in its type
+/// metadata is a *different* definition, so a redefine conflicts).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Definition {
     source: ValueSource,
     ttl: Ttl,
+    meta: ValueMeta,
 }
 
 impl Definition {
-    /// Build a definition from a command source and a TTL.
+    /// Build a definition from a command source and a TTL (no type metadata).
     ///
     /// Returns [`DefineError::StaticNotDefinable`] if `source` is
     /// [`ValueSource::Static`]: only regenerable (command) sources can back a
     /// lazily produced value (see the module note).
     pub fn new(source: ValueSource, ttl: Ttl) -> Result<Self, DefineError> {
         match source {
-            ValueSource::Command { .. } => Ok(Self { source, ttl }),
+            ValueSource::Command { .. } => Ok(Self {
+                source,
+                ttl,
+                meta: ValueMeta::new(),
+            }),
             ValueSource::Static => Err(DefineError::StaticNotDefinable),
         }
+    }
+
+    /// Attach opaque metadata to this definition (builder style; DR-0016).
+    ///
+    /// The core stores it verbatim and copies it onto each value produced from
+    /// this definition; it never interprets the contents.
+    pub fn with_meta(mut self, meta: ValueMeta) -> Self {
+        self.meta = meta;
+        self
     }
 
     /// The value source this definition (re)runs to produce a value.
@@ -61,6 +82,11 @@ impl Definition {
     /// The TTL freshly produced values are loaded with.
     pub fn ttl(&self) -> Ttl {
         self.ttl
+    }
+
+    /// Borrow this definition's opaque metadata (DR-0016). Value-free.
+    pub fn meta(&self) -> &ValueMeta {
+        &self.meta
     }
 }
 

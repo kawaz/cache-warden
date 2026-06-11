@@ -419,6 +419,19 @@ pub struct KvEntryConfig {
     /// this flag (the agent registry needs the PEM resident at startup).
     #[serde(default)]
     pub preload: bool,
+    /// Value type for this definition (DR-0016). The only value today is `"otp"`;
+    /// absent means an ordinary opaque value.
+    #[serde(default, rename = "type")]
+    pub value_type: Option<String>,
+    /// OTP digit count (only with `type = "otp"`).
+    #[serde(default, rename = "otp-digits")]
+    pub otp_digits: Option<u32>,
+    /// OTP time step in seconds (only with `type = "otp"`).
+    #[serde(default, rename = "otp-period")]
+    pub otp_period: Option<u64>,
+    /// OTP hash algorithm `sha1` / `sha256` / `sha512` (only with `type = "otp"`).
+    #[serde(default, rename = "otp-algorithm")]
+    pub otp_algorithm: Option<String>,
 
     // --- Forbidden-on-purpose keys (see KvEntryConfig::validate) ---
     /// Present only to reject inline literal values with a clear error.
@@ -447,6 +460,10 @@ pub struct KvDefinition {
     /// Whether to run the command at startup (eager) instead of lazily on first
     /// get. Defaults to `false` (lazy).
     pub preload: bool,
+    /// Opaque value-type metadata (DR-0016): `type = "otp"` + otp params, or
+    /// empty for an ordinary (opaque) definition. Carried so the type round-trips
+    /// through defs files and the persisted-definitions state file.
+    pub meta: crate::protocol::wire::ValueMetaWire,
 }
 
 /// An error in the configuration file's *content* (distinct from I/O / TOML
@@ -466,6 +483,83 @@ impl ConfigError {
             message: message.into(),
         }
     }
+}
+
+/// Build a [`ValueMetaWire`](crate::protocol::wire::ValueMetaWire) from the
+/// `type` + `otp-*` fields of a `[kv.NAME]` table (DR-0016). Shared by the config
+/// `[kv.*]` parser and the defs-file parser so both speak the same grammar.
+///
+/// Validates that otp parameters only appear with `type = "otp"`, that the digit
+/// / period values are in range, and that the algorithm label is known — failing
+/// at parse time (naming the entry) rather than at first get.
+pub fn build_kv_meta(
+    name: &str,
+    value_type: &Option<String>,
+    digits: Option<u32>,
+    period: Option<u64>,
+    algorithm: &Option<String>,
+) -> Result<crate::protocol::wire::ValueMetaWire, ConfigError> {
+    use crate::protocol::wire::ValueMetaWire;
+    use crate::totp::OtpAlgorithm;
+
+    let has_otp_params = digits.is_some() || period.is_some() || algorithm.is_some();
+    match value_type.as_deref() {
+        None => {
+            if has_otp_params {
+                return Err(ConfigError::new(format!(
+                    "[kv.{name}]: otp-digits / otp-period / otp-algorithm require `type = \"otp\"`"
+                )));
+            }
+            Ok(ValueMetaWire::default())
+        }
+        Some("otp") => {
+            let mut params = std::collections::BTreeMap::new();
+            if let Some(d) = digits {
+                if !(1..=9).contains(&d) {
+                    return Err(ConfigError::new(format!(
+                        "[kv.{name}]: otp-digits must be between 1 and 9, got {d}"
+                    )));
+                }
+                params.insert("digits".to_string(), d.to_string());
+            }
+            if let Some(p) = period {
+                if p == 0 {
+                    return Err(ConfigError::new(format!(
+                        "[kv.{name}]: otp-period must be greater than zero"
+                    )));
+                }
+                params.insert("period".to_string(), p.to_string());
+            }
+            if let Some(a) = algorithm {
+                let algo = OtpAlgorithm::parse(a)
+                    .map_err(|e| ConfigError::new(format!("[kv.{name}]: otp-algorithm: {e}")))?;
+                params.insert("algorithm".to_string(), algo.label().to_string());
+            }
+            Ok(ValueMetaWire {
+                type_label: Some("otp".to_string()),
+                params,
+            })
+        }
+        Some(other) => Err(ConfigError::new(format!(
+            "[kv.{name}]: unknown `type` {other:?} (the only value type is \"otp\")"
+        ))),
+    }
+}
+
+/// The TOML-writable form of value-type metadata: `(type, digits, period,
+/// algorithm)`, each an already-stringified field ready to serialize.
+pub type MetaTomlFields = (String, Option<String>, Option<String>, Option<String>);
+
+/// Read the `type` / `otp-*` fields back out of a [`ValueMetaWire`] for
+/// serialization into a defs / persisted-definitions file (DR-0016 round-trip).
+pub fn meta_to_toml_fields(meta: &crate::protocol::wire::ValueMetaWire) -> Option<MetaTomlFields> {
+    let label = meta.type_label.clone()?;
+    Some((
+        label,
+        meta.params.get("digits").cloned(),
+        meta.params.get("period").cloned(),
+        meta.params.get("algorithm").cloned(),
+    ))
 }
 
 impl std::fmt::Display for ConfigError {
@@ -522,6 +616,13 @@ impl KvEntryConfig {
         };
         let soft_ttl_secs = parse("soft-ttl", &self.soft_ttl)?;
         let hard_ttl_secs = parse("hard-ttl", &self.hard_ttl)?;
+        let meta = build_kv_meta(
+            name,
+            &self.value_type,
+            self.otp_digits,
+            self.otp_period,
+            &self.otp_algorithm,
+        )?;
 
         Ok(KvDefinition {
             name: name.to_string(),
@@ -529,6 +630,7 @@ impl KvEntryConfig {
             soft_ttl_secs,
             hard_ttl_secs,
             preload: self.preload,
+            meta,
         })
     }
 }
@@ -1006,6 +1108,57 @@ hard-ttl = "24h"
         assert_eq!(e.command, vec!["op", "read", "op://vault/item/password"]);
         assert_eq!(e.soft_ttl_secs, Some(3600));
         assert_eq!(e.hard_ttl_secs, Some(86400));
+    }
+
+    #[test]
+    fn kv_otp_typed_entry_validates_and_carries_meta() {
+        let cfg = Config::parse(
+            r#"[kv.OTP]
+command = ["op", "read", "op://vault/item/field"]
+type = "otp"
+otp-digits = 8
+otp-algorithm = "sha256"
+"#,
+        )
+        .unwrap();
+        let entries = cfg.kv_definitions();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.meta.type_label.as_deref(), Some("otp"));
+        assert_eq!(e.meta.params.get("digits").map(String::as_str), Some("8"));
+        assert_eq!(
+            e.meta.params.get("algorithm").map(String::as_str),
+            Some("sha256")
+        );
+    }
+
+    #[test]
+    fn kv_otp_params_without_type_are_rejected() {
+        let err = Config::parse(
+            r#"[kv.X]
+command = ["echo", "x"]
+otp-period = 30
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(e.message.contains("type = \"otp\""), "msg: {}", e.message)
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_unknown_type_is_rejected() {
+        let err = Config::parse(
+            r#"[kv.X]
+command = ["echo", "x"]
+type = "magic"
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigParseError::Content(_)));
     }
 
     #[test]

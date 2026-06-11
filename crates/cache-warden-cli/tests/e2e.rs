@@ -1105,3 +1105,87 @@ fn double_start_is_refused() {
     }
     let _ = wait_for_exit(&mut first, Duration::from_secs(10));
 }
+
+/// OTP value type end-to-end (DR-0016): a seed is cached, `kv.get` returns the
+/// derived code (six digits), the seed never appears in any response, and a
+/// dry-run masks the code. Covers both the static-seed (`kv.set --type otp`) and
+/// the CLI rendering path.
+#[test]
+fn otp_value_type_over_control_socket() {
+    // RFC 6238 SHA1 test seed, base32-encoded.
+    const SEED_B32: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("control.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
+        .arg("run")
+        .arg("--socket")
+        .arg(&socket)
+        .spawn()
+        .expect("spawn daemon");
+    let mut daemon = Daemon { child };
+
+    // --- kv.set a static OTP seed (type = otp, 6 digits default) ---
+    let set = format!(
+        r#"{{"cmd":"kv.set","key":"OTP","source":{{"kind":"static","value_b64":"{}"}},"meta":{{"type":"otp"}}}}"#,
+        b64(SEED_B32.as_bytes())
+    );
+    let resp = request(&socket, &set);
+    assert_eq!(resp["ok"], true, "set otp: {resp}");
+
+    // --- kv.get returns a 6-digit CODE, never the seed (write-only) ---
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"OTP"}"#);
+    assert_eq!(resp["ok"], true, "get otp: {resp}");
+    let got = resp["value_b64"].as_str().expect("value_b64");
+    let code = B64.decode(got).unwrap();
+    assert_eq!(code.len(), 6, "default otp digits");
+    assert!(
+        code.iter().all(|b| b.is_ascii_digit()),
+        "code is digits: {:?}",
+        String::from_utf8_lossy(&code)
+    );
+    // The seed must never appear in the response (write-only; DR-0016 §3).
+    let resp_str = resp.to_string();
+    assert!(!resp_str.contains(SEED_B32), "seed leaked: {resp_str}");
+    assert!(
+        !resp_str.contains(&b64(SEED_B32.as_bytes())),
+        "encoded seed leaked"
+    );
+
+    // --- status reports the otp type but never the seed ---
+    let resp = request(&socket, r#"{"cmd":"status"}"#);
+    let status_str = resp.to_string();
+    assert!(!status_str.contains(SEED_B32), "status leaked seed");
+    let otp = resp["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "OTP")
+        .expect("OTP in status");
+    assert_eq!(otp["value_type"], "otp", "status shows type: {otp}");
+
+    // --- dry-run get masks the code (no value carried) ---
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"OTP","dry_run":true}"#);
+    assert_eq!(resp["ok"], true, "dry-run otp: {resp}");
+    assert_eq!(resp["verified"], true, "dry-run verified: {resp}");
+    let resp_str = resp.to_string();
+    assert!(!resp_str.contains("value_b64"), "dry-run carried a value");
+    assert!(!resp_str.contains(SEED_B32), "dry-run leaked seed");
+
+    // --- an 8-digit otp seed via params ---
+    let set = format!(
+        r#"{{"cmd":"kv.set","key":"OTP8","source":{{"kind":"static","value_b64":"{}"}},"meta":{{"type":"otp","params":{{"digits":"8"}}}}}}"#,
+        b64(SEED_B32.as_bytes())
+    );
+    assert_eq!(request(&socket, &set)["ok"], true);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"OTP8"}"#);
+    let code = B64.decode(resp["value_b64"].as_str().unwrap()).unwrap();
+    assert_eq!(code.len(), 8, "8-digit otp code");
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}

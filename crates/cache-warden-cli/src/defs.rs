@@ -34,10 +34,23 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use cache_warden::Store;
+use cache_warden::{Store, ValueMeta};
 
 use crate::config::{ConfigError, KvDefinition};
 use crate::protocol::parse_duration;
+use crate::protocol::wire::ValueMetaWire;
+
+/// Convert the core's opaque [`ValueMeta`] into the wire shape for persistence
+/// (DR-0016). The reverse of `handler::meta_from_wire`.
+fn meta_to_wire(meta: &ValueMeta) -> ValueMetaWire {
+    ValueMetaWire {
+        type_label: meta.type_label().map(|s| s.to_string()),
+        params: meta
+            .params()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    }
+}
 
 /// Snapshot the store's definition registry as a list of [`KvDefinition`]s
 /// (name-sorted), for persistence.
@@ -62,6 +75,9 @@ pub fn snapshot_definitions(store: &Store) -> Vec<KvDefinition> {
             soft_ttl_secs: ttl.soft().map(|d| d.as_secs()),
             hard_ttl_secs: ttl.hard().map(|d| d.as_secs()),
             preload: false,
+            // Carry the opaque value-type metadata so the type round-trips
+            // through the persisted-definitions file (DR-0016).
+            meta: meta_to_wire(def.meta()),
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -87,6 +103,18 @@ struct DefEntry {
     /// Hard TTL string (e.g. `"24h"`).
     #[serde(default, rename = "hard-ttl")]
     hard_ttl: Option<String>,
+    /// Value type (DR-0016): `"otp"` or absent (opaque).
+    #[serde(default, rename = "type")]
+    value_type: Option<String>,
+    /// OTP digit count (only with `type = "otp"`).
+    #[serde(default, rename = "otp-digits")]
+    otp_digits: Option<u32>,
+    /// OTP time step in seconds (only with `type = "otp"`).
+    #[serde(default, rename = "otp-period")]
+    otp_period: Option<u64>,
+    /// OTP hash algorithm (only with `type = "otp"`).
+    #[serde(default, rename = "otp-algorithm")]
+    otp_algorithm: Option<String>,
 
     // --- Forbidden-on-purpose keys (rejected with a clear error) ---
     /// `preload` is a config-only startup flag; meaningless in a defs file.
@@ -166,6 +194,14 @@ impl DefEntry {
             }
         };
 
+        let meta = crate::config::build_kv_meta(
+            name,
+            &self.value_type,
+            self.otp_digits,
+            self.otp_period,
+            &self.otp_algorithm,
+        )?;
+
         Ok(KvDefinition {
             name: name.to_string(),
             command,
@@ -174,6 +210,7 @@ impl DefEntry {
             // Defs / persisted definitions are always lazy — `preload` is
             // rejected above, so this is unconditionally false.
             preload: false,
+            meta,
         })
     }
 }
@@ -223,6 +260,22 @@ pub fn serialize_definitions(defs: &[KvDefinition]) -> String {
         }
         if let Some(secs) = def.hard_ttl_secs {
             out.push_str(&format!("hard-ttl = \"{secs}s\"\n"));
+        }
+        // Value-type metadata (DR-0016): write `type` + any otp-* params so the
+        // type round-trips. Values are simple numbers / labels — no escaping
+        // beyond the basic-string quoting used elsewhere.
+        if let Some((ty, digits, period, algorithm)) = crate::config::meta_to_toml_fields(&def.meta)
+        {
+            out.push_str(&format!("type = \"{ty}\"\n"));
+            if let Some(d) = digits {
+                out.push_str(&format!("otp-digits = {d}\n"));
+            }
+            if let Some(p) = period {
+                out.push_str(&format!("otp-period = {p}\n"));
+            }
+            if let Some(a) = algorithm {
+                out.push_str(&format!("otp-algorithm = \"{a}\"\n"));
+            }
         }
     }
     out
@@ -330,6 +383,7 @@ mod tests {
             soft_ttl_secs: soft,
             hard_ttl_secs: hard,
             preload: false,
+            meta: Default::default(),
         }
     }
 
@@ -451,6 +505,84 @@ bogus = 1
     #[test]
     fn syntax_error_is_reported() {
         assert!(parse_defs("not = valid = toml").is_err());
+    }
+
+    // ---- value type (DR-0016) ----
+
+    #[test]
+    fn parses_an_otp_typed_entry_with_params() {
+        let defs = parse_defs(
+            r#"[kv.OTP]
+command = ["op", "read", "op://vault/item/field"]
+type = "otp"
+otp-digits = 8
+otp-period = 60
+otp-algorithm = "SHA256"
+"#,
+        )
+        .unwrap();
+        assert_eq!(defs.len(), 1);
+        let d = &defs[0];
+        assert_eq!(d.meta.type_label.as_deref(), Some("otp"));
+        assert_eq!(d.meta.params.get("digits").map(String::as_str), Some("8"));
+        assert_eq!(d.meta.params.get("period").map(String::as_str), Some("60"));
+        // Algorithm normalized to lowercase.
+        assert_eq!(
+            d.meta.params.get("algorithm").map(String::as_str),
+            Some("sha256")
+        );
+    }
+
+    #[test]
+    fn otp_params_without_type_are_rejected() {
+        let err = parse_defs(
+            r#"[kv.X]
+command = ["echo", "x"]
+otp-digits = 8
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("type = \"otp\""),
+            "msg: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn unknown_type_in_defs_is_rejected() {
+        let err = parse_defs(
+            r#"[kv.X]
+command = ["echo", "x"]
+type = "magic"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("unknown `type`"),
+            "msg: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn otp_typed_definition_round_trips_through_serialize() {
+        // A serialized otp definition parses back to the same meta (DR-0016).
+        let mut d = def("OTP", &["op", "read", "op://v/i/f"], Some(3600), None);
+        d.meta = crate::protocol::wire::ValueMetaWire {
+            type_label: Some("otp".to_string()),
+            params: [
+                ("digits".to_string(), "8".to_string()),
+                ("algorithm".to_string(), "sha512".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let text = serialize_definitions(std::slice::from_ref(&d));
+        assert!(text.contains("type = \"otp\""), "text: {text}");
+        assert!(text.contains("otp-digits = 8"), "text: {text}");
+        let back = parse_defs(&text).unwrap();
+        assert_eq!(back[0], d, "otp meta round-trips");
     }
 
     // ---- serialize / round-trip ----

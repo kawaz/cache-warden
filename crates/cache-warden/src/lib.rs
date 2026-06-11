@@ -65,6 +65,7 @@ mod auth;
 mod clock;
 mod definition;
 mod entry;
+mod meta;
 mod process;
 mod secret;
 mod source;
@@ -77,6 +78,7 @@ pub use auth::{
 pub use clock::{Clock, FakeClock, Monotonic, SystemClock};
 pub use definition::{DefineError, Definition};
 pub use entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl, TtlError};
+pub use meta::ValueMeta;
 pub use process::{FakeInspector, InspectError, ProcessInfo, ProcessInspector, SystemInspector};
 pub use secret::SecretBytes;
 pub use source::{CommandRunner, RunError, SourceRunner, TrailingNewline, ValueSource};

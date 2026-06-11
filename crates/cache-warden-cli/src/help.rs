@@ -359,12 +359,36 @@ pub fn kv_define() -> HelpSpec {
                 name: "--hard-ttl DUR",
                 desc: "Hard TTL (value zeroized at expiry)",
             },
+            Row {
+                name: "--type otp",
+                desc: "Mark the value as a TOTP seed: get derives a code\n\
+                       (the seed is never returned; write-only)",
+            },
+            Row {
+                name: "--otp-digits N",
+                desc: "OTP code length (default 6; requires --type otp)",
+            },
+            Row {
+                name: "--otp-period SEC",
+                desc: "OTP time step in seconds (default 30)",
+            },
+            Row {
+                name: "--otp-algorithm A",
+                desc: "OTP hash: sha1 (default) / sha256 / sha512",
+            },
         ],
         detail: "\
 The command is NOT run at define time; the value is produced lazily on the
 first `kv get`. Defining is idempotent under an exact match (same argv/URI +
 TTL is a no-op); a conflicting redefinition is rejected — delete it first with
 `kv del KEY --with-define`, then re-define.
+
+With --type otp the stored value is a TOTP *seed* (raw base32 or an otpauth://
+URI). `kv get` derives the current code from the seed and the wall clock; the
+seed itself is never returned (write-only). Explicit --otp-* flags override any
+parameters read from an otpauth:// URI. A `--type otp` source must point at the
+seed field (plain op://vault/item/field), NOT `?attribute=otp` (which returns a
+computed 30s code, not the seed) — that combination is rejected.
 
 --defs FILE bulk-registers every [kv.NAME] in a TOML file (same grammar as the
 config [kv.*] section: command + soft-ttl / hard-ttl; no inline values, no
@@ -402,10 +426,32 @@ pub fn kv_set() -> HelpSpec {
                 name: "--hard-ttl DUR",
                 desc: "Hard TTL (value zeroized at expiry)",
             },
+            Row {
+                name: "--type otp",
+                desc: "Treat the value as a TOTP seed: get derives a code\n\
+                       (the seed is never returned; write-only)",
+            },
+            Row {
+                name: "--otp-digits N",
+                desc: "OTP code length (default 6; requires --type otp)",
+            },
+            Row {
+                name: "--otp-period SEC",
+                desc: "OTP time step in seconds (default 30)",
+            },
+            Row {
+                name: "--otp-algorithm A",
+                desc: "OTP hash: sha1 (default) / sha256 / sha512",
+            },
         ],
         detail: "\
 `kv set` injects a literal value only. To register a regenerable command
-source, use `kv define` instead.",
+source, use `kv define` instead.
+
+With --type otp the value is a TOTP *seed* (raw base32 or an otpauth:// URI),
+and `kv get` returns the derived code, never the seed (write-only). A static
+otp seed is lost on daemon restart (re-set it), or define it from op for
+self-healing. Explicit --otp-* flags override any otpauth:// URI parameters.",
         show_global: true,
     }
 }
@@ -715,6 +761,10 @@ mod tests {
         assert!(h.contains("--soft-ttl DUR"));
         assert!(h.contains("Global options:"));
         assert!(h.contains("Environment:"));
+        // OTP value-type flags are documented on `kv set` (DR-0016).
+        assert!(h.contains("--type otp"));
+        assert!(h.contains("--otp-digits"));
+        assert!(h.contains("write-only"));
     }
 
     #[test]
@@ -730,6 +780,10 @@ mod tests {
         assert!(h.contains("--with-define"));
         // The bulk-define note mentions no implicit discovery.
         assert!(h.contains(".cache-warden.toml"));
+        // OTP value-type flags + the attribute=otp footgun note (DR-0016).
+        assert!(h.contains("--type otp"));
+        assert!(h.contains("--otp-algorithm"));
+        assert!(h.contains("attribute=otp"));
     }
 
     #[test]

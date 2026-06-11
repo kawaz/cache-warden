@@ -14,8 +14,10 @@ mod daemon;
 mod defs;
 mod help;
 mod mode;
+mod otp_type;
 mod protocol;
 mod refs;
+mod totp;
 
 use commands::client;
 use protocol::wire::{OkPayload, Response};
@@ -86,6 +88,9 @@ fn render_response(resp: Response) -> Result<(), String> {
                                 }
                                 .to_string(),
                             );
+                            if let Some(t) = &e.value_type {
+                                attrs.push(format!("type {t}"));
+                            }
                             if e.defined {
                                 attrs.push("defined".to_string());
                             }
@@ -395,6 +400,7 @@ fn run_define_defs(socket: &std::path::Path, files: &[PathBuf]) -> Result<(), Cl
                 argv: def.command.clone(),
                 soft_ttl_secs: def.soft_ttl_secs,
                 hard_ttl_secs: def.hard_ttl_secs,
+                meta: def.meta.clone(),
             };
             match client::round_trip(socket, &req) {
                 Ok(Response::Ok(_)) => ok_count += 1,
@@ -501,6 +507,7 @@ fn register_defs(socket: &std::path::Path, files: &[std::path::PathBuf]) -> Resu
                 argv: def.command.clone(),
                 soft_ttl_secs: def.soft_ttl_secs,
                 hard_ttl_secs: def.hard_ttl_secs,
+                meta: def.meta.clone(),
             };
             match client::round_trip(socket, &req)? {
                 Response::Ok(_) => {}

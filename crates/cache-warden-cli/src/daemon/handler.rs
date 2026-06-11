@@ -11,11 +11,24 @@
 
 use cache_warden::{
     Authenticator, Clock, DefineError, EntryState, ExtendAuthOutcome, PinAuthOutcome, ProcessInfo,
-    RegenerateDefOutcome, RegenerateOutcome, SecretBytes, SourceRunner, Store, Ttl, ValueSource,
+    RegenerateDefOutcome, RegenerateOutcome, SecretBytes, SourceRunner, Store, Ttl, ValueMeta,
+    ValueSource,
 };
 
-use crate::protocol::wire::{EntryInfo, ErrorKind, Request, Response, SetSource};
+use crate::otp_type;
+use crate::protocol::wire::{EntryInfo, ErrorKind, Request, Response, SetSource, ValueMetaWire};
 use crate::protocol::{decode_b64, encode_b64};
+
+/// Convert wire metadata into the core's opaque [`ValueMeta`].
+pub fn meta_from_wire(meta: ValueMetaWire) -> ValueMeta {
+    match meta.type_label {
+        None if meta.params.is_empty() => ValueMeta::new(),
+        Some(label) => ValueMeta::with_type(label, meta.params),
+        // params without a type label: keep them under an empty type so nothing
+        // is silently dropped (the core never interprets either).
+        None => ValueMeta::with_type(String::new(), meta.params),
+    }
+}
 
 /// Everything [`handle_request`] needs beyond the store: the authenticator, a
 /// source runner for regeneration, the clock, the daemon's identity for
@@ -74,13 +87,15 @@ where
             source,
             soft_ttl_secs,
             hard_ttl_secs,
-        } => handle_set(store, ctx, key, source, soft_ttl_secs, hard_ttl_secs),
+            meta,
+        } => handle_set(store, ctx, key, source, soft_ttl_secs, hard_ttl_secs, meta),
         Request::KvDefine {
             key,
             argv,
             soft_ttl_secs,
             hard_ttl_secs,
-        } => handle_define(store, key, argv, soft_ttl_secs, hard_ttl_secs),
+            meta,
+        } => handle_define(store, key, argv, soft_ttl_secs, hard_ttl_secs, meta),
         Request::KvGet { key, dry_run } => handle_get(store, ctx, key, dry_run),
         Request::KvPin { key, duration_secs } => handle_pin(store, ctx, key, duration_secs),
         Request::KvUnpin { key } => {
@@ -137,6 +152,14 @@ where
         let pin_remaining_secs = store
             .pin_deadline_of(&name)
             .map(|deadline| deadline.saturating_duration_since(now).as_secs());
+        // The opaque value type (DR-0016), read from the value's metadata or, for
+        // a definition-only key, the definition's. Never the secret.
+        let value_type = store
+            .meta_of(&name)
+            .or_else(|| store.definition_of(&name).map(|d| d.meta()))
+            .and_then(|m| m.type_label())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string());
         entries.push(EntryInfo {
             name,
             state,
@@ -144,6 +167,7 @@ where
             defined,
             has_value,
             pin_remaining_secs,
+            value_type,
         });
     }
     Response::status(
@@ -161,6 +185,7 @@ fn handle_set<A, R, C>(
     source: SetSource,
     soft_ttl_secs: Option<u64>,
     hard_ttl_secs: Option<u64>,
+    meta: ValueMetaWire,
 ) -> Response
 where
     A: ?Sized,
@@ -183,11 +208,21 @@ where
         }
     };
 
-    store.set(
+    // For an otp-typed static seed, fail fast if the seed cannot be interpreted,
+    // so a bad seed is rejected at set time rather than silently at the first get
+    // (the seed is never echoed into the error; DR-0016 §5).
+    if otp_type::is_otp(&meta)
+        && let Err(e) = otp_type::validate_seed(&bytes, &meta)
+    {
+        return Response::error(ErrorKind::BadRequest, e);
+    }
+
+    store.set_with_meta(
         key,
         ValueSource::Static,
         SecretBytes::new(bytes),
         ttl,
+        meta_from_wire(meta),
         ctx.clock,
     );
     Response::set_ack()
@@ -204,6 +239,7 @@ fn handle_define(
     argv: Vec<String>,
     soft_ttl_secs: Option<u64>,
     hard_ttl_secs: Option<u64>,
+    meta: ValueMetaWire,
 ) -> Response {
     if argv.is_empty() {
         return Response::error(ErrorKind::BadRequest, "command argv must not be empty");
@@ -216,7 +252,7 @@ fn handle_define(
         Err(e) => return Response::error(ErrorKind::BadRequest, e.to_string()),
     };
 
-    match store.define(key, ValueSource::command(argv), ttl) {
+    match store.define_with_meta(key, ValueSource::command(argv), ttl, meta_from_wire(meta)) {
         Ok(()) => Response::defined_ack(),
         Err(DefineError::Conflict) => Response::error(
             ErrorKind::BadRequest,
@@ -252,8 +288,8 @@ where
     C: Clock,
 {
     // Fast path: a live (Active) value.
-    if let Some(secret) = store.get(&key, ctx.clock) {
-        return finish_get(secret.expose_secret(), dry_run, "active");
+    if store.get(&key, ctx.clock).is_some() {
+        return finish_get(store, &key, dry_run, "active", ctx.clock);
     }
 
     // Not directly readable. Decide why and try to recover.
@@ -276,7 +312,7 @@ where
         Some(EntryState::SoftExpired) => {
             match store.extend_authenticated(&key, ctx.auth, ctx.requester, ctx.clock) {
                 Ok(()) => match store.get(&key, ctx.clock) {
-                    Some(secret) => finish_get(secret.expose_secret(), dry_run, "active"),
+                    Some(_) => finish_get(store, &key, dry_run, "active", ctx.clock),
                     None => Response::error(ErrorKind::Internal, "value gone after extend"),
                 },
                 Err(ExtendAuthOutcome::NotFound) => {
@@ -301,7 +337,7 @@ where
             }
             match store.regenerate(&key, ctx.runner, ctx.auth, ctx.requester, ctx.clock) {
                 Ok(()) => match store.get(&key, ctx.clock) {
-                    Some(secret) => finish_get(secret.expose_secret(), dry_run, "active"),
+                    Some(_) => finish_get(store, &key, dry_run, "active", ctx.clock),
                     None => Response::error(ErrorKind::Internal, "value gone after regenerate"),
                 },
                 Err(RegenerateOutcome::NotFound) => {
@@ -326,16 +362,62 @@ where
     }
 }
 
-/// Build the success response for a resolved value, honoring `dry_run`.
+/// Build the success response for `key`'s **resident, readable** value, honoring
+/// `dry_run` and the value's type (DR-0015 / DR-0016).
 ///
-/// In reveal mode the base64 value is returned. In dry-run mode the value is
-/// **discarded here** — only a value-free `get_verified` (state-only) response
-/// is produced, so the secret bytes never leave the daemon (DR-0015 §6).
-fn finish_get(value: &[u8], dry_run: bool, state: &str) -> Response {
-    if dry_run {
-        Response::get_verified(state)
-    } else {
-        Response::get(encode_b64(value))
+/// The caller has already confirmed `key` is Active and readable. This reads the
+/// value once more (the only borrow), applies the value-type derivation, and
+/// shapes the response:
+///
+/// - **opaque value**: returned (reveal) or hidden (dry-run) verbatim.
+/// - **otp-typed value**: the stored *seed* is run through TOTP and only the
+///   derived **code** is returned (reveal). The seed itself **never** leaves the
+///   daemon (DR-0016 §3, write-only). In dry-run nothing is returned either way.
+///
+/// A seed that cannot be interpreted as TOTP is an error — the code cannot be
+/// produced — and the seed is never echoed (DR-0016 §5).
+fn finish_get<C: Clock>(
+    store: &mut Store,
+    key: &str,
+    dry_run: bool,
+    state: &str,
+    clock: &C,
+) -> Response {
+    // Read the resident value once and copy it out, releasing the mutable borrow
+    // of `store` (the caller guaranteed `key` is readable). The copy is a brief
+    // in-daemon working buffer; an otp seed is converted to a code and dropped
+    // below, and an opaque value is base64-encoded — neither lingers.
+    let value = match store.get(key, clock) {
+        Some(secret) => secret.expose_secret().to_vec(),
+        // Should not happen: the caller just confirmed readability. Be defensive.
+        None => return Response::error(ErrorKind::Internal, "value gone before finish_get"),
+    };
+
+    // Now the immutable read of the metadata is free of the value borrow.
+    let meta = store.meta_of(key).cloned().unwrap_or_default();
+
+    if !otp_type::meta_is_otp(&meta) {
+        // Opaque value: dry-run hides it, reveal returns it (DR-0015).
+        return if dry_run {
+            Response::get_verified(state)
+        } else {
+            Response::get(encode_b64(&value))
+        };
+    }
+
+    // OTP: the stored value is a *seed* — derive the short-lived code and return
+    // only that (the seed never leaves the daemon; DR-0016 §3, write-only).
+    match otp_type::derive_code(&value, &meta) {
+        Ok(code) => {
+            // The code is itself a value: dry-run masks it (DR-0016 §3 / DR-0015).
+            if dry_run {
+                Response::get_verified(state)
+            } else {
+                Response::get(encode_b64(code.as_bytes()))
+            }
+        }
+        // A bad seed cannot produce a code; report without leaking the seed.
+        Err(msg) => Response::error(ErrorKind::BadRequest, msg),
     }
 }
 
@@ -359,13 +441,13 @@ where
 {
     match store.get_or_regenerate(key, ctx.runner, ctx.auth, ctx.requester, ctx.clock) {
         Ok(()) => match store.get(key, ctx.clock) {
-            Some(secret) => finish_get(secret.expose_secret(), dry_run, "active"),
+            Some(_) => finish_get(store, key, dry_run, "active", ctx.clock),
             None => Response::error(ErrorKind::Internal, "value gone after lazy generation"),
         },
         Err(RegenerateDefOutcome::Undefined) => Response::error(ErrorKind::NotFound, "no such key"),
         // A usable value is resident after all; read it directly.
         Err(RegenerateDefOutcome::ValueResident) => match store.get(key, ctx.clock) {
-            Some(secret) => finish_get(secret.expose_secret(), dry_run, "active"),
+            Some(_) => finish_get(store, key, dry_run, "active", ctx.clock),
             None => Response::error(ErrorKind::Internal, "value resident but unreadable"),
         },
         Err(RegenerateDefOutcome::RunFailed(e)) => {
@@ -472,6 +554,7 @@ mod tests {
             },
             soft_ttl_secs: Some(SOFT),
             hard_ttl_secs: Some(HARD),
+            meta: Default::default(),
         }
     }
 
@@ -481,6 +564,7 @@ mod tests {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             soft_ttl_secs: Some(SOFT),
             hard_ttl_secs: Some(HARD),
+            meta: Default::default(),
         }
     }
 
@@ -685,6 +769,7 @@ mod tests {
             argv: vec![],
             soft_ttl_secs: None,
             hard_ttl_secs: None,
+            meta: Default::default(),
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -723,6 +808,7 @@ mod tests {
             },
             soft_ttl_secs: Some(100),
             hard_ttl_secs: Some(10),
+            meta: Default::default(),
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -743,6 +829,7 @@ mod tests {
             },
             soft_ttl_secs: None,
             hard_ttl_secs: None,
+            meta: Default::default(),
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -891,6 +978,7 @@ mod tests {
                     },
                     soft_ttl_secs: None,
                     hard_ttl_secs: None,
+                    meta: Default::default(),
                 },
             );
         }
@@ -1090,5 +1178,217 @@ mod tests {
             },
             _ => panic!("expected ok"),
         }
+    }
+
+    // ---- OTP value type: handler-side derivation (DR-0016) ----
+
+    /// The RFC 6238 SHA1 seed in base32.
+    const OTP_SEED_B32: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    fn otp_wire_meta(params: &[(&str, &str)]) -> ValueMetaWire {
+        ValueMetaWire {
+            type_label: Some("otp".to_string()),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn set_otp_seed(key: &str, seed: &str, params: &[(&str, &str)]) -> Request {
+        Request::KvSet {
+            key: key.into(),
+            source: SetSource::Static {
+                value_b64: encode_b64(seed.as_bytes()),
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            meta: otp_wire_meta(params),
+        }
+    }
+
+    #[test]
+    fn otp_static_seed_get_returns_code_not_seed() {
+        // A static otp seed: get returns a 6-digit code, never the seed (write-only).
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        assert!(handle_request(&mut store, &c, set_otp_seed("OTP", OTP_SEED_B32, &[])).is_ok());
+
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "OTP".into(),
+                dry_run: false,
+            },
+        );
+        let code = get_value(&resp);
+        // Six ASCII digits.
+        assert_eq!(code.len(), 6, "default otp digits");
+        assert!(code.iter().all(|b| b.is_ascii_digit()), "code is digits");
+        // The seed itself must never appear in the response.
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(!line.contains(OTP_SEED_B32), "seed must not leak: {line}");
+        assert!(
+            !line.contains(&encode_b64(OTP_SEED_B32.as_bytes())),
+            "encoded seed must not leak"
+        );
+    }
+
+    #[test]
+    fn otp_digits_param_controls_code_length() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        handle_request(
+            &mut store,
+            &c,
+            set_otp_seed("OTP", OTP_SEED_B32, &[("digits", "8")]),
+        );
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "OTP".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(get_value(&resp).len(), 8);
+    }
+
+    #[test]
+    fn otp_defined_seed_derives_code_via_lazy_chain() {
+        // An otp *definition* (command source): the command yields the seed, and
+        // get derives a code from it (the seed is never returned).
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(OTP_SEED_B32.as_bytes());
+        let c = ctx(&AllowAll, &runner, &clock);
+        let define = Request::KvDefine {
+            key: "OTP".into(),
+            argv: vec!["printf".into(), OTP_SEED_B32.into()],
+            soft_ttl_secs: Some(SOFT),
+            hard_ttl_secs: Some(HARD),
+            meta: otp_wire_meta(&[("digits", "8")]),
+        };
+        assert!(handle_request(&mut store, &c, define).is_ok());
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "OTP".into(),
+                dry_run: false,
+            },
+        );
+        let code = get_value(&resp);
+        assert_eq!(code.len(), 8);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(!line.contains(OTP_SEED_B32), "seed must not leak");
+    }
+
+    #[test]
+    fn otp_seed_from_otpauth_uri() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        let uri = format!("otpauth://totp/Label?secret={OTP_SEED_B32}&digits=8");
+        handle_request(&mut store, &c, set_otp_seed("OTP", &uri, &[]));
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "OTP".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(get_value(&resp).len(), 8, "digits read from the URI");
+    }
+
+    #[test]
+    fn otp_dry_run_masks_the_code() {
+        // dry-run never returns the value — code or seed (DR-0015 / DR-0016 §3).
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c, set_otp_seed("OTP", OTP_SEED_B32, &[]));
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "OTP".into(),
+                dry_run: true,
+            },
+        );
+        assert_verified(&resp);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !line.contains(OTP_SEED_B32),
+            "seed must not leak in dry-run"
+        );
+        assert!(!line.contains("value_b64"), "no value carried");
+    }
+
+    #[test]
+    fn otp_bad_seed_is_bad_request_without_leaking() {
+        // A seed that is neither base32 nor a URI: get fails, seed not echoed.
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        // set rejects the bad seed up front (validate at set time).
+        let bad = "this is not a valid otp seed !!!";
+        let resp = handle_request(&mut store, &c, set_otp_seed("OTP", bad, &[]));
+        assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(!line.contains(bad), "seed must not leak: {line}");
+    }
+
+    #[test]
+    fn otp_type_appears_in_status_not_the_seed() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c, set_otp_seed("OTP", OTP_SEED_B32, &[]));
+        let resp = handle_request(&mut store, &c, Request::Status);
+        match &resp {
+            Response::Ok(ok) => match &ok.payload {
+                OkPayload::Status { entries, .. } => {
+                    assert_eq!(entries[0].value_type.as_deref(), Some("otp"));
+                }
+                _ => panic!("not status"),
+            },
+            _ => panic!("expected ok"),
+        }
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !line.contains(OTP_SEED_B32),
+            "status must not leak the seed"
+        );
+    }
+
+    #[test]
+    fn opaque_value_is_unchanged_by_otp_path() {
+        // A non-otp value is returned verbatim (the derivation only triggers on
+        // the otp type label).
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c, set_static(b"plain-secret"));
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(get_value(&resp), b"plain-secret");
     }
 }

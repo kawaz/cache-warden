@@ -24,6 +24,12 @@ base64 = "0.22"
 toml = "0.8"
 # Peer credential lookup (LOCAL_PEERPID / SO_PEERCRED) on the control socket.
 libc = "0.2"
+# TOTP derivation for the OTP value type (DR-0016): RFC 4226/6238 HMAC-OTP.
+# CLI-only; the core library stays dependency-minimal (DR-0002). RustCrypto
+# crates are small and well-vetted.
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

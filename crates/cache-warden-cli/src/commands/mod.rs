@@ -13,8 +13,128 @@ pub mod run_cmd;
 
 use std::path::PathBuf;
 
-use crate::protocol::wire::{Request, SetSource};
+use crate::protocol::wire::{Request, SetSource, ValueMetaWire};
 use crate::protocol::{decode_b64, encode_b64, parse_duration};
+use crate::totp::OtpAlgorithm;
+
+/// Extract the value-type flags (`--type` and the `--otp-*` parameters) from
+/// `args`, returning the resulting [`ValueMetaWire`] and the remaining args with
+/// those flags removed (DR-0016 §1). Shared by `kv set` and `kv define`.
+///
+/// - `--type otp` selects the OTP value type (the only type today). Any other
+///   `--type` value is rejected.
+/// - `--otp-digits N` / `--otp-period DUR-ish-seconds` / `--otp-algorithm
+///   sha1|sha256|sha512` set the otp parameters. They are only meaningful with
+///   `--type otp`; using one without it is an error (a silent no-op would hide a
+///   mistake). The parameters are carried as opaque strings — the daemon's
+///   handler layer interprets them, not the core.
+/// - `--otp-algorithm` is validated here so a typo fails at the CLI.
+pub fn take_otp_flags(args: &[String]) -> Result<(ValueMetaWire, Vec<String>), String> {
+    let mut type_label: Option<String> = None;
+    let mut digits: Option<String> = None;
+    let mut period: Option<String> = None;
+    let mut algorithm: Option<String> = None;
+    let mut rest = Vec::new();
+
+    // Helper: read the value for a flag given either `--flag VALUE` or
+    // `--flag=VALUE`, advancing the index appropriately.
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let take = |inline: Option<&str>, name: &str| -> Result<String, String> {
+            match inline {
+                Some(v) => Ok(v.to_string()),
+                None => args
+                    .get(i + 1)
+                    .cloned()
+                    .ok_or_else(|| format!("{name} requires an argument")),
+            }
+        };
+        if a == "--type" || a.starts_with("--type=") {
+            let inline = a.strip_prefix("--type=");
+            let v = take(inline, "--type")?;
+            type_label = Some(v);
+            i += if inline.is_some() { 1 } else { 2 };
+        } else if a == "--otp-digits" || a.starts_with("--otp-digits=") {
+            let inline = a.strip_prefix("--otp-digits=");
+            digits = Some(take(inline, "--otp-digits")?);
+            i += if inline.is_some() { 1 } else { 2 };
+        } else if a == "--otp-period" || a.starts_with("--otp-period=") {
+            let inline = a.strip_prefix("--otp-period=");
+            period = Some(take(inline, "--otp-period")?);
+            i += if inline.is_some() { 1 } else { 2 };
+        } else if a == "--otp-algorithm" || a.starts_with("--otp-algorithm=") {
+            let inline = a.strip_prefix("--otp-algorithm=");
+            algorithm = Some(take(inline, "--otp-algorithm")?);
+            i += if inline.is_some() { 1 } else { 2 };
+        } else {
+            rest.push(a.clone());
+            i += 1;
+        }
+    }
+
+    // Validate the chosen type. Only `otp` exists today.
+    let has_otp_params = digits.is_some() || period.is_some() || algorithm.is_some();
+    match type_label.as_deref() {
+        None => {
+            if has_otp_params {
+                return Err(
+                    "--otp-digits / --otp-period / --otp-algorithm require `--type otp`"
+                        .to_string(),
+                );
+            }
+            Ok((ValueMetaWire::default(), rest))
+        }
+        Some("otp") => {
+            // Validate the numeric / algorithm params at the CLI so a typo fails
+            // here rather than reaching the daemon.
+            if let Some(d) = &digits {
+                let n: u32 = d
+                    .parse()
+                    .map_err(|_| format!("--otp-digits must be a number, got {d:?}"))?;
+                if !(1..=9).contains(&n) {
+                    return Err(format!("--otp-digits must be between 1 and 9, got {n}"));
+                }
+            }
+            if let Some(pp) = &period {
+                let n: u64 = pp
+                    .parse()
+                    .map_err(|_| format!("--otp-period must be a number of seconds, got {pp:?}"))?;
+                if n == 0 {
+                    return Err("--otp-period must be greater than zero".to_string());
+                }
+            }
+            if let Some(al) = &algorithm {
+                // Validates and normalizes (lowercases) the label.
+                OtpAlgorithm::parse(al).map_err(|e| e.to_string())?;
+            }
+            let mut params = std::collections::BTreeMap::new();
+            if let Some(d) = digits {
+                params.insert("digits".to_string(), d);
+            }
+            if let Some(pp) = period {
+                params.insert("period".to_string(), pp);
+            }
+            if let Some(al) = algorithm {
+                // Store the normalized lowercase label.
+                params.insert(
+                    "algorithm".to_string(),
+                    OtpAlgorithm::parse(&al).unwrap().label().to_string(),
+                );
+            }
+            Ok((
+                ValueMetaWire {
+                    type_label: Some("otp".to_string()),
+                    params,
+                },
+                rest,
+            ))
+        }
+        Some(other) => Err(format!(
+            "unknown --type {other:?} (the only value type is `otp`)"
+        )),
+    }
+}
 
 /// Default control socket path: `$XDG_STATE_HOME/cache-warden/control.sock`,
 /// falling back to `~/.local/state/cache-warden/control.sock`.
@@ -85,6 +205,11 @@ pub fn parse_kv_set(
     args: &[String],
     stdin: impl FnOnce() -> std::io::Result<Vec<u8>>,
 ) -> Result<Request, String> {
+    // Pull out the value-type flags first (DR-0016); the rest is the existing
+    // static-set grammar.
+    let (meta, args) = take_otp_flags(args)?;
+    let args = args.as_slice();
+
     let mut key: Option<String> = None;
     let mut value: Option<Vec<u8>> = None;
     let mut value_stdin = false;
@@ -181,6 +306,7 @@ pub fn parse_kv_set(
         source,
         soft_ttl_secs,
         hard_ttl_secs,
+        meta,
     })
 }
 
@@ -209,6 +335,21 @@ pub fn expand_source_uri(uri: &str) -> Result<Vec<String>, String> {
 /// required. A `--source op://...` URI is expanded into `["op", "read", URI]`
 /// at parse time (see [`expand_source_uri`]); the daemon only ever sees argv.
 pub fn parse_kv_define(args: &[String]) -> Result<Request, String> {
+    // Pull the value-type flags from the part *before* `--command` (everything
+    // after `--command` is the literal argv and must not be scanned for our
+    // flags). `--source` is a single token so it is safe to scan the whole arg
+    // list when there is no `--command`.
+    let cmd_pos = args.iter().position(|a| a == "--command");
+    let (head, tail): (&[String], &[String]) = match cmd_pos {
+        Some(p) => (&args[..p], &args[p..]),
+        None => (args, &[]),
+    };
+    let (meta, head_rest) = take_otp_flags(head)?;
+    // Reassemble: the otp-stripped head, then the untouched `--command ...` tail.
+    let mut reassembled: Vec<String> = head_rest;
+    reassembled.extend_from_slice(tail);
+    let args = reassembled.as_slice();
+
     let mut key: Option<String> = None;
     let mut command: Option<Vec<String>> = None;
     let mut source: Option<Vec<String>> = None;
@@ -288,11 +429,29 @@ pub fn parse_kv_define(args: &[String]) -> Result<Request, String> {
         }
     };
 
+    // DR-0016 §5: `--type otp` with an `op://...?attribute=otp` source is a
+    // structural error — `?attribute=otp` makes op compute a 30s code, so caching
+    // it (a TTL'd, already-dead value) and then deriving from it is doubly wrong.
+    // An otp seed must point at the seed field (plain `op://vault/item/field`).
+    if crate::otp_type::is_otp(&meta)
+        && argv
+            .iter()
+            .any(|a| a.to_ascii_lowercase().contains("attribute=otp"))
+    {
+        return Err(
+            "`--type otp` with an `?attribute=otp` source is invalid: that returns a \
+             computed 30s code, not the seed. Point the source at the seed field \
+             (plain op://vault/item/field) instead"
+                .to_string(),
+        );
+    }
+
     Ok(Request::KvDefine {
         key,
         argv,
         soft_ttl_secs,
         hard_ttl_secs,
+        meta,
     })
 }
 
@@ -855,5 +1014,173 @@ mod tests {
     #[test]
     fn kv_pin_rejects_options() {
         assert!(parse_kv_pin(&["DB".into(), "8h".into(), "--x".into()]).is_err());
+    }
+
+    // ---- value-type flags (DR-0016) ----
+
+    fn s(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn otp_flags_absent_yield_empty_meta() {
+        let (meta, rest) = take_otp_flags(&s(&["KEY", "--value", "x"])).unwrap();
+        assert!(meta.is_empty());
+        assert_eq!(rest, s(&["KEY", "--value", "x"]));
+    }
+
+    #[test]
+    fn type_otp_with_params_is_collected_and_validated() {
+        let (meta, rest) = take_otp_flags(&s(&[
+            "--type",
+            "otp",
+            "--otp-digits",
+            "8",
+            "--otp-period",
+            "60",
+            "--otp-algorithm",
+            "SHA256",
+            "KEY",
+        ]))
+        .unwrap();
+        assert_eq!(meta.type_label.as_deref(), Some("otp"));
+        assert_eq!(meta.params.get("digits").map(String::as_str), Some("8"));
+        assert_eq!(meta.params.get("period").map(String::as_str), Some("60"));
+        // Algorithm label is normalized to lowercase.
+        assert_eq!(
+            meta.params.get("algorithm").map(String::as_str),
+            Some("sha256")
+        );
+        // The non-otp args pass through untouched.
+        assert_eq!(rest, s(&["KEY"]));
+    }
+
+    #[test]
+    fn otp_flags_accept_equals_form() {
+        let (meta, _rest) = take_otp_flags(&s(&["--type=otp", "--otp-digits=6", "KEY"])).unwrap();
+        assert_eq!(meta.type_label.as_deref(), Some("otp"));
+        assert_eq!(meta.params.get("digits").map(String::as_str), Some("6"));
+    }
+
+    #[test]
+    fn otp_params_without_type_otp_are_rejected() {
+        let err = take_otp_flags(&s(&["--otp-digits", "8", "KEY"])).unwrap_err();
+        assert!(err.contains("require `--type otp`"), "msg: {err}");
+    }
+
+    #[test]
+    fn unknown_type_is_rejected() {
+        let err = take_otp_flags(&s(&["--type", "magic", "KEY"])).unwrap_err();
+        assert!(err.contains("unknown --type"), "msg: {err}");
+    }
+
+    #[test]
+    fn bad_otp_digits_value_is_rejected() {
+        assert!(take_otp_flags(&s(&["--type", "otp", "--otp-digits", "x"])).is_err());
+        assert!(take_otp_flags(&s(&["--type", "otp", "--otp-digits", "0"])).is_err());
+        assert!(take_otp_flags(&s(&["--type", "otp", "--otp-digits", "10"])).is_err());
+    }
+
+    #[test]
+    fn bad_otp_algorithm_is_rejected() {
+        assert!(take_otp_flags(&s(&["--type", "otp", "--otp-algorithm", "md5"])).is_err());
+    }
+
+    #[test]
+    fn kv_set_with_type_otp_attaches_meta() {
+        let req = parse_kv_set(
+            &s(&[
+                "OTP",
+                "--type",
+                "otp",
+                "--otp-digits",
+                "8",
+                "--value",
+                "SEED",
+            ]),
+            no_stdin,
+        )
+        .unwrap();
+        match req {
+            Request::KvSet { key, meta, .. } => {
+                assert_eq!(key, "OTP");
+                assert_eq!(meta.type_label.as_deref(), Some("otp"));
+                assert_eq!(meta.params.get("digits").map(String::as_str), Some("8"));
+            }
+            _ => panic!("expected KvSet"),
+        }
+    }
+
+    #[test]
+    fn kv_define_with_type_otp_attaches_meta() {
+        let req = parse_kv_define(&s(&[
+            "OTP",
+            "--type",
+            "otp",
+            "--source",
+            "op://vault/item/field",
+        ]))
+        .unwrap();
+        match req {
+            Request::KvDefine {
+                key, argv, meta, ..
+            } => {
+                assert_eq!(key, "OTP");
+                assert_eq!(argv, s(&["op", "read", "op://vault/item/field"]));
+                assert_eq!(meta.type_label.as_deref(), Some("otp"));
+            }
+            _ => panic!("expected KvDefine"),
+        }
+    }
+
+    #[test]
+    fn kv_define_otp_with_attribute_otp_source_is_rejected() {
+        // DR-0016 §5: caching a `?attribute=otp` computed code is structurally
+        // wrong; the define must error.
+        let err = parse_kv_define(&s(&[
+            "OTP",
+            "--type",
+            "otp",
+            "--source",
+            "op://vault/item/field?attribute=otp",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("attribute=otp"), "msg: {err}");
+    }
+
+    #[test]
+    fn kv_define_otp_command_argv_is_not_scanned_for_otp_flags() {
+        // A literal `--otp-digits` inside the command argv must NOT be consumed as
+        // our flag (everything after --command is the literal program argv).
+        let req = parse_kv_define(&s(&[
+            "OTP",
+            "--type",
+            "otp",
+            "--command",
+            "myprog",
+            "--otp-digits",
+            "8",
+        ]))
+        .unwrap();
+        match req {
+            Request::KvDefine { argv, meta, .. } => {
+                // The `--otp-digits 8` stayed in the command argv.
+                assert_eq!(argv, s(&["myprog", "--otp-digits", "8"]));
+                // The otp meta came only from the `--type otp` before --command;
+                // no digits param was set from the argv.
+                assert_eq!(meta.type_label.as_deref(), Some("otp"));
+                assert!(meta.params.get("digits").is_none());
+            }
+            _ => panic!("expected KvDefine"),
+        }
+    }
+
+    #[test]
+    fn non_otp_set_still_works_unchanged() {
+        let req = parse_kv_set(&s(&["K", "--value", "v"]), no_stdin).unwrap();
+        match req {
+            Request::KvSet { meta, .. } => assert!(meta.is_empty()),
+            _ => panic!("expected KvSet"),
+        }
     }
 }

@@ -358,6 +358,29 @@ control socket clients (`kv.get`).
 The whole implementation is confined to the `cache-warden-cli` crate (no core / authsock crate changes,
 DR-0002). Inline define on references (`cache-warden://KEY?argv=...`) is unimplemented in v1 (DR-0014).
 
+### OTP Value Type (`--type otp`, DR-0016)
+
+Caches the TOTP **seed** (raw base32 / otpauth:// URI); the 6-digit code is a derived view computed
+daemon-side on every get. Because the cached thing is the seed, TTL / mlock / zeroize / extend / pin /
+regenerate all apply as-is, and the 30-second code window is an orthogonal concept.
+
+- **`--type otp` on `kv define` / `kv set`**: value-type metadata. Parameters are `--otp-digits`
+  (default 6) / `--otp-period` (default 30s) / `--otp-algorithm sha1|sha256|sha512` (default sha1).
+  An otpauth:// URI value supplies parameters from the URI, with explicit flags taking precedence.
+  The type rides along into defs files and definition persistence.
+- **The seed is write-only**: `kv get` on an otp-typed key always returns the derived code; the seed
+  never leaves the daemon again (re-set it if you need it elsewhere). Clients (agents included) only
+  ever hold a ~30-second credential. `run` / `inject` reference resolution injects codes as well.
+  dry-run masks as usual.
+- **The core knows nothing about OTP**: the core carries an opaque metadata slot (a type label plus a
+  string map it stores and compares but never interprets), while the TOTP vocabulary and derivation
+  (RFC 4226 / 6238, RustCrypto hmac + sha1/sha2) stay in the CLI crate's handler layer. Future derived
+  view types ride the same slot with no core change.
+- **Footgun guard**: combining `--type otp` with an `?attribute=otp` source is a define-time error
+  (caching the 30-second code op computed is structurally wrong; the source must point at the seed field).
+- Recommended pattern: keep the seed in op and define it with `--type otp --source op://vault/item/field`
+  (lazy regenerate makes it self-healing across daemon restarts).
+
 ### Workspace Structure (DR-0002)
 
 | Crate | Role | Dependencies | Publish |
@@ -444,10 +467,6 @@ See DR-0004 for the core/adapter assignment of assets being ported.
   `kv.get {dry_run}`, DR-0015) are also implemented (see the "Secret reference injection (run / inject /
   dry-run)" section). **Not started**: inline define on references (`cache-warden://KEY?argv=...`).
 
-- **OTP value type (`--type otp`)**: Cache the TOTP seed and derive the 6-digit code daemon-side on
-  every `kv get` / reference resolution. The seed is write-only (it never leaves the daemon).
-  The design is settled in [DR-0016](./decisions/DR-0016-otp-value-type.md). Implementation has
-  not started yet.
 
 See [ROADMAP.md](./ROADMAP.md) for details.
 

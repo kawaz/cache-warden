@@ -334,9 +334,11 @@ fn register_definitions<R, C>(
 
         // Register the definition so a later `get` can regenerate the value. A
         // conflict (the same name already defined differently) should not happen
-        // at startup from a single config, but is reported defensively.
+        // at startup from a single config, but is reported defensively. The
+        // opaque value-type metadata (DR-0016) rides along with the definition.
         let source = ValueSource::command(entry.command.clone());
-        match store.define(entry.name.clone(), source.clone(), ttl) {
+        let meta = crate::daemon::handler::meta_from_wire(entry.meta.clone());
+        match store.define_with_meta(entry.name.clone(), source.clone(), ttl, meta.clone()) {
             Ok(()) => {}
             Err(DefineError::Conflict) => {
                 eprintln!(
@@ -360,7 +362,14 @@ fn register_definitions<R, C>(
         if entry.preload || force_eager.contains(&entry.name) {
             match runner.run(&entry.command) {
                 Ok(value) => {
-                    store.set(entry.name.clone(), source, value, ttl, clock);
+                    store.set_with_meta(
+                        entry.name.clone(),
+                        source,
+                        value,
+                        ttl,
+                        meta.clone(),
+                        clock,
+                    );
                 }
                 Err(e) => {
                     // The RunError Display is already secret-free (stderr redacted).
@@ -411,7 +420,8 @@ fn restore_persisted_definitions(
             }
         };
         let source = ValueSource::command(def.command.clone());
-        match store.define(def.name.clone(), source, ttl) {
+        let meta = crate::daemon::handler::meta_from_wire(def.meta.clone());
+        match store.define_with_meta(def.name.clone(), source, ttl, meta) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!(
@@ -662,6 +672,7 @@ mod tests {
             },
             soft_ttl_secs: None,
             hard_ttl_secs: None,
+            meta: Default::default(),
         };
         assert!(run_request(&s, None, set).is_ok());
         let resp = run_request(
@@ -745,6 +756,7 @@ mod tests {
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
             preload: false,
+            meta: Default::default(),
         }];
         register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
         assert!(store.is_defined("TOK"), "definition registered");
@@ -765,6 +777,7 @@ mod tests {
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
             preload: true,
+            meta: Default::default(),
         }];
         register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
         let secret = store.get("TOK", &clock).expect("entry preloaded");
@@ -787,6 +800,7 @@ mod tests {
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 preload: false, // not preloaded by flag…
+                meta: Default::default(),
             },
             KvDefinition {
                 name: "OTHER".into(),
@@ -794,6 +808,7 @@ mod tests {
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 preload: false,
+                meta: Default::default(),
             },
         ];
         let eager: std::collections::HashSet<String> =
@@ -825,6 +840,7 @@ mod tests {
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 preload: true,
+                meta: Default::default(),
             },
             KvDefinition {
                 name: "GOOD".into(),
@@ -832,6 +848,7 @@ mod tests {
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 preload: true,
+                meta: Default::default(),
             },
         ];
         register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
@@ -866,6 +883,7 @@ mod tests {
             soft_ttl_secs: None,
             hard_ttl_secs: None,
             preload: false,
+            meta: Default::default(),
         }];
         let eager: std::collections::HashSet<String> =
             ["AGENT_KEY".to_string()].into_iter().collect();
@@ -883,6 +901,7 @@ mod tests {
             soft_ttl_secs: soft,
             hard_ttl_secs: hard,
             preload: false,
+            meta: Default::default(),
         }
     }
 

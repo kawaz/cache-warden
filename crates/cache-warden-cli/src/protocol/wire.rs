@@ -17,7 +17,35 @@
 //! JSON strings cannot represent arbitrary bytes; base64 keeps the wire binary
 //! safe. Error messages never carry secret material.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+/// Opaque value-type metadata carried on `kv.set` / `kv.define` (DR-0016).
+///
+/// This mirrors the core's `ValueMeta`: an optional opaque type label plus an
+/// opaque string→string parameter map. The daemon stores it on the value /
+/// definition and the handler layer interprets `type == "otp"` (the core never
+/// does). An empty `ValueMetaWire` (no type, no params) is the default for an
+/// ordinary opaque value, and serializes to nothing extra on the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueMetaWire {
+    /// The opaque value-type label (e.g. `"otp"`), or absent for an untyped
+    /// value.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_label: Option<String>,
+    /// Opaque type-specific parameters (e.g. OTP `digits` / `period` /
+    /// `algorithm`). Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
+}
+
+impl ValueMetaWire {
+    /// Whether this carries no type and no parameters (the opaque default).
+    pub fn is_empty(&self) -> bool {
+        self.type_label.is_none() && self.params.is_empty()
+    }
+}
 
 /// A request from the management client to the daemon.
 ///
@@ -46,6 +74,11 @@ pub enum Request {
         /// Hard TTL in seconds, or `None` for "never hard-expires".
         #[serde(default)]
         hard_ttl_secs: Option<u64>,
+        /// Opaque value-type metadata (DR-0016). Default empty (an opaque value).
+        /// A static otp *seed* is set with `type = "otp"` + params here, since it
+        /// has no definition to carry the type.
+        #[serde(default, skip_serializing_if = "ValueMetaWire::is_empty")]
+        meta: ValueMetaWire,
     },
     /// Register a command-source *definition* for a key (DR-0014 §1).
     ///
@@ -65,6 +98,11 @@ pub enum Request {
         /// Hard TTL in seconds, or `None` for "never hard-expires".
         #[serde(default)]
         hard_ttl_secs: Option<u64>,
+        /// Opaque value-type metadata (DR-0016). Default empty. An otp definition
+        /// carries `type = "otp"` + params here; it is stamped onto each value
+        /// produced from the definition.
+        #[serde(default, skip_serializing_if = "ValueMetaWire::is_empty")]
+        meta: ValueMetaWire,
     },
     /// Fetch a key's value (TTL-gated, with extend/regenerate as needed).
     #[serde(rename = "kv.get")]
@@ -257,6 +295,11 @@ pub struct EntryInfo {
     /// (DR-0011). A pin already past its deadline reports `0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_remaining_secs: Option<u64>,
+    /// The opaque value-type label (e.g. `"otp"`), or `None` for an untyped
+    /// (opaque) entry (DR-0016). Value-free: the type, never the secret. Reported
+    /// from the value's metadata, or the definition's for a definition-only key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<String>,
 }
 
 /// A structured error returned in a failed [`Response`].
@@ -434,6 +477,7 @@ mod tests {
             },
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
+            meta: Default::default(),
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""cmd":"kv.set""#));
@@ -449,6 +493,7 @@ mod tests {
             argv: vec!["op".into(), "read".into(), "op://v/i/f".into()],
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
+            meta: Default::default(),
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""cmd":"kv.define""#), "{line}");
@@ -630,6 +675,7 @@ mod tests {
                     defined: true,
                     has_value: true,
                     pin_remaining_secs: None,
+                    value_type: None,
                 },
                 EntryInfo {
                     name: "P".into(),
@@ -638,6 +684,7 @@ mod tests {
                     defined: false,
                     has_value: true,
                     pin_remaining_secs: Some(3600),
+                    value_type: Some("otp".into()),
                 },
             ],
         );
@@ -654,9 +701,14 @@ mod tests {
             defined: false,
             has_value: true,
             pin_remaining_secs: None,
+            value_type: None,
         };
         let line = serde_json::to_string(&info).unwrap();
         assert!(!line.contains("pin_remaining_secs"), "{line}");
+        assert!(
+            !line.contains("value_type"),
+            "untyped entry omits the field"
+        );
     }
 
     #[test]
