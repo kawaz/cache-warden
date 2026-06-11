@@ -203,8 +203,8 @@ pub fn top() -> HelpSpec {
                 desc: "Register a regenerable definition (lazy)",
             },
             Row {
-                name: "kv set <KEY> ...",
-                desc: "Cache a static value",
+                name: "kv set <KEY> [VALUE]",
+                desc: "Cache a static value (VALUE omitted = read stdin)",
             },
             Row {
                 name: "kv get <KEY>",
@@ -319,7 +319,12 @@ pub fn kv() -> HelpSpec {
             },
         ],
         options: &[],
-        detail: "",
+        detail: "\
+Every kv subcommand accepts a `--` separator: everything after it is taken as
+positional arguments and never interpreted as an option, so option-looking key
+names stay safe (`kv get -- --weird-key`, `kv del -- \"$key\"`). One
+intersection: in `kv define`, a `--command` consumes the rest of the line, so
+it cannot be combined with a key that itself needs `--`.",
         show_global: true,
     }
 }
@@ -404,20 +409,9 @@ pub fn kv_set() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " kv set"),
         summary: "Cache a static value.",
-        usage: concat!(
-            "cache-warden",
-            " kv set <KEY> (--value V | --value-stdin) [OPTIONS]"
-        ),
+        usage: concat!("cache-warden", " kv set [OPTIONS] [--] KEY [VALUE]"),
         subcommands: &[],
         options: &[
-            Row {
-                name: "--value V",
-                desc: "Use the literal string V as the value",
-            },
-            Row {
-                name: "--value-stdin",
-                desc: "Read the value from stdin (binary safe)",
-            },
             Row {
                 name: "--soft-ttl DUR",
                 desc: "Soft TTL (re-auth to extend). e.g. 1h, 30m, 45s, 86400",
@@ -430,6 +424,17 @@ pub fn kv_set() -> HelpSpec {
         detail: "\
 `kv set` injects a literal, opaque value only. To register a regenerable
 command source, use `kv define` instead.
+
+VALUE is positional: `kv set DB hunter2`. When VALUE is omitted the bytes are
+read from stdin (binary safe): `op read op://v/i/pw | kv set DB`. Reading from
+a terminal is refused — if stdin is a TTY and no VALUE is given, the command
+errors immediately instead of hanging.
+
+A VALUE in argv is visible to `ps` and lands in your shell history, so prefer
+piping stdin for real secrets. A value containing NUL bytes (full binary) can
+only come via stdin (argv cannot carry NUL).
+
+Everything after `--` is positional, never an option: `kv set -- --weird-key v`.
 
 Value types (otp) live on definitions, not on set values: a typed key must be
 regenerable, so register it with `kv define KEY --type otp ...`. `kv set`
@@ -709,14 +714,14 @@ mod tests {
         let h = top().render();
         // Command list present.
         assert!(h.contains("Commands:"));
-        assert!(h.contains("kv set <KEY> ..."));
+        assert!(h.contains("kv set <KEY> [VALUE]"));
         // Global + environment present.
         assert!(h.contains("Global options:"));
         assert!(h.contains("--socket PATH"));
         assert!(h.contains("Environment:"));
         assert!(h.contains("CACHE_WARDEN_CONFIG"));
         // The per-flag `kv set` detail must NOT be on the top page anymore.
-        assert!(!h.contains("--value-stdin"));
+        assert!(!h.contains("shell history"));
         assert!(!h.contains("Hold the value Active"));
     }
 
@@ -730,19 +735,28 @@ mod tests {
         // group help shows the global section too.
         assert!(h.contains("Global options:"));
         // but not the per-flag detail of `kv set`.
-        assert!(!h.contains("--value-stdin"));
+        assert!(!h.contains("shell history"));
+        // The shared `--` separator rule is documented at the group level.
+        assert!(h.contains("`--` separator"));
     }
 
     #[test]
     fn kv_set_help_carries_option_detail() {
         let h = kv_set().render();
         assert!(h.contains("Options:"));
-        assert!(h.contains("--value-stdin"));
-        // `--command` moved to `kv define`; `kv set` is static-only now.
-        assert!(!h.contains("--command"));
+        // The value is positional now: usage shows it, no --value flags remain.
+        assert!(h.contains("KEY [VALUE]"));
+        assert!(!h.contains("--value-stdin"));
+        assert!(!h.contains("--value V"));
         assert!(h.contains("--soft-ttl DUR"));
         assert!(h.contains("Global options:"));
         assert!(h.contains("Environment:"));
+        // Secrets-in-argv warning + binary/NUL note + pipe guidance.
+        assert!(h.contains("shell history"));
+        assert!(h.contains("NUL"));
+        assert!(h.contains("stdin"));
+        // The `--` separator is shown for option-looking keys.
+        assert!(h.contains("kv set -- --weird-key"));
         // Value types (otp) moved to `kv define`; `kv set` no longer lists them
         // but steers users there (DR-0016).
         assert!(!h.contains("--otp-digits"));

@@ -1277,16 +1277,112 @@ fn otp_value_type_over_control_socket() {
     assert_eq!(code.len(), 8, "8-digit otp code");
 
     // --- `kv set --type otp` is rejected and steers to `kv define` (DR-0016) ---
-    let out = run_cli(
-        &socket,
-        &["kv", "set", "BAD", "--type", "otp", "--value", "x"],
-    );
+    let out = run_cli(&socket, &["kv", "set", "BAD", "--type", "otp", "x"]);
     assert!(!out.status.success(), "set --type otp must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("kv define"),
         "set --type otp must steer to define: {stderr}"
     );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+/// `kv set` positional grammar end-to-end: `kv set K V`, VALUE-from-stdin via a
+/// pipe, the removed `--value` flags steering to the new form, and the `--`
+/// separator protecting option-looking keys across set / get / del.
+#[test]
+fn kv_set_positional_value_stdin_pipe_and_double_dash() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+    assert_eq!(request(&socket, r#"{"cmd":"ping"}"#)["ok"], true);
+
+    // --- basic positional form: `kv set K V` then `kv get K` ---
+    let out = run_cli(&socket, &["kv", "set", "K", "v-positional"]);
+    assert!(
+        out.status.success(),
+        "kv set K V failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_cli(&socket, &["kv", "get", "K"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "v-positional");
+
+    // --- VALUE omitted + piped stdin (binary safe: embedded NUL) ---
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .args(["kv", "set", "PIPED", "--socket"])
+        .arg(&socket)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn kv set with piped stdin");
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"bin\0ary").unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "piped kv set failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"PIPED"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"bin\0ary",
+        "stdin value is binary safe"
+    );
+
+    // --- the removed --value flags steer to the new form ---
+    for args in [
+        &["kv", "set", "K", "--value", "v"][..],
+        &["kv", "set", "K", "--value-stdin"][..],
+    ] {
+        let out = run_cli(&socket, args);
+        assert!(!out.status.success(), "{args:?} must fail");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("kv set KEY"),
+            "{args:?} must steer to the positional form: {err}"
+        );
+    }
+
+    // --- `--` separator: an option-looking key set / get / del ---
+    // `--socket` must come before the `--` (after it, everything is positional
+    // — including a literal "--socket"), so build the argv explicitly instead
+    // of using run_cli (which appends the socket at the end).
+    let cli_dd = |verb_args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cache-warden"));
+        cmd.args(["kv", verb_args[0], "--socket"]).arg(&socket);
+        cmd.args(&verb_args[1..]);
+        cmd.output().expect("run cli")
+    };
+    let out = cli_dd(&["set", "--", "--weird-key", "weird-v"]);
+    assert!(
+        out.status.success(),
+        "set -- --weird-key failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = cli_dd(&["get", "--", "--weird-key"]);
+    assert!(
+        out.status.success(),
+        "get -- --weird-key failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "weird-v");
+    let out = cli_dd(&["del", "--", "--weird-key"]);
+    assert!(
+        out.status.success(),
+        "del -- --weird-key failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Gone after the delete.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"--weird-key"}"#);
+    assert_eq!(resp["ok"], false, "deleted key must not resolve: {resp}");
 
     let pid = daemon.child.id();
     unsafe {

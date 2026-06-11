@@ -45,12 +45,22 @@ pub enum ModeFlag {
 /// Extract a single `--reveal` / `--dry-run` flag from `args`, returning the
 /// chosen flag (if any) and the remaining args with it removed.
 ///
+/// Scanning stops at the first standalone `--`: everything from there on is
+/// positional (or, for `run`, the command argv) and is passed through
+/// untouched — `run -- cmd --dry-run` must never have the command's own flag
+/// eaten here. The `--` itself is preserved so downstream parsers still see
+/// the boundary.
+///
 /// Giving both flags (in any order, even repeated) is a usage error: the two
 /// express opposite intents and silently picking one would hide a mistake.
 pub fn take_mode_flag(args: &[String]) -> Result<(Option<ModeFlag>, Vec<String>), String> {
     let mut flag: Option<ModeFlag> = None;
     let mut rest = Vec::new();
-    for a in args {
+    for (i, a) in args.iter().enumerate() {
+        if a == "--" {
+            rest.extend(args[i..].iter().cloned());
+            break;
+        }
         let next = match a.as_str() {
             "--reveal" => Some(ModeFlag::Reveal),
             "--dry-run" => Some(ModeFlag::DryRun),
@@ -159,6 +169,21 @@ mod tests {
     fn take_mode_flag_both_flags_is_error() {
         assert!(take_mode_flag(&args(&["--reveal", "--dry-run"])).is_err());
         assert!(take_mode_flag(&args(&["--dry-run", "--reveal"])).is_err());
+    }
+
+    #[test]
+    fn take_mode_flag_stops_at_double_dash() {
+        // Everything after `--` is positional (or, for `run`, the command argv):
+        // a `--dry-run` there belongs to the consumer, never to us. The `--`
+        // itself is preserved so downstream parsers still see the boundary.
+        let (f, rest) = take_mode_flag(&args(&["--", "--dry-run"])).unwrap();
+        assert_eq!(f, None);
+        assert_eq!(rest, args(&["--", "--dry-run"]));
+
+        // Flags before the `--` still count; after it they are inert.
+        let (f, rest) = take_mode_flag(&args(&["--reveal", "--", "cmd", "--dry-run"])).unwrap();
+        assert_eq!(f, Some(ModeFlag::Reveal));
+        assert_eq!(rest, args(&["--", "cmd", "--dry-run"]));
     }
 
     #[test]

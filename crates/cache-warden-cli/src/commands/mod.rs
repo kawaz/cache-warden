@@ -165,6 +165,12 @@ pub fn take_socket_flag(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        if a == "--" {
+            // Everything after `--` is positional; a `--socket` there is a
+            // value, never our flag. Keep the separator for downstream parsers.
+            rest.extend(args[i..].iter().cloned());
+            break;
+        }
         if a == "--socket" {
             let v = args
                 .get(i + 1)
@@ -194,45 +200,55 @@ pub fn resolve_socket(cli_socket: Option<PathBuf>, config_socket: Option<PathBuf
         .unwrap_or_else(default_socket_path)
 }
 
-/// Parse the arguments to `kv set <KEY> ...` into a [`Request::KvSet`].
+/// Split `args` at the first standalone `--` separator (POSIX-style).
 ///
-/// Grammar (static-only since DR-0014):
-/// `<KEY> (--value V | --value-stdin) [--soft-ttl D] [--hard-ttl D]`
+/// The head may contain options; everything **after** the `--` is positional
+/// and must never be interpreted as an option (defensive scripting:
+/// `kv del -- "$key"` is safe even when `$key` starts with `--`). The separator
+/// itself is dropped. Shared by every kv leaf parser so the rule is uniform.
 ///
-/// `stdin` provides the bytes for `--value-stdin`; it is read only when that
-/// flag is present (kept as a parameter so the parse is testable). Command
-/// sources moved to `kv define` (see [`parse_kv_define`]). Value *types*
-/// (`--type otp` and the `--otp-*` parameters) moved to `kv define` too
-/// (DR-0016): a static seed has nothing to regenerate from, so a typed key must
-/// always carry a definition. `kv set` injects opaque bytes only.
+/// Known intersection (accepted, see `parse_kv_define`): `kv define --command`
+/// consumes the rest of the argv, so a `--command` appearing *before* any `--`
+/// swallows it — a key that needs `--` cannot be combined with a `--command`
+/// source. No practical loss.
+pub fn split_double_dash(args: &[String]) -> (&[String], &[String]) {
+    match args.iter().position(|a| a == "--") {
+        Some(p) => (&args[..p], &args[p + 1..]),
+        None => (args, &[]),
+    }
+}
+
+/// Parse the arguments to `kv set ...` into a [`Request::KvSet`].
+///
+/// Grammar:
+/// `kv set [--soft-ttl D] [--hard-ttl D] [--] KEY [VALUE]`
+///
+/// `VALUE` is positional. When omitted, the bytes are read from stdin (binary
+/// safe) — but only if stdin is **not** a TTY (`stdin_is_tty`): refusing to
+/// read from a terminal turns a forgotten VALUE into an immediate error instead
+/// of a silent hang. `stdin` provides the bytes (kept as a parameter so the
+/// parse is testable).
+///
+/// The old `--value V` / `--value-stdin` flags are rejected with a steer to the
+/// positional form. Command sources moved to `kv define` (see
+/// [`parse_kv_define`]); value types (`--type otp` / `--otp-*`) live on
+/// definitions too (DR-0016). `kv set` injects opaque bytes only.
 pub fn parse_kv_set(
     args: &[String],
+    stdin_is_tty: bool,
     stdin: impl FnOnce() -> std::io::Result<Vec<u8>>,
 ) -> Result<Request, String> {
-    let mut key: Option<String> = None;
-    let mut value: Option<Vec<u8>> = None;
-    let mut value_stdin = false;
+    let (head, tail) = split_double_dash(args);
+
+    let mut positional: Vec<String> = Vec::new();
     let mut soft_ttl_secs: Option<u64> = None;
     let mut hard_ttl_secs: Option<u64> = None;
 
     let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--value" => {
-                let v = args.get(i + 1).ok_or("--value requires an argument")?;
-                value = Some(v.clone().into_bytes());
-                i += 2;
-            }
-            s if s.starts_with("--value=") => {
-                value = Some(s.strip_prefix("--value=").unwrap().as_bytes().to_vec());
-                i += 1;
-            }
-            "--value-stdin" => {
-                value_stdin = true;
-                i += 1;
-            }
+    while i < head.len() {
+        match head[i].as_str() {
             "--soft-ttl" => {
-                let v = args.get(i + 1).ok_or("--soft-ttl requires an argument")?;
+                let v = head.get(i + 1).ok_or("--soft-ttl requires an argument")?;
                 soft_ttl_secs = Some(parse_duration(v).map_err(|e| e.to_string())?.as_secs());
                 i += 2;
             }
@@ -245,7 +261,7 @@ pub fn parse_kv_set(
                 i += 1;
             }
             "--hard-ttl" => {
-                let v = args.get(i + 1).ok_or("--hard-ttl requires an argument")?;
+                let v = head.get(i + 1).ok_or("--hard-ttl requires an argument")?;
                 hard_ttl_secs = Some(parse_duration(v).map_err(|e| e.to_string())?.as_secs());
                 i += 2;
             }
@@ -257,6 +273,14 @@ pub fn parse_kv_set(
                 );
                 i += 1;
             }
+            s if s == "--value" || s == "--value-stdin" || s.starts_with("--value=") => {
+                return Err(format!(
+                    "`{}` was removed: the value is positional now. Use \
+                     `kv set KEY VALUE`, or omit VALUE and pipe the bytes on stdin \
+                     (`... | kv set KEY`)",
+                    s.split('=').next().unwrap_or(s)
+                ));
+            }
             "--command" => {
                 return Err(
                     "`--command` was removed from `kv set`; use `kv define KEY --command ...`"
@@ -267,7 +291,7 @@ pub fn parse_kv_set(
                 return Err(format!(
                     "`{}` is not valid on `kv set`; value types (otp) live on \
                      definitions. Register it with `kv define KEY --type otp ...` instead",
-                    args[i]
+                    head[i]
                 ));
             }
             s if s.starts_with("--type=")
@@ -285,34 +309,33 @@ pub fn parse_kv_set(
                 return Err(format!("unknown option for `kv set`: {s}"));
             }
             other => {
-                if key.is_none() {
-                    key = Some(other.to_string());
-                    i += 1;
-                } else {
-                    return Err(format!("unexpected argument: {other}"));
-                }
+                positional.push(other.to_string());
+                i += 1;
             }
         }
     }
+    positional.extend(tail.iter().cloned());
 
-    let key = key.ok_or("kv set requires a KEY")?;
-
-    // Exactly one value source must be chosen.
-    let chosen = [value.is_some(), value_stdin]
-        .iter()
-        .filter(|b| **b)
-        .count();
-    if chosen == 0 {
-        return Err("kv set requires one of --value or --value-stdin".to_string());
-    }
-    if chosen > 1 {
-        return Err("kv set accepts only one of --value, --value-stdin".to_string());
+    let mut it = positional.into_iter();
+    let key = it.next().ok_or("kv set requires a KEY")?;
+    let value = it.next();
+    if let Some(extra) = it.next() {
+        return Err(format!("unexpected argument: {extra}"));
     }
 
-    let bytes = if value_stdin {
-        stdin().map_err(|e| format!("failed to read stdin: {e}"))?
-    } else {
-        value.unwrap()
+    let bytes = match value {
+        Some(v) => v.into_bytes(),
+        None => {
+            if stdin_is_tty {
+                return Err(
+                    "kv set requires a VALUE (or pipe the bytes on stdin); refusing to \
+                     read stdin from a terminal. Use `kv set KEY VALUE` or \
+                     `... | kv set KEY`"
+                        .to_string(),
+                );
+            }
+            stdin().map_err(|e| format!("failed to read stdin: {e}"))?
+        }
     };
     let source = SetSource::Static {
         value_b64: encode_b64(&bytes),
@@ -351,22 +374,41 @@ pub fn expand_source_uri(uri: &str) -> Result<Vec<String>, String> {
 /// required. A `--source op://...` URI is expanded into `["op", "read", URI]`
 /// at parse time (see [`expand_source_uri`]); the daemon only ever sees argv.
 pub fn parse_kv_define(args: &[String]) -> Result<Request, String> {
-    // Pull the value-type flags from the part *before* `--command` (everything
-    // after `--command` is the literal argv and must not be scanned for our
-    // flags). `--source` is a single token so it is safe to scan the whole arg
-    // list when there is no `--command`.
+    // Two consume-the-rest markers can appear: `--command` (rest = literal
+    // argv) and `--` (rest = positionals). Whichever comes **first** wins:
+    //
+    // - `--command` first: everything after it (a later `--` included) belongs
+    //   to the command argv. This is the documented intersection of the two
+    //   rules — a key that itself needs `--` cannot be combined with a
+    //   `--command` source (use `--source`, or rename the key). Accepted as a
+    //   non-loss (see `split_double_dash`).
+    // - `--` first: everything after it is positional; a later `--command`
+    //   token is a plain positional, never our flag.
     let cmd_pos = args.iter().position(|a| a == "--command");
-    let (head, tail): (&[String], &[String]) = match cmd_pos {
-        Some(p) => (&args[..p], &args[p..]),
-        None => (args, &[]),
+    let dd_pos = args.iter().position(|a| a == "--");
+    let command_first = match (cmd_pos, dd_pos) {
+        (Some(c), Some(d)) => c < d,
+        (Some(_), None) => true,
+        _ => false,
     };
+
+    let (head, cmd_tail, positional_tail): (&[String], &[String], &[String]) = if command_first {
+        let p = cmd_pos.unwrap();
+        (&args[..p], &args[p..], &[])
+    } else {
+        let (h, t) = split_double_dash(args);
+        (h, &[], t)
+    };
+
+    // Pull the value-type flags from the option head only (never from the
+    // command argv or the positionals after `--`).
     let (meta, head_rest) = take_otp_flags(head)?;
     // Reassemble: the otp-stripped head, then the untouched `--command ...` tail.
     let mut reassembled: Vec<String> = head_rest;
-    reassembled.extend_from_slice(tail);
+    reassembled.extend_from_slice(cmd_tail);
     let args = reassembled.as_slice();
 
-    let mut key: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
     let mut command: Option<Vec<String>> = None;
     let mut source: Option<Vec<String>> = None;
     let mut soft_ttl_secs: Option<u64> = None;
@@ -423,17 +465,18 @@ pub fn parse_kv_define(args: &[String]) -> Result<Request, String> {
                 return Err(format!("unknown option for `kv define`: {s}"));
             }
             other => {
-                if key.is_none() {
-                    key = Some(other.to_string());
-                    i += 1;
-                } else {
-                    return Err(format!("unexpected argument: {other}"));
-                }
+                positional.push(other.to_string());
+                i += 1;
             }
         }
     }
+    positional.extend(positional_tail.iter().cloned());
 
-    let key = key.ok_or("kv define requires a KEY")?;
+    let mut it = positional.into_iter();
+    let key = it.next().ok_or("kv define requires a KEY")?;
+    if let Some(extra) = it.next() {
+        return Err(format!("unexpected argument: {extra}"));
+    }
 
     let argv = match (command, source) {
         (Some(_), Some(_)) => {
@@ -500,12 +543,27 @@ pub fn parse_kv_define_plan(args: &[String]) -> Result<DefinePlan, String> {
     // Detect the batch mode by the presence of any `--defs` flag, then collect
     // every `--defs FILE` while rejecting any single-definition flag / KEY mixed
     // in (so the user gets a clear "pick one mode" error, not a half-applied
-    // command).
-    let uses_defs = args
+    // command). A `--defs` after a consume-the-rest marker (`--command` or
+    // `--`) is not our flag, so only scan the option head for the mode switch.
+    let scan_end = args
+        .iter()
+        .position(|a| a == "--command" || a == "--")
+        .unwrap_or(args.len());
+    let uses_defs = args[..scan_end]
         .iter()
         .any(|a| a == "--defs" || a.starts_with("--defs="));
     if !uses_defs {
         return parse_kv_define(args).map(DefinePlan::Single);
+    }
+
+    // Batch mode takes no positionals at all, so a `--` separator (whose only
+    // purpose is to introduce positionals) is rejected like a positional KEY.
+    let (args, tail) = split_double_dash(args);
+    if let Some(first) = tail.first() {
+        return Err(format!(
+            "`kv define --defs FILE` takes no positional KEY (got {first:?}); \
+             the keys come from the file(s)"
+        ));
     }
 
     let mut files: Vec<PathBuf> = Vec::new();
@@ -553,12 +611,13 @@ pub fn parse_kv_define_plan(args: &[String]) -> Result<DefinePlan, String> {
     Ok(DefinePlan::Defs(files))
 }
 
-/// Parse `kv get|unpin <KEY>` into the corresponding [`Request`].
+/// Parse `kv get|unpin [--] <KEY>` into the corresponding [`Request`].
 pub fn parse_kv_single_key(verb: &str, args: &[String]) -> Result<Request, String> {
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-    if let Some(bad) = args.iter().find(|a| a.starts_with("--")) {
+    let (head, tail) = split_double_dash(args);
+    if let Some(bad) = head.iter().find(|a| a.starts_with("--")) {
         return Err(format!("unknown option for `kv {verb}`: {bad}"));
     }
+    let positional: Vec<&String> = head.iter().chain(tail.iter()).collect();
     if positional.len() != 1 {
         return Err(format!("kv {verb} requires exactly one KEY"));
     }
@@ -573,37 +632,40 @@ pub fn parse_kv_single_key(verb: &str, args: &[String]) -> Result<Request, Strin
     }
 }
 
-/// Parse `kv del <KEY> [--with-define]` into a [`Request::KvDel`].
+/// Parse `kv del [--with-define] [--] <KEY>` into a [`Request::KvDel`].
 pub fn parse_kv_del(args: &[String]) -> Result<Request, String> {
-    let mut key: Option<String> = None;
+    let (head, tail) = split_double_dash(args);
+    let mut positional: Vec<String> = Vec::new();
     let mut with_define = false;
-    for a in args {
+    for a in head {
         match a.as_str() {
             "--with-define" => with_define = true,
             s if s.starts_with("--") => {
                 return Err(format!("unknown option for `kv del`: {s}"));
             }
-            other => {
-                if key.is_some() {
-                    return Err(format!("unexpected argument: {other}"));
-                }
-                key = Some(other.to_string());
-            }
+            other => positional.push(other.to_string()),
         }
     }
-    let key = key.ok_or("kv del requires exactly one KEY")?;
+    positional.extend(tail.iter().cloned());
+
+    let mut it = positional.into_iter();
+    let key = it.next().ok_or("kv del requires exactly one KEY")?;
+    if let Some(extra) = it.next() {
+        return Err(format!("unexpected argument: {extra}"));
+    }
     Ok(Request::KvDel { key, with_define })
 }
 
-/// Parse `kv pin <KEY> <DURATION>` into a [`Request::KvPin`].
+/// Parse `kv pin [--] <KEY> <DURATION>` into a [`Request::KvPin`].
 ///
 /// `DURATION` uses the same grammar as the TTL flags (`1h` / `30m` / `45s` /
 /// bare seconds); it is the time from now until the pin lapses.
 pub fn parse_kv_pin(args: &[String]) -> Result<Request, String> {
-    if let Some(bad) = args.iter().find(|a| a.starts_with("--")) {
+    let (head, tail) = split_double_dash(args);
+    if let Some(bad) = head.iter().find(|a| a.starts_with("--")) {
         return Err(format!("unknown option for `kv pin`: {bad}"));
     }
-    let positional: Vec<&String> = args.iter().collect();
+    let positional: Vec<&String> = head.iter().chain(tail.iter()).collect();
     if positional.len() != 2 {
         return Err(
             "kv pin requires exactly a KEY and a DURATION (e.g. `kv pin DB 8h`)".to_string(),
@@ -671,6 +733,20 @@ mod tests {
     }
 
     #[test]
+    fn socket_flag_stops_at_double_dash() {
+        // A `--socket` after `--` is positional data, never our flag; the
+        // separator itself is preserved for the downstream parser.
+        let (p, rest) = take_socket_flag(&s(&["--", "--socket", "/x.sock"])).unwrap();
+        assert_eq!(p, None);
+        assert_eq!(rest, s(&["--", "--socket", "/x.sock"]));
+
+        // Before the `--` it still counts.
+        let (p, rest) = take_socket_flag(&s(&["--socket", "/x.sock", "--", "K"])).unwrap();
+        assert_eq!(p, Some(PathBuf::from("/x.sock")));
+        assert_eq!(rest, s(&["--", "K"]));
+    }
+
+    #[test]
     fn resolve_socket_precedence_cli_over_config_over_default() {
         // CLI wins outright.
         assert_eq!(
@@ -690,8 +766,8 @@ mod tests {
     }
 
     #[test]
-    fn kv_set_value_inline() {
-        let req = parse_kv_set(&["DB".into(), "--value".into(), "pw".into()], no_stdin).unwrap();
+    fn kv_set_positional_key_and_value() {
+        let req = parse_kv_set(&["DB".into(), "pw".into()], false, no_stdin).unwrap();
         match req {
             Request::KvSet {
                 key,
@@ -706,11 +782,10 @@ mod tests {
     }
 
     #[test]
-    fn kv_set_value_stdin_reads_bytes() {
-        let req = parse_kv_set(&["K".into(), "--value-stdin".into()], || {
-            Ok(b"from-stdin".to_vec())
-        })
-        .unwrap();
+    fn kv_set_value_omitted_reads_piped_stdin() {
+        // No VALUE positional + stdin is a pipe: the bytes come from stdin
+        // (binary safe).
+        let req = parse_kv_set(&["K".into()], false, || Ok(b"from-stdin".to_vec())).unwrap();
         match req {
             Request::KvSet {
                 source: SetSource::Static { value_b64 },
@@ -721,10 +796,164 @@ mod tests {
     }
 
     #[test]
+    fn kv_set_value_omitted_on_a_tty_is_an_error() {
+        // No VALUE + stdin is a TTY: refuse immediately (a silent hang waiting
+        // for terminal input would look like a freeze).
+        let err = parse_kv_set(&["K".into()], true, no_stdin).unwrap_err();
+        assert!(
+            err.contains("VALUE") && err.contains("pipe"),
+            "must steer to passing VALUE or piping: {err}"
+        );
+    }
+
+    #[test]
+    fn kv_set_value_flags_are_rejected_with_steer() {
+        // `--value` / `--value-stdin` were replaced by the positional VALUE /
+        // piped stdin; the error steers to the new form.
+        for flags in [
+            vec!["K", "--value", "v"],
+            vec!["K", "--value=v"],
+            vec!["K", "--value-stdin"],
+        ] {
+            let err = parse_kv_set(&s(&flags), false, no_stdin).unwrap_err();
+            assert!(
+                err.contains("kv set KEY VALUE") || err.contains("kv set KEY"),
+                "expected steer to the positional form, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_set_rejects_extra_positionals() {
+        let err = parse_kv_set(&s(&["K", "v", "extra"]), false, no_stdin).unwrap_err();
+        assert!(err.contains("unexpected argument"), "msg: {err}");
+    }
+
+    #[test]
     fn kv_set_command_is_rejected_with_define_hint() {
-        let err =
-            parse_kv_set(&["K".into(), "--command".into(), "op".into()], no_stdin).unwrap_err();
+        let err = parse_kv_set(
+            &["K".into(), "--command".into(), "op".into()],
+            false,
+            no_stdin,
+        )
+        .unwrap_err();
         assert!(err.contains("kv define"), "msg: {err}");
+    }
+
+    // ---- `--` separator: everything after it is positional (all kv leaves) ----
+
+    #[test]
+    fn kv_set_double_dash_makes_option_like_args_positional() {
+        // `kv set -- k --value-stdin` sets KEY=k, VALUE="--value-stdin".
+        let req = parse_kv_set(&s(&["--", "k", "--value-stdin"]), false, no_stdin).unwrap();
+        match req {
+            Request::KvSet {
+                key,
+                source: SetSource::Static { value_b64 },
+                ..
+            } => {
+                assert_eq!(key, "k");
+                assert_eq!(decode_b64(&value_b64).unwrap(), b"--value-stdin");
+            }
+            _ => panic!("expected KvSet"),
+        }
+    }
+
+    #[test]
+    fn kv_set_options_before_double_dash_still_apply() {
+        let req = parse_kv_set(
+            &s(&["--soft-ttl", "30m", "--", "--weird-key", "v"]),
+            false,
+            no_stdin,
+        )
+        .unwrap();
+        match req {
+            Request::KvSet {
+                key, soft_ttl_secs, ..
+            } => {
+                assert_eq!(key, "--weird-key");
+                assert_eq!(soft_ttl_secs, Some(1800));
+            }
+            _ => panic!("expected KvSet"),
+        }
+    }
+
+    #[test]
+    fn kv_get_double_dash_accepts_option_like_key() {
+        assert_eq!(
+            parse_kv_single_key("get", &s(&["--", "--weird-key"])).unwrap(),
+            Request::KvGet {
+                key: "--weird-key".into(),
+                dry_run: false,
+            }
+        );
+    }
+
+    #[test]
+    fn kv_unpin_double_dash_accepts_option_like_key() {
+        assert_eq!(
+            parse_kv_single_key("unpin", &s(&["--", "--weird-key"])).unwrap(),
+            Request::KvUnpin {
+                key: "--weird-key".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn kv_del_double_dash_accepts_option_like_key() {
+        // Options before `--` still apply; the key after it is never an option.
+        assert_eq!(
+            parse_kv_del(&s(&["--with-define", "--", "--weird-key"])).unwrap(),
+            Request::KvDel {
+                key: "--weird-key".into(),
+                with_define: true,
+            }
+        );
+    }
+
+    #[test]
+    fn kv_pin_double_dash_accepts_option_like_key() {
+        assert_eq!(
+            parse_kv_pin(&s(&["--", "--weird-key", "8h"])).unwrap(),
+            Request::KvPin {
+                key: "--weird-key".into(),
+                duration_secs: 28800,
+            }
+        );
+    }
+
+    #[test]
+    fn kv_define_double_dash_accepts_option_like_key() {
+        let req = parse_kv_define(&s(&["--source", "op://v/i/f", "--", "--weird-key"])).unwrap();
+        match req {
+            Request::KvDefine { key, argv, .. } => {
+                assert_eq!(key, "--weird-key");
+                assert_eq!(argv, s(&["op", "read", "op://v/i/f"]));
+            }
+            _ => panic!("expected KvDefine"),
+        }
+    }
+
+    #[test]
+    fn kv_define_command_before_double_dash_consumes_everything() {
+        // Known intersection (documented): `--command` consumes the rest of the
+        // argv, so a `--` after it belongs to the command, not to our parser.
+        let req = parse_kv_define(&s(&["K", "--command", "prog", "--", "x"])).unwrap();
+        match req {
+            Request::KvDefine { argv, .. } => {
+                assert_eq!(argv, s(&["prog", "--", "x"]));
+            }
+            _ => panic!("expected KvDefine"),
+        }
+    }
+
+    #[test]
+    fn kv_define_command_after_double_dash_is_positional() {
+        // `--` first: a later `--command` is a positional (here: an unexpected
+        // second positional after KEY).
+        let err =
+            parse_kv_define(&s(&["--source", "op://v/i/f", "--", "K", "--command"])).unwrap_err();
+        assert!(err.contains("unexpected argument"), "msg: {err}");
     }
 
     #[test]
@@ -873,15 +1102,8 @@ mod tests {
     #[test]
     fn kv_set_ttls_parse() {
         let req = parse_kv_set(
-            &[
-                "K".into(),
-                "--value".into(),
-                "v".into(),
-                "--soft-ttl".into(),
-                "30m".into(),
-                "--hard-ttl".into(),
-                "86400".into(),
-            ],
+            &s(&["K", "v", "--soft-ttl", "30m", "--hard-ttl", "86400"]),
+            false,
             no_stdin,
         )
         .unwrap();
@@ -899,33 +1121,31 @@ mod tests {
     }
 
     #[test]
-    fn kv_set_requires_a_source() {
-        assert!(parse_kv_set(&["K".into()], no_stdin).is_err());
-    }
-
-    #[test]
-    fn kv_set_rejects_multiple_sources() {
-        let err = parse_kv_set(
-            &[
-                "K".into(),
-                "--value".into(),
-                "v".into(),
-                "--value-stdin".into(),
-            ],
-            no_stdin,
-        )
-        .unwrap_err();
-        assert!(err.contains("only one"));
+    fn kv_set_value_may_follow_options() {
+        // Positional args are not position-locked: options may come first.
+        let req = parse_kv_set(&s(&["--soft-ttl", "30m", "K", "v"]), false, no_stdin).unwrap();
+        match req {
+            Request::KvSet {
+                key,
+                source: SetSource::Static { value_b64 },
+                ..
+            } => {
+                assert_eq!(key, "K");
+                assert_eq!(decode_b64(&value_b64).unwrap(), b"v");
+            }
+            _ => panic!("expected KvSet"),
+        }
     }
 
     #[test]
     fn kv_set_requires_key() {
-        assert!(parse_kv_set(&["--value".into(), "v".into()], no_stdin).is_err());
+        assert!(parse_kv_set(&[], false, no_stdin).is_err());
+        assert!(parse_kv_set(&s(&["--soft-ttl", "30m"]), false, no_stdin).is_err());
     }
 
     #[test]
     fn kv_set_rejects_unknown_option() {
-        assert!(parse_kv_set(&["K".into(), "--bogus".into()], no_stdin).is_err());
+        assert!(parse_kv_set(&["K".into(), "--bogus".into()], false, no_stdin).is_err());
     }
 
     #[test]
@@ -1040,9 +1260,10 @@ mod tests {
 
     #[test]
     fn otp_flags_absent_yield_empty_meta() {
-        let (meta, rest) = take_otp_flags(&s(&["KEY", "--value", "x"])).unwrap();
+        // Foreign flags pass through untouched (only --type/--otp-* are taken).
+        let (meta, rest) = take_otp_flags(&s(&["KEY", "--soft-ttl", "1h"])).unwrap();
         assert!(meta.is_empty());
-        assert_eq!(rest, s(&["KEY", "--value", "x"]));
+        assert_eq!(rest, s(&["KEY", "--soft-ttl", "1h"]));
     }
 
     #[test]
@@ -1106,13 +1327,13 @@ mod tests {
     fn kv_set_rejects_type_otp_and_steers_to_define() {
         // DR-0016: value types live on definitions; `kv set` is opaque-only.
         for flags in [
-            vec!["OTP", "--type", "otp", "--value", "SEED"],
-            vec!["OTP", "--type=otp", "--value", "SEED"],
-            vec!["OTP", "--otp-digits", "8", "--value", "SEED"],
-            vec!["OTP", "--otp-period=30", "--value", "SEED"],
-            vec!["OTP", "--otp-algorithm", "sha256", "--value", "SEED"],
+            vec!["OTP", "--type", "otp", "SEED"],
+            vec!["OTP", "--type=otp", "SEED"],
+            vec!["OTP", "--otp-digits", "8", "SEED"],
+            vec!["OTP", "--otp-period=30", "SEED"],
+            vec!["OTP", "--otp-algorithm", "sha256", "SEED"],
         ] {
-            let err = parse_kv_set(&s(&flags), no_stdin).unwrap_err();
+            let err = parse_kv_set(&s(&flags), false, no_stdin).unwrap_err();
             assert!(
                 err.contains("kv define"),
                 "expected steer to `kv define`, got: {err}"
@@ -1186,7 +1407,7 @@ mod tests {
 
     #[test]
     fn plain_set_still_works_unchanged() {
-        let req = parse_kv_set(&s(&["K", "--value", "v"]), no_stdin).unwrap();
+        let req = parse_kv_set(&s(&["K", "v"]), false, no_stdin).unwrap();
         match req {
             Request::KvSet { key, source, .. } => {
                 assert_eq!(key, "K");

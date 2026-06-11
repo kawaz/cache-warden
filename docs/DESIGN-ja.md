@@ -52,8 +52,9 @@ cache-warden kv define DB_PASSWORD --soft-ttl 1h --hard-ttl 24h --command op rea
 # 初回 get で初めて upstream を実行してキャッシュ投入（以降はヒットで数 ms、soft TTL 切れは再認証で延長）
 cache-warden kv get DB_PASSWORD
 
-# static ソース: その場の値をキャッシュ
-cache-warden kv set TEMP_CERT --value "$(cat cert.pem)" --soft-ttl 8h
+# static ソース: その場の値をキャッシュ (VALUE は位置引数、省略時は stdin から読む。
+# 秘密値は argv に乗ると ps / shell history に残るので pipe 推奨)
+cat cert.pem | cache-warden kv set TEMP_CERT --soft-ttl 8h
 
 # run: env 中の cache-warden://KEY 参照を実値に解決して子コマンドを exec
 DB_PASSWORD='cache-warden://DB_PASSWORD' cache-warden run -- ./migrate
@@ -214,7 +215,7 @@ preload = true
   を二重に書く必要はない）。
 - **static を config に書けない**: `[kv.*]` は command ソースのみ。リテラル値（`value` 等）を
   書くと設定エラー（平文秘密値が config に残る漏洩を構造的に防ぐ）。リテラル値は実行時に
-  `cache-warden kv set --value-stdin` で投入する。
+  pipe で投入する（`... | cache-warden kv set KEY`）。
 - **`[cli].default-mode`（DR-0015）**: `kv get` / `run` / `inject` のデフォルト極性を
   `"reveal"`（実値・既定）/ `"dry-run"`（マスク検証）から選ぶ。優先順位は
   `--reveal` / `--dry-run` フラグ > 環境変数 `CACHE_WARDEN_DRY_RUN`（`=1` で dry-run）>

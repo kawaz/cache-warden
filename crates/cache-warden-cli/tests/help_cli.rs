@@ -63,14 +63,17 @@ fn top_help_lists_commands_not_per_flag_detail() {
     let out = stdout(&o);
     assert!(out.contains("Commands:"));
     assert!(out.contains("Environment:"));
-    // The per-flag `kv set` detail moved to `kv set --help`.
-    assert!(!out.contains("--value-stdin"));
+    // The per-flag `kv set` detail lives in `kv set --help`, not here.
+    assert!(!out.contains("ps / shell history"));
     assert!(!out.contains("Hold the value Active"));
 }
 
 #[test]
 fn kv_set_help_carries_options_and_kv_pin_carries_detail() {
-    assert!(stdout(&cw(&["kv", "set", "--help"])).contains("--value-stdin"));
+    let set_help = stdout(&cw(&["kv", "set", "--help"]));
+    // Positional VALUE + pipe guidance (no --value/--value-stdin flags).
+    assert!(set_help.contains("KEY [VALUE]"));
+    assert!(!set_help.contains("--value-stdin"));
     assert!(stdout(&cw(&["kv", "pin", "--help"])).contains("Hold the value Active"));
 }
 
@@ -160,15 +163,18 @@ fn leaf_missing_args_prints_message_and_help_to_stderr_exit_one() {
 }
 
 #[test]
-fn kv_set_without_source_shows_kv_set_help_on_stderr() {
-    let o = cw(&["kv", "set", "K"]); // no value source
+fn kv_set_removed_value_flag_shows_kv_set_help_on_stderr() {
+    // `--value` was replaced by the positional VALUE: the error steers to the
+    // new form and the leaf help accompanies it on stderr.
+    let o = cw(&["kv", "set", "K", "--value", "v"]);
     assert_eq!(o.status.code(), Some(1));
     let err = stderr(&o);
-    assert!(err.contains("requires one of --value"));
     assert!(
-        err.contains("--value-stdin"),
-        "kv set help accompanies error"
+        err.contains("kv set KEY VALUE"),
+        "steers to new form: {err}"
     );
+    assert!(err.contains("Usage:"), "kv set help accompanies error");
+    assert!(err.contains("cache-warden kv set"), "leaf help shown");
 }
 
 // ---- unknown subcommand: one-line error, no help dump -------------------

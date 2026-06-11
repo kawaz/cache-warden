@@ -144,13 +144,13 @@ _cache-warden() {
                     '1:key:'
                   ;;
                 set)
+                  # VALUE is positional (omitted = read from piped stdin).
                   _arguments \
                     "$socket_opt" \
                     '--help[Show this help message]' \
-                    '--value[Use the literal string V as the value]:value' \
-                    '--value-stdin[Read the value from stdin (binary safe)]' \
                     "$ttl_opts[@]" \
-                    '1:key:_cw_keys'
+                    '1:key:_cw_keys' \
+                    '2:value (omit to read stdin):'
                   ;;
                 get)
                   _arguments \

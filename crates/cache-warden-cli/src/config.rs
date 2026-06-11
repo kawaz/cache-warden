@@ -44,9 +44,9 @@
 //! write a literal secret value into the config file. This is deliberate: a
 //! plaintext secret committed to a config file (and thus to dotfiles repos,
 //! backups, `cat`-able paths) is exactly the leak the cache exists to avoid.
-//! Static values must be injected at runtime via `cache-warden kv set
-//! --value-stdin`, never persisted in config. A `value` / `value-stdin` /
-//! `static` key in `[kv.*]` is rejected as a configuration error.
+//! Static values must be piped in at runtime (`... | cache-warden kv set KEY`),
+//! never persisted in config. A `value` / `value-stdin` / `static` key in
+//! `[kv.*]` is rejected as a configuration error.
 //!
 //! # `[auth]` omitted => no re-authentication
 //!
@@ -603,12 +603,12 @@ impl KvEntryConfig {
     fn validate(&self, name: &str) -> Result<KvDefinition, ConfigError> {
         if self.value.is_some() {
             return Err(ConfigError::new(format!(
-                "[kv.{name}]: inline `value` is not allowed — secrets must not be stored in config; use a `command` source or inject the value at runtime with `cache-warden kv set --value-stdin`"
+                "[kv.{name}]: inline `value` is not allowed — secrets must not be stored in config; use a `command` source or pipe the value in at runtime (`... | cache-warden kv set {name}`)"
             )));
         }
         if self.value_stdin.is_some() {
             return Err(ConfigError::new(format!(
-                "[kv.{name}]: `value-stdin` is not a config key — inject literal values at runtime with `cache-warden kv set --value-stdin`"
+                "[kv.{name}]: `value-stdin` is not a config key — pipe literal values in at runtime (`... | cache-warden kv set {name}`)"
             )));
         }
         if self.r#static.is_some() {

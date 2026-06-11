@@ -348,11 +348,15 @@ fn dispatch_kv(
 
     let req = match sub {
         "set" => or_usage(
-            commands::parse_kv_set(kv_args, || {
-                let mut buf = Vec::new();
-                std::io::stdin().read_to_end(&mut buf)?;
-                Ok(buf)
-            }),
+            commands::parse_kv_set(
+                kv_args,
+                std::io::IsTerminal::is_terminal(&std::io::stdin()),
+                || {
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf)?;
+                    Ok(buf)
+                },
+            ),
             leaf_help,
         )?,
         "del" => or_usage(commands::parse_kv_del(kv_args), leaf_help)?,

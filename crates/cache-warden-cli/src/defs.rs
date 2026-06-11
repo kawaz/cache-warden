@@ -160,8 +160,8 @@ impl DefEntry {
         }
         if self.value_stdin.is_some() {
             return Err(ConfigError::new(format!(
-                "[kv.{name}]: `value-stdin` is not a defs key — inject literal \
-                 values at runtime with `cache-warden kv set --value-stdin`"
+                "[kv.{name}]: `value-stdin` is not a defs key — pipe literal \
+                 values in at runtime (`... | cache-warden kv set {name}`)"
             )));
         }
         if self.r#static.is_some() {

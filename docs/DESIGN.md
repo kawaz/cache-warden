@@ -41,8 +41,9 @@ cache-warden kv define DB_PASSWORD --soft-ttl 1h --hard-ttl 24h --command op rea
 # the first get runs the upstream and populates the cache (subsequent hits take a few ms; soft TTL expiry extends via re-auth)
 cache-warden kv get DB_PASSWORD
 
-# static source: cache a value provided inline
-cache-warden kv set TEMP_CERT --value "$(cat cert.pem)" --soft-ttl 8h
+# static source: cache a value (VALUE is positional; omitted = read stdin.
+# a VALUE in argv shows up in ps / shell history, so pipe real secrets)
+cat cert.pem | cache-warden kv set TEMP_CERT --soft-ttl 8h
 
 # run: resolve cache-warden://KEY references in the env to real values and exec the child command
 DB_PASSWORD='cache-warden://DB_PASSWORD' cache-warden run -- ./migrate
@@ -215,8 +216,8 @@ preload = true
   is needed at startup", so there is no need to also write `preload = true`).
 - **No inline static values**: a `[kv.*]` entry may only declare a `command` source. Writing a
   literal value (`value`, etc.) is a configuration error — this structurally prevents a plaintext
-  secret from being persisted in config. Literal values are injected at runtime via
-  `cache-warden kv set --value-stdin`.
+  secret from being persisted in config. Literal values are piped in at runtime
+  (`... | cache-warden kv set KEY`).
 - **`[cli].default-mode` (DR-0015)**: selects the default polarity of `kv get` / `run` / `inject`
   between `"reveal"` (real value, default) and `"dry-run"` (masked verification). Precedence is
   `--reveal` / `--dry-run` flags > the `CACHE_WARDEN_DRY_RUN` environment variable (`=1` means dry-run)

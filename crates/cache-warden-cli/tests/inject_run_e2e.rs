@@ -94,7 +94,14 @@ fn stop(mut daemon: Daemon) {
 /// Run the CLI as a client with extra env, returning the captured output.
 fn run_cli_env(socket: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cache-warden"));
-    cmd.args(args).arg("--socket").arg(socket);
+    // `--socket` must precede any `--` separator: everything after `--` is
+    // positional (for `run`, the command argv), so a trailing `--socket` would
+    // belong to the child command, not to us. Insert it right after the
+    // top-level command word instead.
+    cmd.arg(args[0])
+        .arg("--socket")
+        .arg(socket)
+        .args(&args[1..]);
     for (k, v) in envs {
         cmd.env(k, v);
     }

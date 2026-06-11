@@ -126,10 +126,11 @@ _expect_contains "kv define opts" "cache-warden kv define KEY --" \
 
 print "== kv set options =="
 _expect_contains "kv set opts" "cache-warden kv set KEY --" \
-  --value --value-stdin --soft-ttl --hard-ttl
-# Value types (otp) live on `kv define`, not `kv set` (DR-0016).
-_expect_not_contains "kv set has no otp opts" "cache-warden kv set KEY --" \
-  --type --otp-digits --otp-period --otp-algorithm
+  --soft-ttl --hard-ttl
+# VALUE is positional now; the --value flags are gone, and value types (otp)
+# live on `kv define`, not `kv set` (DR-0016).
+_expect_not_contains "kv set has no removed/otp opts" "cache-warden kv set KEY --" \
+  --value --value-stdin --type --otp-digits --otp-period --otp-algorithm
 
 print "== kv get options =="
 _expect_contains "kv get opts" "cache-warden kv get KEY --" --dry-run --reveal
@@ -154,8 +155,8 @@ _verify_dynamic_keys() {
   "$BIN" daemon run --socket "$SOCK" >/dev/null 2>&1 &
   local dpid=$!
   sleep 0.8
-  "$BIN" kv set ALPHA_TOKEN --value a --socket "$SOCK" >/dev/null 2>&1
-  "$BIN" kv set BETA_SECRET --value b --socket "$SOCK" >/dev/null 2>&1
+  "$BIN" kv set ALPHA_TOKEN a --socket "$SOCK" >/dev/null 2>&1
+  "$BIN" kv set BETA_SECRET b --socket "$SOCK" >/dev/null 2>&1
 
   # 子 zsh でヘルパを定義し、socket 抽出 + kv list を実行して結果を返す。
   local result
