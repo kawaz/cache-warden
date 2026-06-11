@@ -187,7 +187,7 @@ pub fn parse_kv_set(
     })
 }
 
-/// Parse `kv get|del <KEY>` into the corresponding [`Request`].
+/// Parse `kv get|del|unpin <KEY>` into the corresponding [`Request`].
 pub fn parse_kv_single_key(verb: &str, args: &[String]) -> Result<Request, String> {
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if let Some(bad) = args.iter().find(|a| a.starts_with("--")) {
@@ -200,8 +200,30 @@ pub fn parse_kv_single_key(verb: &str, args: &[String]) -> Result<Request, Strin
     match verb {
         "get" => Ok(Request::KvGet { key }),
         "del" => Ok(Request::KvDel { key }),
+        "unpin" => Ok(Request::KvUnpin { key }),
         _ => Err(format!("unknown kv subcommand: {verb}")),
     }
+}
+
+/// Parse `kv pin <KEY> <DURATION>` into a [`Request::KvPin`].
+///
+/// `DURATION` uses the same grammar as the TTL flags (`1h` / `30m` / `45s` /
+/// bare seconds); it is the time from now until the pin lapses.
+pub fn parse_kv_pin(args: &[String]) -> Result<Request, String> {
+    if let Some(bad) = args.iter().find(|a| a.starts_with("--")) {
+        return Err(format!("unknown option for `kv pin`: {bad}"));
+    }
+    let positional: Vec<&String> = args.iter().collect();
+    if positional.len() != 2 {
+        return Err(
+            "kv pin requires exactly a KEY and a DURATION (e.g. `kv pin DB 8h`)".to_string(),
+        );
+    }
+    let key = positional[0].clone();
+    let duration_secs = parse_duration(positional[1])
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    Ok(Request::KvPin { key, duration_secs })
 }
 
 /// Render a successful kv-get response by writing the decoded value to stdout.
@@ -416,5 +438,50 @@ mod tests {
     #[test]
     fn kv_get_rejects_options() {
         assert!(parse_kv_single_key("get", &["K".into(), "--x".into()]).is_err());
+    }
+
+    #[test]
+    fn kv_unpin_parses_single_key() {
+        assert_eq!(
+            parse_kv_single_key("unpin", &["K".into()]).unwrap(),
+            Request::KvUnpin { key: "K".into() }
+        );
+    }
+
+    #[test]
+    fn kv_pin_parses_key_and_duration() {
+        let req = parse_kv_pin(&["DB".into(), "8h".into()]).unwrap();
+        assert_eq!(
+            req,
+            Request::KvPin {
+                key: "DB".into(),
+                duration_secs: 28800,
+            }
+        );
+        // Bare seconds and m/s suffixes via the shared duration parser.
+        assert_eq!(
+            parse_kv_pin(&["K".into(), "90".into()]).unwrap(),
+            Request::KvPin {
+                key: "K".into(),
+                duration_secs: 90,
+            }
+        );
+    }
+
+    #[test]
+    fn kv_pin_requires_key_and_duration() {
+        assert!(parse_kv_pin(&["DB".into()]).is_err());
+        assert!(parse_kv_pin(&[]).is_err());
+        assert!(parse_kv_pin(&["DB".into(), "8h".into(), "extra".into()]).is_err());
+    }
+
+    #[test]
+    fn kv_pin_rejects_bad_duration() {
+        assert!(parse_kv_pin(&["DB".into(), "8days".into()]).is_err());
+    }
+
+    #[test]
+    fn kv_pin_rejects_options() {
+        assert!(parse_kv_pin(&["DB".into(), "8h".into(), "--x".into()]).is_err());
     }
 }

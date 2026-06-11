@@ -27,11 +27,17 @@ SSH 鍵もまた「キャッシュされる秘密値の一種」であり、SSH 
 - **value ソース**: 値の供給元。二種類:
   - `static`: `set` 時に直接与えられた値（パイプ / 引数）。hard TTL 切れ後は再取得不可（再 set が必要）。
   - `command`: 上流コマンド（例 `op read ...`）の実行結果。hard TTL 切れ後はコマンド再実行で再生成できる。
-- **soft TTL / hard TTL**: 二段階のライフサイクル。
+- **soft TTL / hard TTL**: 二段階のライフサイクル。soft と hard は **別々の基準点**から測る（DR-0011）。
   - **soft TTL 切れ**: 上流に取りに行かず、ユーザを再認証（TouchID 等）してキャッシュを延長する。
+    基準は `extended_at`（最後の extend 時刻）。使うたびに延命される（idle extend）。
   - **hard TTL 切れ**: メモリから zeroize して破棄する。`command` 型は再取得、`static` 型はエラー。
+    基準は `loaded_at`（set / regenerate 時刻に固定）。extend では動かないので **値の絶対寿命**であり、
+    使い続けても元のスケジュールで必ず破棄される。
+- **pin**: hard / soft の失効判定を指定期限まで明示的に抑止する手動操作（DR-0011）。「夜中に hard が
+  来るが、これから 8 時間は止めたくない」用途。**再認証必須**（Active からでも要求、extend と非対称）。
+  期限が来たら通常判定に戻り、本来の hard を過ぎていれば即破棄。`unpin` で解除（認証不要）。
 - **プロセス認証**: 要求元プロセスをプロセスツリー遡上で検証し、誰が値を取れるかを制御する。
-- **再認証**: soft TTL 切れ時のユーザ認証手段（TouchID / LocalAuthentication など）。
+- **再認証**: soft TTL 切れ時 / pin 時のユーザ認証手段（TouchID / LocalAuthentication など）。
 - **アダプタ**: コアの上に載るプロトコル境界。SSH 鍵を扱う authsock アダプタ、KV を直接扱う
   KV アダプタ（CLI / socket API）など。
 
@@ -113,10 +119,13 @@ cache-warden daemon run（単一プロセス / tokio ランタイム）
   叩けるデバッグ容易性を優先。
 - **値のエンコーディング**: 秘密値はバイナリ安全のため base64（`value_b64` のように
   `_b64` サフィックスで明示）。エラーメッセージには秘密値を含めない。
-- **コマンド v1**: `ping` / `status`（デーモン情報 + エントリ一覧。**値は含めない**）/
+- **コマンド v1**: `ping` / `status`（デーモン情報 + エントリ一覧。**値は含めない**。pin 中は残り秒を併記）/
   `kv.set`（static + `value_b64` または command + `argv`、soft/hard TTL 秒）/
   `kv.get`（SoftExpired は再認証で延長、HardExpired + regenerable は再生成して値を返す）/
-  `kv.del` / `kv.list`。レスポンスは `{"ok":true,...}` / `{"ok":false,"error":{"kind":...,"message":...}}`。
+  `kv.del` / `kv.list` /
+  `kv.pin`（key + duration 秒。期限まで失効抑止、再認証必須。DR-0011）/
+  `kv.unpin`（key。pin 解除、認証不要）。
+  レスポンスは `{"ok":true,...}` / `{"ok":false,"error":{"kind":...,"message":...}}`。
 - **peer 認証**: 接続ごとに LOCAL_PEERPID（macOS）/ SO_PEERCRED（Linux）で peer pid を
   取得し、`SystemInspector::ancestry` で祖先チェーンを得て Store の auth ゲートに
   requester として渡す。UDS 0600 + 同一 uid が第一防壁、ancestry は監査・将来ポリシーの
@@ -126,7 +135,9 @@ cache-warden daemon run（単一プロセス / tokio ランタイム）
   iteration（同じ `Authenticator` trait の別実装として差し込む）。
 
 CLI サブコマンド体系 v1: `daemon run` / `ping` / `status` /
-`kv set|get|del|list` / `config show|path|edit`（引数なしは help、ロングオプション）。
+`kv set|get|del|list|pin|unpin` / `config show|path|edit`（引数なしは help、ロングオプション）。
+`kv pin <KEY> <DURATION>` は TTL を無視して値を期限まで Active 保持（再認証必須）、
+`kv unpin <KEY>` は解除。
 
 - **`daemon` グループ**: デーモンのライフサイクル操作を隔離する。`daemon run`（フォアグラウンド起動）
   のみ実装済み。`daemon register` / `daemon unregister`（launchd/systemd サービス登録）/
@@ -182,13 +193,22 @@ hard-ttl = "24h"
 
 ### value ライフサイクル（概念）
 
+soft と hard は別基準（DR-0011）。soft = `extended_at`（extend で延命）、
+hard = `loaded_at`（set/regenerate で固定、extend では不動 = 絶対寿命）。
+
 ```
-set ──> [キャッシュ保持] ──soft TTL 切れ──> 再認証(TouchID)
-            │                                   │成功→延長して保持
-            │                                   │失敗→取得不可
-            └──hard TTL 切れ──> zeroize で破棄
+                  extend (使うたびに soft を延命、hard は不動)
+                  ┌────────────────────────────┐
+                  ▼                            │
+set ──> [キャッシュ保持] ──soft TTL 切れ(extended_at 基準)──> 再認証(TouchID)
+            │                                       │成功→延長して保持
+            │                                       │失敗→取得不可
+            └──hard TTL 切れ(loaded_at 基準)──> zeroize で破棄
                                   │ command 型: コマンド再実行 → 再認証 → 再生成
                                   │ static 型 : エラー（再 set が必要）
+
+pin(期限) ─── 期限まで soft/hard とも失効抑止(Active 扱い) ───> 期限後は通常判定
+            （再認証必須。Active からでも要求。unpin で解除＝認証不要）
 ```
 
 ## open question（未確定・「朧げ」な部分）

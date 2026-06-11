@@ -61,6 +61,22 @@ pub enum Request {
     /// List all key names (no values, no state).
     #[serde(rename = "kv.list")]
     KvList,
+    /// Pin a key Active for `duration_secs`, suppressing soft/hard expiry until
+    /// the deadline (re-auth required; DR-0011).
+    #[serde(rename = "kv.pin")]
+    KvPin {
+        /// The key to pin.
+        key: String,
+        /// How long from now to hold the value Active, in seconds.
+        duration_secs: u64,
+    },
+    /// Drop an active pin on a key, returning it to normal TTL evaluation
+    /// (no re-auth; DR-0011).
+    #[serde(rename = "kv.unpin")]
+    KvUnpin {
+        /// The key to unpin.
+        key: String,
+    },
 }
 
 /// The value source for a [`Request::KvSet`].
@@ -154,12 +170,24 @@ pub enum OkPayload {
         /// Always `true`; lets `untagged` disambiguate from `Pong`.
         set: bool,
     },
+    /// Reply to [`Request::KvPin`] (acknowledgement with the resolved deadline).
+    Pinned {
+        /// Always `true`; lets `untagged` disambiguate the reply.
+        pinned: bool,
+        /// Seconds from now until the pin lapses (echoes the request duration).
+        pin_remaining_secs: u64,
+    },
+    /// Reply to [`Request::KvUnpin`].
+    Unpinned {
+        /// Whether the key existed (the pin, if any, was dropped).
+        unpinned: bool,
+    },
 }
 
 /// Value-free description of a stored entry, for `status`.
 ///
-/// Carries the name, lifecycle state, and remaining hard-TTL seconds — never
-/// the value.
+/// Carries the name, lifecycle state, regenerability, and (if pinned) the pin's
+/// remaining seconds — never the value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryInfo {
     /// The key name.
@@ -168,6 +196,10 @@ pub struct EntryInfo {
     pub state: String,
     /// Whether the entry's source can be regenerated after hard expiry.
     pub regenerable: bool,
+    /// Seconds until an active pin lapses, or `None` when the entry is not pinned
+    /// (DR-0011). A pin already past its deadline reports `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_remaining_secs: Option<u64>,
 }
 
 /// A structured error returned in a failed [`Response`].
@@ -193,6 +225,9 @@ pub enum ErrorKind {
     AuthFailed,
     /// A hard-expired static entry cannot be regenerated (re-set needed).
     NotRegenerable,
+    /// The entry is hard-expired (destroyed) and the requested operation needs a
+    /// live value (e.g. `kv.pin`).
+    HardExpired,
     /// The upstream source command failed during regeneration.
     UpstreamFailed,
     /// An internal daemon error (lock poisoned, etc.).
@@ -237,6 +272,25 @@ impl Response {
         Response::Ok(OkResponse {
             ok: true,
             payload: OkPayload::Deleted { deleted },
+        })
+    }
+
+    /// Construct a `pin` success response carrying the remaining pin seconds.
+    pub fn pinned(pin_remaining_secs: u64) -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::Pinned {
+                pinned: true,
+                pin_remaining_secs,
+            },
+        })
+    }
+
+    /// Construct an `unpin` success response.
+    pub fn unpinned(unpinned: bool) -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::Unpinned { unpinned },
         })
     }
 
@@ -385,12 +439,65 @@ mod tests {
             42,
             "0.1.5".into(),
             "/tmp/x.sock".into(),
-            vec![EntryInfo {
-                name: "K".into(),
-                state: "active".into(),
-                regenerable: true,
-            }],
+            vec![
+                EntryInfo {
+                    name: "K".into(),
+                    state: "active".into(),
+                    regenerable: true,
+                    pin_remaining_secs: None,
+                },
+                EntryInfo {
+                    name: "P".into(),
+                    state: "active".into(),
+                    regenerable: false,
+                    pin_remaining_secs: Some(3600),
+                },
+            ],
         );
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn entry_info_omits_pin_field_when_absent() {
+        // An unpinned entry must not serialize the pin field at all (skip_if).
+        let info = EntryInfo {
+            name: "K".into(),
+            state: "active".into(),
+            regenerable: false,
+            pin_remaining_secs: None,
+        };
+        let line = serde_json::to_string(&info).unwrap();
+        assert!(!line.contains("pin_remaining_secs"), "{line}");
+    }
+
+    #[test]
+    fn kv_pin_unpin_requests_roundtrip() {
+        roundtrip_request(&Request::KvPin {
+            key: "K".into(),
+            duration_secs: 28800,
+        });
+        roundtrip_request(&Request::KvUnpin { key: "K".into() });
+        let line = serde_json::to_string(&Request::KvPin {
+            key: "K".into(),
+            duration_secs: 60,
+        })
+        .unwrap();
+        assert!(line.contains(r#""cmd":"kv.pin""#));
+        assert!(line.contains(r#""duration_secs":60"#));
+    }
+
+    #[test]
+    fn pin_unpin_responses_roundtrip() {
+        roundtrip_response(&Response::pinned(28800));
+        roundtrip_response(&Response::unpinned(true));
+        roundtrip_response(&Response::unpinned(false));
+    }
+
+    #[test]
+    fn hard_expired_error_kind_serializes_snake_case() {
+        let resp = Response::error(ErrorKind::HardExpired, "destroyed");
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""kind":"hard_expired""#), "{line}");
         roundtrip_response(&resp);
     }
 

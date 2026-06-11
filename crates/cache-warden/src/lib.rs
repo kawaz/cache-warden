@@ -74,8 +74,8 @@ pub use auth::{
     RecordingAuthenticator,
 };
 pub use clock::{Clock, FakeClock, Monotonic, SystemClock};
-pub use entry::{CacheEntry, EntryState, ExtendError, Ttl, TtlError};
+pub use entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl, TtlError};
 pub use process::{FakeInspector, InspectError, ProcessInfo, ProcessInspector, SystemInspector};
 pub use secret::SecretBytes;
 pub use source::{CommandRunner, RunError, SourceRunner, TrailingNewline, ValueSource};
-pub use store::{ExtendAuthOutcome, ExtendOutcome, RegenerateOutcome, Store};
+pub use store::{ExtendAuthOutcome, ExtendOutcome, PinAuthOutcome, RegenerateOutcome, Store};

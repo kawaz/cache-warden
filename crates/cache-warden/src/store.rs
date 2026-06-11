@@ -13,8 +13,8 @@
 use std::collections::BTreeMap;
 
 use crate::auth::{AuthContext, AuthError, AuthOperation, Authenticator};
-use crate::clock::Clock;
-use crate::entry::{CacheEntry, EntryState, ExtendError, Ttl};
+use crate::clock::{Clock, Monotonic};
+use crate::entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl};
 use crate::process::ProcessInfo;
 use crate::secret::SecretBytes;
 use crate::source::{RunError, SourceRunner, ValueSource};
@@ -27,6 +27,7 @@ fn auth_context(key: &str, op: AuthOperation, requester: Option<&[ProcessInfo]>)
     let ctx = match op {
         AuthOperation::Extend => AuthContext::extend(key),
         AuthOperation::Regenerate => AuthContext::regenerate(key),
+        AuthOperation::Pin => AuthContext::pin(key),
     };
     match requester {
         Some(chain) => ctx.with_requester(chain.to_vec()),
@@ -204,6 +205,72 @@ impl Store {
         Ok(())
     }
 
+    /// Re-authenticate the user, then pin `key` Active until `deadline`.
+    ///
+    /// This is the manual reprieve of DR-0011: it holds a live value alive past
+    /// its soft *and* hard windows until `deadline` (e.g. "keep this usable for
+    /// the next 8 hours so an overnight hard expiry can't interrupt work").
+    ///
+    /// # Why pin always re-authenticates (even from Active)
+    ///
+    /// Unlike [`Store::extend_authenticated`], which skips the prompt while the
+    /// entry is already Active (there is nothing to unlock), pin **always**
+    /// demands authentication. Pinning is a security-relaxing operation — it
+    /// suppresses the very expiry that would otherwise zeroize the secret — so
+    /// the human must consciously authorize extending the value's exposure. The
+    /// asymmetry is deliberate: extend merely re-confirms a window that the TTL
+    /// already permits, whereas pin overrides it.
+    ///
+    /// The authenticator is consulted *before* the pin is applied; a denied or
+    /// unavailable authenticator leaves the entry untouched. A hard-expired
+    /// entry cannot be pinned (its value is destroyed); use regenerate / re-set.
+    ///
+    /// `requester` is forwarded into the [`AuthContext`] exactly as in
+    /// [`Store::extend_authenticated`].
+    pub fn pin_authenticated(
+        &mut self,
+        key: &str,
+        deadline: Monotonic,
+        auth: &(impl Authenticator + ?Sized),
+        requester: Option<&[ProcessInfo]>,
+        clock: &impl Clock,
+    ) -> Result<(), PinAuthOutcome> {
+        let entry = self.entries.get_mut(key).ok_or(PinAuthOutcome::NotFound)?;
+        // Reject a destroyed value before bothering the user for biometrics.
+        if entry.state(clock) == EntryState::HardExpired {
+            return Err(PinAuthOutcome::HardExpired);
+        }
+        auth.authenticate(&auth_context(key, AuthOperation::Pin, requester))
+            .map_err(PinAuthOutcome::AuthFailed)?;
+        entry
+            .pin_until(deadline, clock)
+            .map_err(|PinError::HardExpired| PinAuthOutcome::HardExpired)
+    }
+
+    /// Drop any active pin on `key`, returning it to normal TTL evaluation.
+    ///
+    /// Returns `false` if the key is absent. Unlike [`Store::pin_authenticated`]
+    /// this needs **no** authentication: removing a reprieve only moves the entry
+    /// back toward expiry (the safe direction), so there is nothing to gate.
+    pub fn unpin(&mut self, key: &str) -> bool {
+        match self.entries.get_mut(key) {
+            Some(entry) => {
+                entry.unpin();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The active pin deadline for `key`, or `None` if absent or not pinned.
+    ///
+    /// Value-free metadata for `status` / `list`: it reveals *when* a reprieve
+    /// lapses, never the secret. A caller computes remaining seconds against the
+    /// clock (a deadline already in the past reports a non-positive remainder).
+    pub fn pin_deadline_of(&self, key: &str) -> Option<Monotonic> {
+        self.entries.get(key).and_then(CacheEntry::pin_deadline)
+    }
+
     /// Remove `key`, returning `true` if it was present.
     ///
     /// The removed entry is dropped (zeroizing its secret).
@@ -330,6 +397,39 @@ impl std::error::Error for RegenerateOutcome {
         match self {
             RegenerateOutcome::RunFailed(e) => Some(e),
             RegenerateOutcome::AuthFailed(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Outcome of [`Store::pin_authenticated`] when it cannot succeed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PinAuthOutcome {
+    /// No entry exists under the given key.
+    NotFound,
+    /// The entry's value is already hard-expired (destroyed); it cannot be
+    /// pinned. Regenerate (command source) or re-set (static) instead.
+    HardExpired,
+    /// Re-authentication was denied or unavailable; the entry was not pinned.
+    AuthFailed(AuthError),
+}
+
+impl std::fmt::Display for PinAuthOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinAuthOutcome::NotFound => write!(f, "no such key"),
+            PinAuthOutcome::HardExpired => {
+                write!(f, "entry is hard-expired (destroyed); cannot pin")
+            }
+            PinAuthOutcome::AuthFailed(e) => write!(f, "pin blocked: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PinAuthOutcome {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PinAuthOutcome::AuthFailed(e) => Some(e),
             _ => None,
         }
     }
@@ -836,5 +936,174 @@ mod tests {
         assert_eq!(err, RegenerateOutcome::RunFailed(RunError::EmptyOutput));
         assert_eq!(auth.call_count(), 0, "auth must not run if fetch failed");
         assert_eq!(s.state_of("K", &clock), Some(EntryState::HardExpired));
+    }
+
+    // ---- pin_authenticated / unpin (DR-0011) ----
+
+    use crate::clock::Monotonic;
+
+    fn deadline_secs(secs: u64) -> Monotonic {
+        Monotonic::from_offset(Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn pin_authenticated_always_prompts_even_when_active() {
+        // Unlike extend, pin demands auth from Active too (security-relaxing).
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &clock,
+        );
+        let auth = RecordingAuthenticator::allowing();
+        s.pin_authenticated("K", deadline_secs(100), &auth, None, &clock)
+            .unwrap();
+        assert_eq!(auth.call_count(), 1, "pin prompts even from Active");
+        assert_eq!(auth.calls()[0], AuthContext::pin("K"));
+    }
+
+    #[test]
+    fn pin_authenticated_keeps_value_gettable_past_ttl() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &clock,
+        );
+        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &clock)
+            .unwrap();
+        clock.advance(Duration::from_secs(500)); // past soft and hard windows
+        assert_eq!(
+            s.get("K", &clock).unwrap().expose_secret(),
+            b"v",
+            "pinned value survives its TTL"
+        );
+        assert_eq!(s.state_of("K", &clock), Some(EntryState::Active));
+    }
+
+    #[test]
+    fn pin_authenticated_denied_leaves_entry_unpinned() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &clock,
+        );
+        let err = s
+            .pin_authenticated("K", deadline_secs(1000), &DenyAll, None, &clock)
+            .unwrap_err();
+        assert_eq!(err, PinAuthOutcome::AuthFailed(AuthError::Denied));
+        assert_eq!(s.pin_deadline_of("K"), None, "denied pin must not apply");
+    }
+
+    #[test]
+    fn pin_authenticated_missing_key() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        assert_eq!(
+            s.pin_authenticated("ghost", deadline_secs(100), &AllowAll, None, &clock),
+            Err(PinAuthOutcome::NotFound)
+        );
+    }
+
+    #[test]
+    fn pin_authenticated_hard_expired_is_rejected_without_prompt() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &clock,
+        );
+        clock.advance(HARD); // hard-expired
+        let auth = RecordingAuthenticator::allowing();
+        assert_eq!(
+            s.pin_authenticated("K", deadline_secs(1000), &auth, None, &clock),
+            Err(PinAuthOutcome::HardExpired)
+        );
+        assert_eq!(auth.call_count(), 0, "no prompt for a destroyed value");
+    }
+
+    #[test]
+    fn pin_authenticated_forwards_requester_into_context() {
+        use crate::process::ProcessInfo;
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &clock,
+        );
+        let chain = vec![ProcessInfo {
+            pid: 11,
+            ppid: Some(1),
+            path: Some(std::path::PathBuf::from("/usr/bin/ssh")),
+            start_time: None,
+        }];
+        let auth = RecordingAuthenticator::allowing();
+        s.pin_authenticated("K", deadline_secs(100), &auth, Some(&chain), &clock)
+            .unwrap();
+        assert_eq!(auth.calls()[0].requester.as_deref(), Some(chain.as_slice()));
+    }
+
+    #[test]
+    fn re_pin_overwrites_deadline_via_store() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &clock,
+        );
+        s.pin_authenticated("K", deadline_secs(20), &AllowAll, None, &clock)
+            .unwrap();
+        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &clock)
+            .unwrap();
+        assert_eq!(s.pin_deadline_of("K"), Some(deadline_secs(1000)));
+    }
+
+    #[test]
+    fn unpin_returns_entry_to_normal_evaluation() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &clock,
+        );
+        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &clock)
+            .unwrap();
+        clock.advance(Duration::from_secs(15)); // past soft
+        assert_eq!(s.state_of("K", &clock), Some(EntryState::Active), "pinned");
+        assert!(s.unpin("K"));
+        assert_eq!(s.pin_deadline_of("K"), None);
+        assert_eq!(
+            s.state_of("K", &clock),
+            Some(EntryState::SoftExpired),
+            "after unpin the soft window applies again"
+        );
+    }
+
+    #[test]
+    fn unpin_missing_key_is_false() {
+        let mut s = Store::new();
+        assert!(!s.unpin("ghost"));
     }
 }

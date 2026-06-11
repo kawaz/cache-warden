@@ -79,6 +79,15 @@ impl AuthContext {
         }
     }
 
+    /// Re-auth to pin an entry under `key` past its TTL, requester unknown.
+    pub fn pin(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            operation: AuthOperation::Pin,
+            requester: None,
+        }
+    }
+
     /// Attach the requesting process's ancestry chain.
     ///
     /// Builder style: `AuthContext::extend("K").with_requester(chain)`. Passing
@@ -97,6 +106,13 @@ pub enum AuthOperation {
     Extend,
     /// Regenerate a hard-expired command entry upstream.
     Regenerate,
+    /// Pin an entry Active past its TTL until an explicit deadline.
+    ///
+    /// Pin is a security-relaxing operation (it holds a value alive past its
+    /// expiry windows), so the [`crate::Store`] layer demands re-authentication
+    /// for it even from an Active entry — unlike [`AuthOperation::Extend`], which
+    /// skips the prompt while Active. See [`crate::Store::pin_authenticated`].
+    Pin,
 }
 
 /// Re-authenticates the user before a TTL-gated value is unlocked.
@@ -310,6 +326,7 @@ impl Authenticator for CommandAuthenticator {
         let operation = match ctx.operation {
             AuthOperation::Extend => "extend",
             AuthOperation::Regenerate => "regenerate",
+            AuthOperation::Pin => "pin",
         };
 
         let mut command = std::process::Command::new(program);
@@ -398,6 +415,17 @@ mod tests {
             AuthContext::regenerate("k").operation,
             AuthOperation::Regenerate
         );
+        assert_eq!(AuthContext::pin("k").operation, AuthOperation::Pin);
+    }
+
+    #[test]
+    fn command_authenticator_passes_pin_operation_via_env() {
+        let a = CommandAuthenticator::new(argv(&[
+            "sh",
+            "-c",
+            r#"[ "$CACHE_WARDEN_AUTH_OPERATION" = "pin" ]"#,
+        ]));
+        assert!(a.authenticate(&AuthContext::pin("K")).is_ok());
     }
 
     #[test]

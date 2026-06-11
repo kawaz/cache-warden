@@ -10,8 +10,8 @@
 //! every control-socket command maps onto a [`Store`] operation here.
 
 use cache_warden::{
-    Authenticator, Clock, EntryState, ExtendAuthOutcome, ProcessInfo, RegenerateOutcome,
-    SecretBytes, SourceRunner, Store, Ttl, ValueSource,
+    Authenticator, Clock, EntryState, ExtendAuthOutcome, PinAuthOutcome, ProcessInfo,
+    RegenerateOutcome, SecretBytes, SourceRunner, Store, Ttl, ValueSource,
 };
 
 use crate::protocol::wire::{EntryInfo, ErrorKind, Request, Response, SetSource};
@@ -67,6 +67,14 @@ where
             hard_ttl_secs,
         } => handle_set(store, ctx, key, source, soft_ttl_secs, hard_ttl_secs),
         Request::KvGet { key } => handle_get(store, ctx, key),
+        Request::KvPin { key, duration_secs } => handle_pin(store, ctx, key, duration_secs),
+        Request::KvUnpin { key } => {
+            if store.unpin(&key) {
+                Response::unpinned(true)
+            } else {
+                Response::error(ErrorKind::NotFound, "no such key")
+            }
+        }
     }
 }
 
@@ -86,6 +94,7 @@ where
     // Collect names first to avoid holding an immutable borrow across the
     // mutable `state_of` calls.
     let names: Vec<String> = store.list().iter().map(|s| s.to_string()).collect();
+    let now = ctx.clock.now();
     let mut entries = Vec::with_capacity(names.len());
     for name in names {
         let Some(state) = store.state_of(&name, ctx.clock) else {
@@ -95,10 +104,16 @@ where
             .source_of(&name)
             .map(|s| s.is_regenerable())
             .unwrap_or(false);
+        // Remaining pin seconds (None when not pinned; 0 once the deadline has
+        // passed). Never exposes the value.
+        let pin_remaining_secs = store
+            .pin_deadline_of(&name)
+            .map(|deadline| deadline.saturating_duration_since(now).as_secs());
         entries.push(EntryInfo {
             name,
             state: state_str(state).to_string(),
             regenerable,
+            pin_remaining_secs,
         });
     }
     Response::status(
@@ -221,6 +236,37 @@ where
                 }
             }
         }
+    }
+}
+
+/// Pin `key` Active for `duration_secs` (re-auth required; DR-0011).
+///
+/// The deadline is `clock.now() + duration_secs`. Pinning always prompts for
+/// re-authentication (even from Active) because it relaxes expiry; the core
+/// [`Store::pin_authenticated`] enforces that. A hard-expired or missing entry
+/// is reported without applying any pin.
+fn handle_pin<A, R, C>(
+    store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: String,
+    duration_secs: u64,
+) -> Response
+where
+    A: Authenticator + ?Sized,
+    C: Clock,
+{
+    let deadline = ctx
+        .clock
+        .now()
+        .saturating_add(std::time::Duration::from_secs(duration_secs));
+    match store.pin_authenticated(&key, deadline, ctx.auth, ctx.requester, ctx.clock) {
+        Ok(()) => Response::pinned(duration_secs),
+        Err(PinAuthOutcome::NotFound) => Response::error(ErrorKind::NotFound, "no such key"),
+        Err(PinAuthOutcome::HardExpired) => Response::error(
+            ErrorKind::HardExpired,
+            "entry is hard-expired (destroyed); cannot pin",
+        ),
+        Err(PinAuthOutcome::AuthFailed(e)) => Response::error(ErrorKind::AuthFailed, e.to_string()),
     }
 }
 
@@ -586,6 +632,119 @@ mod tests {
                     assert_eq!(entries.len(), 1);
                     assert_eq!(entries[0].name, "K");
                     assert_eq!(entries[0].state, "active");
+                    assert_eq!(entries[0].pin_remaining_secs, None);
+                }
+                _ => panic!("not status"),
+            },
+            _ => panic!("expected ok"),
+        }
+    }
+
+    // ---- kv.pin / kv.unpin (DR-0011) ----
+
+    fn pin(key: &str, secs: u64) -> Request {
+        Request::KvPin {
+            key: key.into(),
+            duration_secs: secs,
+        }
+    }
+
+    #[test]
+    fn pin_then_get_survives_soft_expiry() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c, set_static(b"v"));
+        // Pin for 1000s; then let the soft window (10s) lapse.
+        let resp = handle_request(&mut store, &c, pin("K", 1000));
+        assert!(resp.is_ok(), "pin ok: {resp:?}");
+        clock.advance(Duration::from_secs(SOFT + 5));
+        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        assert_eq!(get_value(&resp), b"v", "pinned value gettable past soft");
+    }
+
+    #[test]
+    fn pin_denied_is_auth_failed() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&DenyAll, &runner, &clock);
+        handle_request(&mut store, &c, set_static(b"v"));
+        let resp = handle_request(&mut store, &c, pin("K", 1000));
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+    }
+
+    #[test]
+    fn pin_missing_key_is_not_found() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        assert_eq!(
+            err_kind(&handle_request(&mut store, &c, pin("ghost", 100))),
+            ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn pin_hard_expired_is_rejected() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c, set_static(b"v"));
+        clock.advance(Duration::from_secs(HARD)); // hard-expired
+        assert_eq!(
+            err_kind(&handle_request(&mut store, &c, pin("K", 1000))),
+            ErrorKind::HardExpired
+        );
+    }
+
+    #[test]
+    fn unpin_returns_to_normal_and_missing_is_not_found() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c, set_static(b"v"));
+        handle_request(&mut store, &c, pin("K", 1000));
+        // Unpin then soft-expire: the value is gated again.
+        let resp = handle_request(&mut store, &c, Request::KvUnpin { key: "K".into() });
+        match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::Unpinned { unpinned } => assert!(unpinned),
+                _ => panic!("not unpinned"),
+            },
+            _ => panic!("expected ok"),
+        }
+        // Missing key unpin -> not found.
+        assert_eq!(
+            err_kind(&handle_request(
+                &mut store,
+                &c,
+                Request::KvUnpin {
+                    key: "ghost".into()
+                }
+            )),
+            ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn status_reports_pin_remaining_seconds() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        handle_request(&mut store, &c, set_static(b"v"));
+        handle_request(&mut store, &c, pin("K", 1000));
+        clock.advance(Duration::from_secs(100));
+        let resp = handle_request(&mut store, &c, Request::Status);
+        match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::Status { entries, .. } => {
+                    assert_eq!(entries[0].pin_remaining_secs, Some(900));
                 }
                 _ => panic!("not status"),
             },

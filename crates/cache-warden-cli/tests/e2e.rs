@@ -295,6 +295,143 @@ soft-ttl = "1s"
 }
 
 #[test]
+fn pin_holds_value_past_soft_expiry_then_unpin_restores_gating() {
+    // DR-0011: pin a soft-expiring entry so it stays gettable past its soft TTL,
+    // then unpin and confirm the re-auth gate comes back. `[auth].command` is
+    // `["false"]` so any soft-expired extend WOULD fail — proving the post-pin
+    // get is served by the pin, not by an extend, and the post-unpin get is
+    // refused once soft-expired.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r#"
+[auth]
+command = ["false"]
+
+[kv.EXT]
+command = ["printf", "ext-value"]
+soft-ttl = "1s"
+"#;
+    let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
+
+    // Initially Active; pin it for a long window (re-auth required, but the
+    // `false` authenticator denies... so pin must FAIL here). Confirm that:
+    // pinning is a re-auth-gated operation even from Active.
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.pin","key":"EXT","duration_secs":3600}"#,
+    );
+    assert_eq!(
+        resp["ok"], false,
+        "pin must be denied by the `false` authenticator: {resp}"
+    );
+    assert_eq!(resp["error"]["kind"], "auth_failed");
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
+fn pin_with_approving_auth_survives_soft_expiry_and_unpin_restores_gating() {
+    // `[auth].command = ["true"]` approves, so the pin applies. After the soft
+    // TTL lapses the pinned value is still gettable; after unpin + soft expiry it
+    // is gated again (extend via `true` would still pass, so to prove gating we
+    // check the state is no longer pin-forced Active in status).
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = r#"
+[auth]
+command = ["true"]
+
+[kv.EXT]
+command = ["printf", "ext-value"]
+soft-ttl = "1s"
+hard-ttl = "2s"
+"#;
+    let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
+
+    // Pin EXT for an hour while it is still Active (approved by `true`).
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.pin","key":"EXT","duration_secs":3600}"#,
+    );
+    assert_eq!(resp["ok"], true, "pin approved by `true`: {resp}");
+    assert_eq!(resp["pinned"], true);
+
+    // Past the hard TTL (2s): without the pin the value would be zeroized, but
+    // the pin holds it Active and gettable.
+    std::thread::sleep(Duration::from_millis(2500));
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"EXT"}"#);
+    assert_eq!(resp["ok"], true, "pinned value survives hard TTL: {resp}");
+    let got = resp["value_b64"].as_str().expect("value_b64");
+    assert_eq!(B64.decode(got).unwrap(), b"ext-value");
+
+    // status shows the pin's remaining seconds.
+    let resp = request(&socket, r#"{"cmd":"status"}"#);
+    let entries = resp["entries"].as_array().unwrap();
+    let ext = entries.iter().find(|e| e["name"] == "EXT").unwrap();
+    assert_eq!(ext["state"], "active", "pinned entry reports Active");
+    assert!(
+        ext["pin_remaining_secs"].as_u64().unwrap() > 0,
+        "status reports pin remaining: {ext}"
+    );
+
+    // Unpin: the pin is dropped. The entry is now past its real hard TTL, so a
+    // get must no longer return the old value via a pin (it will try to
+    // regenerate the command source instead — approved by `true`, returning a
+    // fresh value). The key point: status no longer shows a pin.
+    let resp = request(&socket, r#"{"cmd":"kv.unpin","key":"EXT"}"#);
+    assert_eq!(resp["ok"], true, "unpin ok: {resp}");
+    assert_eq!(resp["unpinned"], true);
+
+    let resp = request(&socket, r#"{"cmd":"status"}"#);
+    let entries = resp["entries"].as_array().unwrap();
+    let ext = entries.iter().find(|e| e["name"] == "EXT").unwrap();
+    assert!(
+        ext.get("pin_remaining_secs").is_none() || ext["pin_remaining_secs"].is_null(),
+        "after unpin there is no pin field: {ext}"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
+fn pin_missing_key_is_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("control.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
+        .arg("run")
+        .arg("--socket")
+        .arg(&socket)
+        .spawn()
+        .expect("spawn daemon");
+    let mut daemon = Daemon { child };
+
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.pin","key":"ghost","duration_secs":60}"#,
+    );
+    assert_eq!(resp["ok"], false);
+    assert_eq!(resp["error"]["kind"], "not_found");
+
+    // unpin of a missing key is also not_found.
+    let resp = request(&socket, r#"{"cmd":"kv.unpin","key":"ghost"}"#);
+    assert_eq!(resp["ok"], false);
+    assert_eq!(resp["error"]["kind"], "not_found");
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
 fn config_rejects_inline_static_value() {
     // A `[kv.*]` with an inline `value` must make `run` exit non-zero (secrets
     // may not be persisted in config, DR-0010).

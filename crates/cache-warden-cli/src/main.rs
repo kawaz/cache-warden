@@ -35,6 +35,8 @@ Commands:
     kv get <KEY>       Fetch a cached value
     kv del <KEY>       Delete a cached value
     kv list            List cached key names
+    kv pin <KEY> <DUR> Hold a value Active for DUR, ignoring its TTL (re-auth)
+    kv unpin <KEY>     Drop a pin, returning the value to normal TTL evaluation
     config show        Show the effective configuration
     config path        Show the config file path (or the search order)
     config edit        Open the config in $EDITOR
@@ -45,6 +47,13 @@ Commands:
     --command ARGV...  Run ARGV; its stdout is the value (regenerable)
     --soft-ttl DUR     Soft TTL (re-auth to extend). e.g. 1h, 30m, 45s, 86400
     --hard-ttl DUR     Hard TTL (value zeroized at expiry)
+
+`kv pin <KEY> <DUR>`:
+    Hold the value Active for DUR (e.g. 8h), suppressing both soft and hard
+    expiry until then. Useful before a long unattended run so an overnight hard
+    expiry can't interrupt it. Re-authentication is always required (pinning
+    relaxes the TTL). `kv unpin <KEY>` removes the pin (no re-auth).
+    DUR uses the same grammar as the TTL flags: 1h, 30m, 45s, or bare seconds.
 
 Global options:
     --socket PATH      Control socket path. Precedence:
@@ -80,6 +89,12 @@ fn render_response(resp: Response) -> Result<(), String> {
                 OkPayload::Deleted { deleted } => {
                     println!("{}", if deleted { "deleted" } else { "not found" })
                 }
+                OkPayload::Pinned {
+                    pin_remaining_secs, ..
+                } => println!("pinned for {pin_remaining_secs}s"),
+                OkPayload::Unpinned { unpinned } => {
+                    println!("{}", if unpinned { "unpinned" } else { "not found" })
+                }
                 OkPayload::List { keys } => {
                     for k in keys {
                         println!("{k}");
@@ -110,7 +125,12 @@ fn render_response(resp: Response) -> Result<(), String> {
                             } else {
                                 "static"
                             };
-                            println!("  {} [{}] ({})", e.name, e.state, regen);
+                            match e.pin_remaining_secs {
+                                Some(secs) => {
+                                    println!("  {} [{}] ({regen}, pinned {secs}s)", e.name, e.state)
+                                }
+                                None => println!("  {} [{}] ({regen})", e.name, e.state),
+                            }
                         }
                     }
                 }
@@ -132,6 +152,7 @@ fn error_kind_str(kind: &protocol::wire::ErrorKind) -> &'static str {
         NotFound => "not found",
         AuthFailed => "auth failed",
         NotRegenerable => "not regenerable",
+        HardExpired => "hard expired",
         UpstreamFailed => "upstream failed",
         Internal => "internal error",
     }
@@ -181,7 +202,7 @@ fn run() -> Result<(), String> {
             let sub = rest
                 .first()
                 .cloned()
-                .ok_or("kv requires a subcommand: set | get | del | list")?;
+                .ok_or("kv requires a subcommand: set | get | del | list | pin | unpin")?;
             let kv_args = &rest[1..];
             let req = match sub.as_str() {
                 "set" => commands::parse_kv_set(kv_args, || {
@@ -191,6 +212,8 @@ fn run() -> Result<(), String> {
                 })?,
                 "get" => commands::parse_kv_single_key("get", kv_args)?,
                 "del" => commands::parse_kv_single_key("del", kv_args)?,
+                "unpin" => commands::parse_kv_single_key("unpin", kv_args)?,
+                "pin" => commands::parse_kv_pin(kv_args)?,
                 "list" => {
                     if !kv_args.is_empty() {
                         return Err(format!("`kv list` takes no arguments: {kv_args:?}"));
