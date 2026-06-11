@@ -356,6 +356,11 @@ See DR-0004 for the core/adapter assignment of assets being ported.
   Implementation has not started yet (the current implementation keeps `kv set --command` with eager
   execution).
 
+- **OTP value type (`--type otp`)**: Cache the TOTP seed and derive the 6-digit code daemon-side on
+  every `kv get` / reference resolution. The seed is write-only (it never leaves the daemon).
+  The design is settled in [DR-0016](./decisions/DR-0016-otp-value-type.md). Implementation has
+  not started yet.
+
 See [ROADMAP.md](./ROADMAP.md) for details.
 
 ## Related Documents
