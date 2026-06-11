@@ -393,28 +393,33 @@ control socket clients (`kv.get`).
 The whole implementation is confined to the `cache-warden-cli` crate (no core / authsock crate changes,
 DR-0002). Inline define on references (`cache-warden://KEY?argv=...`) is unimplemented in v1 (DR-0014).
 
-### OTP Value Type (`--type otp`, DR-0016)
+### OTP Value Type (`kv define --type otp`, DR-0016)
 
 Caches the TOTP **seed** (raw base32 / otpauth:// URI); the 6-digit code is a derived view computed
 daemon-side on every get. Because the cached thing is the seed, TTL / mlock / zeroize / extend / pin /
 regenerate all apply as-is, and the 30-second code window is an orthogonal concept.
 
-- **`--type otp` on `kv define` / `kv set`**: value-type metadata. Parameters are `--otp-digits`
+- **`--type otp` on `kv define` only**: value-type metadata. Parameters are `--otp-digits`
   (default 6) / `--otp-period` (default 30s) / `--otp-algorithm sha1|sha256|sha512` (default sha1).
   An otpauth:// URI value supplies parameters from the URI, with explicit flags taking precedence.
-  The type rides along into defs files and definition persistence.
+  The type rides along into defs files and definition persistence. **The type lives on the
+  definition**, so a typed key always carries one. `kv set` is opaque-bytes-only and rejects
+  `--type` / `--otp-*`, steering you to `kv define` (a static seed would vanish on restart and force
+  callers to keep the seed in plaintext to re-inject it — the anti-feature DR-0016 removes).
 - **The seed is write-only**: `kv get` on an otp-typed key always returns the derived code; the seed
-  never leaves the daemon again (re-set it if you need it elsewhere). Clients (agents included) only
-  ever hold a ~30-second credential. `run` / `inject` reference resolution injects codes as well.
-  dry-run masks as usual.
-- **The core knows nothing about OTP**: the core carries an opaque metadata slot (a type label plus a
-  string map it stores and compares but never interprets), while the TOTP vocabulary and derivation
-  (RFC 4226 / 6238, RustCrypto hmac + sha1/sha2) stay in the CLI crate's handler layer. Future derived
-  view types ride the same slot with no core change.
+  never leaves the daemon again. Clients (agents included) only ever hold a ~30-second credential.
+  `run` / `inject` reference resolution injects codes as well. dry-run masks as usual.
+- **The core knows nothing about OTP**: the value type lives on the **definition**'s opaque metadata
+  slot (a type label plus a string map the core stores and compares but never interprets); the value
+  entry is always opaque bytes. Type detection (status / get) reads the definition registry
+  (`definition_of(key).meta()`). The TOTP vocabulary and derivation (RFC 4226 / 6238, RustCrypto hmac +
+  sha1/sha2) stay in the CLI crate's handler layer. Future derived view types ride the same slot with
+  no core change.
 - **Footgun guard**: combining `--type otp` with an `?attribute=otp` source is a define-time error
   (caching the 30-second code op computed is structurally wrong; the source must point at the seed field).
-- Recommended pattern: keep the seed in op and define it with `--type otp --source op://vault/item/field`
-  (lazy regenerate makes it self-healing across daemon restarts).
+- Recommended pattern: keep the seed in op and define it with `kv define --type otp --source
+  op://vault/item/field` (lazy regenerate makes it self-healing across daemon restarts). Deleting only
+  the value (`del`) keeps the definition, so the next get re-derives otp; `del --with-define` drops the type.
 
 ### Workspace Structure (DR-0002)
 

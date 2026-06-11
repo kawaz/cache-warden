@@ -469,11 +469,12 @@ fn run_defs_registers_then_injects() {
 
 // ---- OTP value type via the CLI (DR-0016) -------------------------------
 
-/// `cache-warden kv set --type otp` then `kv get` prints a 6-digit CODE (not the
-/// seed), and a `run --env X=cache-warden://OTP` injects the same shape of code
-/// — the reference resolution naturally yields the derived code, never the seed.
+/// `cache-warden kv define --type otp` then `kv get` prints a 6-digit CODE (not
+/// the seed), and a `run --env X=cache-warden://OTP` injects the same shape of
+/// code — the reference resolution naturally yields the derived code, never the
+/// seed. Value types live on definitions now (DR-0016).
 #[test]
-fn otp_set_get_and_run_inject_the_code_not_the_seed() {
+fn otp_define_get_and_run_inject_the_code_not_the_seed() {
     // RFC 6238 SHA1 test seed (base32).
     const SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 
@@ -481,14 +482,25 @@ fn otp_set_get_and_run_inject_the_code_not_the_seed() {
     let (daemon, socket) = spawn_plain(dir.path());
     assert_eq!(request(&socket, r#"{"cmd":"ping"}"#)["ok"], true);
 
-    // Cache the seed as an otp-typed static value via the CLI.
+    // Register an otp definition whose command emits the seed (the seed itself
+    // is never stored as a set value). The first get produces it lazily.
     let out = run_cli(
         &socket,
-        &["kv", "set", "OTP", "--type", "otp", "--value", SEED],
+        &[
+            "kv",
+            "define",
+            "OTP",
+            "--type",
+            "otp",
+            "--command",
+            "printf",
+            "%s",
+            SEED,
+        ],
     );
     assert!(
         out.status.success(),
-        "kv set --type otp failed: {}",
+        "kv define --type otp failed: {}",
         stderr(&out)
     );
 

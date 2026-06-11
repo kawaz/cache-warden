@@ -19,7 +19,8 @@ use crate::totp::OtpAlgorithm;
 
 /// Extract the value-type flags (`--type` and the `--otp-*` parameters) from
 /// `args`, returning the resulting [`ValueMetaWire`] and the remaining args with
-/// those flags removed (DR-0016 §1). Shared by `kv set` and `kv define`.
+/// those flags removed (DR-0016 §1). Used by `kv define` only — a value type
+/// implies a regenerable definition, so `kv set` rejects these flags.
 ///
 /// - `--type otp` selects the OTP value type (the only type today). Any other
 ///   `--type` value is rejected.
@@ -200,16 +201,14 @@ pub fn resolve_socket(cli_socket: Option<PathBuf>, config_socket: Option<PathBuf
 ///
 /// `stdin` provides the bytes for `--value-stdin`; it is read only when that
 /// flag is present (kept as a parameter so the parse is testable). Command
-/// sources moved to `kv define` (see [`parse_kv_define`]).
+/// sources moved to `kv define` (see [`parse_kv_define`]). Value *types*
+/// (`--type otp` and the `--otp-*` parameters) moved to `kv define` too
+/// (DR-0016): a static seed has nothing to regenerate from, so a typed key must
+/// always carry a definition. `kv set` injects opaque bytes only.
 pub fn parse_kv_set(
     args: &[String],
     stdin: impl FnOnce() -> std::io::Result<Vec<u8>>,
 ) -> Result<Request, String> {
-    // Pull out the value-type flags first (DR-0016); the rest is the existing
-    // static-set grammar.
-    let (meta, args) = take_otp_flags(args)?;
-    let args = args.as_slice();
-
     let mut key: Option<String> = None;
     let mut value: Option<Vec<u8>> = None;
     let mut value_stdin = false;
@@ -264,6 +263,24 @@ pub fn parse_kv_set(
                         .to_string(),
                 );
             }
+            "--type" | "--otp-digits" | "--otp-period" | "--otp-algorithm" => {
+                return Err(format!(
+                    "`{}` is not valid on `kv set`; value types (otp) live on \
+                     definitions. Register it with `kv define KEY --type otp ...` instead",
+                    args[i]
+                ));
+            }
+            s if s.starts_with("--type=")
+                || s.starts_with("--otp-digits=")
+                || s.starts_with("--otp-period=")
+                || s.starts_with("--otp-algorithm=") =>
+            {
+                let flag = s.split('=').next().unwrap_or(s);
+                return Err(format!(
+                    "`{flag}` is not valid on `kv set`; value types (otp) live on \
+                     definitions. Register it with `kv define KEY --type otp ...` instead"
+                ));
+            }
             s if s.starts_with("--") => {
                 return Err(format!("unknown option for `kv set`: {s}"));
             }
@@ -306,7 +323,6 @@ pub fn parse_kv_set(
         source,
         soft_ttl_secs,
         hard_ttl_secs,
-        meta,
     })
 }
 
@@ -1087,27 +1103,20 @@ mod tests {
     }
 
     #[test]
-    fn kv_set_with_type_otp_attaches_meta() {
-        let req = parse_kv_set(
-            &s(&[
-                "OTP",
-                "--type",
-                "otp",
-                "--otp-digits",
-                "8",
-                "--value",
-                "SEED",
-            ]),
-            no_stdin,
-        )
-        .unwrap();
-        match req {
-            Request::KvSet { key, meta, .. } => {
-                assert_eq!(key, "OTP");
-                assert_eq!(meta.type_label.as_deref(), Some("otp"));
-                assert_eq!(meta.params.get("digits").map(String::as_str), Some("8"));
-            }
-            _ => panic!("expected KvSet"),
+    fn kv_set_rejects_type_otp_and_steers_to_define() {
+        // DR-0016: value types live on definitions; `kv set` is opaque-only.
+        for flags in [
+            vec!["OTP", "--type", "otp", "--value", "SEED"],
+            vec!["OTP", "--type=otp", "--value", "SEED"],
+            vec!["OTP", "--otp-digits", "8", "--value", "SEED"],
+            vec!["OTP", "--otp-period=30", "--value", "SEED"],
+            vec!["OTP", "--otp-algorithm", "sha256", "--value", "SEED"],
+        ] {
+            let err = parse_kv_set(&s(&flags), no_stdin).unwrap_err();
+            assert!(
+                err.contains("kv define"),
+                "expected steer to `kv define`, got: {err}"
+            );
         }
     }
 
@@ -1176,10 +1185,13 @@ mod tests {
     }
 
     #[test]
-    fn non_otp_set_still_works_unchanged() {
+    fn plain_set_still_works_unchanged() {
         let req = parse_kv_set(&s(&["K", "--value", "v"]), no_stdin).unwrap();
         match req {
-            Request::KvSet { meta, .. } => assert!(meta.is_empty()),
+            Request::KvSet { key, source, .. } => {
+                assert_eq!(key, "K");
+                assert!(matches!(source, SetSource::Static { .. }));
+            }
             _ => panic!("expected KvSet"),
         }
     }

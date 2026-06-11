@@ -384,18 +384,12 @@ fn register_definitions<R, C>(
         }
 
         // Lazy by default; `preload = true` or an authsock-referenced key runs
-        // the command eagerly.
+        // the command eagerly. The produced value is opaque bytes; the key's
+        // type (otp) stays on the definition registered just above (DR-0016).
         if entry.preload || force_eager.contains(&entry.name) {
             match runner.run(&entry.command) {
                 Ok(value) => {
-                    store.set_with_meta(
-                        entry.name.clone(),
-                        source,
-                        value,
-                        ttl,
-                        meta.clone(),
-                        clock,
-                    );
+                    store.set(entry.name.clone(), source, value, ttl, clock);
                 }
                 Err(e) => {
                     // The RunError Display is already secret-free (stderr redacted).
@@ -700,7 +694,6 @@ mod tests {
             },
             soft_ttl_secs: None,
             hard_ttl_secs: None,
-            meta: Default::default(),
         };
         assert!(run_request(&s, None, set).is_ok());
         let resp = run_request(

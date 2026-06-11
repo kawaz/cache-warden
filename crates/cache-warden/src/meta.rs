@@ -1,11 +1,15 @@
-//! An opaque, core-uninterpreted metadata slot for values and definitions.
+//! An opaque, core-uninterpreted metadata slot for definitions.
 //!
 //! [`ValueMeta`] is a small, deliberately *generic* attribute bag the core
-//! attaches to a cached value (or a definition) and **never interprets**. It
-//! exists so an adapter layer can tag an entry with a value *type* and its
-//! type-specific parameters (DR-0016: the OTP value type tags entries `type =
-//! "otp"` with `digits` / `period` / `algorithm`), while the core stays unaware
-//! of what any of it means.
+//! attaches to a [`Definition`](crate::Definition) and **never interprets**. It
+//! exists so an adapter layer can tag a *key* with a value *type* and its
+//! type-specific parameters (DR-0016: the OTP value type tags a definition
+//! `type = "otp"` with `digits` / `period` / `algorithm`), while the core stays
+//! unaware of what any of it means.
+//!
+//! The type lives on the definition, not on the cached value: a typed key is
+//! always definition-backed (DR-0016), so the value entry stays opaque bytes and
+//! type detection reads the definition registry.
 //!
 //! # Design rationale: why a generic bag, not OTP fields
 //!
@@ -22,12 +26,12 @@
 
 use std::collections::BTreeMap;
 
-/// An opaque type label + parameter bag attached to a value or definition.
+/// An opaque type label + parameter bag attached to a definition.
 ///
 /// The core treats every field as inert data: it stores, clones, compares, and
 /// hands it back, but never reads its meaning. An empty `ValueMeta`
 /// ([`ValueMeta::is_empty`]) is the "no type metadata" default an ordinary
-/// (opaque) value carries.
+/// (opaque) definition carries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ValueMeta {
     /// An opaque value-type label (e.g. `"otp"`), or `None` for an untyped

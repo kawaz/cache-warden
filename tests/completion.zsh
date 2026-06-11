@@ -89,6 +89,25 @@ _expect_contains() {
   fi
 }
 
+_expect_not_contains() {
+  local desc="$1" line="$2"; shift 2
+  local out; out="$(_capture "$line")"
+  local -a present
+  local w
+  for w in "$@"; do
+    [[ "$out" == *"$w"* ]] && present+=("$w")
+  done
+  if (( $#present == 0 )); then
+    print -- "PASS: $desc"
+    (( pass++ ))
+  else
+    print -- "FAIL: $desc — unexpected: ${present[*]}"
+    print -- "  ----- captured (sanitized) -----"
+    print -r -- "$out" | tr -cd '[:print:]\n' | sed 's/^/  | /'
+    (( fail++ ))
+  fi
+}
+
 print "== top-level subcommands =="
 _expect_contains "top commands" "cache-warden " daemon ping status kv run inject config
 
@@ -107,7 +126,10 @@ _expect_contains "kv define opts" "cache-warden kv define KEY --" \
 
 print "== kv set options =="
 _expect_contains "kv set opts" "cache-warden kv set KEY --" \
-  --value --value-stdin --soft-ttl --hard-ttl --type
+  --value --value-stdin --soft-ttl --hard-ttl
+# Value types (otp) live on `kv define`, not `kv set` (DR-0016).
+_expect_not_contains "kv set has no otp opts" "cache-warden kv set KEY --" \
+  --type --otp-digits --otp-period --otp-algorithm
 
 print "== kv get options =="
 _expect_contains "kv get opts" "cache-warden kv get KEY --" --dry-run --reveal

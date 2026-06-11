@@ -60,11 +60,13 @@ impl Store {
         Self::default()
     }
 
-    /// Insert or replace the entry under `key`, becoming Active now (no type
-    /// metadata).
+    /// Insert or replace the entry under `key`, becoming Active now.
     ///
     /// Any previous entry under the same key is dropped (and thus its secret
-    /// zeroized) before the new one takes its place.
+    /// zeroized) before the new one takes its place. The value is opaque bytes;
+    /// a value *type* (e.g. otp) lives on the key's definition (DR-0016), so a
+    /// preloaded typed value is `set` here while its type rides on the
+    /// definition registered separately.
     pub fn set(
         &mut self,
         key: impl Into<String>,
@@ -73,34 +75,10 @@ impl Store {
         ttl: Ttl,
         clock: &impl Clock,
     ) {
-        self.set_with_meta(key, source, value, ttl, ValueMeta::new(), clock);
-    }
-
-    /// Insert or replace the entry under `key` with opaque type metadata
-    /// (DR-0016).
-    ///
-    /// Same as [`Store::set`] but tags the value with a core-uninterpreted
-    /// [`ValueMeta`] (e.g. an `otp` type + its parameters). A static seed for a
-    /// derived type is set this way, since it has no definition to carry the type.
-    pub fn set_with_meta(
-        &mut self,
-        key: impl Into<String>,
-        source: ValueSource,
-        value: SecretBytes,
-        ttl: Ttl,
-        meta: ValueMeta,
-        clock: &impl Clock,
-    ) {
-        let entry = CacheEntry::new(source, value, ttl, clock).with_meta(meta);
+        let entry = CacheEntry::new(source, value, ttl, clock);
         // Inserting overwrites the old entry; the displaced CacheEntry is dropped
         // here, zeroizing its secret.
         self.entries.insert(key.into(), entry);
-    }
-
-    /// Borrow the opaque [`ValueMeta`] of `key`'s value entry, or `None` if the
-    /// key has no value entry. Value-free metadata (DR-0016).
-    pub fn meta_of(&self, key: &str) -> Option<&ValueMeta> {
-        self.entries.get(key).map(CacheEntry::meta)
     }
 
     /// Borrow the secret under `key` iff it exists and is currently Active.
@@ -229,9 +207,6 @@ impl Store {
 
         let ttl = entry.ttl();
         let source = entry.source().clone();
-        // Carry the value's opaque type metadata across regeneration (DR-0016):
-        // a regenerated otp seed stays otp-typed.
-        let meta = entry.meta().clone();
 
         // 2. Re-run upstream. On failure nothing is mutated.
         let value = runner.run(&argv).map_err(RegenerateOutcome::RunFailed)?;
@@ -241,10 +216,8 @@ impl Store {
             .map_err(RegenerateOutcome::AuthFailed)?;
 
         // 4. Replace with a fresh Active entry (overwrite zeroizes the old one).
-        self.entries.insert(
-            key.to_string(),
-            CacheEntry::new(source, value, ttl, clock).with_meta(meta),
-        );
+        self.entries
+            .insert(key.to_string(), CacheEntry::new(source, value, ttl, clock));
         Ok(())
     }
 
@@ -504,9 +477,6 @@ impl Store {
         };
         let source = definition.source().clone();
         let ttl = definition.ttl();
-        // The definition's opaque type metadata is stamped onto the produced
-        // value (DR-0016): a value lazily made from an otp definition is otp.
-        let meta = definition.meta().clone();
 
         // 1. Re-run upstream. On failure nothing is mutated.
         let value = runner.run(&argv).map_err(RegenerateDefOutcome::RunFailed)?;
@@ -516,10 +486,8 @@ impl Store {
             .map_err(RegenerateDefOutcome::AuthFailed)?;
 
         // 3. Install a fresh Active entry (overwriting any destroyed husk).
-        self.entries.insert(
-            key.to_string(),
-            CacheEntry::new(source, value, ttl, clock).with_meta(meta),
-        );
+        self.entries
+            .insert(key.to_string(), CacheEntry::new(source, value, ttl, clock));
         Ok(())
     }
 
@@ -1589,7 +1557,7 @@ mod tests {
         assert_eq!(auth.calls()[0].requester.as_deref(), Some(chain.as_slice()));
     }
 
-    // ---- opaque value metadata (DR-0016) ----
+    // ---- opaque value-type metadata lives on the definition (DR-0016) ----
 
     fn otp_meta() -> ValueMeta {
         ValueMeta::with_type(
@@ -1602,41 +1570,28 @@ mod tests {
     }
 
     #[test]
-    fn set_with_meta_tags_the_value_entry() {
-        let clock = FakeClock::new();
+    fn definition_carries_the_type_metadata() {
+        // The value type is a property of the definition, not the value: the core
+        // stores it on the definition and never copies it onto a produced value
+        // (a value is always opaque bytes; DR-0016).
         let mut s = Store::new();
-        s.set_with_meta(
-            "OTP",
-            ValueSource::Static,
-            SecretBytes::from("seed"),
-            ttl(),
-            otp_meta(),
-            &clock,
+        s.define_with_meta("OTP", cmd_source(), ttl(), otp_meta())
+            .unwrap();
+        assert_eq!(s.definition_of("OTP").unwrap().meta(), &otp_meta());
+        assert_eq!(
+            s.definition_of("OTP").unwrap().meta().type_label(),
+            Some("otp")
         );
-        assert_eq!(s.meta_of("OTP"), Some(&otp_meta()));
-        // The opaque label and a param are readable, but the core never
-        // interprets them.
-        assert_eq!(s.meta_of("OTP").unwrap().type_label(), Some("otp"));
-        assert_eq!(s.meta_of("OTP").unwrap().param("digits"), Some("6"));
+        assert_eq!(
+            s.definition_of("OTP").unwrap().meta().param("digits"),
+            Some("6")
+        );
     }
 
     #[test]
-    fn plain_set_carries_empty_meta() {
-        let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("v"),
-            ttl(),
-            &clock,
-        );
-        assert!(s.meta_of("K").unwrap().is_empty());
-    }
-
-    #[test]
-    fn definition_meta_is_stamped_onto_lazily_produced_value() {
-        // A definition tagged otp produces an otp-tagged value (DR-0016).
+    fn lazily_produced_value_keeps_its_type_on_the_definition() {
+        // Producing the value does not move the type onto the value entry; the
+        // definition remains the source of truth for the key's type (DR-0016).
         let clock = FakeClock::new();
         let mut s = Store::new();
         s.define_with_meta("K", cmd_source(), ttl(), otp_meta())
@@ -1644,29 +1599,31 @@ mod tests {
         let runner = CountingRunner::new(b"seed-bytes");
         s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
             .unwrap();
-        assert_eq!(s.meta_of("K"), Some(&otp_meta()), "value inherits def meta");
+        assert!(s.has_value("K"));
+        assert_eq!(
+            s.definition_of("K").unwrap().meta(),
+            &otp_meta(),
+            "type still read from the definition after production"
+        );
     }
 
     #[test]
-    fn regenerate_preserves_value_meta() {
-        // A value's opaque type survives hard-expiry regeneration (DR-0016).
+    fn regenerated_value_type_still_read_from_definition() {
+        // After a hard-expiry regeneration the produced value is opaque, but the
+        // definition's type survives, so the key stays otp-typed (DR-0016).
         let clock = FakeClock::new();
         let mut s = Store::new();
-        s.set_with_meta(
-            "K",
-            ValueSource::command(["echo".into(), "v".into()]),
-            SecretBytes::from("orig"),
-            ttl(),
-            otp_meta(),
-            &clock,
-        );
+        s.define_with_meta("K", cmd_source(), ttl(), otp_meta())
+            .unwrap();
+        s.get_or_regenerate("K", &CountingRunner::new(b"orig"), &AllowAll, None, &clock)
+            .unwrap();
         clock.advance(HARD);
-        let runner = CountingRunner::new(b"fresh");
-        s.regenerate("K", &runner, &AllowAll, None, &clock).unwrap();
+        s.get_or_regenerate("K", &CountingRunner::new(b"fresh"), &AllowAll, None, &clock)
+            .unwrap();
         assert_eq!(
-            s.meta_of("K"),
-            Some(&otp_meta()),
-            "meta survives regenerate"
+            s.definition_of("K").unwrap().meta(),
+            &otp_meta(),
+            "type survives regenerate (it lives on the definition)"
         );
     }
 

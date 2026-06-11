@@ -61,6 +61,10 @@ pub enum Request {
     #[serde(rename = "status")]
     Status,
     /// Insert or replace a static key (literal value only; DR-0014 §1).
+    ///
+    /// `set` carries opaque bytes only: value *types* (otp) live on definitions
+    /// (DR-0016), so there is no `meta` field here. Register a typed key with
+    /// `kv.define` instead.
     #[serde(rename = "kv.set")]
     KvSet {
         /// The key to set.
@@ -74,11 +78,6 @@ pub enum Request {
         /// Hard TTL in seconds, or `None` for "never hard-expires".
         #[serde(default)]
         hard_ttl_secs: Option<u64>,
-        /// Opaque value-type metadata (DR-0016). Default empty (an opaque value).
-        /// A static otp *seed* is set with `type = "otp"` + params here, since it
-        /// has no definition to carry the type.
-        #[serde(default, skip_serializing_if = "ValueMetaWire::is_empty")]
-        meta: ValueMetaWire,
     },
     /// Register a command-source *definition* for a key (DR-0014 §1).
     ///
@@ -477,7 +476,6 @@ mod tests {
             },
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
-            meta: Default::default(),
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""cmd":"kv.set""#));

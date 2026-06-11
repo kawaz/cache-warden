@@ -53,11 +53,16 @@ _cache-warden() {
   # 共通 --socket オプション (コマンド名の後ならどこでも有効)。
   local socket_opt='--socket[Control socket path]:socket:_files'
 
-  # 共通 TTL/OTP オプション (kv define / kv set 共有)。
-  local -a ttl_otp_opts
-  ttl_otp_opts=(
+  # 共通 TTL オプション (kv define / kv set 共有)。
+  local -a ttl_opts
+  ttl_opts=(
     '--soft-ttl[Soft TTL (re-auth to extend). e.g. 1h, 30m, 45s, 86400]:duration'
     '--hard-ttl[Hard TTL (value zeroized at expiry)]:duration'
+  )
+  # 値型 (OTP) オプション (kv define 専用; DR-0016)。set は静的バイト列のみ。
+  local -a ttl_otp_opts
+  ttl_otp_opts=(
+    "$ttl_opts[@]"
     '--type[Mark the value as a TOTP seed]:type:(otp)'
     '--otp-digits[OTP code length (default 6)]:digits'
     '--otp-period[OTP time step in seconds (default 30)]:seconds'
@@ -144,7 +149,7 @@ _cache-warden() {
                     '--help[Show this help message]' \
                     '--value[Use the literal string V as the value]:value' \
                     '--value-stdin[Read the value from stdin (binary safe)]' \
-                    "$ttl_otp_opts[@]" \
+                    "$ttl_opts[@]" \
                     '1:key:_cw_keys'
                   ;;
                 get)

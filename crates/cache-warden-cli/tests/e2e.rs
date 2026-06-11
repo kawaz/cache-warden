@@ -1202,10 +1202,9 @@ fn double_start_is_refused() {
     let _ = wait_for_exit(&mut first, Duration::from_secs(10));
 }
 
-/// OTP value type end-to-end (DR-0016): a seed is cached, `kv.get` returns the
-/// derived code (six digits), the seed never appears in any response, and a
-/// dry-run masks the code. Covers both the static-seed (`kv.set --type otp`) and
-/// the CLI rendering path.
+/// OTP value type end-to-end (DR-0016): a seed is produced by an otp *definition*
+/// (value types live on definitions now), `kv.get` returns the derived code (six
+/// digits), the seed never appears in any response, and a dry-run masks the code.
 #[test]
 fn otp_value_type_over_control_socket() {
     // RFC 6238 SHA1 test seed, base32-encoded.
@@ -1222,13 +1221,12 @@ fn otp_value_type_over_control_socket() {
         .expect("spawn daemon");
     let mut daemon = Daemon { child };
 
-    // --- kv.set a static OTP seed (type = otp, 6 digits default) ---
-    let set = format!(
-        r#"{{"cmd":"kv.set","key":"OTP","source":{{"kind":"static","value_b64":"{}"}},"meta":{{"type":"otp"}}}}"#,
-        b64(SEED_B32.as_bytes())
+    // --- kv.define an OTP key whose command emits the seed (6 digits default) ---
+    let def = format!(
+        r#"{{"cmd":"kv.define","key":"OTP","argv":["printf","%s","{SEED_B32}"],"meta":{{"type":"otp"}}}}"#
     );
-    let resp = request(&socket, &set);
-    assert_eq!(resp["ok"], true, "set otp: {resp}");
+    let resp = request(&socket, &def);
+    assert_eq!(resp["ok"], true, "define otp: {resp}");
 
     // --- kv.get returns a 6-digit CODE, never the seed (write-only) ---
     let resp = request(&socket, r#"{"cmd":"kv.get","key":"OTP"}"#);
@@ -1269,15 +1267,26 @@ fn otp_value_type_over_control_socket() {
     assert!(!resp_str.contains("value_b64"), "dry-run carried a value");
     assert!(!resp_str.contains(SEED_B32), "dry-run leaked seed");
 
-    // --- an 8-digit otp seed via params ---
-    let set = format!(
-        r#"{{"cmd":"kv.set","key":"OTP8","source":{{"kind":"static","value_b64":"{}"}},"meta":{{"type":"otp","params":{{"digits":"8"}}}}}}"#,
-        b64(SEED_B32.as_bytes())
+    // --- an 8-digit otp definition via params ---
+    let def = format!(
+        r#"{{"cmd":"kv.define","key":"OTP8","argv":["printf","%s","{SEED_B32}"],"meta":{{"type":"otp","params":{{"digits":"8"}}}}}}"#
     );
-    assert_eq!(request(&socket, &set)["ok"], true);
+    assert_eq!(request(&socket, &def)["ok"], true);
     let resp = request(&socket, r#"{"cmd":"kv.get","key":"OTP8"}"#);
     let code = B64.decode(resp["value_b64"].as_str().unwrap()).unwrap();
     assert_eq!(code.len(), 8, "8-digit otp code");
+
+    // --- `kv set --type otp` is rejected and steers to `kv define` (DR-0016) ---
+    let out = run_cli(
+        &socket,
+        &["kv", "set", "BAD", "--type", "otp", "--value", "x"],
+    );
+    assert!(!out.status.success(), "set --type otp must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("kv define"),
+        "set --type otp must steer to define: {stderr}"
+    );
 
     let pid = daemon.child.id();
     unsafe {

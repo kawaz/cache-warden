@@ -426,32 +426,14 @@ pub fn kv_set() -> HelpSpec {
                 name: "--hard-ttl DUR",
                 desc: "Hard TTL (value zeroized at expiry)",
             },
-            Row {
-                name: "--type otp",
-                desc: "Treat the value as a TOTP seed: get derives a code\n\
-                       (the seed is never returned; write-only)",
-            },
-            Row {
-                name: "--otp-digits N",
-                desc: "OTP code length (default 6; requires --type otp)",
-            },
-            Row {
-                name: "--otp-period SEC",
-                desc: "OTP time step in seconds (default 30)",
-            },
-            Row {
-                name: "--otp-algorithm A",
-                desc: "OTP hash: sha1 (default) / sha256 / sha512",
-            },
         ],
         detail: "\
-`kv set` injects a literal value only. To register a regenerable command
-source, use `kv define` instead.
+`kv set` injects a literal, opaque value only. To register a regenerable
+command source, use `kv define` instead.
 
-With --type otp the value is a TOTP *seed* (raw base32 or an otpauth:// URI),
-and `kv get` returns the derived code, never the seed (write-only). A static
-otp seed is lost on daemon restart (re-set it), or define it from op for
-self-healing. Explicit --otp-* flags override any otpauth:// URI parameters.",
+Value types (otp) live on definitions, not on set values: a typed key must be
+regenerable, so register it with `kv define KEY --type otp ...`. `kv set`
+rejects `--type` / `--otp-*` and points you there.",
         show_global: true,
     }
 }
@@ -761,10 +743,10 @@ mod tests {
         assert!(h.contains("--soft-ttl DUR"));
         assert!(h.contains("Global options:"));
         assert!(h.contains("Environment:"));
-        // OTP value-type flags are documented on `kv set` (DR-0016).
-        assert!(h.contains("--type otp"));
-        assert!(h.contains("--otp-digits"));
-        assert!(h.contains("write-only"));
+        // Value types (otp) moved to `kv define`; `kv set` no longer lists them
+        // but steers users there (DR-0016).
+        assert!(!h.contains("--otp-digits"));
+        assert!(h.contains("kv define KEY --type otp"));
     }
 
     #[test]

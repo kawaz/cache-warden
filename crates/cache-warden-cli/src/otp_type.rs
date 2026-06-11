@@ -64,15 +64,6 @@ fn overrides_from_meta(meta: &ValueMeta) -> Result<OtpOverrides, String> {
     })
 }
 
-/// Validate that `seed` is a usable otp seed under `meta`, without deriving a
-/// code (used at `kv set --type otp` time to fail a bad seed early; DR-0016 §5).
-///
-/// The seed bytes are never echoed into the returned error.
-pub fn validate_seed(seed: &[u8], meta: &ValueMetaWire) -> Result<(), String> {
-    let core = meta_from_wire_for_validation(meta);
-    resolve(seed, &core).map(|_| ())
-}
-
 /// Derive the current TOTP code for `seed` under `meta`, as an ASCII digit
 /// string (DR-0016 §3). The seed is consumed only here; the caller returns the
 /// code, never the seed.
@@ -96,12 +87,6 @@ fn resolve(seed: &[u8], meta: &ValueMeta) -> Result<(Vec<u8>, OtpParams), String
     let overrides = overrides_from_meta(meta)?;
     let resolved = totp::resolve_seed(seed_str, &overrides).map_err(|e| e.to_string())?;
     Ok((resolved.key, resolved.params))
-}
-
-/// Build a throwaway core [`ValueMeta`] from a wire block, for seed validation
-/// at set time (we only need the params, not to store it).
-fn meta_from_wire_for_validation(meta: &ValueMetaWire) -> ValueMeta {
-    ValueMeta::with_type(OTP_TYPE, meta.params.clone())
 }
 
 /// The current Unix time in seconds (wall clock).
@@ -177,12 +162,6 @@ mod tests {
             !err.contains("this is not"),
             "must not echo the seed: {err}"
         );
-    }
-
-    #[test]
-    fn validate_seed_accepts_good_and_rejects_bad() {
-        assert!(validate_seed(b"GEZDGNBVGY3TQOJQ", &wire_otp(&[])).is_ok());
-        assert!(validate_seed(b"!!!not base32!!!", &wire_otp(&[])).is_err());
     }
 
     #[test]
