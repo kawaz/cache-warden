@@ -150,6 +150,17 @@ impl Shared {
 /// `socket_path` is already resolved by the caller (CLI `--socket` > env >
 /// `[daemon].socket` > built-in default); the daemon does not re-derive it.
 pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
+    // Suppress core dumps before any secret enters the Store: a crash must not
+    // write in-memory secrets (incl. mlocked pages, DR-0007) to disk. Fail-open
+    // and consistent with the mlock policy — a failure warns but does not abort
+    // (see `hardening::suppress_core_dumps`).
+    if !super::hardening::suppress_core_dumps() {
+        eprintln!(
+            "cache-warden: warning: could not disable core dumps (RLIMIT_CORE); \
+             a crash could leak in-memory secrets to a core file"
+        );
+    }
+
     let listener = bind_control_socket(&socket_path)?;
 
     let runner = CommandRunner::new();

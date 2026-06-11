@@ -12,9 +12,12 @@
 //!   forwarded upstream agents (port Iterations 1–2).
 //! - [`upstream_path`]: resolve an upstream agent socket path around the macOS
 //!   TCC privacy prompt (state-dir symlink for Group Container sockets).
+//! - [`hardening`]: process-wide startup hardening — suppress core dumps so a
+//!   crash cannot leak in-memory secrets to disk (design §3 judgement 5a).
 
 pub mod authsock;
 pub mod handler;
+pub mod hardening;
 pub mod peer;
 pub mod server;
 pub mod upstream_path;
