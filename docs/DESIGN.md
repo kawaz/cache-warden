@@ -169,7 +169,7 @@ hard-ttl = "24h"
   secret from being persisted in config. Literal values are injected at runtime via
   `cache-warden kv set --value-stdin`.
 
-### authsock Adapter (SSH agent socket, port plan Iteration 1)
+### authsock Adapter (SSH agent socket, port plan Iterations 1–2)
 
 cache-warden listens on the SSH agent sockets declared in config and answers an SSH client's
 signing requests with private-key PEMs cached in the KV core. To a client whose `SSH_AUTH_SOCK`
@@ -183,7 +183,8 @@ hard-ttl = "24h"
 
 [authsock.sockets.default]
 path = "~/.ssh/cache-warden.sock"            # agent socket (leading ~/ is expanded)
-keys = ["GITHUB_KEY"]                        # core KV key names this socket can sign with
+keys = ["GITHUB_KEY"]                        # KV key names this socket signs with locally
+upstreams = ["~/.1password/agent.sock"]      # upstream agents to merge keys from / forward to (optional)
 ```
 
 - **cache-warden creates the socket**: one listener task per `[authsock.sockets.NAME]` (DR-0008,
@@ -198,15 +199,26 @@ keys = ["GITHUB_KEY"]                        # core KV key names this socket can
   command source on hard expiry; the peer pid → ancestry chain is passed as the requester). The PEM is
   borrowed via `expose_secret()` only for the in-process signing call, and **a successful sign calls
   extend to refresh the idle window** (a frequently-used key stays alive without re-auth, DR-0011).
+- **Upstream agent forwarding (Iteration 2)**: a socket may list `upstreams` — other agent sockets
+  (the 1Password agent, a system ssh-agent, ...) whose private material we cannot hold, so signing is
+  **forwarded**. REQUEST_IDENTITIES merges the KV keys with each upstream's keys and de-duplicates by
+  blob with **local keys winning**; a down upstream is skipped (one-line stderr warning) and the rest
+  still answer (graceful degradation). A SIGN_REQUEST for a KV key is signed locally; for an upstream
+  key it is forwarded to the upstream that advertised that blob during enumeration (falling back to
+  trying every upstream in order). Upstream connections are opened per request (no pooling — the
+  1Password agent socket is volatile, and the cost is negligible against signing / TouchID latency).
+  On macOS, a 1Password agent socket under Group Containers is reached via a stable state-dir symlink
+  to avoid a TCC prompt (not needed on Linux; cfg-gated).
 - **Failures leak nothing**: an unknown key, denied re-auth, hard-expired static key, malformed
-  request, or signing error all return `SSH_AGENT_FAILURE` (empty payload). No error detail reaches
-  the agent protocol.
-- **Isolation**: the connection handler runs on the blocking pool just like the control socket (a
-  re-auth command can block on a prompt for minutes and must not pin an async worker).
+  request, signing error, or all-upstreams-failed all return `SSH_AGENT_FAILURE` (empty payload). No
+  error detail reaches the agent protocol.
+- **Isolation**: the local-sign handler runs on the blocking pool just like the control socket (a
+  re-auth command can block on a prompt for minutes and must not pin an async worker); upstream I/O is
+  async (non-blocking sockets) on the runtime.
 
-> The current state (Iteration 1) covers signing with a single static / command-preloaded key.
-> Upstream agent forwarding, key filters, op key discovery, and the three-layer policy are later
-> iterations (port plan §2).
+> The current state (Iterations 1–2) covers signing with static / command-preloaded KV keys plus
+> merging keys from / forwarding signatures to upstream agents. Key filters, op key discovery, and the
+> three-layer policy are later iterations (port plan §2).
 
 ### Workspace Structure (DR-0002)
 

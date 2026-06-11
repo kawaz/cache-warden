@@ -92,9 +92,15 @@ pub struct AuthsockSocketConfig {
     pub path: String,
     /// Core KV key names whose private-key PEMs this socket can sign with. Each
     /// is enumerated (public key) in REQUEST_IDENTITIES and looked up on a
-    /// matching SIGN_REQUEST.
+    /// matching SIGN_REQUEST. These are signed **locally** (the adapter holds
+    /// the PEM through the core).
     #[serde(default)]
     pub keys: Vec<String>,
+    /// Upstream agent socket paths (each a leading `~/` is expanded). Their keys
+    /// are merged into REQUEST_IDENTITIES and their SIGN_REQUESTs are
+    /// **forwarded** (we never hold the upstream's private material). Optional.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
 }
 
 /// One validated agent socket ready to bind.
@@ -104,8 +110,11 @@ pub struct AuthsockSocket {
     pub name: String,
     /// The resolved socket path (leading `~/` expanded).
     pub path: PathBuf,
-    /// Core KV key names this socket signs with.
+    /// Core KV key names this socket signs with locally.
     pub keys: Vec<String>,
+    /// Upstream agent socket paths (leading `~/` expanded) whose keys are merged
+    /// and whose signatures are forwarded.
+    pub upstreams: Vec<PathBuf>,
 }
 
 /// `[daemon]` section.
@@ -256,23 +265,25 @@ impl AuthsockSocketConfig {
     /// Validate this socket against the schema rules and produce an
     /// [`AuthsockSocket`].
     ///
-    /// Rejects an empty `path` and an empty `keys` list (a socket with no keys
-    /// would answer REQUEST_IDENTITIES with nothing and could never sign).
+    /// Rejects an empty `path`, and a socket with neither `keys` nor `upstreams`
+    /// (it would answer REQUEST_IDENTITIES with nothing and could never sign).
     fn validate(&self, name: &str) -> Result<AuthsockSocket, ConfigError> {
         if self.path.trim().is_empty() {
             return Err(ConfigError::new(format!(
                 "[authsock.sockets.{name}]: `path` must not be empty"
             )));
         }
-        if self.keys.is_empty() {
+        if self.keys.is_empty() && self.upstreams.is_empty() {
             return Err(ConfigError::new(format!(
-                "[authsock.sockets.{name}]: `keys` must list at least one KV key name"
+                "[authsock.sockets.{name}]: needs at least one of `keys` (local KV keys) or \
+                 `upstreams` (forwarded agent sockets)"
             )));
         }
         Ok(AuthsockSocket {
             name: name.to_string(),
             path: expand_tilde(&self.path),
             keys: self.keys.clone(),
+            upstreams: self.upstreams.iter().map(|p| expand_tilde(p)).collect(),
         })
     }
 }
@@ -775,7 +786,7 @@ keys = ["K"]
     }
 
     #[test]
-    fn authsock_socket_with_empty_keys_is_rejected() {
+    fn authsock_socket_with_empty_keys_and_no_upstreams_is_rejected() {
         let err = Config::parse(
             r#"[authsock.sockets.s]
 path = "/tmp/s.sock"
@@ -784,9 +795,66 @@ keys = []
         )
         .unwrap_err();
         match err {
-            ConfigParseError::Content(e) => assert!(e.message.contains("at least one KV key")),
+            ConfigParseError::Content(e) => {
+                assert!(e.message.contains("`keys`") && e.message.contains("`upstreams`"))
+            }
             other => panic!("expected content error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn authsock_socket_upstreams_are_read_and_tilde_expanded() {
+        let cfg = Config::parse(
+            r#"[authsock.sockets.default]
+path = "/tmp/cache-warden.sock"
+keys = ["GITHUB_KEY"]
+upstreams = ["~/.1password/agent.sock", "/tmp/other.sock"]
+"#,
+        )
+        .unwrap();
+        // SAFETY: single-threaded test.
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+        let socks = cfg.authsock_sockets();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert_eq!(
+            socks[0].upstreams,
+            vec![
+                PathBuf::from("/home/tester/.1password/agent.sock"),
+                PathBuf::from("/tmp/other.sock"),
+            ]
+        );
+    }
+
+    #[test]
+    fn authsock_socket_with_only_upstreams_is_allowed() {
+        // An upstream-only socket (no local KV keys) is valid: it just forwards.
+        let cfg = Config::parse(
+            r#"[authsock.sockets.proxy]
+path = "/tmp/p.sock"
+upstreams = ["/tmp/agent.sock"]
+"#,
+        )
+        .unwrap();
+        let socks = cfg.authsock_sockets();
+        assert_eq!(socks.len(), 1);
+        assert!(socks[0].keys.is_empty());
+        assert_eq!(socks[0].upstreams, vec![PathBuf::from("/tmp/agent.sock")]);
+    }
+
+    #[test]
+    fn authsock_socket_omitting_upstreams_defaults_to_empty() {
+        let cfg = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+keys = ["K"]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.authsock_sockets()[0].upstreams.is_empty());
     }
 
     #[test]

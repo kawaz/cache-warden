@@ -290,13 +290,56 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
   - **brief から変えた点**: なし（milestone 通り）。RSA は signer に移植済みだが、Ed25519 鍵で E2E を
     回し署名パスを実証（RSA も単体テストで検証済み）。
 
-### Iteration 2: upstream proxy member（agent 転送）
+### Iteration 2: upstream proxy member（agent 転送）✅ 完了（2026-06-11）
 
-- スコープ: `agent/upstream.rs` 移植。source の `agent:` member を upstream に転送。
+- スコープ: `agent/upstream.rs` 移植。socket の `upstreams` を upstream に転送。
   REQUEST_IDENTITIES で upstream の鍵も集約、SIGN を upstream にルーティング（warden_proxy の
   `SigningBackend::Agent` 経路）。
 - 依存: Iteration 1。
 - 検証: 1Password agent socket を upstream に指定し、その鍵で署名が通る（warden と挙動突き合わせ）。
+- 実績（2026-06-11）:
+  - **upstream 移植**（`cache-warden-authsock/src/upstream.rs`）: warden の `agent/upstream.rs` を移植。
+    `Upstream::new(path)` / `connect()`（connect timeout 10s）/ `UpstreamConnection::send_receive()`
+    （request timeout 30s、`AgentCodec` の write→read）。**warden 固有を削った点**: `from_env()`
+    （`SSH_AUTH_SOCK` 起点の生成、cache-warden は config の `upstreams` 配列で明示指定するので不要）、
+    `socket_path()` 以外の `stream_mut()` / `into_stream()`（warden の basic proxy 用、cache-warden は
+    一発 send_receive のみで未使用）。エラー型は warden の巨大共通 Error から `Error::Upstream(String)`
+    1 バリアントへ縮小（接続失敗で全体を壊さず該当 upstream のみスキップする graceful degradation の
+    キャリア）。**防御維持**: upstream 応答も `AgentCodec` の size 上限 / framing / identity count 上限
+    チェックを通る（upstream を信頼しない）。`tracing` は外し cache-warden 流。
+  - **config 拡張**（`[authsock.sockets.NAME].upstreams`）: `~/` 展開付き path 配列、省略可。
+    `keys` か `upstreams` のどちらかがあれば valid（upstream-only socket = 純フォワード を許可）。両方空は
+    拒否。`deny_unknown_fields`。
+  - **daemon 統合**（`cache-warden-cli/src/daemon/authsock.rs`）: `SocketState.upstreams: Vec<Upstream>`。
+    接続ごとに `UpstreamRoutes`（blob→upstream index）を保持。
+    - **REQUEST_IDENTITIES**: KV registry の identities を先に積み、各 upstream の identities を async で
+      取得してマージ。`seen`（HashSet）で重複 blob を dedup（**KV 優先** = local が勝つ）。upstream が
+      落ちていればスキップ + stderr 1 行警告（残りで応答）。non-IdentitiesAnswer 応答は「鍵なし」として
+      寛容に扱う（warden 踏襲）。生き残った upstream blob を `routes` に記録。
+    - **SIGN_REQUEST**: ① registry にあれば従来のローカル署名（`spawn_blocking` で認証ゲート経由、
+      Iteration 1 経路）。② upstream 未設定なら FAILURE。③ `routes` に記録があればその upstream へ転送。
+      ④ 記録が無い/stale なら全 upstream を順次試行（warden の fallback、列挙せず署名するクライアント用）。
+      全滅で FAILURE。転送は `forward_sign`（接続失敗・非 SIGN_RESPONSE 応答は `None` で次へ）。
+    - **async/blocking 分離**: upstream I/O は async（non-blocking socket）でランタイム上、KV ローカル署名
+      （TouchID で分単位ブロックしうる）は従来通り `spawn_blocking`。
+  - **接続都度（キャッシュなし）の理由**: warden 同様、upstream は REQUEST_IDENTITIES / SIGN_REQUEST
+    ごとに `connect()`。1Password agent はロック/再起動で socket が揮発し、コネクションをキャッシュすると
+    使用ごとに half-open 検出・復旧が要る。接続都度なら署名/TouchID レイテンシに対し無視できるコストで
+    その複雑さを回避（`upstream.rs` の doc + DESIGN に明記）。
+  - **macOS TCC 回避**（`cache-warden-cli/src/daemon/upstream_path.rs`）: upstream path が
+    `Library/Group Containers/` 配下なら state dir（`$XDG_STATE_HOME/cache-warden/upstreams/`）に
+    安定 symlink を張って経由（launchd 下で TCC ダイアログを避ける、warden の `onepassword_agent_socket`
+    知見をそのまま取込）。Linux/その他は path をそのまま（cfg 分岐）。best-effort（symlink 失敗時は
+    元 path で直接接続を試みる）。
+  - **検証**: 単体（upstream 5 件: new / 接続失敗 = Upstream エラー / fake agent 応答 / closed = エラー、
+    daemon 7 件: 未対応 type / merge / dedup local 優先 / upstream down 時 degradation / 列挙後の転送 /
+    列挙なし fallback / local 鍵は upstream 併存でもローカル署名 / unknown blob FAILURE、upstream_path 2–3
+    件: 非 Group-Container は verbatim / macOS symlink redirect）+ E2E（`authsock_e2e.rs` に 3 件追加:
+    fake upstream agent を立て、`ssh-add -l` で KV+upstream 鍵がマージ列挙 / upstream 鍵への SIGN が転送
+    されて upstream の sentinel 署名が返る / upstream 停止時に KV 鍵だけで列挙+ローカル署名 verify）。
+    `just ci` 全通過、既存テスト回帰なし。
+  - **brief から変えた点**: なし（milestone 通り）。新 DR 不要（KeySource 2 軸の agent proxy 経路の
+    具体化で、DR-0004 判断 8 / 本 plan の範囲内。設計判断の追加なし）。
 
 ### Iteration 3: 鍵フィルタ
 

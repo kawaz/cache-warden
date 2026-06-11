@@ -22,10 +22,11 @@ ssh-encoding = "0.2"
 # Local error enum for this crate. The core library stays std-only; the adapter
 # may take an ergonomic error dependency.
 thiserror = "2"
-# Async framing of agent messages over a connection. Only the `io-util` traits
-# (AsyncRead / AsyncWrite) are needed here; the listener wiring (net / runtime)
-# lives on the CLI side (DR-0008).
-tokio = { version = "1", features = ["io-util"] }
+# Async framing of agent messages over a connection (`io-util`), plus the
+# upstream-agent client: `net` for `UnixStream::connect` and `time` for the
+# connect / request timeouts. The *listener* wiring (accept loop, runtime) still
+# lives on the CLI side (DR-0008); only the upstream *client* side is here.
+tokio = { version = "1", features = ["io-util", "net", "time"] }
 
 # --- Signer (local 1Password-style signing; ported from authsock-warden) ---
 # Native signing-crate types kept end-to-end to avoid lossy intermediate
@@ -49,7 +50,8 @@ base64 = "0.22"
 zeroize = "1"
 
 [dev-dependencies]
-# Drive the async codec tests (in-memory cursors + #[tokio::test]).
-tokio = { version = "1", features = ["rt", "io-util", "macros"] }
+# Drive the async codec / upstream tests (in-memory cursors + fake agent socket
+# via `net`; #[tokio::test] needs `rt` + `macros`).
+tokio = { version = "1", features = ["rt", "io-util", "macros", "net"] }
 # Build canonical wire vectors in integration tests.
 bytes = "1"

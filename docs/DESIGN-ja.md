@@ -177,7 +177,7 @@ hard-ttl = "24h"
   書くと設定エラー（平文秘密値が config に残る漏洩を構造的に防ぐ）。リテラル値は実行時に
   `cache-warden kv set --value-stdin` で投入する。
 
-### authsock アダプタ（SSH agent socket、port plan Iteration 1）
+### authsock アダプタ（SSH agent socket、port plan Iteration 1–2）
 
 cache-warden は config で宣言した SSH agent socket を自ら listen し、KV にキャッシュした
 秘密鍵 PEM で SSH クライアントの署名要求に応える。`SSH_AUTH_SOCK` をこの socket に向けた
@@ -191,7 +191,8 @@ hard-ttl = "24h"
 
 [authsock.sockets.default]
 path = "~/.ssh/cache-warden.sock"            # agent socket（leading ~/ 展開）
-keys = ["GITHUB_KEY"]                        # この socket が署名に使う KV キー名のリスト
+keys = ["GITHUB_KEY"]                        # ローカル署名する KV キー名のリスト
+upstreams = ["~/.1password/agent.sock"]      # 鍵をマージし署名を転送する上流 agent（省略可）
 ```
 
 - **socket は cache-warden が作る**: `[authsock.sockets.NAME]` ごとに listener task を 1 本
@@ -206,13 +207,23 @@ keys = ["GITHUB_KEY"]                        # この socket が署名に使う 
   再生成、peer pid → 祖先チェーンを requester として渡す）。取得した PEM を `expose_secret()` で
   短命に借りてプロセス内で署名し、**成功時は extend で idle 延命**する（使い続ける鍵は再認証なしで
   生き続ける、DR-0011）。
-- **失敗は何も漏らさない**: 未知鍵 / 認証拒否 / hard 切れ static / 不正要求 / 署名失敗はすべて
-  `SSH_AGENT_FAILURE`（payload 空）。エラー詳細を agent protocol に出さない。
-- **隔離**: 接続ハンドラは control socket と同じく `spawn_blocking` で隔離する（再認証コマンドは
-  プロンプト待ちで分単位ブロックし得るため、async ワーカーを占有させない）。
+- **upstream agent の転送（Iteration 2）**: socket は `upstreams` に別の agent socket（1Password
+  agent、システム ssh-agent 等）を列挙できる。その鍵は秘密素材を持てないので**署名を転送**する。
+  REQUEST_IDENTITIES は KV 鍵 + 各 upstream の鍵をマージして応答し、blob 重複は **KV 優先**で dedup。
+  落ちている upstream はスキップして残りで応答する（stderr に 1 行警告 = graceful degradation）。
+  SIGN_REQUEST は、KV 鍵ならローカル署名、upstream 鍵なら「列挙時にその blob を出した upstream」へ転送
+  （記録が無ければ全 upstream を順次試行）。upstream 接続は要求ごとに張る（揮発する 1Password agent
+  socket のキャッシュ複雑化を避ける、コストは署名/TouchID レイテンシに対し無視できる）。macOS では
+  Group Containers 配下の 1Password agent socket を state dir の安定 symlink 経由にして TCC ダイアログを
+  回避する（Linux では不要、cfg 分岐）。
+- **失敗は何も漏らさない**: 未知鍵 / 認証拒否 / hard 切れ static / 不正要求 / 署名失敗 / 全 upstream 失敗は
+  すべて `SSH_AGENT_FAILURE`（payload 空）。エラー詳細を agent protocol に出さない。
+- **隔離**: KV ローカル署名のハンドラは control socket と同じく `spawn_blocking` で隔離する（再認証
+  コマンドはプロンプト待ちで分単位ブロックし得るため、async ワーカーを占有させない）。upstream への
+  I/O は async（non-blocking socket）でランタイム上。
 
-> 現状（Iteration 1）は static / command プリロードの鍵 1 本での署名まで。upstream agent への
-> 転送、鍵フィルタ、op 鍵発見、3 層ポリシーは後続 iteration（port plan §2）。
+> 現状（Iteration 1–2）は static / command プリロードの鍵によるローカル署名 + upstream agent への
+> 鍵マージ・署名転送まで。鍵フィルタ、op 鍵発見、3 層ポリシーは後続 iteration（port plan §2）。
 
 ### Workspace 構成（DR-0002）
 

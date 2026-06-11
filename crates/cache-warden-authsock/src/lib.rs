@@ -25,15 +25,20 @@
 //!   producing an SSH wire signature blob.
 //! - [`PublicKeyRegistry`]: value-free map from a wire public-key blob to the
 //!   core KV key holding the private PEM (the REQUEST_IDENTITIES source).
+//! - [`Upstream`]: a connection to another agent socket whose keys are merged in
+//!   and whose signatures are forwarded (the agent-proxy KeySource, DR-0004
+//!   decision 8 / port plan Iteration 2).
 
 mod codec;
 mod error;
 mod message;
 mod registry;
 mod signer;
+mod upstream;
 
 pub use codec::AgentCodec;
 pub use error::{Error, Result};
 pub use message::{AgentMessage, Identity, MessageType, SignRequestFields};
 pub use registry::{PublicKeyRegistry, RegisteredKey};
 pub use signer::sign;
+pub use upstream::{Upstream, UpstreamConnection};

@@ -125,6 +125,23 @@ pub(crate) struct Shared {
     pid: u32,
 }
 
+#[cfg(test)]
+impl Shared {
+    /// Build a `Shared` directly for tests (no config / socket binding), using
+    /// the production [`CommandRunner`]. The authsock unit tests use this to
+    /// exercise the local-sign path against a real core.
+    pub(crate) fn new_for_test(store: Store, auth: Auth, clock: SystemClock) -> Self {
+        Self {
+            store: Mutex::new(store),
+            runner: CommandRunner::new(),
+            auth,
+            clock,
+            socket_path: String::new(),
+            pid: std::process::id(),
+        }
+    }
+}
+
 /// Run the daemon in the foreground until SIGINT / SIGTERM, using `config`.
 ///
 /// Binds `socket_path`, preloads the config's `[kv.*]` command entries, serves

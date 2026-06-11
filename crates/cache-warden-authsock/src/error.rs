@@ -23,6 +23,12 @@ pub enum Error {
     /// embeds key material) so it is safe to surface in logs.
     #[error("Key store error: {0}")]
     KeyStore(String),
+
+    /// An upstream agent could not be reached or misbehaved (connect / request
+    /// timeout, peer closed, unexpected response). The caller skips that
+    /// upstream and keeps serving the rest (graceful degradation, Iteration 2).
+    #[error("Upstream agent error: {0}")]
+    Upstream(String),
 }
 
 /// Result type alias using this crate's [`Error`].
