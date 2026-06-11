@@ -75,7 +75,10 @@ mod tests {
 
     #[test]
     fn request_roundtrips_through_line_codec() {
-        let req = Request::KvGet { key: "K".into() };
+        let req = Request::KvGet {
+            key: "K".into(),
+            dry_run: false,
+        };
         let line = encode_request(&req).unwrap();
         assert_eq!(decode_request(&line).unwrap(), req);
     }

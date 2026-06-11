@@ -43,6 +43,12 @@ cache-warden kv get DB_PASSWORD
 
 # static source: cache a value provided inline
 cache-warden kv set TEMP_CERT --value "$(cat cert.pem)" --soft-ttl 8h
+
+# run: resolve cache-warden://KEY references in the env to real values and exec the child command
+DB_PASSWORD='cache-warden://DB_PASSWORD' cache-warden run -- ./migrate
+
+# inject: expand references in a template to real values (--dry-run verifies only the wiring, emits no value)
+cache-warden inject --in config.tmpl --out config.toml
 ```
 
 > The CLI syntax above is illustrative for explaining the domain and is not the formal subcommand specification
@@ -115,7 +121,9 @@ The management CLI ↔ daemon protocol. Full details and alternatives are in
   value-sourced key only and does not run the upstream; exact-match no-op / mismatch `bad_request`; DR-0014) /
   `kv.set` (**static only** = `value_b64`, soft/hard TTL seconds) /
   `kv.get` (when the value is absent or HardExpired, generates lazily if a definition exists; soft-expired extends
-  via re-auth, hard-expired regenerable entries regenerate) /
+  via re-auth, hard-expired regenerable entries regenerate; with `dry_run: true` it completes the normal retrieval
+  path — lazy generation / extend / regenerate / auth — but the response **omits** `value_b64`, returning only
+  success/failure and state, so the value never leaves the daemon; DR-0015) /
   `kv.del` (drops only the value, keeping the definition = regenerated on the next get; `with_define: true` deletes
   the definition too) / `kv.list` (also lists definition-only keys) /
   `kv.pin` (key + duration seconds: suppress expiry until the deadline, re-auth required; DR-0011) /
@@ -130,7 +138,11 @@ The management CLI ↔ daemon protocol. Full details and alternatives are in
   authenticator lands in a later iteration (slotting in beside it behind the same `Authenticator` trait).
 
 The CLI subcommand layout v1: `daemon run` / `ping` / `status` /
-`kv define|set|get|del|list|pin|unpin` / `config show|path|edit` (no-args shows help; long options).
+`kv define|set|get|del|list|pin|unpin` / `run` / `inject` / `config show|path|edit` (no-args shows help; long options).
+The three verbs `kv get` / `run` / `inject` carry `--dry-run` / `--reveal` (default is the real value, reveal;
+`--dry-run` verifies the wiring with masked values and emits no value; the polarity is switchable via config /
+environment variable, DR-0015; `run` / `inject` are detailed in the "Secret reference injection (run / inject /
+dry-run)" section).
 `kv define KEY (--command ARGV... | --source URI) [--soft-ttl D] [--hard-ttl D]` registers a value-sourced key's
 definition (the upstream is not run — deferred to the first get; idempotent = exact-match no-op / mismatch error).
 `--source URI` is sugar that expands an op:// URI to `["op","read","<URI>"]` (anything other than op:// is an error).
@@ -147,8 +159,10 @@ next get); `kv del KEY --with-define` deletes the definition too.
 - **`status` contrast**: top-level `status` lists the cache entries (user-facing, value-free); the future
   `daemon status` will report process/service-registration state (operations-facing). Same word, different
   concern, so they are split.
-- **Future `run`**: the freed top-level `run` is reserved for an op-run equivalent (inject secret values
-  into the environment and exec a child command); see "Future Considerations".
+- **Top-level `run` / `inject`**: the top-level `run` is the op-run equivalent (inject secret values
+  into the environment and exec a child command); `inject` is the op-inject equivalent (expand
+  `cache-warden://KEY` references in a template to real values). Both are implemented as control socket
+  clients (see the "Secret reference injection (run / inject / dry-run)" section, DR-0013 / DR-0015).
 
 ### Configuration (TOML config + re-auth command, DR-0010)
 
@@ -160,6 +174,9 @@ when no config is present. Search order (highest priority first): `$CACHE_WARDEN
 ```toml
 [daemon]
 socket = "~/.local/state/cache-warden/control.sock"  # CLI --socket > [daemon].socket > default
+
+[cli]
+default-mode = "reveal"               # "reveal" (default, real value) | "dry-run" (masked verification). DR-0015
 
 [auth]
 command = ["/path/to/reauth-prompt"]  # omitted => AllowAll (no re-auth)
@@ -191,6 +208,11 @@ preload = true
   literal value (`value`, etc.) is a configuration error — this structurally prevents a plaintext
   secret from being persisted in config. Literal values are injected at runtime via
   `cache-warden kv set --value-stdin`.
+- **`[cli].default-mode` (DR-0015)**: selects the default polarity of `kv get` / `run` / `inject`
+  between `"reveal"` (real value, default) and `"dry-run"` (masked verification). Precedence is
+  `--reveal` / `--dry-run` flags > the `CACHE_WARDEN_DRY_RUN` environment variable (`=1` means dry-run)
+  > `[cli].default-mode` > the built-in default (reveal). Setting `CACHE_WARDEN_DRY_RUN=1` only in an AI
+  agent's environment achieves "agents default to dry-run, humans stay as-is" with one mechanism.
 
 ### authsock Adapter (SSH agent socket, port plan Iterations 1–4)
 
@@ -293,6 +315,49 @@ allowed_processes = ["ssh"]                  # processes allowed to use this soc
 > discovery, and per-socket process access control (`allowed_processes`). Per-key `allowed_processes`
 > (the key layer) is a later iteration (port plan §2).
 
+### Secret reference injection (`run` / `inject` / dry-run, DR-0013 / DR-0015)
+
+Two verbs that make the CLI the primary path for handing multiple secret values to a child process or a
+config file at once. Both are independent of the authsock adapter / auth core and are self-contained as
+control socket clients (`kv.get`).
+
+- **Reference syntax**: `cache-warden://KEY` (a single scheme, no aliases). A referenceable KEY matches
+  `[A-Za-z0-9_][A-Za-z0-9_.-]*` (every env-variable-style name fits). Resolution is single-pass — a
+  reference appearing inside an already-resolved value is **not expanded recursively** (structurally
+  ruling out expansion blow-ups and secondary expansion). Repeated references to the same KEY are
+  deduplicated to a single resolution (no repeated TouchID prompts). Production is **fail-closed** (if
+  even one reference fails to resolve, no child process is started and no output is produced, exiting
+  non-zero).
+- **`run` — env injection + exec**: `run [--env NAME=VALUE]... [--defs FILE]... [--dry-run|--reveal] -- CMD [ARGS...]`.
+  Among the inherited env and `--env` entries, only those **whose value equals** `cache-warden://KEY`
+  as a whole are resolved and substituted (the same whole-value rule as op run; partial substitution is
+  `inject`'s job). **argv is not an injection surface**: a child's argv is visible to other users via
+  `ps` / `/proc/PID/cmdline`, so substituting into argv would be a structural leak. A reference-looking
+  string among ARGS is passed verbatim after a one-line stderr warning (so a legitimate use where the
+  child resolves it itself is not broken). After resolution, `exec` replaces the process image, leaving
+  no parent lingering with resolved secrets (exec failure: not found = 127 / not executable = 126).
+- **`inject` — template substitution**: `inject [--in FILE] [--out FILE] [--defs FILE]... [--dry-run|--reveal]`.
+  Defaults to stdin → stdout. Substitutes every reference in the template **as a substring** with the real
+  value, processed as bytes (binary-safe). Output is written only after all references resolve (no partial
+  output left behind). `--out FILE` is **created 0600** (umask-independent; never births a secret-bearing
+  file readable by group/others).
+- **`--defs FILE` (DR-0014 integration)**: reads the definitions used for reference resolution from a file
+  (the same defs-file format as `kv define --defs`, no auto-discovery).
+- **dry-run (DR-0015)**: common to all three verbs `kv get` / `run` / `inject`. The default is the real
+  value (reveal); `--dry-run` **verifies only the wiring full-chain and emits no value**. It does not
+  compromise on verification depth: it runs the upstream of unloaded definitions, extends a SoftExpired
+  entry, regenerates a HardExpired one, and passes the auth gate (TouchID) just as production does (so
+  "dry-run OK = production passes"; it **has side effects** = the cache warms up). The **value never leaves
+  the daemon**: masking is not the client hiding a received value — the value-free `kv.get {dry_run}`
+  response means the value never reaches the client. The mask form is `<cache-warden:KEY:masked>` on
+  success / `<cache-warden:KEY:failed>` on failure (unmistakable for a real secret, only the key name is
+  legible). dry-run does not stop early — it **evaluates every reference** and then, if any failed, exits
+  non-zero with a stderr summary. Polarity switching (`[cli].default-mode` / `CACHE_WARDEN_DRY_RUN`) is in
+  the Configuration section.
+
+The whole implementation is confined to the `cache-warden-cli` crate (no core / authsock crate changes,
+DR-0002). Inline define on references (`cache-warden://KEY?argv=...`) is unimplemented in v1 (DR-0014).
+
 ### Workspace Structure (DR-0002)
 
 | Crate | Role | Dependencies | Publish |
@@ -366,14 +431,6 @@ See DR-0004 for the core/adapter assignment of assets being ported.
   to interact with the KV programmatically into a single Unix domain socket protocol (DR-0008; design is the next step).
 - **Native TouchID**: cache-warden itself issues re-authentication via LocalAuthentication, without relying on an upstream (op). Can also be repurposed as a gate for SSH key signing.
 - **Additional adapters**: Adapters for secret value protocols beyond SSH / KV.
-- **Top-level `run` (op-run equivalent)**: Moving daemon startup to `daemon run` frees the top-level `run`
-  to inject secret values into the environment and exec a child command (`cache-warden run -- cmd`).
-  Together with `cache-warden://KEY` reference substitution (`inject`), it is implemented as a control
-  socket client. The design is settled in
-  [DR-0013](./decisions/DR-0013-secret-reference-injection.md) (reference syntax / env is whole-value
-  only with no argv substitution / exec after resolution / `inject` does substring substitution).
-  Implementation has not started yet.
-
 - **KV definition model (`kv define` / definition layers / definition persistence)**: Split verb
   responsibilities into define (registers the definition only; execution is lazy) / set (static only) /
   get (read only), with a definition registry held separately from the value store. The design is settled
@@ -382,7 +439,10 @@ See DR-0004 for the core/adapter assignment of assets being ported.
   `kv get` / `kv del --with-define` / `[kv.*]` lazy-by-default + `preload` opt-in (authsock-referenced keys
   are auto-eager) / defs files (`kv define --defs FILE`, no auto-discovery) / opt-in persistence of online
   definitions (`[daemon].persist-definitions`; values are never written; startup merges config-wins with a
-  normalizing re-write). **Not started**: inline define on references (`cache-warden://KEY?argv=...`).
+  normalizing re-write). Secret reference injection (`run` / `inject`, DR-0013) and the dry-run verification
+  mode (the three verbs' `--dry-run` / `--reveal`, `[cli].default-mode`, `CACHE_WARDEN_DRY_RUN`,
+  `kv.get {dry_run}`, DR-0015) are also implemented (see the "Secret reference injection (run / inject /
+  dry-run)" section). **Not started**: inline define on references (`cache-warden://KEY?argv=...`).
 
 - **OTP value type (`--type otp`)**: Cache the TOTP seed and derive the 6-digit code daemon-side on
   every `kv get` / reference resolution. The seed is write-only (it never leaves the daemon).

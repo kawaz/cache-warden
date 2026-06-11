@@ -81,7 +81,7 @@ where
             soft_ttl_secs,
             hard_ttl_secs,
         } => handle_define(store, key, argv, soft_ttl_secs, hard_ttl_secs),
-        Request::KvGet { key } => handle_get(store, ctx, key),
+        Request::KvGet { key, dry_run } => handle_get(store, ctx, key, dry_run),
         Request::KvPin { key, duration_secs } => handle_pin(store, ctx, key, duration_secs),
         Request::KvUnpin { key } => {
             if store.unpin(&key) {
@@ -232,7 +232,20 @@ fn handle_define(
     }
 }
 
-fn handle_get<A, R, C>(store: &mut Store, ctx: &HandlerCtx<'_, A, R, C>, key: String) -> Response
+/// Handle `kv.get`, running the full retrieval chain (lazy generate / extend /
+/// regenerate / re-auth) exactly the same way for reveal and dry-run.
+///
+/// `dry_run` only changes the *shape of a success response*: the chain still
+/// runs to completion (DR-0015 §2 — "verification must not be shallow"), but the
+/// value is **not** carried back. Failures are reported identically in both
+/// modes. The value-free conversion happens in one place ([`finish_get`]) so a
+/// dry-run can never accidentally emit a value.
+fn handle_get<A, R, C>(
+    store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: String,
+    dry_run: bool,
+) -> Response
 where
     A: Authenticator + ?Sized,
     R: SourceRunner,
@@ -240,7 +253,7 @@ where
 {
     // Fast path: a live (Active) value.
     if let Some(secret) = store.get(&key, ctx.clock) {
-        return Response::get(encode_b64(secret.expose_secret()));
+        return finish_get(secret.expose_secret(), dry_run, "active");
     }
 
     // Not directly readable. Decide why and try to recover.
@@ -250,7 +263,7 @@ where
         // key truly does not exist (DR-0014 §1).
         None => {
             if store.is_defined(&key) {
-                lazy_generate(store, ctx, &key)
+                lazy_generate(store, ctx, &key, dry_run)
             } else {
                 Response::error(ErrorKind::NotFound, "no such key")
             }
@@ -263,7 +276,7 @@ where
         Some(EntryState::SoftExpired) => {
             match store.extend_authenticated(&key, ctx.auth, ctx.requester, ctx.clock) {
                 Ok(()) => match store.get(&key, ctx.clock) {
-                    Some(secret) => Response::get(encode_b64(secret.expose_secret())),
+                    Some(secret) => finish_get(secret.expose_secret(), dry_run, "active"),
                     None => Response::error(ErrorKind::Internal, "value gone after extend"),
                 },
                 Err(ExtendAuthOutcome::NotFound) => {
@@ -284,11 +297,11 @@ where
             // (it works even when the value entry's own source is static), so
             // prefer the definition path when one exists (DR-0014 §2).
             if store.is_defined(&key) {
-                return lazy_generate(store, ctx, &key);
+                return lazy_generate(store, ctx, &key, dry_run);
             }
             match store.regenerate(&key, ctx.runner, ctx.auth, ctx.requester, ctx.clock) {
                 Ok(()) => match store.get(&key, ctx.clock) {
-                    Some(secret) => Response::get(encode_b64(secret.expose_secret())),
+                    Some(secret) => finish_get(secret.expose_secret(), dry_run, "active"),
                     None => Response::error(ErrorKind::Internal, "value gone after regenerate"),
                 },
                 Err(RegenerateOutcome::NotFound) => {
@@ -313,6 +326,19 @@ where
     }
 }
 
+/// Build the success response for a resolved value, honoring `dry_run`.
+///
+/// In reveal mode the base64 value is returned. In dry-run mode the value is
+/// **discarded here** — only a value-free `get_verified` (state-only) response
+/// is produced, so the secret bytes never leave the daemon (DR-0015 §6).
+fn finish_get(value: &[u8], dry_run: bool, state: &str) -> Response {
+    if dry_run {
+        Response::get_verified(state)
+    } else {
+        Response::get(encode_b64(value))
+    }
+}
+
 /// Produce `key`'s value from its registered definition (DR-0014 lazy path).
 ///
 /// Runs the definition's command and re-authenticates inside
@@ -320,7 +346,12 @@ where
 /// to avoid double prompting), then returns the freshly produced value. A
 /// `ValueResident` outcome means the value became readable concurrently; fall
 /// back to a plain get.
-fn lazy_generate<A, R, C>(store: &mut Store, ctx: &HandlerCtx<'_, A, R, C>, key: &str) -> Response
+fn lazy_generate<A, R, C>(
+    store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: &str,
+    dry_run: bool,
+) -> Response
 where
     A: Authenticator + ?Sized,
     R: SourceRunner,
@@ -328,13 +359,13 @@ where
 {
     match store.get_or_regenerate(key, ctx.runner, ctx.auth, ctx.requester, ctx.clock) {
         Ok(()) => match store.get(key, ctx.clock) {
-            Some(secret) => Response::get(encode_b64(secret.expose_secret())),
+            Some(secret) => finish_get(secret.expose_secret(), dry_run, "active"),
             None => Response::error(ErrorKind::Internal, "value gone after lazy generation"),
         },
         Err(RegenerateDefOutcome::Undefined) => Response::error(ErrorKind::NotFound, "no such key"),
         // A usable value is resident after all; read it directly.
         Err(RegenerateDefOutcome::ValueResident) => match store.get(key, ctx.clock) {
-            Some(secret) => Response::get(encode_b64(secret.expose_secret())),
+            Some(secret) => finish_get(secret.expose_secret(), dry_run, "active"),
             None => Response::error(ErrorKind::Internal, "value resident but unreadable"),
         },
         Err(RegenerateDefOutcome::RunFailed(e)) => {
@@ -488,8 +519,96 @@ mod tests {
         let c = ctx(&AllowAll, &runner, &clock);
 
         assert!(handle_request(&mut store, &c, set_static(b"hunter2")).is_ok());
-        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         assert_eq!(get_value(&resp), b"hunter2");
+    }
+
+    fn dry_get(key: &str) -> Request {
+        Request::KvGet {
+            key: key.into(),
+            dry_run: true,
+        }
+    }
+
+    /// Assert a response is a value-free dry-run success (no value carried).
+    fn assert_verified(resp: &Response) {
+        match resp {
+            Response::Ok(ok) => match &ok.payload {
+                OkPayload::GetVerified { verified, .. } => assert!(*verified),
+                other => panic!("expected GetVerified, got {other:?}"),
+            },
+            Response::Err(e) => panic!("expected verified ok, got error: {e:?}"),
+        }
+        // And the serialized form must never carry a value field.
+        let line = serde_json::to_string(resp).unwrap();
+        assert!(
+            !line.contains("value_b64"),
+            "dry-run leaked a value: {line}"
+        );
+    }
+
+    #[test]
+    fn dry_run_get_static_value_returns_verified_without_value() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        assert!(handle_request(&mut store, &c, set_static(b"hunter2")).is_ok());
+        let resp = handle_request(&mut store, &c, dry_get("K"));
+        assert_verified(&resp);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !line.contains("hunter2"),
+            "dry-run leaked the value: {line}"
+        );
+    }
+
+    #[test]
+    fn dry_run_get_runs_full_lazy_chain() {
+        // DR-0015 §2: dry-run is NOT shallow — a definition-only key is lazily
+        // produced (the command runs) even though the value is not returned.
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"from-cmd");
+        let c = ctx(&AllowAll, &runner, &clock);
+        assert!(handle_request(&mut store, &c, define_cmd("K", &["echo", "x"])).is_ok());
+        assert_eq!(runner.runs(), 0);
+        let resp = handle_request(&mut store, &c, dry_get("K"));
+        assert_verified(&resp);
+        assert_eq!(
+            runner.runs(),
+            1,
+            "dry-run still runs the upstream (full chain)"
+        );
+    }
+
+    #[test]
+    fn dry_run_get_missing_key_is_not_found() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        let resp = handle_request(&mut store, &c, dry_get("ghost"));
+        assert_eq!(err_kind(&resp), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn dry_run_get_auth_failure_is_reported_like_reveal() {
+        // A dry-run still honors the auth gate (DR-0015 §2: TouchID effects).
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&DenyAll, &runner, &clock);
+        handle_request(&mut store, &c, define_cmd("K", &["echo", "x"]));
+        let resp = handle_request(&mut store, &c, dry_get("K"));
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
     }
 
     #[test]
@@ -503,6 +622,7 @@ mod tests {
             &c,
             Request::KvGet {
                 key: "ghost".into(),
+                dry_run: false,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::NotFound);
@@ -518,10 +638,24 @@ mod tests {
         let c = ctx(&AllowAll, &runner, &clock);
         assert!(handle_request(&mut store, &c, define_cmd("K", &["echo", "x"])).is_ok());
         assert_eq!(runner.runs(), 0, "define must not run the command");
-        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         assert_eq!(get_value(&resp), b"from-cmd");
         assert_eq!(runner.runs(), 1, "first get runs once (lazy)");
-        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         assert_eq!(get_value(&resp), b"from-cmd");
         assert_eq!(runner.runs(), 1, "second get is a cache hit");
     }
@@ -565,7 +699,14 @@ mod tests {
         let runner = CountingRunner::new(b"x");
         let c = ctx(&DenyAll, &runner, &clock);
         handle_request(&mut store, &c, define_cmd("K", &["echo", "x"]));
-        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
     }
 
@@ -617,7 +758,14 @@ mod tests {
         let c = ctx(&AllowAll, &runner, &clock);
         handle_request(&mut store, &c, set_static(b"v"));
         clock.advance(Duration::from_secs(15)); // soft-expired
-        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         assert_eq!(get_value(&resp), b"v", "AllowAll extends and returns value");
     }
 
@@ -629,7 +777,14 @@ mod tests {
         let c = ctx(&DenyAll, &runner, &clock);
         handle_request(&mut store, &c, set_static(b"v"));
         clock.advance(Duration::from_secs(15));
-        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
     }
 
@@ -645,12 +800,22 @@ mod tests {
             get_value(&handle_request(
                 &mut store,
                 &c,
-                Request::KvGet { key: "K".into() }
+                Request::KvGet {
+                    key: "K".into(),
+                    dry_run: false
+                }
             )),
             b"fresh"
         );
         clock.advance(Duration::from_secs(HARD)); // hard-expired
-        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         assert_eq!(get_value(&resp), b"fresh");
         assert_eq!(runner.runs(), 2, "first get ran once, regenerate ran once");
     }
@@ -663,7 +828,14 @@ mod tests {
         let c = ctx(&AllowAll, &runner, &clock);
         handle_request(&mut store, &c, set_static(b"v"));
         clock.advance(Duration::from_secs(HARD));
-        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         assert_eq!(err_kind(&resp), ErrorKind::NotRegenerable);
     }
 
@@ -681,14 +853,24 @@ mod tests {
             get_value(&handle_request(
                 &mut store,
                 &c_ok,
-                Request::KvGet { key: "K".into() }
+                Request::KvGet {
+                    key: "K".into(),
+                    dry_run: false
+                }
             )),
             b"v"
         );
         clock.advance(Duration::from_secs(HARD));
         let fail = FailingRunner;
         let c_fail = ctx(&AllowAll, &fail, &clock);
-        let resp = handle_request(&mut store, &c_fail, Request::KvGet { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c_fail,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         assert_eq!(err_kind(&resp), ErrorKind::UpstreamFailed);
     }
 
@@ -811,7 +993,14 @@ mod tests {
         let resp = handle_request(&mut store, &c, pin("K", 1000));
         assert!(resp.is_ok(), "pin ok: {resp:?}");
         clock.advance(Duration::from_secs(SOFT + 5));
-        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         assert_eq!(get_value(&resp), b"v", "pinned value gettable past soft");
     }
 

@@ -664,7 +664,14 @@ mod tests {
             hard_ttl_secs: None,
         };
         assert!(run_request(&s, None, set).is_ok());
-        let resp = run_request(&s, None, Request::KvGet { key: "K".into() });
+        let resp = run_request(
+            &s,
+            None,
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            },
+        );
         match resp {
             Response::Ok(ok) => match ok.payload {
                 OkPayload::Get { value_b64 } => assert_eq!(decode_b64(&value_b64).unwrap(), b"v"),

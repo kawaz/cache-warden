@@ -76,6 +76,11 @@ const ENVIRONMENT: &[Row] = &[
         desc: "Base dir for the default control socket path",
     },
     Row {
+        name: "CACHE_WARDEN_DRY_RUN",
+        desc: "Default to dry-run for kv get / run / inject when set\n\
+               (1/true/yes/on); a --reveal flag still overrides it",
+    },
+    Row {
         name: "EDITOR / VISUAL",
         desc: "Editor launched by `config edit`",
     },
@@ -220,6 +225,14 @@ pub fn top() -> HelpSpec {
             Row {
                 name: "kv unpin <KEY>",
                 desc: "Drop a pin, returning the value to normal TTL evaluation",
+            },
+            Row {
+                name: "run -- CMD ...",
+                desc: "Resolve env references then exec CMD (--dry-run to verify)",
+            },
+            Row {
+                name: "inject",
+                desc: "Substitute references in a template stream (--dry-run to verify)",
             },
             Row {
                 name: "config show",
@@ -402,10 +415,120 @@ pub fn kv_get() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " kv get"),
         summary: "Fetch a cached value (raw bytes to stdout).",
-        usage: concat!("cache-warden", " kv get <KEY>"),
+        usage: concat!("cache-warden", " kv get <KEY> [--dry-run | --reveal]"),
         subcommands: &[],
-        options: &[],
-        detail: "",
+        options: &[
+            Row {
+                name: "--dry-run",
+                desc: "Verify retrieval WITHOUT emitting the value: print a mask\n\
+                       (<cache-warden:KEY:masked>), running the full chain\n\
+                       (lazy generate / extend / regenerate / re-auth)",
+            },
+            Row {
+                name: "--reveal",
+                desc: "Force real-value output (use when the default has been\n\
+                       set to dry-run via config / CACHE_WARDEN_DRY_RUN)",
+            },
+        ],
+        detail: "\
+By default `kv get` REVEALS the real value (raw bytes to stdout). For a safe
+check, use --dry-run: it runs the full retrieval chain (and so has side
+effects — upstream execution, re-authentication / TouchID, cache warming) but
+returns only a mask, never the value. On failure --dry-run prints
+<cache-warden:KEY:failed> and exits non-zero.",
+        show_global: true,
+    }
+}
+
+/// Top-level `run` leaf page (DR-0013 / DR-0015).
+pub fn run_cmd() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " run"),
+        summary: "Resolve cache-warden://KEY env references, then exec a command.",
+        usage: concat!(
+            "cache-warden",
+            " run [--env NAME=VALUE]... [--defs FILE]... [--dry-run | --reveal] -- CMD [ARGS...]"
+        ),
+        subcommands: &[],
+        options: &[
+            Row {
+                name: "--env NAME=VALUE",
+                desc: "Add/override a child env var (repeatable). A value that is\n\
+                       exactly cache-warden://KEY is resolved; --env wins over\n\
+                       the inherited environment",
+            },
+            Row {
+                name: "--defs FILE",
+                desc: "Register a TOML defs file before resolving (repeatable)",
+            },
+            Row {
+                name: "--dry-run",
+                desc: "Verify WITHOUT real values: exec with MASKED env\n\
+                       (<cache-warden:KEY:masked>); non-zero exit if any ref fails",
+            },
+            Row {
+                name: "--reveal",
+                desc: "Force real values (use when the default has been set to\n\
+                       dry-run via config / CACHE_WARDEN_DRY_RUN)",
+            },
+        ],
+        detail: "\
+By default `run` REVEALS real values. For a safe check, use --dry-run: it runs
+the full retrieval chain — with side effects (upstream execution,
+re-authentication / TouchID, cache warming) — but injects only masks, never the
+value, and exits non-zero if any reference fails.
+
+Only env values that are ENTIRELY a reference are substituted (whole-value
+rule). argv is never an injection face: a reference-looking token after `--` is
+passed verbatim with a warning (use --env NAME=cache-warden://KEY). On success
+`run` execs the command (no parent lingers holding secrets).",
+        show_global: true,
+    }
+}
+
+/// Top-level `inject` leaf page (DR-0013 / DR-0015).
+pub fn inject_cmd() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " inject"),
+        summary: "Substitute cache-warden://KEY references in a template stream.",
+        usage: concat!(
+            "cache-warden",
+            " inject [--in FILE] [--out FILE] [--defs FILE]... [--dry-run | --reveal]"
+        ),
+        subcommands: &[],
+        options: &[
+            Row {
+                name: "--in FILE",
+                desc: "Read the template from FILE (default: stdin)",
+            },
+            Row {
+                name: "--out FILE",
+                desc: "Write the result to FILE, created 0600 (default: stdout)",
+            },
+            Row {
+                name: "--defs FILE",
+                desc: "Register a TOML defs file before resolving (repeatable)",
+            },
+            Row {
+                name: "--dry-run",
+                desc: "Verify WITHOUT real values: emit MASKS\n\
+                       (<cache-warden:KEY:masked>); non-zero exit if any ref fails",
+            },
+            Row {
+                name: "--reveal",
+                desc: "Force real values (use when the default has been set to\n\
+                       dry-run via config / CACHE_WARDEN_DRY_RUN)",
+            },
+        ],
+        detail: "\
+By default `inject` REVEALS real values. For a safe check, use --dry-run: it
+runs the full retrieval chain — with side effects (upstream execution,
+re-authentication / TouchID, cache warming) — but emits only masks, never the
+value, and exits non-zero if any reference fails.
+
+References are replaced as substrings (embedded composition is allowed, unlike
+`run`'s whole-value env rule). Processing is byte-oriented and binary safe. In
+reveal mode it is fail-closed: nothing is written if any reference fails.",
         show_global: true,
     }
 }

@@ -13,7 +13,9 @@ mod config;
 mod daemon;
 mod defs;
 mod help;
+mod mode;
 mod protocol;
+mod refs;
 
 use commands::client;
 use protocol::wire::{OkPayload, Response};
@@ -52,6 +54,12 @@ fn render_response(resp: Response) -> Result<(), String> {
                     std::io::stdout()
                         .write_all(&bytes)
                         .map_err(|e| e.to_string())?;
+                }
+                // A value-free dry-run get is dispatched by `dispatch_kv_get`,
+                // not this generic renderer; surface it defensively if it ever
+                // reaches here (e.g. a future caller wires it through).
+                OkPayload::GetVerified { state, .. } => {
+                    println!("verified ({state}); no value (dry-run)");
                 }
                 OkPayload::Status {
                     pid,
@@ -194,7 +202,9 @@ fn run() -> Result<(), CliError> {
         "config" => dispatch_config(&rest, &loaded),
         "ping" => Ok(run_client(&socket, &protocol::wire::Request::Ping)?),
         "status" => Ok(run_client(&socket, &protocol::wire::Request::Status)?),
-        "kv" => dispatch_kv(&rest, &socket),
+        "kv" => dispatch_kv(&rest, &socket, &loaded.config),
+        "run" => dispatch_run(&rest, &socket, &loaded.config),
+        "inject" => dispatch_inject(&rest, &socket, &loaded.config),
         "--help" | "--version" => unreachable!("handled above"),
         other => Err(CliError::Message(format!(
             "unknown command: {other} (try `{NAME} --help`)"
@@ -264,8 +274,26 @@ fn dispatch_config(rest: &[String], loaded: &config::LoadedConfig) -> Result<(),
     or_usage(commands::config_cmd::run(sub, tail, loaded), leaf_help)
 }
 
+/// Resolve the reveal/dry-run mode from CLI flags (`mode_flag`), the
+/// `CACHE_WARDEN_DRY_RUN` env var, and `[cli].default-mode` (DR-0015 §4).
+fn resolve_cli_mode(
+    mode_flag: Option<mode::ModeFlag>,
+    config: &config::Config,
+) -> Result<mode::Mode, String> {
+    let env = mode::env_dry_run_is_set()?;
+    Ok(mode::resolve_mode(
+        mode_flag,
+        env,
+        config.cli_default_mode(),
+    ))
+}
+
 /// Dispatch the `kv` group.
-fn dispatch_kv(rest: &[String], socket: &std::path::Path) -> Result<(), CliError> {
+fn dispatch_kv(
+    rest: &[String],
+    socket: &std::path::Path,
+    config: &config::Config,
+) -> Result<(), CliError> {
     if rest.is_empty() {
         println!("{}", help::kv().render());
         return Ok(());
@@ -306,6 +334,13 @@ fn dispatch_kv(rest: &[String], socket: &std::path::Path) -> Result<(), CliError
         };
     }
 
+    // `get` carries the reveal/dry-run polarity, so it is dispatched specially:
+    // it strips the mode flags, resolves the mode, and renders a masked output
+    // in dry-run (DR-0015).
+    if sub == "get" {
+        return dispatch_kv_get(kv_args, socket, config);
+    }
+
     let req = match sub {
         "set" => or_usage(
             commands::parse_kv_set(kv_args, || {
@@ -315,7 +350,6 @@ fn dispatch_kv(rest: &[String], socket: &std::path::Path) -> Result<(), CliError
             }),
             leaf_help,
         )?,
-        "get" => or_usage(commands::parse_kv_single_key("get", kv_args), leaf_help)?,
         "del" => or_usage(commands::parse_kv_del(kv_args), leaf_help)?,
         "unpin" => or_usage(commands::parse_kv_single_key("unpin", kv_args), leaf_help)?,
         "pin" => or_usage(commands::parse_kv_pin(kv_args), leaf_help)?,
@@ -391,6 +425,203 @@ fn run_define_defs(socket: &std::path::Path, files: &[PathBuf]) -> Result<(), Cl
         }
         Err(CliError::Message(msg))
     }
+}
+
+/// Dispatch `kv get <KEY> [--dry-run|--reveal]` (DR-0015).
+///
+/// In reveal mode the raw value is written to stdout (the existing behaviour).
+/// In dry-run mode the full retrieval chain runs on the daemon but no value is
+/// returned; the client prints the mask (`<cache-warden:KEY:masked>` on success,
+/// `<cache-warden:KEY:failed>` + non-zero exit on failure — DR-0015 §3).
+fn dispatch_kv_get(
+    kv_args: &[String],
+    socket: &std::path::Path,
+    config: &config::Config,
+) -> Result<(), CliError> {
+    let (mode_flag, rest) = or_usage(mode::take_mode_flag(kv_args), help::kv_get)?;
+    let mode = or_usage(resolve_cli_mode(mode_flag, config), help::kv_get)?;
+    let req = or_usage(commands::parse_kv_single_key("get", &rest), help::kv_get)?;
+    let key = match &req {
+        protocol::wire::Request::KvGet { key, .. } => key.clone(),
+        _ => unreachable!("parse_kv_single_key(\"get\") returns KvGet"),
+    };
+    let req = protocol::wire::Request::KvGet {
+        key: key.clone(),
+        dry_run: mode.is_dry_run(),
+    };
+
+    let resp = client::round_trip(socket, &req)?;
+    use protocol::wire::{OkPayload, Response};
+    match resp {
+        Response::Ok(ok) => match ok.payload {
+            OkPayload::Get { value_b64 } => {
+                let bytes = commands::decode_get_value(&value_b64)?;
+                use std::io::Write as _;
+                std::io::stdout()
+                    .write_all(&bytes)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            OkPayload::GetVerified { .. } => {
+                // dry-run success: print the masked value (key name only).
+                println!("{}", refs::mask(&key, true));
+                Ok(())
+            }
+            other => Err(CliError::Message(format!(
+                "unexpected response payload for kv get: {other:?}"
+            ))),
+        },
+        Response::Err(e) => {
+            // dry-run reports the failure as a masked `failed` token on stdout
+            // before exiting non-zero (DR-0015 §3); reveal just errors out.
+            if mode.is_dry_run() {
+                println!("{}", refs::mask(&key, false));
+            }
+            Err(CliError::Message(format!(
+                "{}: {}",
+                error_kind_str(&e.error.kind),
+                e.error.message
+            )))
+        }
+    }
+}
+
+/// Register every definition from one or more `--defs` files, returning a fatal
+/// error string if any file is unreadable / any definition conflicts. Shared by
+/// `run` / `inject` (the `kv define --defs` batch path uses [`run_define_defs`],
+/// which reports per-file success counts; here a failure is simply fatal because
+/// `run` / `inject` must not proceed with a half-applied definition set).
+fn register_defs(socket: &std::path::Path, files: &[std::path::PathBuf]) -> Result<(), String> {
+    use protocol::wire::{Request, Response};
+    for file in files {
+        let defs = defs::parse_defs_file(file)?;
+        for def in defs {
+            let req = Request::KvDefine {
+                key: def.name.clone(),
+                argv: def.command.clone(),
+                soft_ttl_secs: def.soft_ttl_secs,
+                hard_ttl_secs: def.hard_ttl_secs,
+            };
+            match client::round_trip(socket, &req)? {
+                Response::Ok(_) => {}
+                Response::Err(e) => {
+                    return Err(format!("{}: {}", def.name, e.error.message));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch `cache-warden run [...] -- CMD [ARGS...]` (DR-0013 / DR-0015).
+fn dispatch_run(
+    rest: &[String],
+    socket: &std::path::Path,
+    config: &config::Config,
+) -> Result<(), CliError> {
+    if help::wants_help(rest) {
+        println!("{}", help::run_cmd().render());
+        return Ok(());
+    }
+    let (mode_flag, rest) = or_usage(mode::take_mode_flag(rest), help::run_cmd)?;
+    let mode = or_usage(resolve_cli_mode(mode_flag, config), help::run_cmd)?;
+    let parsed = or_usage(commands::run_cmd::parse_run(&rest), help::run_cmd)?;
+
+    // Register any --defs before resolving (so a lazily-defined key exists).
+    register_defs(socket, &parsed.defs)?;
+
+    // Warn (once per token) that argv references are NOT injected (DR-0013).
+    for tok in commands::run_cmd::argv_reference_tokens(&parsed.command) {
+        eprintln!(
+            "{NAME}: warning: {tok:?} looks like a secret reference but argv is not an injection face (it is passed verbatim); use --env NAME=cache-warden://KEY instead"
+        );
+    }
+
+    let inherited: Vec<(String, String)> = std::env::vars().collect();
+    let mut resolver = client::SocketResolver::new(socket, mode);
+    let resolved = commands::run_cmd::resolve_env(&inherited, &parsed.envs, mode, &mut resolver)?;
+
+    // dry-run fail-closed-but-evaluated: if a reference failed, do not exec; exit
+    // non-zero after summarizing (DR-0015 §3). Reveal fail-closed already
+    // produced an Err above (no exec).
+    if mode.is_dry_run() && !resolved.failures.is_empty() {
+        return Err(CliError::Message(format!(
+            "dry-run: {} reference(s) failed to resolve: {}",
+            resolved.failures.len(),
+            resolved.failures.join(", ")
+        )));
+    }
+
+    exec_command(&parsed.command, &resolved.vars)
+}
+
+/// Replace the current process image with `command`, using `vars` as the entire
+/// environment (DR-0013: exec so no parent lingers holding secrets). Only
+/// returns on failure: not-found → 127, other exec error → 126 (shell
+/// convention).
+fn exec_command(command: &[String], vars: &[(String, String)]) -> Result<(), CliError> {
+    use std::os::unix::process::CommandExt as _;
+    let mut cmd = std::process::Command::new(&command[0]);
+    cmd.args(&command[1..]);
+    cmd.env_clear();
+    cmd.envs(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // `exec` only returns if it failed.
+    let err = cmd.exec();
+    let code = if err.kind() == std::io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    };
+    eprintln!("{NAME}: cannot exec {:?}: {err}", command[0]);
+    process::exit(code);
+}
+
+/// Dispatch `cache-warden inject [...]` (DR-0013 / DR-0015).
+fn dispatch_inject(
+    rest: &[String],
+    socket: &std::path::Path,
+    config: &config::Config,
+) -> Result<(), CliError> {
+    if help::wants_help(rest) {
+        println!("{}", help::inject_cmd().render());
+        return Ok(());
+    }
+    let (mode_flag, rest) = or_usage(mode::take_mode_flag(rest), help::inject_cmd)?;
+    let mode = or_usage(resolve_cli_mode(mode_flag, config), help::inject_cmd)?;
+    let parsed = or_usage(commands::inject_cmd::parse_inject(&rest), help::inject_cmd)?;
+
+    register_defs(socket, &parsed.defs)?;
+
+    // Read the template (stdin or --in FILE), binary safe.
+    let template: Vec<u8> = match &parsed.in_file {
+        None => {
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| CliError::Message(format!("failed to read stdin: {e}")))?;
+            buf
+        }
+        Some(path) => std::fs::read(path)
+            .map_err(|e| CliError::Message(format!("cannot read {}: {e}", path.display())))?,
+    };
+
+    let mut resolver = client::SocketResolver::new(socket, mode);
+    let rendered = commands::inject_cmd::render(&template, mode, &mut resolver)?;
+
+    // Write the (fully rendered) output: stdout or 0600 --out FILE.
+    commands::inject_cmd::write_output(parsed.out_file.as_deref(), &rendered.bytes)
+        .map_err(|e| CliError::Message(format!("failed to write output: {e}")))?;
+
+    // dry-run: a non-empty failure set means exit non-zero after writing
+    // (DR-0015 §3). Reveal already failed-closed inside `render`.
+    if !rendered.failures.is_empty() {
+        return Err(CliError::Message(format!(
+            "dry-run: {} reference(s) failed to resolve: {}",
+            rendered.failures.len(),
+            rendered.failures.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn main() {

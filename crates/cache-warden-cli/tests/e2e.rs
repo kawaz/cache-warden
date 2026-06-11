@@ -1026,6 +1026,44 @@ fn persisted_config_priority_merge_drops_clashing_persisted_entry() {
 }
 
 #[test]
+fn kv_get_dry_run_returns_verified_without_value_over_the_wire() {
+    // DR-0015 §6: `kv.get` with `dry_run: true` runs the full chain but the wire
+    // response carries no value (only `verified` + state).
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+
+    let set = format!(
+        r#"{{"cmd":"kv.set","key":"DB","source":{{"kind":"static","value_b64":"{}"}}}}"#,
+        b64(b"top-secret")
+    );
+    assert_eq!(request(&socket, &set)["ok"], true);
+
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"DB","dry_run":true}"#);
+    assert_eq!(resp["ok"], true, "dry-run get: {resp}");
+    assert_eq!(resp["verified"], true, "carries verified flag: {resp}");
+    assert!(
+        resp.get("value_b64").is_none(),
+        "no value on the wire: {resp}"
+    );
+    let body = resp.to_string();
+    assert!(!body.contains("top-secret"), "dry-run leaked value: {body}");
+    assert!(!body.contains(&b64(b"top-secret")));
+
+    // A normal get still returns the real value (default reveal).
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"DB"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"top-secret"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
 fn double_start_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("control.sock");

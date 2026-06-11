@@ -71,6 +71,12 @@ pub enum Request {
     KvGet {
         /// The key to fetch.
         key: String,
+        /// When `true`, run the full retrieval chain (lazy generate / extend /
+        /// regenerate / re-auth) but **do not** return the value: the response
+        /// carries only success/failure and the entry state (DR-0015 §2/§6). The
+        /// value never reaches the client process. Default `false` (reveal).
+        #[serde(default)]
+        dry_run: bool,
     },
     /// Delete a key's value, and (with `with_define`) its definition too.
     #[serde(rename = "kv.del")]
@@ -178,6 +184,17 @@ pub enum OkPayload {
     Get {
         /// The fetched secret value, base64-encoded.
         value_b64: String,
+    },
+    /// Reply to a dry-run [`Request::KvGet`] (`dry_run: true`): the retrieval
+    /// chain ran to completion but the value is **not** carried (DR-0015 §2/§6).
+    /// `verified` is always `true`; it lets the `untagged` enum distinguish this
+    /// value-free success from the value-carrying `Get`.
+    GetVerified {
+        /// Always `true`; marks a value-free dry-run success.
+        verified: bool,
+        /// The entry's lifecycle state after the chain completed (e.g.
+        /// `"active"`), for diagnostics. Never the value.
+        state: String,
     },
     /// Reply to [`Request::KvList`].
     List {
@@ -304,6 +321,18 @@ impl Response {
         Response::Ok(OkResponse {
             ok: true,
             payload: OkPayload::Get { value_b64 },
+        })
+    }
+
+    /// Construct a value-free dry-run `get` success response (DR-0015 §2/§6):
+    /// the chain completed but no value is carried, only the resulting state.
+    pub fn get_verified(state: impl Into<String>) -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::GetVerified {
+                verified: true,
+                state: state.into(),
+            },
         })
     }
 
@@ -474,7 +503,10 @@ mod tests {
 
     #[test]
     fn get_request_roundtrips() {
-        roundtrip_request(&Request::KvGet { key: "K".into() });
+        roundtrip_request(&Request::KvGet {
+            key: "K".into(),
+            dry_run: false,
+        });
         roundtrip_request(&Request::KvDel {
             key: "K".into(),
             with_define: false,
@@ -518,6 +550,54 @@ mod tests {
     #[test]
     fn get_response_roundtrips() {
         roundtrip_response(&Response::get("cHc=".into()));
+    }
+
+    #[test]
+    fn kv_get_dry_run_field_defaults_to_false_and_roundtrips() {
+        // Absent dry_run defaults to false (backward-compatible wire).
+        let line = r#"{"cmd":"kv.get","key":"K"}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        match req {
+            Request::KvGet { dry_run, .. } => assert!(!dry_run),
+            _ => panic!("expected KvGet"),
+        }
+        roundtrip_request(&Request::KvGet {
+            key: "K".into(),
+            dry_run: true,
+        });
+        let line = serde_json::to_string(&Request::KvGet {
+            key: "K".into(),
+            dry_run: true,
+        })
+        .unwrap();
+        assert!(line.contains(r#""dry_run":true"#), "{line}");
+    }
+
+    #[test]
+    fn get_verified_response_carries_no_value_and_roundtrips() {
+        let resp = Response::get_verified("active");
+        assert!(resp.is_ok());
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""verified":true"#), "{line}");
+        assert!(line.contains(r#""state":"active""#), "{line}");
+        // Crucially, no value field of any sort.
+        assert!(
+            !line.contains("value_b64"),
+            "dry-run must not carry a value"
+        );
+        roundtrip_response(&resp);
+        // And it decodes back to the value-free arm, not the value-carrying Get.
+        let back: Response = serde_json::from_str(&line).unwrap();
+        match back {
+            Response::Ok(OkResponse {
+                payload: OkPayload::GetVerified { verified, state },
+                ..
+            }) => {
+                assert!(verified);
+                assert_eq!(state, "active");
+            }
+            other => panic!("expected GetVerified, got {other:?}"),
+        }
     }
 
     #[test]

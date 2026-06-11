@@ -87,6 +87,38 @@ pub struct Config {
     /// SSH agent adapter settings (the authsock adapter; port plan Iteration 1).
     #[serde(default)]
     pub authsock: AuthsockConfig,
+    /// Client-side defaults (DR-0015): the reveal/dry-run polarity for the
+    /// value-emitting verbs (`kv get` / `run` / `inject`).
+    #[serde(default)]
+    pub cli: CliConfig,
+}
+
+/// `[cli]` section: client-side defaults (DR-0015 §4).
+///
+/// `default-mode` sets the polarity used when neither a `--reveal` / `--dry-run`
+/// flag nor `CACHE_WARDEN_DRY_RUN` is given. The built-in default is `"reveal"`
+/// (real values); an operator can flip a whole context to `"dry-run"` here.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliConfig {
+    /// `"reveal"` (default) or `"dry-run"`. Absent means "not set" (the resolver
+    /// falls through to the built-in reveal default).
+    #[serde(default, rename = "default-mode")]
+    pub default_mode: Option<String>,
+}
+
+impl CliConfig {
+    /// The configured default [`Mode`](crate::mode::Mode), or `None` if unset.
+    ///
+    /// Validated by [`Config::parse`] (an unknown string is rejected there), so
+    /// this re-parse is infallible at call time.
+    pub fn default_mode(&self) -> Option<crate::mode::Mode> {
+        match self.default_mode.as_deref() {
+            Some("dry-run") => Some(crate::mode::Mode::DryRun),
+            Some("reveal") => Some(crate::mode::Mode::Reveal),
+            _ => None,
+        }
+    }
 }
 
 /// `[authsock]` section: SSH agent sockets the daemon serves.
@@ -621,6 +653,16 @@ impl Config {
             .github
             .timeout_duration()
             .map_err(ConfigParseError::Content)?;
+        // Validate `[cli].default-mode` eagerly: only "reveal" / "dry-run" are
+        // accepted, so a typo (`default-mode = "dryrun"`) fails at startup.
+        if let Some(m) = &cfg.cli.default_mode
+            && m != "reveal"
+            && m != "dry-run"
+        {
+            return Err(ConfigParseError::Content(ConfigError::new(format!(
+                "[cli]: `default-mode` must be \"reveal\" or \"dry-run\", got {m:?}"
+            ))));
+        }
         // An empty (or omitted) auth command is treated as "no command", not as
         // a configured-but-empty command; reject the misleading empty form.
         if let Some(argv) = &cfg.auth.command
@@ -657,6 +699,12 @@ impl Config {
     /// Whether online definitions are persisted across restarts (DR-0014 §4).
     pub fn persist_definitions(&self) -> bool {
         self.daemon.persist_definitions
+    }
+
+    /// The configured default reveal/dry-run [`Mode`](crate::mode::Mode), or
+    /// `None` when `[cli].default-mode` is unset (DR-0015 §4).
+    pub fn cli_default_mode(&self) -> Option<crate::mode::Mode> {
+        self.cli.default_mode()
     }
 
     /// The validated authsock agent sockets, in deterministic (name-sorted)
@@ -867,6 +915,35 @@ socket = "~/.local/state/cache-warden/control.sock"
             Some(v) => unsafe { std::env::set_var("HOME", v) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    #[test]
+    fn cli_default_mode_absent_is_none() {
+        let cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.cli_default_mode(), None);
+    }
+
+    #[test]
+    fn cli_default_mode_reveal_and_dry_run_parse() {
+        let cfg = Config::parse("[cli]\ndefault-mode = \"reveal\"\n").unwrap();
+        assert_eq!(cfg.cli_default_mode(), Some(crate::mode::Mode::Reveal));
+        let cfg = Config::parse("[cli]\ndefault-mode = \"dry-run\"\n").unwrap();
+        assert_eq!(cfg.cli_default_mode(), Some(crate::mode::Mode::DryRun));
+    }
+
+    #[test]
+    fn cli_default_mode_invalid_is_rejected() {
+        let err = Config::parse("[cli]\ndefault-mode = \"dryrun\"\n").unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => assert!(e.message.contains("default-mode")),
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_unknown_field_is_rejected() {
+        let err = Config::parse("[cli]\nbogus = 1\n").unwrap_err();
+        assert!(matches!(err, ConfigParseError::Toml(_)));
     }
 
     #[test]

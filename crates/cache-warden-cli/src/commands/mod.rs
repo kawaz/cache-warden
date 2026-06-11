@@ -8,6 +8,8 @@
 pub mod client;
 pub mod config_cmd;
 pub mod daemon_cmd;
+pub mod inject_cmd;
+pub mod run_cmd;
 
 use std::path::PathBuf;
 
@@ -387,7 +389,10 @@ pub fn parse_kv_single_key(verb: &str, args: &[String]) -> Result<Request, Strin
     }
     let key = positional[0].clone();
     match verb {
-        "get" => Ok(Request::KvGet { key }),
+        "get" => Ok(Request::KvGet {
+            key,
+            dry_run: false,
+        }),
         "unpin" => Ok(Request::KvUnpin { key }),
         _ => Err(format!("unknown kv subcommand: {verb}")),
     }
@@ -752,7 +757,10 @@ mod tests {
     fn kv_get_parses() {
         assert_eq!(
             parse_kv_single_key("get", &["K".into()]).unwrap(),
-            Request::KvGet { key: "K".into() }
+            Request::KvGet {
+                key: "K".into(),
+                dry_run: false,
+            }
         );
     }
 

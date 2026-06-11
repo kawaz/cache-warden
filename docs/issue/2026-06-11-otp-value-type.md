@@ -21,4 +21,4 @@ seed は write-only（デーモンから出ない）。設計は
 ## 関連
 
 - [docs/decisions/DR-0016-otp-value-type.md](../decisions/DR-0016-otp-value-type.md)
-- [docs/issue/2026-06-11-secret-reference-injection.md](./2026-06-11-secret-reference-injection.md) — run / inject（コード注入の経路）
+- [docs/decisions/DR-0013-secret-reference-injection.md](../decisions/DR-0013-secret-reference-injection.md) — run / inject（コード注入の経路、実装済み）

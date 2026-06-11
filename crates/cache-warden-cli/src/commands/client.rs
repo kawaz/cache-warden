@@ -10,8 +10,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use crate::protocol::wire::{Request, Response};
-use crate::protocol::{decode_response, encode_request};
+use crate::mode::Mode;
+use crate::protocol::wire::{OkPayload, Request, Response};
+use crate::protocol::{decode_b64, decode_response, encode_request};
+use crate::refs::{ResolveResult, ResolvedValue, Resolver};
 
 /// Send one request to the daemon at `socket` and read one response.
 ///
@@ -45,4 +47,41 @@ pub fn round_trip(socket: &Path, req: &Request) -> Result<Response, String> {
     }
     decode_response(response_line.trim_end())
         .map_err(|e| format!("malformed response from daemon: {e}"))
+}
+
+/// A [`Resolver`] that resolves each key by a `kv.get` over the control socket
+/// (DR-0013 / DR-0015). In reveal mode the value bytes are returned; in dry-run
+/// mode `dry_run: true` is sent and the daemon's value-free `verified` reply
+/// maps to [`ResolvedValue::Verified`] (the value never reaches this process).
+pub struct SocketResolver<'a> {
+    socket: &'a Path,
+    mode: Mode,
+}
+
+impl<'a> SocketResolver<'a> {
+    /// Build a resolver bound to `socket`, resolving in `mode`.
+    pub fn new(socket: &'a Path, mode: Mode) -> Self {
+        Self { socket, mode }
+    }
+}
+
+impl Resolver for SocketResolver<'_> {
+    fn resolve(&mut self, key: &str) -> ResolveResult {
+        let req = Request::KvGet {
+            key: key.to_string(),
+            dry_run: self.mode.is_dry_run(),
+        };
+        match round_trip(self.socket, &req)? {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::Get { value_b64 } => {
+                    let bytes = decode_b64(&value_b64)
+                        .map_err(|e| format!("daemon returned invalid base64: {e}"))?;
+                    Ok(ResolvedValue::Value(bytes))
+                }
+                OkPayload::GetVerified { .. } => Ok(ResolvedValue::Verified),
+                other => Err(format!("unexpected response payload for kv.get: {other:?}")),
+            },
+            Response::Err(e) => Err(e.error.message),
+        }
+    }
 }

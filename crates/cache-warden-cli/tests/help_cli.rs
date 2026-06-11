@@ -45,6 +45,8 @@ fn help_flag_goes_to_stdout_exit_zero_at_every_level() {
         &["kv", "get", "--help"][..],
         &["kv", "del", "--help"][..],
         &["kv", "pin", "--help"][..],
+        &["run", "--help"][..],
+        &["inject", "--help"][..],
         &["config", "--help"][..],
         &["config", "show", "--help"][..],
     ] {
@@ -84,6 +86,36 @@ fn kv_define_help_carries_command_and_source() {
 fn kv_top_help_lists_define_subcommand() {
     let out = stdout(&cw(&["kv"]));
     assert!(out.contains("define"));
+}
+
+#[test]
+fn top_help_lists_run_and_inject() {
+    let out = stdout(&cw(&["--help"]));
+    assert!(out.contains("run -- CMD"));
+    assert!(out.contains("inject"));
+}
+
+#[test]
+fn dry_run_is_visible_in_every_value_verb_help() {
+    // DR-0015 §5: an agent reading help must discover --dry-run on get/run/inject.
+    for args in [
+        &["kv", "get", "--help"][..],
+        &["run", "--help"][..],
+        &["inject", "--help"][..],
+    ] {
+        let out = stdout(&cw(args));
+        assert!(out.contains("--dry-run"), "{args:?} mentions --dry-run");
+        assert!(out.contains("--reveal"), "{args:?} mentions --reveal");
+        // Default-reveal + side-effect note are called out (DR-0015 §5).
+        assert!(
+            out.to_lowercase().contains("reveal"),
+            "{args:?} explains the default is reveal"
+        );
+        assert!(
+            out.contains("side effect") || out.contains("side-effect") || out.contains("re-auth"),
+            "{args:?} warns dry-run has side effects: {out}"
+        );
+    }
 }
 
 // ---- group with no subcommand: stdout, exit 0 ---------------------------
