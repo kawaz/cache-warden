@@ -57,7 +57,8 @@ use cache_warden::{
     SourceRunner, Store, SystemInspector,
 };
 use cache_warden_authsock::{
-    AgentCodec, AgentMessage, Identity, MessageType, PublicKeyRegistry, Upstream, sign,
+    AgentCodec, AgentMessage, FilterEvaluator, Identity, MessageType, PublicKeyRegistry, Upstream,
+    sign,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
@@ -116,6 +117,10 @@ struct SocketState {
     /// relayed). Resolved paths (macOS TCC symlink applied); empty for a
     /// local-only socket. Cheap to clone per connection.
     upstreams: Vec<Upstream>,
+    /// Per-socket key filter (port plan Iteration 3). Restricts which public keys
+    /// this socket enumerates (REQUEST_IDENTITIES) and can sign with
+    /// (SIGN_REQUEST). An empty evaluator matches every key (no filtering).
+    filter: FilterEvaluator,
     /// The shared process core (Store / auth / runner / clock).
     shared: Arc<Shared>,
 }
@@ -169,18 +174,34 @@ pub fn spawn_listeners(
             .map(|p| Upstream::new(resolve_upstream_path(p)))
             .collect();
 
+        // Build the key filter. The tokens were validated at config parse, so
+        // this re-parse cannot fail; fall back to an unfiltered evaluator (and
+        // warn) on the impossible error rather than aborting the socket.
+        let filter = match FilterEvaluator::parse(&socket.filters) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "cache-warden: authsock `{}`: filter rebuild failed ({e}); serving unfiltered",
+                    socket.name
+                );
+                FilterEvaluator::default()
+            }
+        };
+
         println!(
-            "cache-warden: authsock `{}` listening on {} ({} local key(s), {} upstream(s))",
+            "cache-warden: authsock `{}` listening on {} ({} local key(s), {} upstream(s), {} filter term(s))",
             socket.name,
             socket.path.display(),
             registry.len(),
-            upstreams.len()
+            upstreams.len(),
+            filter.len()
         );
 
         let state = Arc::new(SocketState {
             name: socket.name.clone(),
             registry,
             upstreams,
+            filter,
             shared: Arc::clone(&shared),
         });
         let path = socket.path.clone();
@@ -272,17 +293,25 @@ async fn respond(
     }
 }
 
-/// REQUEST_IDENTITIES: local registry keys plus each upstream's keys, merged and
-/// de-duplicated by blob (local wins). Down upstreams are skipped with a stderr
-/// warning. `routes` is rebuilt to map each surviving upstream blob to its
-/// upstream index.
+/// REQUEST_IDENTITIES: local registry keys plus each upstream's keys, merged,
+/// de-duplicated by blob (local wins), then **filtered** (port plan Iteration 3).
+/// Only keys that pass this socket's filter are enumerated. Down upstreams are
+/// skipped with a stderr warning. `routes` is rebuilt to map each surviving
+/// (post-filter) upstream blob to its upstream index — so a blob the filter
+/// hides is never routable for a later SIGN_REQUEST either.
 async fn request_identities(
     state: &Arc<SocketState>,
     request: &AgentMessage,
     routes: &mut UpstreamRoutes,
 ) -> AgentMessage {
-    // Local identities first so they win de-dup against any upstream copy.
-    let mut merged: Vec<Identity> = state.registry.identities();
+    // Local identities first so they win de-dup against any upstream copy. Apply
+    // the filter on the full comment-bearing identity (the registry keeps it).
+    let mut merged: Vec<Identity> = state
+        .registry
+        .identities()
+        .into_iter()
+        .filter(|id| state.filter.matches(id))
+        .collect();
     let mut seen: std::collections::HashSet<Vec<u8>> =
         merged.iter().map(|id| id.key_blob.to_vec()).collect();
 
@@ -291,6 +320,11 @@ async fn request_identities(
         match upstream_identities(upstream, request).await {
             Ok(identities) => {
                 for id in identities {
+                    // Filter upstream keys too: a hidden key is neither shown nor
+                    // routed (so a later SIGN for it falls through to FAILURE).
+                    if !state.filter.matches(&id) {
+                        continue;
+                    }
                     let blob = id.key_blob.to_vec();
                     if seen.insert(blob.clone()) {
                         routes.insert(blob, idx);
@@ -341,7 +375,9 @@ async fn sign_request(
     let key_blob = fields.key_blob.to_vec();
 
     // 1. A blob we can sign locally (Iteration 1 path) is signed on the blocking
-    //    pool through the core auth gate.
+    //    pool through the core auth gate. The filter is enforced inside the sign
+    //    path (via `signable_kv_key`, using the registry's comment), so a key this
+    //    socket hides yields FAILURE even though its PEM is reachable.
     if state.registry.lookup(&key_blob).is_some() {
         let state = Arc::clone(state);
         let msg = msg.clone();
@@ -356,6 +392,8 @@ async fn sign_request(
     }
 
     // 3. Forward to the upstream that advertised this blob last enumeration.
+    //    `routes` only holds blobs that passed the filter during enumeration, so
+    //    a hidden key is never routed here.
     if let Some(&idx) = routes.get(&key_blob)
         && let Some(upstream) = state.upstreams.get(idx)
         && let Some(resp) = forward_sign(upstream, msg).await
@@ -365,6 +403,23 @@ async fn sign_request(
 
     // 4. Fallback: a client may sign without enumerating first (or our record is
     //    stale). Try every upstream in order until one signs (authsock-warden).
+    //
+    //    The filter still applies, but here we only know the *blob* (no comment).
+    //    A comment-dependent filter cannot be judged without the comment, and
+    //    judging it against an empty comment is unsafe: a `not-comment=secret*`
+    //    rule would *admit* a hidden key (empty comment does not match `secret*`,
+    //    so the negation passes). So if the filter needs a comment at all, fail
+    //    closed — a key can only be signed after it was enumerated (where the
+    //    real comment was available). This is the intended "no enumerate, no
+    //    sign" behaviour for comment filters. A blob-only filter (fingerprint /
+    //    type / pubkey / keyfile) is evaluated exactly.
+    if !state.filter.is_blob_only()
+        || !state
+            .filter
+            .matches(&Identity::new(fields.key_blob.clone(), String::new()))
+    {
+        return AgentMessage::failure();
+    }
     for upstream in &state.upstreams {
         if let Some(resp) = forward_sign(upstream, msg).await {
             return resp;
@@ -390,31 +445,64 @@ async fn forward_sign(upstream: &Upstream, msg: &AgentMessage) -> Option<AgentMe
 fn local_sign(state: &SocketState, peer: Option<u32>, msg: &AgentMessage) -> AgentMessage {
     let requester: Option<Vec<ProcessInfo>> =
         peer.and_then(|pid| SystemInspector::new().ancestry(pid).ok());
-    handle_local_sign(
-        &state.registry,
-        &state.shared.store,
-        state.shared.auth.as_ref(),
-        &state.shared.runner,
-        &state.shared.clock,
-        requester.as_deref(),
-        msg,
-    )
+    let ctx = LocalSignCtx {
+        registry: &state.registry,
+        filter: &state.filter,
+        store: &state.shared.store,
+        auth: state.shared.auth.as_ref(),
+        runner: &state.shared.runner,
+        clock: &state.shared.clock,
+    };
+    sign_local_with_ctx(&ctx, requester.as_deref(), msg)
+}
+
+/// Resolve the core KV key a SIGN_REQUEST may use, or `None` to reject it.
+///
+/// Returns `Some(kv_key)` only when the requested blob is a registered local key
+/// **and** passes the socket filter (judged with the registry's comment, so a
+/// comment filter holds on the direct-sign path — a key the socket does not
+/// expose cannot be signed with). An unknown blob or a filtered-out key yields
+/// `None`, which the caller maps to SSH_AGENT_FAILURE.
+fn signable_kv_key(
+    registry: &PublicKeyRegistry,
+    filter: &FilterEvaluator,
+    key_blob: &[u8],
+) -> Option<String> {
+    let registered = registry.lookup(key_blob)?;
+    let identity = Identity::new(registered.key_blob.clone(), registered.comment.clone());
+    filter.matches(&identity).then(|| registered.kv_key.clone())
+}
+
+/// The borrowed core services a local sign needs, grouped so the signing helper
+/// keeps a small argument list (the alternative — passing five separate borrows
+/// — trips `clippy::too_many_arguments`). Each field is a short-lived borrow of a
+/// `Shared` member; nothing here owns a secret.
+struct LocalSignCtx<'a, A: ?Sized, R, C> {
+    /// The registered public keys (blob → KV key) this socket can sign with.
+    registry: &'a PublicKeyRegistry,
+    /// The socket's key filter (a hidden key is rejected even though reachable).
+    filter: &'a FilterEvaluator,
+    /// The core store holding the private-key PEMs.
+    store: &'a std::sync::Mutex<Store>,
+    /// The re-authentication gate (shared with the control socket).
+    auth: &'a A,
+    /// The command runner used to regenerate a hard-expired command source.
+    runner: &'a R,
+    /// The monotonic clock for TTL evaluation.
+    clock: &'a C,
 }
 
 /// Pure local-sign dispatch for one SIGN_REQUEST against the core (no socket
-/// I/O). The blob is assumed to be in `registry` (the async caller checked).
+/// I/O). The blob is assumed to be in `ctx.registry` (the async caller checked).
 ///
 /// Factored out of the async server so the SIGN_REQUEST → core → signature path
-/// is unit-testable without a runtime. Looks up the key blob, fetches the PEM
-/// through the auth gate, signs, refreshes the idle window, returns
-/// SIGN_RESPONSE. Any failure (unknown, denied, hard-expired static, sign error)
-/// is SSH_AGENT_FAILURE.
-fn handle_local_sign<A, R, C>(
-    registry: &PublicKeyRegistry,
-    store: &std::sync::Mutex<Store>,
-    auth: &A,
-    runner: &R,
-    clock: &C,
+/// is unit-testable without a runtime. Resolves the key blob to a signable KV key
+/// via [`signable_kv_key`] (registry lookup **and** the socket filter), fetches
+/// the PEM through the auth gate, signs, refreshes the idle window, returns
+/// SIGN_RESPONSE. Any failure (unknown, filtered out, denied, hard-expired
+/// static, sign error) is SSH_AGENT_FAILURE.
+fn sign_local_with_ctx<A, R, C>(
+    ctx: &LocalSignCtx<'_, A, R, C>,
     requester: Option<&[ProcessInfo]>,
     msg: &AgentMessage,
 ) -> AgentMessage
@@ -427,13 +515,14 @@ where
         Ok(f) => f,
         Err(_) => return AgentMessage::failure(),
     };
-    let Some(registered) = registry.lookup(&fields.key_blob) else {
-        // Unknown key: do not reveal which keys exist beyond IDENTITIES.
+    // Unknown key or filtered-out key: do not reveal which keys exist beyond
+    // IDENTITIES.
+    let Some(kv_key) = signable_kv_key(ctx.registry, ctx.filter, &fields.key_blob) else {
         return AgentMessage::failure();
     };
-    let kv_key = registered.kv_key.clone();
+    let (auth, runner, clock) = (ctx.auth, ctx.runner, ctx.clock);
 
-    let mut store = match store.lock() {
+    let mut store = match ctx.store.lock() {
         Ok(g) => g,
         Err(_) => return AgentMessage::failure(),
     };
@@ -521,9 +610,50 @@ mod tests {
     const ED25519_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMFMCAQEwBQYDK2VwBCIEILfg0K3JM0GwuUuqBcJ79jKqV2owfa4zpRsarl64dDjC\noSMDIQBuIlSrfmaRn6Jj82jh6SDZkTFg0u5TlA9B1wYE2+lIyQ==\n-----END PRIVATE KEY-----\n";
     const ED25519_PUB: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG4iVKt+ZpGfomPzaOHpINmRMWDS7lOUD0HXBgTb6UjJ";
+    /// A second real Ed25519 public key, distinct from `ED25519_PUB`, used as an
+    /// upstream key whose blob is a *parseable* SSH key (so blob-derived filters
+    /// like `type=ed25519` evaluate it). FOR TESTS ONLY.
+    const ED25519_PUB_2: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBbyz9iB+TRYs24UYiJkxLijlyJM2nU0INtBiiWHN4tY";
 
     const SOFT: u64 = 10;
     const HARD: u64 = 30;
+
+    /// An empty evaluator: matches every key (the "no filtering" baseline used by
+    /// the Iteration 1/2 tests, whose behaviour must be unchanged).
+    fn no_filter() -> FilterEvaluator {
+        FilterEvaluator::default()
+    }
+
+    /// Test shim for the local-sign path: groups the borrows into a
+    /// [`LocalSignCtx`] and calls [`sign_local_with_ctx`]. Kept with the original
+    /// flat argument list so the existing tests read unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_local_sign<A, R, C>(
+        registry: &PublicKeyRegistry,
+        filter: &FilterEvaluator,
+        store: &Mutex<Store>,
+        auth: &A,
+        runner: &R,
+        clock: &C,
+        requester: Option<&[ProcessInfo]>,
+        msg: &AgentMessage,
+    ) -> AgentMessage
+    where
+        A: Authenticator + ?Sized,
+        R: SourceRunner,
+        C: Clock,
+    {
+        let ctx = LocalSignCtx {
+            registry,
+            filter,
+            store,
+            auth,
+            runner,
+            clock,
+        };
+        sign_local_with_ctx(&ctx, requester, msg)
+    }
 
     struct NoRunner;
     impl SourceRunner for NoRunner {
@@ -614,7 +744,16 @@ mod tests {
         let (store, registry) = fixture(&clock);
         let data = b"agent challenge bytes";
         let req = sign_request(&blob_of(ED25519_PUB), data, 0);
-        let resp = handle_local_sign(&registry, &store, &AllowAll, &NoRunner, &clock, None, &req);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None,
+            &req,
+        );
         assert_eq!(resp.msg_type, MessageType::SignResponse);
 
         // The response carries one length-prefixed signature blob; verify it.
@@ -633,7 +772,16 @@ mod tests {
         let clock = FakeClock::new();
         let (store, registry) = fixture(&clock);
         let req = sign_request(b"bogus-blob", b"data", 0);
-        let resp = handle_local_sign(&registry, &store, &AllowAll, &NoRunner, &clock, None, &req);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None,
+            &req,
+        );
         assert_eq!(resp.msg_type, MessageType::Failure);
     }
 
@@ -645,7 +793,16 @@ mod tests {
         clock.advance(Duration::from_secs(SOFT + 1));
         let data = b"data";
         let req = sign_request(&blob_of(ED25519_PUB), data, 0);
-        let resp = handle_local_sign(&registry, &store, &DenyAll, &NoRunner, &clock, None, &req);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &DenyAll,
+            &NoRunner,
+            &clock,
+            None,
+            &req,
+        );
         assert_eq!(resp.msg_type, MessageType::Failure);
         assert!(resp.payload.is_empty(), "FAILURE must carry no detail");
     }
@@ -656,7 +813,16 @@ mod tests {
         let (store, registry) = fixture(&clock);
         clock.advance(Duration::from_secs(SOFT + 1)); // soft-expired
         let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
-        let resp = handle_local_sign(&registry, &store, &AllowAll, &NoRunner, &clock, None, &req);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None,
+            &req,
+        );
         assert_eq!(resp.msg_type, MessageType::SignResponse);
     }
 
@@ -666,7 +832,16 @@ mod tests {
         let (store, registry) = fixture(&clock);
         clock.advance(Duration::from_secs(HARD)); // hard-expired, static => destroyed
         let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
-        let resp = handle_local_sign(&registry, &store, &AllowAll, &NoRunner, &clock, None, &req);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None,
+            &req,
+        );
         assert_eq!(resp.msg_type, MessageType::Failure);
     }
 
@@ -679,14 +854,32 @@ mod tests {
         // Advance near soft expiry, sign (Active -> extend refreshes window).
         clock.advance(Duration::from_secs(SOFT - 1));
         let req = sign_request(&blob_of(ED25519_PUB), b"d1", 0);
-        let resp = handle_local_sign(&registry, &store, &DenyAll, &NoRunner, &clock, None, &req);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &DenyAll,
+            &NoRunner,
+            &clock,
+            None,
+            &req,
+        );
         // Active sign with DenyAll still succeeds (no prompt while Active) and
         // extends the window.
         assert_eq!(resp.msg_type, MessageType::SignResponse);
         // Advance past the *original* soft deadline but within the refreshed one.
         clock.advance(Duration::from_secs(2));
         let req2 = sign_request(&blob_of(ED25519_PUB), b"d2", 0);
-        let resp2 = handle_local_sign(&registry, &store, &DenyAll, &NoRunner, &clock, None, &req2);
+        let resp2 = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &DenyAll,
+            &NoRunner,
+            &clock,
+            None,
+            &req2,
+        );
         assert_eq!(
             resp2.msg_type,
             MessageType::SignResponse,
@@ -701,7 +894,16 @@ mod tests {
         let clock = FakeClock::new();
         let (store, registry) = fixture(&clock);
         let req = AgentMessage::new(MessageType::Lock, bytes::Bytes::new());
-        let resp = handle_local_sign(&registry, &store, &AllowAll, &NoRunner, &clock, None, &req);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None,
+            &req,
+        );
         assert_eq!(resp.msg_type, MessageType::Failure);
     }
 
@@ -714,11 +916,17 @@ mod tests {
 
     /// A short, unique socket path under `/tmp` (under the sockaddr_un limit).
     fn short_sock(tag: &str) -> PathBuf {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        PathBuf::from(format!("/tmp/cw-as-{tag}-{}-{n}.sock", std::process::id()))
+        // A process-wide atomic counter guarantees uniqueness across parallel
+        // tests; a wall-clock timestamp alone can collide when two threads sample
+        // the same nanosecond (which surfaced once the suite created enough fake
+        // upstream sockets concurrently).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        PathBuf::from(format!(
+            "/tmp/cw-as-{tag}-{}-{seq}.sock",
+            std::process::id()
+        ))
     }
 
     /// Read one framed agent message from `stream`, returning its raw body
@@ -775,8 +983,16 @@ mod tests {
     }
 
     /// Build a `SocketState` with the GITHUB_KEY local registry plus the given
-    /// upstream paths.
+    /// upstream paths (no filter).
     fn socket_state(upstream_paths: &[&Path]) -> Arc<SocketState> {
+        socket_state_filtered(upstream_paths, no_filter())
+    }
+
+    /// Like [`socket_state`] but with an explicit filter (Iteration 3).
+    fn socket_state_filtered(
+        upstream_paths: &[&Path],
+        filter: FilterEvaluator,
+    ) -> Arc<SocketState> {
         let clock = SystemClock::new();
         let mut store = Store::new();
         store.set(
@@ -796,6 +1012,7 @@ mod tests {
             name: "test".into(),
             registry,
             upstreams: upstream_paths.iter().map(Upstream::new).collect(),
+            filter,
             shared,
         })
     }
@@ -937,5 +1154,207 @@ mod tests {
         let sign_req = sign_request(b"totally-unknown-blob", b"d", 0);
         let resp = respond(&state, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::Failure);
+    }
+
+    // ---- Iteration 3: per-socket key filters ----
+    //
+    // The local key registers under the PKCS#8 PEM with no comment, so its
+    // registry comment falls back to the kv key name "GITHUB_KEY". The filters
+    // below exercise both comment-based (enumeration-bound) and blob-based
+    // (type) matching.
+
+    fn parse_filter(tokens: &[&str]) -> FilterEvaluator {
+        let groups: Vec<Vec<String>> = tokens.iter().map(|t| vec![t.to_string()]).collect();
+        FilterEvaluator::parse(&groups).unwrap()
+    }
+
+    #[test]
+    fn handle_local_sign_with_matching_filter_signs() {
+        // A filter that admits the local key (by its fallback comment) signs.
+        let clock = FakeClock::new();
+        let (store, registry) = fixture(&clock);
+        let filter = parse_filter(&["comment=GITHUB_KEY"]);
+        let data = b"filtered-but-allowed";
+        let req = sign_request(&blob_of(ED25519_PUB), data, 0);
+        let resp = handle_local_sign(
+            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+    }
+
+    #[test]
+    fn handle_local_sign_with_excluding_filter_is_failure() {
+        // A filter that hides the local key rejects a direct SIGN_REQUEST even
+        // though the PEM is reachable (no enumeration needed to deny).
+        let clock = FakeClock::new();
+        let (store, registry) = fixture(&clock);
+        let filter = parse_filter(&["comment=other-key*"]);
+        let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
+        let resp = handle_local_sign(
+            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+        assert!(resp.payload.is_empty(), "FAILURE must carry no detail");
+    }
+
+    #[test]
+    fn handle_local_sign_blob_filter_admits_ed25519() {
+        // A type=ed25519 filter (blob-derived) admits the Ed25519 local key.
+        let clock = FakeClock::new();
+        let (store, registry) = fixture(&clock);
+        let filter = parse_filter(&["type=ed25519"]);
+        let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
+        let resp = handle_local_sign(
+            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+    }
+
+    #[test]
+    fn handle_local_sign_blob_filter_excludes_other_type() {
+        // A type=rsa filter hides the Ed25519 local key.
+        let clock = FakeClock::new();
+        let (store, registry) = fixture(&clock);
+        let filter = parse_filter(&["type=rsa"]);
+        let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
+        let resp = handle_local_sign(
+            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+    }
+
+    #[tokio::test]
+    async fn identities_filter_hides_non_matching_local_key() {
+        // A filter that excludes the local key yields an empty IDENTITIES_ANSWER.
+        let state = socket_state_filtered(&[], parse_filter(&["comment=nope*"]));
+        let mut routes = UpstreamRoutes::new();
+        let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
+        let resp = respond(&state, None, &req, &mut routes).await;
+        let ids = resp.parse_identities().unwrap();
+        assert!(ids.is_empty(), "filtered-out local key must not enumerate");
+    }
+
+    #[tokio::test]
+    async fn identities_filter_keeps_matching_local_key() {
+        let state = socket_state_filtered(&[], parse_filter(&["comment=GITHUB_KEY"]));
+        let mut routes = UpstreamRoutes::new();
+        let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
+        let resp = respond(&state, None, &req, &mut routes).await;
+        let ids = resp.parse_identities().unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].key_blob.as_ref(), blob_of(ED25519_PUB).as_slice());
+    }
+
+    #[tokio::test]
+    async fn filtered_out_local_key_sign_is_failure_via_respond() {
+        // The full async path: a hidden local key's SIGN_REQUEST is FAILURE.
+        let state = socket_state_filtered(&[], parse_filter(&["comment=nope*"]));
+        let mut routes = UpstreamRoutes::new();
+        let sign_req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
+        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        assert_eq!(resp.msg_type, MessageType::Failure);
+    }
+
+    #[tokio::test]
+    async fn filter_hides_upstream_key_from_enumeration_and_routing() {
+        // An upstream advertises a key whose comment the filter excludes: it must
+        // not appear in IDENTITIES and must not be routed (so a later SIGN for it
+        // is not forwarded). The local key (which the filter admits) still shows.
+        let up_id = upstream_identity("secret-upstream");
+        let upstream_sig = AgentMessage::sign_response(b"SHOULD-NOT-REACH");
+        let (path, _h) = spawn_fake_upstream(vec![up_id.clone()], Some(upstream_sig));
+        // Filter admits only the local key (by its fallback comment), not the
+        // upstream's "secret-upstream" comment.
+        let state = socket_state_filtered(&[&path], parse_filter(&["comment=GITHUB_KEY"]));
+        let mut routes = UpstreamRoutes::new();
+
+        let enum_req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
+        let resp = respond(&state, None, &enum_req, &mut routes).await;
+        let ids = resp.parse_identities().unwrap();
+        // Only the local key enumerates; the upstream key is filtered out.
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].key_blob.as_ref(), blob_of(ED25519_PUB).as_slice());
+        assert!(
+            !routes.contains_key(&up_id.key_blob.to_vec()),
+            "a filtered-out upstream key must not be routable"
+        );
+
+        // A SIGN for the hidden upstream blob is not forwarded -> FAILURE
+        // (comment-only filter, no route, fallback also denies by empty comment).
+        let sign_req = sign_request(&up_id.key_blob, b"x", 0);
+        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        assert_eq!(resp.msg_type, MessageType::Failure);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn negated_comment_filter_cannot_be_bypassed_by_signing_without_enumerating() {
+        // Regression: a `not-comment=secret*` filter hides keys whose comment
+        // starts with "secret". A client that signs an upstream key's blob
+        // WITHOUT enumerating first (routes stays empty) must still be denied.
+        // The old fallback judged the filter against an empty comment, and
+        // `not-comment=secret*` *passes* an empty comment — wrongly admitting the
+        // hidden key. The fix fails closed whenever the filter needs a comment.
+        let up_id = upstream_identity("secret-upstream");
+        let upstream_sig = AgentMessage::sign_response(b"SHOULD-NOT-REACH");
+        let (path, _h) = spawn_fake_upstream(vec![up_id.clone()], Some(upstream_sig));
+        let state = socket_state_filtered(&[&path], parse_filter(&["not-comment=secret*"]));
+        let mut routes = UpstreamRoutes::new();
+
+        // No enumeration: sign the hidden blob directly.
+        let sign_req = sign_request(&up_id.key_blob, b"x", 0);
+        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        assert_eq!(
+            resp.msg_type,
+            MessageType::Failure,
+            "a comment-filtered socket must not sign an un-enumerated upstream key"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn blob_only_filter_still_signs_upstream_without_enumerating() {
+        // The fail-closed rule must not over-restrict: a blob-only filter
+        // (here `type=ed25519`) can be judged from the blob alone, so signing an
+        // admitted upstream key without a prior enumeration still works. The
+        // upstream key must be a parseable SSH blob for the type filter to read
+        // it, so we use a second real key (not the synthetic `upstream_identity`).
+        let up_blob = bytes::Bytes::from(blob_of(ED25519_PUB_2));
+        let up_id = Identity::new(up_blob.clone(), "anything".to_string());
+        let upstream_sig = AgentMessage::sign_response(b"FORWARDED-OK");
+        let (path, _h) = spawn_fake_upstream(vec![up_id.clone()], Some(upstream_sig));
+        let state = socket_state_filtered(&[&path], parse_filter(&["type=ed25519"]));
+        let mut routes = UpstreamRoutes::new();
+
+        let sign_req = sign_request(&up_id.key_blob, b"x", 0);
+        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn filter_admits_upstream_key_when_comment_matches() {
+        // Sanity: when the filter admits the upstream comment, the upstream key
+        // enumerates and a SIGN for it is forwarded.
+        let up_id = upstream_identity("work-upstream");
+        let upstream_sig = AgentMessage::sign_response(b"FORWARDED-OK");
+        let (path, _h) = spawn_fake_upstream(vec![up_id.clone()], Some(upstream_sig.clone()));
+        let state = socket_state_filtered(&[&path], parse_filter(&["comment=*upstream*"]));
+        let mut routes = UpstreamRoutes::new();
+
+        let enum_req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
+        let resp = respond(&state, None, &enum_req, &mut routes).await;
+        let ids = resp.parse_identities().unwrap();
+        // The local key's comment "GITHUB_KEY" does not match *upstream*, so only
+        // the upstream key passes.
+        let blobs: Vec<_> = ids.iter().map(|i| i.key_blob.to_vec()).collect();
+        assert!(blobs.contains(&up_id.key_blob.to_vec()));
+        assert!(!blobs.contains(&blob_of(ED25519_PUB)));
+
+        let sign_req = sign_request(&up_id.key_blob, b"x", 0);
+        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+        assert_eq!(resp.payload, upstream_sig.payload);
+        std::fs::remove_file(&path).ok();
     }
 }

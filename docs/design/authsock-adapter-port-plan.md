@@ -341,12 +341,54 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
   - **brief から変えた点**: なし（milestone 通り）。新 DR 不要（KeySource 2 軸の agent proxy 経路の
     具体化で、DR-0004 判断 8 / 本 plan の範囲内。設計判断の追加なし）。
 
-### Iteration 3: 鍵フィルタ
+### Iteration 3: 鍵フィルタ ✅ 完了（2026-06-11）
 
 - スコープ: `filter/*`（comment/fingerprint/keytype/pubkey/rule/evaluator、github/keyfile は後送り可）移植。
   socket 単位で REQUEST_IDENTITIES の公開鍵可視性を絞る。
 - 依存: Iteration 1（identities 経路）。
 - 検証: warden の filter テスト移植 + 実機で comment フィルタが効く（`ssh-add -L` の差分）。
+- 実績（2026-06-11）:
+  - **filter 移植**（`cache-warden-authsock/src/filter/`）: warden の `comment` / `fingerprint` /
+    `keytype` / `pubkey` / `keyfile` matcher、`FilterRule`（`not-` 否定 + auto-detect）、
+    `FilterEvaluator`（OR of AND）をそのまま移植。warden の各 matcher テストも移植して green。
+    `pubkey` は wire blob を `key_data().encode()` で作り（registry / `Identity::new` と同じ符号化）、
+    列挙 Identity と exact 一致することをテストで証明。`globset` / `regex` 依存を追加。
+  - **github filter は未移植（後送り、port plan 許容範囲内）**: warden の `github=<user>` は
+    `github.com/<user>.keys` を HTTP 取得し、重い HTTP クライアント依存（`reqwest` + TLS スタック）を
+    呼ぶ。本 iteration の他フィルタは全てネットワーク不要・依存軽量なので、github だけ後段（op 発見
+    iteration 以降 or hardening）に隔離した。`rule.rs` / `mod.rs` の doc に「deferred」と明記。
+    ネットワーク不要の `keyfile`（ローカル authorized_keys）は移植済み（warden の `shellexpand` 依存は
+    避け、`~/` のみの最小展開に置換。`tracing::warn!` は cache-warden 流 `eprintln!` に）。
+    `evaluator` の `ensure_loaded`/`reload` は warden では github のため async だったが、github を外すと
+    keyfile のみ（sync）になるので `reload` を sync 化した。
+  - **config 拡張**（`[authsock.sockets.NAME].filters`）: warden の filter 文字列形式を踏襲しつつ新スキーマに
+    馴染む形。warden の `deserialize_filters`（string = 単一ルール OR 項、配列 = AND グループ）を移植し、
+    プロンプト例 `filters = ["comment=github*"]` がそのまま動く。`Vec<Vec<String>>`（OR of AND）。token の
+    妥当性は config parse 時に `FilterEvaluator::parse` で検証（不正パターンは socket 名付きで fail-fast、
+    `keyfile=` は実ファイル読込まで起動時に走る）。`deny_unknown_fields` 維持。
+  - **daemon 統合**（`cache-warden-cli/src/daemon/authsock.rs`）: `SocketState.filter: FilterEvaluator`。
+    - **REQUEST_IDENTITIES**: KV registry の comment 込み Identity と各 upstream の Identity をマージした
+      後にフィルタ適用。通過鍵だけ列挙し、フィルタで隠れた upstream blob は `routes` にも記録しない
+      （= 後続 SIGN で転送されない）。
+    - **SIGN_REQUEST**: フィルタ通過鍵のみ署名許可。ローカル鍵は `handle_local_sign` 内で registry の
+      comment 込み Identity を組んで判定（comment フィルタが直接署名経路でも効く）。upstream 鍵は列挙で
+      記録した route 経由のみ（comment-only フィルタは「列挙してから署名」を要求 = warden 同様、列挙に
+      出ない鍵への直接署名要求を拒否）。列挙なし fallback は blob だけの Identity で判定するので、
+      `fingerprint` / `type` / `pubkey` は正確に許可/拒否、comment-only は deny。
+    - フィルタ無し socket（`filters` 省略 = 空 evaluator）は従来通り全鍵。
+  - **検証**: 単体（filter crate 全 matcher + evaluator テスト移植、config の filters パース 6 件、
+    daemon ハンドラ 9 件: matching/excluding comment フィルタの local 署名、blob フィルタ type の許可/除外、
+    列挙の絞り込み、隠れた upstream 鍵の非列挙・非ルーティング・SIGN FAILURE、comment 一致 upstream の
+    列挙・転送）+ E2E（`authsock_e2e.rs` に 1 件追加: 2 socket 構成 = `filters=["comment=github*"]` の
+    filtered socket と無フィルタの all socket、実 ssh-keygen 鍵 2 本で「filtered は github 鍵のみ列挙 /
+    other 鍵への SIGN は FAILURE / filtered は github 鍵を署名 verify / all は両鍵列挙 + other 鍵署名
+    verify」）。`just ci` 全通過、既存テスト回帰なし。
+  - **brief から変えた点**: github filter を未移植（理由 = reqwest 等の重い依存。プロンプト・port plan
+    とも後送り許容）。新 DR 不要（DR-0004「鍵フィルタ = アダプタ」の具体化、設計判断の追加なし）。
+  - **互換メモ**: warden の SIGN 経路は `Identity::new(blob, "")`（comment 空）で `filter.matches` を直接
+    評価し、allowed_keys_cache（列挙通過鍵）との OR で許可していた。cache-warden は allowed_keys_cache 相当を
+    持たず、ローカルは registry の comment、upstream は `routes` を「列挙通過鍵の記録」として使う。意味論
+    （列挙に出ない鍵への直接署名を拒否、blob 判定可能なフィルタは列挙なしでも評価）は warden と等価。
 
 ### Iteration 4: op 鍵発見 + ローカル署名（DR-011 / DR-015）
 

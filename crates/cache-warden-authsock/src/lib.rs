@@ -28,9 +28,16 @@
 //! - [`Upstream`]: a connection to another agent socket whose keys are merged in
 //!   and whose signatures are forwarded (the agent-proxy KeySource, DR-0004
 //!   decision 8 / port plan Iteration 2).
+//! - [`FilterEvaluator`] (+ [`Filter`] / [`FilterRule`] / the matchers): per-socket
+//!   key filters that restrict which public keys a socket exposes and signs with
+//!   (port plan Iteration 3). The `github` filter is deferred (network fetch).
+//! - [`FilterEvaluator`] and the filter matchers: per-socket key visibility
+//!   (port plan Iteration 3). They restrict which public keys a socket enumerates
+//!   and can sign with, reading only the public side of a key.
 
 mod codec;
 mod error;
+mod filter;
 mod message;
 mod registry;
 mod signer;
@@ -38,6 +45,10 @@ mod upstream;
 
 pub use codec::AgentCodec;
 pub use error::{Error, Result};
+pub use filter::{
+    CommentMatcher, Filter, FilterEvaluator, FilterGroup, FilterRule, FingerprintMatcher,
+    KeyTypeMatcher, KeyfileMatcher, PubkeyMatcher,
+};
 pub use message::{AgentMessage, Identity, MessageType, SignRequestFields};
 pub use registry::{PublicKeyRegistry, RegisteredKey};
 pub use signer::sign;

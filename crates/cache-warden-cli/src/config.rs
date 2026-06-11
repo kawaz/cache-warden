@@ -101,6 +101,71 @@ pub struct AuthsockSocketConfig {
     /// **forwarded** (we never hold the upstream's private material). Optional.
     #[serde(default)]
     pub upstreams: Vec<String>,
+    /// Key filters restricting which public keys this socket exposes and can sign
+    /// with (port plan Iteration 3). Each TOML element is one **OR term**: a
+    /// string is a single-rule term (`"comment=github*"`), an array is an AND
+    /// group (`["comment=*@work*", "type=ed25519"]`). The terms are ORed, the
+    /// rules within a group ANDed. An empty / omitted list means no filtering
+    /// (all keys are exposed). See [`deserialize_filters`].
+    #[serde(default, deserialize_with = "deserialize_filters")]
+    pub filters: Vec<Vec<String>>,
+}
+
+/// Deserialize `filters` from a TOML array of strings and/or arrays of strings.
+///
+/// Mirrors authsock-warden's filter syntax so an operator's mental model carries
+/// over (port plan §3): each element becomes one OR term —
+/// - `"comment=github*"` → a single-rule term (`["comment=github*"]`),
+/// - `["comment=*@work*", "type=ed25519"]` → an AND group.
+///
+/// The resulting `Vec<Vec<String>>` is OR-of-AND: the outer vec is ORed, each
+/// inner vec is ANDed. The *rule tokens* themselves are validated later (at
+/// socket construction) so a parse error names the socket.
+fn deserialize_filters<'de, D>(deserializer: D) -> Result<Vec<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct FiltersVisitor;
+
+    impl<'de> Visitor<'de> for FiltersVisitor {
+        type Value = Vec<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a sequence of strings or arrays of strings")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut result = Vec::new();
+            while let Some(value) = seq.next_element::<toml::Value>()? {
+                match value {
+                    // A single string is a one-rule OR term.
+                    toml::Value::String(s) => result.push(vec![s]),
+                    // An array is an AND group (every element must be a string).
+                    toml::Value::Array(arr) => {
+                        let group: Vec<String> = arr
+                            .into_iter()
+                            .map(|v| {
+                                v.as_str().map(str::to_string).ok_or_else(|| {
+                                    de::Error::custom("expected string in filter group")
+                                })
+                            })
+                            .collect::<Result<_, _>>()?;
+                        result.push(group);
+                    }
+                    _ => return Err(de::Error::custom("expected string or array of strings")),
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    deserializer.deserialize_seq(FiltersVisitor)
 }
 
 /// One validated agent socket ready to bind.
@@ -115,6 +180,11 @@ pub struct AuthsockSocket {
     /// Upstream agent socket paths (leading `~/` expanded) whose keys are merged
     /// and whose signatures are forwarded.
     pub upstreams: Vec<PathBuf>,
+    /// Key-filter terms (OR of AND) restricting which keys this socket exposes
+    /// and can sign with. Empty means no filtering. The tokens are validated at
+    /// parse time (so a bad token fails startup, naming the socket); the daemon
+    /// builds a `FilterEvaluator` from them.
+    pub filters: Vec<Vec<String>>,
 }
 
 /// `[daemon]` section.
@@ -279,11 +349,19 @@ impl AuthsockSocketConfig {
                  `upstreams` (forwarded agent sockets)"
             )));
         }
+        // Validate the filter tokens at startup so a bad pattern fails fast and
+        // names the socket. A successful parse is discarded — the daemon rebuilds
+        // the evaluator from the stored tokens. (A `keyfile=` filter reads its
+        // file here, surfacing a missing/unreadable keyfile at startup too.)
+        cache_warden_authsock::FilterEvaluator::parse(&self.filters).map_err(|e| {
+            ConfigError::new(format!("[authsock.sockets.{name}]: invalid `filters`: {e}"))
+        })?;
         Ok(AuthsockSocket {
             name: name.to_string(),
             path: expand_tilde(&self.path),
             keys: self.keys.clone(),
             upstreams: self.upstreams.iter().map(|p| expand_tilde(p)).collect(),
+            filters: self.filters.clone(),
         })
     }
 }
@@ -876,6 +954,104 @@ keys = ["K"]
 path = "/tmp/s.sock"
 keys = ["K"]
 bogus = 1
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigParseError::Toml(_)));
+    }
+
+    // ---- authsock filters ----
+
+    #[test]
+    fn authsock_socket_omitting_filters_defaults_to_empty() {
+        let cfg = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+keys = ["K"]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.authsock_sockets()[0].filters.is_empty());
+    }
+
+    #[test]
+    fn authsock_socket_string_filter_is_a_single_rule_or_term() {
+        let cfg = Config::parse(
+            r#"[authsock.sockets.github]
+path = "/tmp/g.sock"
+keys = ["K"]
+filters = ["comment=github*"]
+"#,
+        )
+        .unwrap();
+        let socks = cfg.authsock_sockets();
+        assert_eq!(socks[0].filters, vec![vec!["comment=github*".to_string()]]);
+    }
+
+    #[test]
+    fn authsock_socket_mixed_string_and_array_filters_parse_as_or_of_and() {
+        // "f1", "f2", ["f3", "f4"] => f1 || f2 || (f3 && f4)
+        let cfg = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+keys = ["K"]
+filters = ["comment=a*", "type=ed25519", ["comment=*work*", "type=rsa"]]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.authsock_sockets()[0].filters,
+            vec![
+                vec!["comment=a*".to_string()],
+                vec!["type=ed25519".to_string()],
+                vec!["comment=*work*".to_string(), "type=rsa".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn authsock_socket_invalid_filter_token_is_rejected_naming_socket() {
+        let err = Config::parse(
+            r#"[authsock.sockets.broken]
+path = "/tmp/s.sock"
+keys = ["K"]
+filters = ["bogus=x"]
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(
+                    e.message.contains("broken"),
+                    "must name the socket: {}",
+                    e.message
+                );
+                assert!(e.message.contains("filters"), "msg: {}", e.message);
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authsock_socket_invalid_filter_regex_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+keys = ["K"]
+filters = ["comment=~[invalid"]
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigParseError::Content(_)));
+    }
+
+    #[test]
+    fn authsock_socket_non_string_filter_element_is_toml_error() {
+        let err = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+keys = ["K"]
+filters = [42]
 "#,
         )
         .unwrap_err();

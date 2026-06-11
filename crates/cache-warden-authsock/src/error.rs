@@ -29,6 +29,13 @@ pub enum Error {
     /// upstream and keeps serving the rest (graceful degradation, Iteration 2).
     #[error("Upstream agent error: {0}")]
     Upstream(String),
+
+    /// A malformed key-filter specification: an unknown filter form, an invalid
+    /// glob / regex pattern, a bad fingerprint / public key, or an unreadable
+    /// keyfile (Iteration 3). The message names only the offending pattern /
+    /// path — it never carries private material.
+    #[error("Filter error: {0}")]
+    Filter(String),
 }
 
 /// Result type alias using this crate's [`Error`].

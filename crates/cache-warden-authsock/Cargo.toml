@@ -28,6 +28,13 @@ thiserror = "2"
 # lives on the CLI side (DR-0008); only the upstream *client* side is here.
 tokio = { version = "1", features = ["io-util", "net", "time"] }
 
+# --- Key filters (per-socket key visibility; ported from authsock-warden) ---
+# Glob matching for comment filters (e.g. `comment=github*`). Mirrors the
+# authsock-warden filter selection.
+globset = "0.4"
+# Regex matching for comment filters (the `~regex` form).
+regex = "1"
+
 # --- Signer (local 1Password-style signing; ported from authsock-warden) ---
 # Native signing-crate types kept end-to-end to avoid lossy intermediate
 # conversions (see signer.rs design rationale). Versions/features follow the
@@ -55,3 +62,5 @@ zeroize = "1"
 tokio = { version = "1", features = ["rt", "io-util", "macros", "net"] }
 # Build canonical wire vectors in integration tests.
 bytes = "1"
+# Temp authorized_keys files for the keyfile filter tests.
+tempfile = "3"

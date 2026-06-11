@@ -169,7 +169,7 @@ hard-ttl = "24h"
   secret from being persisted in config. Literal values are injected at runtime via
   `cache-warden kv set --value-stdin`.
 
-### authsock Adapter (SSH agent socket, port plan Iterations 1–2)
+### authsock Adapter (SSH agent socket, port plan Iterations 1–3)
 
 cache-warden listens on the SSH agent sockets declared in config and answers an SSH client's
 signing requests with private-key PEMs cached in the KV core. To a client whose `SSH_AUTH_SOCK`
@@ -185,6 +185,7 @@ hard-ttl = "24h"
 path = "~/.ssh/cache-warden.sock"            # agent socket (leading ~/ is expanded)
 keys = ["GITHUB_KEY"]                        # KV key names this socket signs with locally
 upstreams = ["~/.1password/agent.sock"]      # upstream agents to merge keys from / forward to (optional)
+filters = ["comment=github*"]                # restrict which keys this socket shows / signs (optional)
 ```
 
 - **cache-warden creates the socket**: one listener task per `[authsock.sockets.NAME]` (DR-0008,
@@ -209,16 +210,35 @@ upstreams = ["~/.1password/agent.sock"]      # upstream agents to merge keys fro
   1Password agent socket is volatile, and the cost is negligible against signing / TouchID latency).
   On macOS, a 1Password agent socket under Group Containers is reached via a stable state-dir symlink
   to avoid a TCC prompt (not needed on Linux; cfg-gated).
-- **Failures leak nothing**: an unknown key, denied re-auth, hard-expired static key, malformed
-  request, signing error, or all-upstreams-failed all return `SSH_AGENT_FAILURE` (empty payload). No
-  error detail reaches the agent protocol.
+- **Key filters (Iteration 3)**: a socket can restrict *which* keys it shows / signs with via
+  `filters`, so socket A can carry only GitHub keys while socket B carries everything. Each TOML
+  element is one **OR term**: a string is a single-rule term (`"comment=github*"`), an array is an AND
+  group (`["comment=*@work*", "type=ed25519"]`). Terms are ORed, rules within a group are ANDed
+  (OR-of-AND). An empty / omitted `filters` means no filtering (all keys). Rule forms are `comment=` /
+  `type=` / `fingerprint=` / `pubkey=` / `keyfile=` (each negatable with `not-`, authsock-warden
+  compatible); `comment` accepts exact / glob (`*` / `?`) / `~regex`. A filter reads **only the public
+  side** of a key (blob / comment / type / fingerprint) and never touches secret material.
+  - **REQUEST_IDENTITIES**: the filter is applied after merging KV + upstream keys; only passing keys
+    are enumerated. A filtered-out upstream key is not recorded for routing either.
+  - **SIGN_REQUEST**: only filtered-in keys may sign — **a direct sign for a key the socket does not
+    enumerate is also rejected**. Local keys are judged with their registry comment (so a comment
+    filter holds on the direct-sign path); an upstream key is allowed only via a route recorded during
+    enumeration (a comment-only filter therefore demands "enumerate, then sign"). Blob-derivable
+    `fingerprint` / `type` / `pubkey` filters are evaluated exactly even without a prior enumeration.
+  - **`github` filter is not ported this iteration**: authsock-warden's `github=<user>` (fetch
+    `github.com/<user>.keys` over HTTP) pulls in a heavy HTTP-client dependency (reqwest), so it is
+    deferred (allowed by port plan Iteration 3). The network-free `keyfile` (local authorized_keys) is
+    ported.
+- **Failures leak nothing**: an unknown key, a filtered-out key, denied re-auth, hard-expired static
+  key, malformed request, signing error, or all-upstreams-failed all return `SSH_AGENT_FAILURE` (empty
+  payload). No error detail reaches the agent protocol.
 - **Isolation**: the local-sign handler runs on the blocking pool just like the control socket (a
   re-auth command can block on a prompt for minutes and must not pin an async worker); upstream I/O is
   async (non-blocking sockets) on the runtime.
 
-> The current state (Iterations 1–2) covers signing with static / command-preloaded KV keys plus
-> merging keys from / forwarding signatures to upstream agents. Key filters, op key discovery, and the
-> three-layer policy are later iterations (port plan §2).
+> The current state (Iterations 1–3) covers signing with static / command-preloaded KV keys, merging
+> keys from / forwarding signatures to upstream agents, and per-socket key filters. op key discovery,
+> the three-layer policy, and the `github` filter are later iterations (port plan §2).
 
 ### Workspace Structure (DR-0002)
 

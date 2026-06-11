@@ -101,9 +101,17 @@ impl UpstreamConnection {
 
     async fn send_receive_inner(&mut self, msg: &AgentMessage) -> Result<AgentMessage> {
         let (mut reader, mut writer) = self.stream.split();
-        AgentCodec::write(&mut writer, msg).await?;
+        // Every failure talking to an upstream is an Upstream error so callers
+        // can degrade per-upstream uniformly. The underlying I/O error kind also
+        // differs by OS for a peer that closed early (Linux reports EPIPE at
+        // write time, macOS surfaces EOF at read time), so the wrapping keeps
+        // the contract platform-independent.
+        AgentCodec::write(&mut writer, msg)
+            .await
+            .map_err(|e| Error::Upstream(format!("write to upstream agent failed: {e}")))?;
         AgentCodec::read(&mut reader)
-            .await?
+            .await
+            .map_err(|e| Error::Upstream(format!("read from upstream agent failed: {e}")))?
             .ok_or_else(|| Error::Upstream("upstream agent closed connection".to_string()))
     }
 }

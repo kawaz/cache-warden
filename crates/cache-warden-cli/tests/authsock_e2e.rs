@@ -485,6 +485,145 @@ fn sign_for_upstream_key_is_forwarded() {
     assert_eq!(&resp_payload[4..4 + sig_len], UPSTREAM_SENTINEL_SIG);
 }
 
+// ---- Iteration 3: per-socket key filters ----
+
+/// Build a config with two KV keys (`GITHUB_KEY`, `OTHER_KEY`) preloaded via
+/// `cat`, exposed through two agent sockets:
+/// - `filtered_sock`: `filters = ["comment=github*"]` (only the github key),
+/// - `all_sock`: no filter (both keys).
+fn config_two_sockets_one_filtered(
+    github_key_path: &Path,
+    other_key_path: &Path,
+    filtered_sock: &Path,
+    all_sock: &Path,
+) -> String {
+    let mut s = String::new();
+    s.push_str("[kv.GITHUB_KEY]\n");
+    s.push_str(&format!(
+        "command = [\"cat\", \"{}\"]\n\n",
+        github_key_path.display()
+    ));
+    s.push_str("[kv.OTHER_KEY]\n");
+    s.push_str(&format!(
+        "command = [\"cat\", \"{}\"]\n\n",
+        other_key_path.display()
+    ));
+
+    s.push_str("[authsock.sockets.filtered]\n");
+    s.push_str(&format!("path = \"{}\"\n", filtered_sock.display()));
+    s.push_str("keys = [\"GITHUB_KEY\", \"OTHER_KEY\"]\n");
+    s.push_str("filters = [\"comment=github*\"]\n\n");
+
+    s.push_str("[authsock.sockets.all]\n");
+    s.push_str(&format!("path = \"{}\"\n", all_sock.display()));
+    s.push_str("keys = [\"GITHUB_KEY\", \"OTHER_KEY\"]\n");
+    s
+}
+
+/// The filtered socket exposes only the matching key; the unfiltered socket
+/// exposes both; and a SIGN_REQUEST for the hidden key on the filtered socket is
+/// SSH_AGENT_FAILURE (filtering applies to signing, not just enumeration).
+#[test]
+fn filter_socket_hides_non_matching_key_and_rejects_its_sign() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Two real keys with distinct comments.
+    let github_key = dir.path().join("id_github");
+    let github_pub = ssh_keygen_ed25519(&github_key, "github-work");
+    let other_key = dir.path().join("id_other");
+    let other_pub = ssh_keygen_ed25519(&other_key, "other-personal");
+
+    let filtered_sock = dir.path().join("filtered.sock");
+    let all_sock = dir.path().join("all.sock");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_two_sockets_one_filtered(&github_key, &other_key, &filtered_sock, &all_sock),
+    )
+    .unwrap();
+
+    let (_daemon, _control) = spawn_daemon(dir.path(), &config_path);
+    wait_for_socket(&filtered_sock);
+    wait_for_socket(&all_sock);
+
+    // --- filtered socket: only the github key is enumerated ---
+    let (ok, listing) = ssh_add_list(&filtered_sock);
+    assert!(ok, "ssh-add -l on filtered sock failed: {listing}");
+    assert!(
+        listing.contains("github-work"),
+        "filtered sock must list the github key, got: {listing}"
+    );
+    assert!(
+        !listing.contains("other-personal"),
+        "filtered sock must NOT list the other key, got: {listing}"
+    );
+
+    // Cross-check on the wire: only the github blob is present.
+    let (rtype, rpayload) = agent_round_trip(&filtered_sock, SSH_AGENTC_REQUEST_IDENTITIES, &[]);
+    assert_eq!(rtype, SSH_AGENT_IDENTITIES_ANSWER);
+    let blobs: Vec<_> = parse_identities(&rpayload)
+        .into_iter()
+        .map(|(b, _)| b)
+        .collect();
+    assert!(blobs.contains(&public_key_blob(&github_pub)));
+    assert!(!blobs.contains(&public_key_blob(&other_pub)));
+
+    // --- filtered socket: signing the github key works ---
+    let blob = public_key_blob(&github_pub);
+    let data = b"filtered-sock signs the allowed key";
+    let mut payload = Vec::new();
+    put_string(&mut payload, &blob);
+    put_string(&mut payload, data);
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    let (resp_type, resp_payload) =
+        agent_round_trip(&filtered_sock, SSH_AGENTC_SIGN_REQUEST, &payload);
+    assert_eq!(resp_type, SSH_AGENT_SIGN_RESPONSE);
+    let sig_len = u32::from_be_bytes(resp_payload[..4].try_into().unwrap()) as usize;
+    let sig = ssh_key::Signature::try_from(&resp_payload[4..4 + sig_len]).unwrap();
+    let pk = ssh_key::PublicKey::from_openssh(&github_pub).unwrap();
+    <ssh_key::PublicKey as signature::Verifier<ssh_key::Signature>>::verify(&pk, data, &sig)
+        .expect("allowed key signs on the filtered socket");
+
+    // --- filtered socket: signing the HIDDEN key is FAILURE ---
+    let hidden_blob = public_key_blob(&other_pub);
+    let mut payload = Vec::new();
+    put_string(&mut payload, &hidden_blob);
+    put_string(&mut payload, b"should be rejected");
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    let (resp_type, resp_payload) =
+        agent_round_trip(&filtered_sock, SSH_AGENTC_SIGN_REQUEST, &payload);
+    assert_eq!(
+        resp_type, SSH_AGENT_FAILURE,
+        "signing a filtered-out key must yield FAILURE, got type {resp_type}"
+    );
+    assert!(
+        resp_payload.is_empty(),
+        "FAILURE must carry no payload (no leak)"
+    );
+
+    // --- unfiltered socket: BOTH keys are enumerated ---
+    let (ok, listing) = ssh_add_list(&all_sock);
+    assert!(ok, "ssh-add -l on all sock failed: {listing}");
+    assert!(
+        listing.contains("github-work") && listing.contains("other-personal"),
+        "unfiltered sock must list both keys, got: {listing}"
+    );
+
+    // And the unfiltered socket signs the "other" key fine.
+    let mut payload = Vec::new();
+    put_string(&mut payload, &public_key_blob(&other_pub));
+    let data = b"unfiltered sock signs the other key";
+    put_string(&mut payload, data);
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    let (resp_type, resp_payload) = agent_round_trip(&all_sock, SSH_AGENTC_SIGN_REQUEST, &payload);
+    assert_eq!(resp_type, SSH_AGENT_SIGN_RESPONSE);
+    let sig_len = u32::from_be_bytes(resp_payload[..4].try_into().unwrap()) as usize;
+    let sig = ssh_key::Signature::try_from(&resp_payload[4..4 + sig_len]).unwrap();
+    let pk = ssh_key::PublicKey::from_openssh(&other_pub).unwrap();
+    <ssh_key::PublicKey as signature::Verifier<ssh_key::Signature>>::verify(&pk, data, &sig)
+        .expect("other key signs on the unfiltered socket");
+}
+
 /// With the upstream down, the daemon must still serve the local key
 /// (degradation): `ssh-add -l` lists the local key and a local sign verifies.
 #[test]
