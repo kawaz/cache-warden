@@ -186,6 +186,7 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
     // daemon and the other sockets stay up.
     let authsock_handles = super::authsock::spawn_listeners(
         &config.authsock_sockets(),
+        &config.authsock_sources(),
         Arc::clone(&shared),
         shutdown_rx,
     );

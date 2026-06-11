@@ -669,3 +669,248 @@ fn local_key_survives_when_upstream_is_down() {
     <ssh_key::PublicKey as signature::Verifier<ssh_key::Signature>>::verify(&pk, data, &sig)
         .expect("local signature must verify");
 }
+
+// ---- Iteration 4: op:// source discovery + lazy local signing ----
+
+/// Spawn the daemon with extra environment variables (PATH for a fake `op`,
+/// XDG_CACHE_HOME for an isolated op-key disk cache).
+fn spawn_daemon_with_env(
+    dir: &Path,
+    config_path: &Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> (Daemon, PathBuf) {
+    let control = dir.join("control.sock");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cache-warden"));
+    cmd.arg("daemon")
+        .arg("run")
+        .arg("--socket")
+        .arg(&control)
+        .env("CACHE_WARDEN_CONFIG", config_path);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().expect("spawn daemon");
+    (Daemon { child }, control)
+}
+
+/// Compute the SHA256 fingerprint of a public key file via `ssh-keygen -lf`,
+/// returning the `SHA256:...` token (what `op item list` reports).
+fn ssh_fingerprint(pub_path: &Path) -> String {
+    let out = Command::new("ssh-keygen")
+        .args(["-l", "-f"])
+        .arg(pub_path)
+        .output()
+        .expect("ssh-keygen -lf");
+    assert!(out.status.success(), "ssh-keygen -lf failed");
+    let line = String::from_utf8_lossy(&out.stdout);
+    line.split_whitespace()
+        .find(|t| t.starts_with("SHA256:"))
+        .expect("fingerprint token")
+        .to_string()
+}
+
+/// Write a fake `op` CLI shell script into `bin_dir/op` that emulates the three
+/// calls the discovery + lazy-load path makes, backed by the real key files.
+///
+/// - `op ... item list ... --format json` → a one-item SSH-key array with the
+///   key's fingerprint (so discovery enumerates it).
+/// - `op ... item get ITEM --fields public_key --format json` → `{"value": pub}`.
+/// - `op ... item get ITEM --fields private_key --reveal` → the **plain** PEM
+///   (no JSON), matching `private_key_argv` (the core captures stdout verbatim).
+///
+/// `item_id` is the synthetic id the script answers for. The `--account` flag the
+/// daemon passes is accepted and ignored.
+fn write_fake_op(bin_dir: &Path, item_id: &str, fingerprint: &str, key_path: &Path) {
+    let pub_path = key_path.with_extension("pub");
+    let pub_line = std::fs::read_to_string(&pub_path)
+        .unwrap()
+        .trim()
+        .to_string();
+    let op_path = bin_dir.join("op");
+    // The script greps its own argv for the subcommand + field, then prints the
+    // canned response from the real key files.
+    let script = format!(
+        r#"#!/bin/sh
+# fake op CLI for cache-warden e2e (Iteration 4)
+args="$*"
+case "$args" in
+  *"item list"*)
+    cat <<JSON
+[
+  {{"id":"{item_id}","title":"e2e op key","vault":{{"id":"v1","name":"Private"}},
+   "category":"SSH_KEY","additional_information":"{fingerprint}"}}
+]
+JSON
+    ;;
+  *"item get"*"public_key"*)
+    printf '{{"id":"public_key","type":"STRING","value":"%s"}}' "{pub_line}"
+    ;;
+  *"item get"*"private_key"*)
+    cat "{key_file}"
+    ;;
+  *)
+    echo "fake op: unhandled args: $args" >&2
+    exit 1
+    ;;
+esac
+"#,
+        item_id = item_id,
+        fingerprint = fingerprint,
+        pub_line = pub_line,
+        key_file = key_path.display(),
+    );
+    std::fs::write(&op_path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&op_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Config for an op-source socket: `[authsock.sources.default] kind="op"` +
+/// `[authsock.sockets.default] source="default"`.
+fn op_source_config(sock_path: &Path, soft_ttl: &str, hard_ttl: &str, auth_false: bool) -> String {
+    let mut s = String::new();
+    if auth_false {
+        s.push_str("[auth]\ncommand = [\"false\"]\n\n");
+    }
+    s.push_str("[authsock.sources.default]\n");
+    s.push_str("kind = \"op\"\n");
+    s.push_str(&format!("soft-ttl = \"{soft_ttl}\"\n"));
+    s.push_str(&format!("hard-ttl = \"{hard_ttl}\"\n\n"));
+    s.push_str("[authsock.sockets.default]\n");
+    s.push_str(&format!("path = \"{}\"\n", sock_path.display()));
+    s.push_str("source = \"default\"\n");
+    s
+}
+
+/// The whole op path: discovery enumerates the 1Password key (fake `op`), it
+/// shows in `ssh-add -l`, and the first SIGN_REQUEST lazily fetches the private
+/// key via `op item get` and produces a verifiable signature.
+#[test]
+fn op_source_discovers_key_and_signs_lazily() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cache = dir.path().join("cache"); // isolated XDG_CACHE_HOME
+
+    // A real key the fake `op` serves as a 1Password item.
+    let key_path = dir.path().join("op_key");
+    let pub_line = ssh_keygen_ed25519(&key_path, "e2e-op-key");
+    let fp = ssh_fingerprint(&key_path.with_extension("pub"));
+    write_fake_op(&bin, "iteme2e", &fp, &key_path);
+
+    let agent_sock = dir.path().join("agent.sock");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        op_source_config(&agent_sock, "1h", "24h", false),
+    )
+    .unwrap();
+
+    // PATH = our fake-op bin dir first, then the inherited PATH (for ssh-keygen).
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_os = std::ffi::OsString::from(bin.as_os_str());
+    path_os.push(":");
+    path_os.push(&inherited);
+
+    let (_daemon, _control) = spawn_daemon_with_env(
+        dir.path(),
+        &config_path,
+        &[
+            ("PATH", path_os.as_os_str()),
+            ("XDG_CACHE_HOME", cache.as_os_str()),
+        ],
+    );
+    wait_for_socket(&agent_sock);
+
+    // (1) The discovered op key shows in ssh-add -l with its item title comment.
+    let (ok, listing) = ssh_add_list(&agent_sock);
+    assert!(ok, "ssh-add -l failed: {listing}");
+    assert!(
+        listing.contains("e2e op key"),
+        "op key should enumerate with its title comment, got: {listing}"
+    );
+
+    // (2) First SIGN_REQUEST lazily fetches the private key (op item get) and
+    //     returns a signature that verifies against the discovered public key.
+    let blob = public_key_blob(&pub_line);
+    let data = b"op-source signing challenge";
+    let mut payload = Vec::new();
+    put_string(&mut payload, &blob);
+    put_string(&mut payload, data);
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    let (resp_type, resp_payload) =
+        agent_round_trip(&agent_sock, SSH_AGENTC_SIGN_REQUEST, &payload);
+    assert_eq!(
+        resp_type, SSH_AGENT_SIGN_RESPONSE,
+        "op key SIGN must succeed, got type {resp_type}"
+    );
+    let sig_len = u32::from_be_bytes(resp_payload[..4].try_into().unwrap()) as usize;
+    let sig = ssh_key::Signature::try_from(&resp_payload[4..4 + sig_len]).unwrap();
+    let pk = ssh_key::PublicKey::from_openssh(&pub_line).unwrap();
+    <ssh_key::PublicKey as signature::Verifier<ssh_key::Signature>>::verify(&pk, data, &sig)
+        .expect("lazily-loaded op signature must verify against the public key");
+}
+
+/// An op source whose lazy load needs (denied) re-auth: with `[auth].command =
+/// ["false"]`, the first SIGN_REQUEST's auth step is denied, so the key is never
+/// loaded and the response is SSH_AGENT_FAILURE with no payload.
+#[test]
+fn op_source_sign_with_denied_auth_is_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cache = dir.path().join("cache");
+
+    let key_path = dir.path().join("op_key");
+    let pub_line = ssh_keygen_ed25519(&key_path, "deny-op-key");
+    let fp = ssh_fingerprint(&key_path.with_extension("pub"));
+    write_fake_op(&bin, "itemdeny", &fp, &key_path);
+
+    let agent_sock = dir.path().join("agent.sock");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        op_source_config(&agent_sock, "1h", "24h", true),
+    )
+    .unwrap();
+
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_os = std::ffi::OsString::from(bin.as_os_str());
+    path_os.push(":");
+    path_os.push(&inherited);
+
+    let (_daemon, _control) = spawn_daemon_with_env(
+        dir.path(),
+        &config_path,
+        &[
+            ("PATH", path_os.as_os_str()),
+            ("XDG_CACHE_HOME", cache.as_os_str()),
+        ],
+    );
+    wait_for_socket(&agent_sock);
+
+    // The key still enumerates (public discovery is auth-free). Its comment is
+    // the op item *title* ("e2e op key"), not the ssh-keygen file comment.
+    let (ok, listing) = ssh_add_list(&agent_sock);
+    assert!(ok, "ssh-add -l failed: {listing}");
+    assert!(
+        listing.contains("e2e op key"),
+        "op key should enumerate before the denied sign, got: {listing}"
+    );
+
+    // ...but the lazy load's re-auth is denied, so the sign fails cleanly.
+    let blob = public_key_blob(&pub_line);
+    let mut payload = Vec::new();
+    put_string(&mut payload, &blob);
+    put_string(&mut payload, b"challenge");
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    let (resp_type, resp_payload) =
+        agent_round_trip(&agent_sock, SSH_AGENTC_SIGN_REQUEST, &payload);
+    assert_eq!(
+        resp_type, SSH_AGENT_FAILURE,
+        "denied lazy-load auth must yield FAILURE, got type {resp_type}"
+    );
+    assert!(resp_payload.is_empty(), "FAILURE must carry no detail");
+}

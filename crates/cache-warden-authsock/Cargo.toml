@@ -56,11 +56,18 @@ base64 = "0.22"
 # Zeroize transient key-material buffers (PEM body / DER / seed) in the signer.
 zeroize = "1"
 
+# --- op key discovery (1Password vault enumeration; ported from authsock-warden) ---
+# Deserialize `op item list` / `op item get` JSON and (de)serialize the public-key
+# disk cache (`op_map.json`, fingerprint → public-key map; holds no secrets).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 [dev-dependencies]
 # Drive the async codec / upstream tests (in-memory cursors + fake agent socket
 # via `net`; #[tokio::test] needs `rt` + `macros`).
 tokio = { version = "1", features = ["rt", "io-util", "macros", "net"] }
 # Build canonical wire vectors in integration tests.
 bytes = "1"
-# Temp authorized_keys files for the keyfile filter tests.
+# Temp authorized_keys files for the keyfile filter tests, and a private cache
+# dir for the op disk-cache tests.
 tempfile = "3"

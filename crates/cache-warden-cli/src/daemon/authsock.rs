@@ -48,17 +48,18 @@
 //! block on a user prompt for minutes, which must not pin an async worker. The
 //! upstream calls are async (non-blocking socket I/O) and stay on the runtime.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use cache_warden::{
-    Authenticator, Clock, EntryState, ProcessInfo, ProcessInspector, RegenerateOutcome,
-    SourceRunner, Store, SystemInspector,
+    AuthContext, Authenticator, Clock, EntryState, ProcessInfo, ProcessInspector,
+    RegenerateOutcome, SourceRunner, Store, SystemInspector, Ttl, ValueSource,
 };
 use cache_warden_authsock::{
-    AgentCodec, AgentMessage, FilterEvaluator, Identity, MessageType, PublicKeyRegistry, Upstream,
-    sign,
+    AgentCodec, AgentMessage, DiscoveredKey, FilterEvaluator, Identity, KeySource, MessageType,
+    OpKeyCache, OpSource, PublicKeyRegistry, RealOpClient, RegisteredKey, Upstream, discover_keys,
+    private_key_argv, sign,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
@@ -67,7 +68,7 @@ use tokio::task::JoinHandle;
 use super::peer::peer_pid;
 use super::server::{Shared, bind_control_socket};
 use super::upstream_path::resolve_upstream_path;
-use crate::config::AuthsockSocket;
+use crate::config::{AuthsockSocket, AuthsockSource};
 
 /// Build a public-key registry for `keys` from the PEMs cached in `store`.
 ///
@@ -125,22 +126,118 @@ struct SocketState {
     shared: Arc<Shared>,
 }
 
+/// Discover the keys of every `[authsock.sources.*]` once, with the production
+/// `op` CLI client. A source's discovery failure (op not signed in, network
+/// down) is logged and the source yields no keys — startup is never blocked, and
+/// the socket comes up so a later `refresh` can populate it (port plan §2).
+///
+/// Returns a `source name → discovered keys` map. Sharing one discovery across
+/// every socket that references the same source mirrors authsock-warden's shared
+/// op state (one TouchID-bearing `op item list`, not one per socket).
+fn discover_all_sources(sources: &[AuthsockSource]) -> BTreeMap<String, Vec<DiscoveredKey>> {
+    let mut out = BTreeMap::new();
+    for source in sources {
+        let client = match &source.op_account {
+            Some(a) => RealOpClient::with_account(a.clone()),
+            None => RealOpClient::new(),
+        };
+        let op_sources: Vec<OpSource> = source
+            .members
+            .iter()
+            .filter_map(|m| OpSource::parse(m))
+            .collect();
+        let cache = OpKeyCache::load();
+        match discover_keys(&client, &op_sources, cache) {
+            Ok((keys, fresh_cache)) => {
+                fresh_cache.save();
+                println!(
+                    "cache-warden: authsock source `{}`: discovered {} op key(s)",
+                    source.name,
+                    keys.len()
+                );
+                out.insert(source.name.clone(), keys);
+            }
+            Err(e) => {
+                eprintln!(
+                    "cache-warden: authsock source `{}`: op discovery failed ({e}); \
+                     serving no keys from this source",
+                    source.name
+                );
+                out.insert(source.name.clone(), Vec::new());
+            }
+        }
+    }
+    out
+}
+
+/// Register a source's discovered keys into `registry` as op-sourced keys.
+///
+/// Each discovered key becomes a [`KeySource::Op`] entry: the public key is
+/// enumerable now (REQUEST_IDENTITIES), and the private PEM is fetched lazily at
+/// first sign via `op item get` (the argv built by [`private_key_argv`]). The
+/// core KV key is namespaced (`__authsock_op:<item_id>`) so it never collides
+/// with a manual `[kv.*]` entry. A key whose public blob fails to parse is
+/// logged and skipped. Returns how many keys were registered.
+fn register_op_keys(
+    socket_name: &str,
+    source: &AuthsockSource,
+    keys: &[DiscoveredKey],
+    registry: &mut PublicKeyRegistry,
+) -> usize {
+    let mut n = 0;
+    for key in keys {
+        let kv_key = op_kv_key(&key.item_id);
+        let argv = private_key_argv(&key.item_id, source.op_account.as_deref());
+        let src = KeySource::Op {
+            argv,
+            soft_ttl_secs: source.soft_ttl_secs,
+            hard_ttl_secs: source.hard_ttl_secs,
+        };
+        match registry.register_op_key(&kv_key, &key.public_key, &key.title, src) {
+            Ok(()) => n += 1,
+            Err(e) => eprintln!(
+                "cache-warden: authsock `{socket_name}`: op key `{}` is not a usable public \
+                 key, skipping ({e})",
+                key.title
+            ),
+        }
+    }
+    n
+}
+
+/// The core KV key name for an op-sourced key (namespaced to avoid `[kv.*]`
+/// collisions). The item id is alphanumeric (validated at fetch time).
+fn op_kv_key(item_id: &str) -> String {
+    format!("__authsock_op:{item_id}")
+}
+
 /// Spawn one listener task per validated `[authsock.sockets.*]`.
 ///
 /// Returns `(socket_path, JoinHandle)` pairs so the caller can await each task
 /// on shutdown and remove its socket file. A socket whose registry ends up
 /// empty (no key resolved) is still bound — it simply answers REQUEST_IDENTITIES
 /// with an empty list until a key is set.
+///
+/// `sources` are the validated `[authsock.sources.*]`; their keys are discovered
+/// once up front (see [`discover_all_sources`]) and registered into the registry
+/// of every socket that references them via `source`.
 pub fn spawn_listeners(
     sockets: &[AuthsockSocket],
+    sources: &[AuthsockSource],
     shared: Arc<Shared>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Vec<(PathBuf, JoinHandle<()>)> {
+    // Discover every op source once (shared across sockets referencing it).
+    let discovered = discover_all_sources(sources);
+    let source_by_name: BTreeMap<&str, &AuthsockSource> =
+        sources.iter().map(|s| (s.name.as_str(), s)).collect();
+
     let mut handles = Vec::new();
     for socket in sockets {
         // Derive this socket's public-key registry up front (under the store
-        // lock) from the configured keys' currently-cached PEMs.
-        let registry = {
+        // lock) from the configured keys' currently-cached PEMs, then add any
+        // op-sourced keys from the source it references.
+        let mut registry = {
             let mut store = match shared.store.lock() {
                 Ok(g) => g,
                 Err(_) => {
@@ -153,6 +250,17 @@ pub fn spawn_listeners(
             };
             build_registry(&socket.name, &socket.keys, &mut store, &shared.clock)
         };
+
+        // Add op-sourced keys (lazily loaded at sign time; see [`KeySource::Op`]).
+        let mut op_key_count = 0;
+        if let Some(source_name) = &socket.source
+            && let (Some(source), Some(keys)) = (
+                source_by_name.get(source_name.as_str()),
+                discovered.get(source_name),
+            )
+        {
+            op_key_count = register_op_keys(&socket.name, source, keys, &mut registry);
+        }
 
         let listener = match bind_control_socket(&socket.path) {
             Ok(l) => l,
@@ -189,10 +297,11 @@ pub fn spawn_listeners(
         };
 
         println!(
-            "cache-warden: authsock `{}` listening on {} ({} local key(s), {} upstream(s), {} filter term(s))",
+            "cache-warden: authsock `{}` listening on {} ({} key(s) incl. {} op, {} upstream(s), {} filter term(s))",
             socket.name,
             socket.path.display(),
             registry.len(),
+            op_key_count,
             upstreams.len(),
             filter.len()
         );
@@ -456,21 +565,21 @@ fn local_sign(state: &SocketState, peer: Option<u32>, msg: &AgentMessage) -> Age
     sign_local_with_ctx(&ctx, requester.as_deref(), msg)
 }
 
-/// Resolve the core KV key a SIGN_REQUEST may use, or `None` to reject it.
+/// Resolve the registered key a SIGN_REQUEST may use, or `None` to reject it.
 ///
-/// Returns `Some(kv_key)` only when the requested blob is a registered local key
-/// **and** passes the socket filter (judged with the registry's comment, so a
-/// comment filter holds on the direct-sign path — a key the socket does not
-/// expose cannot be signed with). An unknown blob or a filtered-out key yields
-/// `None`, which the caller maps to SSH_AGENT_FAILURE.
-fn signable_kv_key(
-    registry: &PublicKeyRegistry,
+/// Returns `Some(&RegisteredKey)` only when the requested blob is registered
+/// (local KV or op-sourced) **and** passes the socket filter (judged with the
+/// registry's comment, so a comment filter holds on the direct-sign path — a key
+/// the socket does not expose cannot be signed with). An unknown blob or a
+/// filtered-out key yields `None`, which the caller maps to SSH_AGENT_FAILURE.
+fn signable_key<'r>(
+    registry: &'r PublicKeyRegistry,
     filter: &FilterEvaluator,
     key_blob: &[u8],
-) -> Option<String> {
+) -> Option<&'r RegisteredKey> {
     let registered = registry.lookup(key_blob)?;
     let identity = Identity::new(registered.key_blob.clone(), registered.comment.clone());
-    filter.matches(&identity).then(|| registered.kv_key.clone())
+    filter.matches(&identity).then_some(registered)
 }
 
 /// The borrowed core services a local sign needs, grouped so the signing helper
@@ -516,10 +625,13 @@ where
         Err(_) => return AgentMessage::failure(),
     };
     // Unknown key or filtered-out key: do not reveal which keys exist beyond
-    // IDENTITIES.
-    let Some(kv_key) = signable_kv_key(ctx.registry, ctx.filter, &fields.key_blob) else {
+    // IDENTITIES. Clone the small bits we need so the registry borrow ends before
+    // we take the store lock (the source carries the op fetch spec).
+    let Some(registered) = signable_key(ctx.registry, ctx.filter, &fields.key_blob) else {
         return AgentMessage::failure();
     };
+    let kv_key = registered.kv_key.clone();
+    let source = registered.source.clone();
     let (auth, runner, clock) = (ctx.auth, ctx.runner, ctx.clock);
 
     let mut store = match ctx.store.lock() {
@@ -527,8 +639,10 @@ where
         Err(_) => return AgentMessage::failure(),
     };
 
-    // Fetch the PEM through the same auth gate as the control socket.
-    if !ensure_active(&mut store, &kv_key, auth, runner, requester, clock) {
+    // Fetch the PEM through the same auth gate as the control socket. For an
+    // op-sourced key the core entry may not exist yet (lazy NotLoaded): the
+    // first sign fetches it via `op item get`, authenticates, and `set`s it.
+    if !ensure_loaded(&mut store, &kv_key, &source, auth, runner, requester, clock) {
         return AgentMessage::failure();
     }
 
@@ -555,13 +669,25 @@ where
 
 /// Make `key`'s value readable (Active), running the core's auth gate.
 ///
-/// Returns `true` if the value is now Active (already-Active, extended after
-/// soft expiry, or regenerated after hard expiry). Returns `false` on any
-/// failure (missing, denied, hard-expired static, regenerate error) — the
-/// caller maps that to SSH_AGENT_FAILURE.
-fn ensure_active<A, R, C>(
+/// `source` describes how the private value reaches the core:
+///
+/// - [`KeySource::Local`]: the entry exists from startup. An absent entry is a
+///   failure (its PEM was never loaded); otherwise the Iteration 1 gate applies
+///   (Active passes, SoftExpired extends, HardExpired regenerates if regenerable).
+/// - [`KeySource::Op`]: the entry is created **lazily**. If the core has no entry
+///   yet (the NotLoaded case), the source command (`op item get`) is run to fetch
+///   the PEM, the user re-authenticates, and the value is `set` as a command
+///   source with the source's TTLs — then it is Active. Once it exists, the same
+///   Iteration 1 gate applies (idle extend within soft, regenerate via the same
+///   command after hard).
+///
+/// Returns `true` if the value is now Active, `false` on any failure (denied,
+/// hard-expired static, fetch error) — the caller maps that to SSH_AGENT_FAILURE.
+#[allow(clippy::too_many_arguments)]
+fn ensure_loaded<A, R, C>(
     store: &mut Store,
     key: &str,
+    source: &KeySource,
     auth: &A,
     runner: &R,
     requester: Option<&[ProcessInfo]>,
@@ -573,7 +699,26 @@ where
     C: Clock,
 {
     match store.state_of(key, clock) {
-        None => false,
+        // Absent. For an op key this is the lazy NotLoaded path: fetch + auth +
+        // set. A local key has no value to load, so it stays a failure.
+        None => match source {
+            KeySource::Local => false,
+            KeySource::Op {
+                argv,
+                soft_ttl_secs,
+                hard_ttl_secs,
+            } => lazy_load_op_key(
+                store,
+                key,
+                argv,
+                *soft_ttl_secs,
+                *hard_ttl_secs,
+                auth,
+                runner,
+                requester,
+                clock,
+            ),
+        },
         Some(EntryState::Active) => true,
         Some(EntryState::SoftExpired) => {
             matches!(
@@ -595,6 +740,59 @@ where
             }
         }
     }
+}
+
+/// First-sign load of an op key: run the fetch command, re-authenticate, and
+/// `set` the value into the core as a command source (port plan §1.3 / §1.4).
+///
+/// The command (`op item get ... --reveal`) runs **before** the auth prompt so an
+/// upstream failure (op not signed in) surfaces without wasting a TouchID — the
+/// same order the core's `regenerate` uses. The fetched `SecretBytes` is dropped
+/// (zeroized) if auth is denied, leaving no entry behind. On success the value is
+/// `set` with the source's TTLs and is immediately Active.
+#[allow(clippy::too_many_arguments)]
+fn lazy_load_op_key<A, R, C>(
+    store: &mut Store,
+    key: &str,
+    argv: &[String],
+    soft_ttl_secs: Option<u64>,
+    hard_ttl_secs: Option<u64>,
+    auth: &A,
+    runner: &R,
+    requester: Option<&[ProcessInfo]>,
+    clock: &C,
+) -> bool
+where
+    A: Authenticator + ?Sized,
+    R: SourceRunner,
+    C: Clock,
+{
+    let ttl = match Ttl::new(
+        soft_ttl_secs.map(std::time::Duration::from_secs),
+        hard_ttl_secs.map(std::time::Duration::from_secs),
+    ) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    // Fetch the PEM first (before bothering the user for biometrics).
+    let value = match runner.run(argv) {
+        Ok(v) => v,
+        // The RunError Display is secret-free; we drop it silently (FAILURE).
+        Err(_) => return false,
+    };
+    // Re-authenticate. `value` is dropped (zeroized) on denial. The op
+    // first-load is the regenerate-equivalent of an absent value, so it uses the
+    // Regenerate auth operation (the same context the later hard-expiry
+    // regenerate of this key uses).
+    let ctx = match requester {
+        Some(chain) => AuthContext::regenerate(key).with_requester(chain.to_vec()),
+        None => AuthContext::regenerate(key),
+    };
+    if auth.authenticate(&ctx).is_err() {
+        return false;
+    }
+    store.set(key, ValueSource::command(argv.to_vec()), value, ttl, clock);
+    true
 }
 
 #[cfg(test)]
@@ -905,6 +1103,324 @@ mod tests {
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
+    }
+
+    // ---- Iteration 4: op-sourced keys (lazy load + core KV wiring) ----
+
+    /// A runner that returns the Ed25519 PEM (the op item get fetch), counting
+    /// runs so tests can assert the value is fetched at most once until hard
+    /// expiry. Ignores argv (the real argv is `op item get ...`).
+    struct PemRunner {
+        runs: std::cell::Cell<usize>,
+    }
+    impl PemRunner {
+        fn new() -> Self {
+            Self {
+                runs: std::cell::Cell::new(0),
+            }
+        }
+        fn runs(&self) -> usize {
+            self.runs.get()
+        }
+    }
+    impl SourceRunner for PemRunner {
+        fn run(&self, _argv: &[String]) -> Result<SecretBytes, RunError> {
+            self.runs.set(self.runs.get() + 1);
+            Ok(SecretBytes::from(ED25519_PEM))
+        }
+    }
+
+    /// A registry holding one op-sourced key (no core entry yet — lazy) plus an
+    /// empty store. The op key's KV name is namespaced like the production path.
+    fn op_fixture(soft: u64, hard: u64) -> (Mutex<Store>, PublicKeyRegistry) {
+        let mut registry = PublicKeyRegistry::new();
+        let argv = private_key_argv("itemABC", Some("kawaz.1password.com"));
+        registry
+            .register_op_key(
+                op_kv_key("itemABC"),
+                ED25519_PUB,
+                "kawaz op key",
+                KeySource::Op {
+                    argv,
+                    soft_ttl_secs: Some(soft),
+                    hard_ttl_secs: Some(hard),
+                },
+            )
+            .unwrap();
+        // The core starts empty: the op key's value is loaded lazily on first sign.
+        (Mutex::new(Store::new()), registry)
+    }
+
+    #[test]
+    fn op_key_first_sign_lazily_loads_fetches_and_signs() {
+        let clock = FakeClock::new();
+        let (store, registry) = op_fixture(SOFT, HARD);
+        let runner = PemRunner::new();
+        let data = b"agent challenge for op key";
+        let req = sign_request(&blob_of(ED25519_PUB), data, 0);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &runner,
+            &clock,
+            None,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+        assert_eq!(runner.runs(), 1, "first sign fetches the PEM once");
+
+        // The signature verifies against the public key.
+        let mut buf = &resp.payload[..];
+        use bytes::Buf;
+        let len = buf.get_u32() as usize;
+        let sig = ssh_key::Signature::try_from(&buf[..len]).unwrap();
+        let pk = ssh_key::PublicKey::from_openssh(ED25519_PUB).unwrap();
+        <ssh_key::PublicKey as signature::Verifier<ssh_key::Signature>>::verify(&pk, data, &sig)
+            .unwrap();
+
+        // The core now holds the op key's value (lazy load created it).
+        let key = op_kv_key("itemABC");
+        assert!(store.lock().unwrap().get(&key, &clock).is_some());
+    }
+
+    #[test]
+    fn op_key_second_sign_within_soft_hits_cache_no_refetch() {
+        let clock = FakeClock::new();
+        let (store, registry) = op_fixture(SOFT, HARD);
+        let runner = PemRunner::new();
+        let req = sign_request(&blob_of(ED25519_PUB), b"d1", 0);
+        let r1 = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &runner,
+            &clock,
+            None,
+            &req,
+        );
+        assert_eq!(r1.msg_type, MessageType::SignResponse);
+        // Advance within the soft window; the cached value signs without re-fetch.
+        clock.advance(Duration::from_secs(SOFT - 2));
+        let req2 = sign_request(&blob_of(ED25519_PUB), b"d2", 0);
+        let r2 = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &DenyAll,
+            &runner,
+            &clock,
+            None,
+            &req2,
+        );
+        assert_eq!(
+            r2.msg_type,
+            MessageType::SignResponse,
+            "cached op key signs within soft window without re-auth"
+        );
+        assert_eq!(runner.runs(), 1, "no second op item get within soft window");
+    }
+
+    #[test]
+    fn op_key_after_hard_expiry_regenerates_via_same_command() {
+        let clock = FakeClock::new();
+        let (store, registry) = op_fixture(SOFT, HARD);
+        let runner = PemRunner::new();
+        let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
+        let _ = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &runner,
+            &clock,
+            None,
+            &req,
+        );
+        assert_eq!(runner.runs(), 1);
+        // Past the hard window: the value is destroyed; the next sign regenerates
+        // it by re-running the same op item get command (a second fetch).
+        clock.advance(Duration::from_secs(HARD + 1));
+        let req2 = sign_request(&blob_of(ED25519_PUB), b"d2", 0);
+        let r2 = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &runner,
+            &clock,
+            None,
+            &req2,
+        );
+        assert_eq!(r2.msg_type, MessageType::SignResponse);
+        assert_eq!(runner.runs(), 2, "hard-expired op key re-fetches");
+    }
+
+    #[test]
+    fn op_key_first_sign_denied_auth_loads_nothing_and_fails() {
+        let clock = FakeClock::new();
+        let (store, registry) = op_fixture(SOFT, HARD);
+        let runner = PemRunner::new();
+        let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &DenyAll,
+            &runner,
+            &clock,
+            None,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+        assert!(resp.payload.is_empty(), "FAILURE must carry no detail");
+        // The fetch ran (before auth), but the denied value was discarded — no
+        // core entry was created.
+        assert_eq!(runner.runs(), 1);
+        let key = op_kv_key("itemABC");
+        assert!(store.lock().unwrap().get(&key, &clock).is_none());
+    }
+
+    #[test]
+    fn op_key_fetch_failure_skips_auth_and_fails() {
+        let clock = FakeClock::new();
+        let (store, registry) = op_fixture(SOFT, HARD);
+        // NoRunner always fails the fetch (op not signed in / network down).
+        let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+        let key = op_kv_key("itemABC");
+        assert!(store.lock().unwrap().get(&key, &clock).is_none());
+    }
+
+    #[test]
+    fn op_key_unknown_blob_is_failure() {
+        let clock = FakeClock::new();
+        let (store, registry) = op_fixture(SOFT, HARD);
+        let req = sign_request(b"not-a-registered-blob", b"d", 0);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &PemRunner::new(),
+            &clock,
+            None,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+    }
+
+    #[test]
+    fn op_key_filtered_out_is_failure() {
+        // A comment filter that hides the op key denies its direct SIGN_REQUEST.
+        let clock = FakeClock::new();
+        let (store, registry) = op_fixture(SOFT, HARD);
+        let filter = parse_filter(&["comment=nope*"]);
+        let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
+        let resp = handle_local_sign(
+            &registry,
+            &filter,
+            &store,
+            &AllowAll,
+            &PemRunner::new(),
+            &clock,
+            None,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+    }
+
+    #[test]
+    fn op_key_enumerates_with_comment_from_title() {
+        // The op key shows in REQUEST_IDENTITIES with the item title as its comment.
+        let (_store, registry) = op_fixture(SOFT, HARD);
+        let ids = registry.identities();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].key_blob.as_ref(), blob_of(ED25519_PUB).as_slice());
+        assert_eq!(ids[0].comment, "kawaz op key");
+    }
+
+    // ---- register_op_keys (discovery → registry wiring) ----
+
+    #[test]
+    fn register_op_keys_namespaces_and_threads_account_and_ttls() {
+        let source = AuthsockSource {
+            name: "default".into(),
+            op_account: Some("kawaz.1password.com".into()),
+            members: vec!["op://".into()],
+            soft_ttl_secs: Some(3600),
+            hard_ttl_secs: Some(86400),
+        };
+        let keys = vec![DiscoveredKey {
+            item_id: "itemABC".into(),
+            public_key: ED25519_PUB.into(),
+            title: "kawaz key".into(),
+            fingerprint: "SHA256:x".into(),
+            vault: "Private".into(),
+        }];
+        let mut registry = PublicKeyRegistry::new();
+        let n = register_op_keys("sock", &source, &keys, &mut registry);
+        assert_eq!(n, 1);
+        let reg = registry.lookup(&blob_of(ED25519_PUB)).unwrap();
+        assert_eq!(reg.kv_key, "__authsock_op:itemABC");
+        assert_eq!(reg.comment, "kawaz key");
+        match &reg.source {
+            KeySource::Op {
+                argv,
+                soft_ttl_secs,
+                hard_ttl_secs,
+            } => {
+                assert_eq!(*soft_ttl_secs, Some(3600));
+                assert_eq!(*hard_ttl_secs, Some(86400));
+                assert!(argv.contains(&"--account".to_string()));
+                assert!(argv.contains(&"kawaz.1password.com".to_string()));
+                assert!(argv.contains(&"--reveal".to_string()));
+                assert!(argv.contains(&"itemABC".to_string()));
+            }
+            other => panic!("expected Op source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_op_keys_skips_unparseable_public_key() {
+        let source = AuthsockSource {
+            name: "default".into(),
+            op_account: None,
+            members: vec!["op://".into()],
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+        };
+        let keys = vec![
+            DiscoveredKey {
+                item_id: "good".into(),
+                public_key: ED25519_PUB.into(),
+                title: "good".into(),
+                fingerprint: "SHA256:a".into(),
+                vault: "v".into(),
+            },
+            DiscoveredKey {
+                item_id: "bad".into(),
+                public_key: "not a key".into(),
+                title: "bad".into(),
+                fingerprint: "SHA256:b".into(),
+                vault: "v".into(),
+            },
+        ];
+        let mut registry = PublicKeyRegistry::new();
+        let n = register_op_keys("sock", &source, &keys, &mut registry);
+        assert_eq!(n, 1, "the unparseable key is skipped");
     }
 
     // ---- Iteration 2: upstream merge / routing (async, against a fake agent) ----

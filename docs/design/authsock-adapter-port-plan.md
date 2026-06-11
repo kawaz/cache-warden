@@ -390,7 +390,7 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
     持たず、ローカルは registry の comment、upstream は `routes` を「列挙通過鍵の記録」として使う。意味論
     （列挙に出ない鍵への直接署名を拒否、blob 判定可能なフィルタは列挙なしでも評価）は warden と等価。
 
-### Iteration 4: op 鍵発見 + ローカル署名（DR-011 / DR-015）
+### Iteration 4: op 鍵発見 + ローカル署名（DR-011 / DR-015）✅ 完了（2026-06-11）
 
 - スコープ: `keystore/op.rs` / `cache.rs` 移植 + 公開鍵レジストリ（key_blob → itemid）を実装。
   SIGN ミス時に `ValueSource::Command(op item get ...)` でコアに遅延 set → 署名（§1.3 案 / §1.4）。
@@ -399,6 +399,70 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
 - 検証: op:// source で `ssh-add -L` に op 鍵が出る、初回 SIGN で TouchID 1 回 → 2 回目以降キャッシュヒット
   （= soft TTL 内は再認証なし）。warden と TouchID 回数を突き合わせる。
 - **最も重い iteration**。発見フローの TouchID 制御が壊れると日常利用が劣化するので慎重に。
+- 実績（2026-06-11）:
+  - **op CLI 抽象**（`cache-warden-authsock/src/op.rs`）: warden の `keystore/op.rs` を移植しつつ
+    `OpClient` trait（`item_list_json` / `item_get_public_key_json`）で op CLI 呼び出しを境界化。
+    本番は `RealOpClient`（同期 `std::process`、`op_account` を `--account` で渡す）、テストは fake op で
+    JSON 解析・発見・キャッシュ・KV 配線を全網羅（実 op CLI 依存テストは CI に入れない）。`OpSource::parse`
+    で `op://` / `op://VAULT` / `op://VAULT/ITEM` をパース、`validate_item_id`（英数字のみ）で itemid の
+    flag injection を防止。`parse_item_list` / `parse_field_value` は純関数で単体テスト。
+  - **ディスクキャッシュ**（`op_cache.rs`）: warden の `cache.rs` 移植。`$XDG_CACHE_HOME/cache-warden/op_map.json`
+    （fingerprint → 公開鍵、秘密情報なし、0600）。path 注入可能（テストは temp dir）。version 不一致 /
+    破損 / 不在は空キャッシュ（fail-open、ヒントに過ぎない）。
+  - **発見ロジック**（`op_discovery.rs`）: DR-011 の **最小版（ディスクキャッシュ → op item list →
+    op item get）**。source ごとに `op item list` 列挙 → fingerprint がキャッシュにあれば公開鍵再利用
+    （op item get なし）、無ければ `op item get --fields public_key`。source 跨ぎは fingerprint で dedup。
+    更新キャッシュを返す（daemon が保存）。`DiscoveredKey { item_id, public_key, title, fingerprint, vault }`。
+  - **公開鍵レジストリ拡張**（`registry.rs`）: `RegisteredKey` に `KeySource`（`Local` / `Op { argv,
+    soft_ttl_secs, hard_ttl_secs }`）を追加。`register_op_key` は**公開鍵 OpenSSH 文字列から** blob を導出
+    （秘密鍵に触れない）。`Local` は従来 PEM 由来（Iteration 1）。
+  - **コア KV 遅延配線**（`cache-warden-cli/src/daemon/authsock.rs`）: op 鍵は daemon 起動時に
+    **レジストリにのみ登録**（コア entry はまだ無し = NotLoaded）。SIGN 時 `ensure_loaded` が分岐:
+    - 既存 entry → Iteration 1 ゲート（Active=即署名 / SoftExpired=`extend_authenticated` / HardExpired=
+      `regenerate` で同 argv 再実行）。
+    - **op 鍵 + entry 不在** → `lazy_load_op_key`: runner で `op item get ... --reveal` 実行 → 再認証
+      （fetch 先・auth 後の順は core regenerate と同じ。拒否時 value は zeroize drop）→ `store.set`
+      （command source + source の TTL）。以降は soft 内キャッシュヒット、soft 切れ extend、hard 切れ
+      regenerate。**warden では未配線だった TTL コアをここで初めて実配線**（port plan の肝）。
+    - KV key は `__authsock_op:<item_id>` で namespaced（手動 `[kv.*]` と衝突回避）。
+  - **op private_key の JSON 後処理問題（§1.4 / §3-11）の解決**: warden は `--format json` で取得し `.value`
+    抽出していたが、cache-warden コアの `CommandRunner` は **stdout 生バイト**を値にするため JSON だと
+    `{"value":"<PEM>"}` が保存されてしまう。→ `private_key_argv` は **`--format json` を付けず**
+    `op item get ITEM --fields private_key --reveal`（プレーン PEM 出力）にした。コア既定の
+    `TrailingNewline::TrimOne` が op の末尾改行 1 個を落とし、signer がパースできる PEM がそのまま残る。
+    `--reveal` は concealed SSH key field 取得に必須（DR-011）。
+  - **config 新スキーマ**（`[authsock.sources.NAME]` = `kind="op"` / `op_account` / `members` /
+    `soft-ttl` / `hard-ttl`、`[authsock.sockets.NAME].source = "NAME"`）: `deny_unknown_fields`、
+    起動時バリデーション（未対応 kind / 非 op:// member / 不正 TTL / 未宣言 source 参照を fail-fast、
+    socket 名付き）。`members` 省略は `["op://"]`。`keys` / `upstreams` / `source` は併存可（1 socket が
+    複数経路を束ねられる）。kawaz の実 warden 設定（`members=["op://"]` + `source="default"`）が動く。
+  - **github フィルタ併用**: Iteration 3 で未実装のため、op source の socket が github フィルタを使う設定は
+    config parse 時点で「未対応」として fail-fast（既存 github defer の扱いに合わせる。op 固有の追加対応なし）。
+  - **検証**: 単体（op.rs 14 / op_cache.rs 7 / op_discovery.rs 6 / registry op 5 / daemon op-sign 8 +
+    register 2 / config sources 13）+ E2E（`authsock_e2e.rs` に 2 件: **fake op スクリプトを PATH に置く**
+    真の end-to-end。`op://` source で discovery → `ssh-add -l` に op 鍵列挙 → 初回 SIGN で遅延 fetch →
+    署名 verify / `[auth].command=["false"]` で遅延 load の再認証拒否 → FAILURE + payload 空）。
+    `just ci` 全通過（fmt / clippy -D warnings / test / build）、既存テスト回帰なし。
+- **新規判断（要記録）**:
+  1. **op 抽象の置き場**: アダプタ crate（`op.rs` / `op_cache.rs` / `op_discovery.rs`）。op CLI は
+     `OpClient` trait 境界、本番 `RealOpClient`（同期 std::process）。理由 = SSH 鍵 ↔ 1Password の語彙は
+     アダプタ責務（DR-0004）、trait 境界で CI に実 op を持ち込まずテスト可能。
+  2. **op_source 設定 = `[authsock.sources.*]` + socket `source` 参照**（新スキーマ）。warden の
+     `[[sources]] members` を cache-warden 流に翻訳。互換レイヤなし（§3 判断 2 確定方針どおり）。
+  3. **NotLoaded = レジストリ + 遅延コア KV set**（§1.3 案 / §3 判断 4 確定どおり）。コアに「値なし entry」
+     概念を足さず、アダプタ `KeySource::Op` が fetch 方法を保持、初回 SIGN で `store.set`。
+  4. **private_key 取得はプレーン出力**（`--format json` なし、上記）。コア CommandRunner の生 stdout +
+     TrimOne で PEM が綺麗に残る。アダプタ側の JSON 後処理は不要にした。
+- **見送り（理由付き、Iteration 後送り or follow-up）**:
+  - **DR-011 の 1Password agent socket 高速路（ステップ 3–4）**: 最小実装ではディスクキャッシュ +
+    op item get のみ。理由 = agent socket 経由の fingerprint 照合は **二つ目の async 解決経路**を足す一方、
+    定常状態（warm restart）はディスクキャッシュで op item get ゼロになり、初回発見時のみ 1 鍵 1 回
+    op item get を払うだけ。本 iteration の本丸（前例のないコア KV / TTL 配線）に集中するため follow-up に
+    隔離。`op_discovery.rs` の doc に明記。**未配線だが既存 `Upstream` クライアントで実装可能**。
+  - **github フィルタ**: Iteration 3 同様未移植（HTTP 取得方式が別途決定待ち）。op source 併用は parse 時に
+    未対応エラー。
+  - **DR / journal 起票**: 上記新規判断は本 plan の Iteration 4 実績に集約。独立 DR は kawaz 判断
+    （config 新スキーマ / op 抽象置き場は DR-0004 判断 2・8 の具体化の範囲内で、設計方針の新規追加なし）。
 
 ### Iteration 5: ポリシー（3 層）+ プロセス認証配線
 

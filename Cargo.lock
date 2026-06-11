@@ -92,6 +92,8 @@ dependencies = [
  "pkcs8",
  "regex",
  "rsa",
+ "serde",
+ "serde_json",
  "sha1",
  "sha2",
  "signature",

@@ -34,11 +34,21 @@
 //! - [`FilterEvaluator`] and the filter matchers: per-socket key visibility
 //!   (port plan Iteration 3). They restrict which public keys a socket enumerates
 //!   and can sign with, reading only the public side of a key.
+//! - [`OpClient`] / [`discover_keys`] / [`OpKeyCache`]: 1Password (`op`) SSH-key
+//!   discovery (port plan Iteration 4 / DR-011). Enumerates `op://` vault keys,
+//!   resolves public keys (disk-cached), and yields a `public-key → item id` map.
+//!   The private PEM is fetched lazily at sign time through the core KV
+//!   ([`private_key_argv`] as a [`cache_warden::ValueSource::Command`]); the
+//!   registry's [`KeySource::Op`] carries that fetch spec. The op CLI sits behind
+//!   the [`OpClient`] trait so discovery is tested with a fake (no `op` in CI).
 
 mod codec;
 mod error;
 mod filter;
 mod message;
+mod op;
+mod op_cache;
+mod op_discovery;
 mod registry;
 mod signer;
 mod upstream;
@@ -50,6 +60,9 @@ pub use filter::{
     KeyTypeMatcher, KeyfileMatcher, PubkeyMatcher,
 };
 pub use message::{AgentMessage, Identity, MessageType, SignRequestFields};
-pub use registry::{PublicKeyRegistry, RegisteredKey};
+pub use op::{OpClient, OpKeyInfo, OpSource, RealOpClient, private_key_argv, validate_item_id};
+pub use op_cache::{CachedKey, OpKeyCache, default_cache_path};
+pub use op_discovery::{DiscoveredKey, discover_keys};
+pub use registry::{KeySource, PublicKeyRegistry, RegisteredKey};
 pub use signer::sign;
 pub use upstream::{Upstream, UpstreamConnection};

@@ -18,12 +18,39 @@
 
 use std::collections::BTreeMap;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::message::Identity;
 use crate::signer::public_key_blob_from_pem;
 use bytes::Bytes;
 
-/// One registered key: its public blob, comment, and backing core KV key.
+/// How a registered key's private-key PEM reaches the core [`cache_warden::Store`].
+///
+/// This is the adapter-side resolution of the DR-0004 "NotLoaded" gap (port plan
+/// §1.3 / §3-4): the public key is always enumerable, while *when* and *how* the
+/// secret value is loaded into the core differs by key source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySource {
+    /// The private PEM is **already** a core KV entry (preloaded `[kv.*]` /
+    /// runtime `kv set`). The core entry exists from startup; signing follows the
+    /// Iteration 1 extend / regenerate gate.
+    Local,
+    /// The private PEM is fetched lazily from 1Password at first sign. The core
+    /// has **no** entry until then; on first sign the daemon runs `argv` (an `op
+    /// item get`), authenticates, and `set`s the value as a command source with
+    /// `soft_ttl_secs` / `hard_ttl_secs`. Thereafter the Iteration 1 gate (idle
+    /// extend within soft, regenerate via the same `argv` after hard) applies.
+    Op {
+        /// The command argv the core runs to (re)produce the private-key PEM.
+        argv: Vec<String>,
+        /// Soft TTL in seconds for the lazily-created core entry, or `None`.
+        soft_ttl_secs: Option<u64>,
+        /// Hard TTL in seconds for the lazily-created core entry, or `None`.
+        hard_ttl_secs: Option<u64>,
+    },
+}
+
+/// One registered key: its public blob, comment, backing core KV key, and the
+/// [`KeySource`] describing how its private value reaches the core.
 #[derive(Debug, Clone)]
 pub struct RegisteredKey {
     /// Wire-format public-key blob (the SIGN_REQUEST / IDENTITIES identifier).
@@ -32,6 +59,8 @@ pub struct RegisteredKey {
     pub comment: String,
     /// Name of the core [`cache_warden::Store`] entry holding the private PEM.
     pub kv_key: String,
+    /// How the private value is sourced into the core (local vs lazy op fetch).
+    pub source: KeySource,
 }
 
 /// A registry of public keys keyed by their wire blob.
@@ -71,6 +100,47 @@ impl PublicKeyRegistry {
                 key_blob: Bytes::from(key_blob),
                 comment,
                 kv_key,
+                source: KeySource::Local,
+            },
+        );
+        Ok(())
+    }
+
+    /// Register an op-sourced key from its **public** key (OpenSSH string).
+    ///
+    /// Unlike [`Self::register_from_pem`], no private material is touched: the
+    /// wire blob is derived from the public key alone (op discovery resolved it),
+    /// and `source` carries the lazy fetch spec ([`KeySource::Op`]). The comment
+    /// defaults to `comment` (the item title); if empty it falls back to `kv_key`.
+    ///
+    /// Returns an error if `public_openssh` is not a parseable OpenSSH public key.
+    pub fn register_op_key(
+        &mut self,
+        kv_key: impl Into<String>,
+        public_openssh: &str,
+        comment: &str,
+        source: KeySource,
+    ) -> Result<()> {
+        use ssh_encoding::Encode;
+        let kv_key = kv_key.into();
+        let pk = ssh_key::PublicKey::from_openssh(public_openssh)
+            .map_err(|e| Error::KeyStore(format!("invalid op public key: {e}")))?;
+        let mut key_blob = Vec::new();
+        pk.key_data()
+            .encode(&mut key_blob)
+            .map_err(|_| Error::KeyStore("failed to encode op public key blob".to_string()))?;
+        let comment = if comment.is_empty() {
+            kv_key.clone()
+        } else {
+            comment.to_string()
+        };
+        self.by_blob.insert(
+            key_blob.clone(),
+            RegisteredKey {
+                key_blob: Bytes::from(key_blob),
+                comment,
+                kv_key,
+                source,
             },
         );
         Ok(())
@@ -164,5 +234,52 @@ mod tests {
     fn register_rejects_garbage_pem() {
         let mut reg = PublicKeyRegistry::new();
         assert!(reg.register_from_pem("K", "not a key").is_err());
+    }
+
+    #[test]
+    fn register_from_pem_marks_source_local() {
+        let mut reg = PublicKeyRegistry::new();
+        reg.register_from_pem("K", OP_PRIVATE_KEY_PEM).unwrap();
+        let expected = ssh_key::PublicKey::from_openssh(OP_PUBLIC_KEY).unwrap();
+        let mut blob = Vec::new();
+        expected.key_data().encode(&mut blob).unwrap();
+        assert_eq!(reg.lookup(&blob).unwrap().source, KeySource::Local);
+    }
+
+    #[test]
+    fn register_op_key_derives_blob_from_public_key_and_keeps_source() {
+        let mut reg = PublicKeyRegistry::new();
+        let src = KeySource::Op {
+            argv: vec!["op".into(), "item".into(), "get".into(), "itemX".into()],
+            soft_ttl_secs: Some(3600),
+            hard_ttl_secs: Some(86400),
+        };
+        reg.register_op_key("OP_itemX", OP_PUBLIC_KEY, "My Title", src.clone())
+            .unwrap();
+
+        let expected = ssh_key::PublicKey::from_openssh(OP_PUBLIC_KEY).unwrap();
+        let mut blob = Vec::new();
+        expected.key_data().encode(&mut blob).unwrap();
+        let found = reg.lookup(&blob).expect("op key registered");
+        assert_eq!(found.kv_key, "OP_itemX");
+        assert_eq!(found.comment, "My Title");
+        assert_eq!(found.source, src);
+    }
+
+    #[test]
+    fn register_op_key_comment_falls_back_to_kv_key_when_empty() {
+        let mut reg = PublicKeyRegistry::new();
+        reg.register_op_key("OP_x", OP_PUBLIC_KEY, "", KeySource::Local)
+            .unwrap();
+        assert_eq!(reg.identities()[0].comment, "OP_x");
+    }
+
+    #[test]
+    fn register_op_key_rejects_garbage_public_key() {
+        let mut reg = PublicKeyRegistry::new();
+        assert!(
+            reg.register_op_key("K", "not a public key", "c", KeySource::Local)
+                .is_err()
+        );
     }
 }

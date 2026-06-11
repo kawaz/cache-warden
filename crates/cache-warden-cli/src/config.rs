@@ -79,9 +79,57 @@ pub struct Config {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthsockConfig {
+    /// Key sources keyed by name (port plan Iteration 4). A source enumerates
+    /// keys from an upstream key store (currently only `kind = "op"`, 1Password
+    /// vault discovery) and a `[authsock.sockets.*]` references it via `source`.
+    #[serde(default)]
+    pub sources: BTreeMap<String, AuthsockSourceConfig>,
     /// Agent sockets keyed by name. `BTreeMap` keeps a deterministic bind order.
     #[serde(default)]
     pub sockets: BTreeMap<String, AuthsockSocketConfig>,
+}
+
+/// One `[authsock.sources.NAME]`: a key source (op vault discovery).
+///
+/// The only `kind` today is `"op"` (port plan Iteration 4 / DR-011): it lists SSH
+/// keys from 1Password vaults named by `members` (`op://`, `op://VAULT`,
+/// `op://VAULT/ITEM`) and serves their private keys by fetching each lazily at
+/// sign time through the core KV. The TTLs become the lazily-created core entry's
+/// soft / hard windows (a socket cannot override them in this iteration).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthsockSourceConfig {
+    /// Source kind. Must be `"op"`.
+    pub kind: String,
+    /// 1Password account (`op --account ...`), e.g. `"kawaz.1password.com"`.
+    /// Omit to use the `op` CLI's default account.
+    #[serde(default)]
+    pub op_account: Option<String>,
+    /// `op://` source members enumerating which vaults/items to discover. An
+    /// empty / omitted list defaults to a single bare `op://` (all SSH keys).
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Soft TTL string (e.g. `"1h"`) for each discovered key's core entry.
+    #[serde(default, rename = "soft-ttl")]
+    pub soft_ttl: Option<String>,
+    /// Hard TTL string (e.g. `"24h"`) for each discovered key's core entry.
+    #[serde(default, rename = "hard-ttl")]
+    pub hard_ttl: Option<String>,
+}
+
+/// A validated key source ready for discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthsockSource {
+    /// The source name (the `[authsock.sources.NAME]` key).
+    pub name: String,
+    /// 1Password account, or `None` for the `op` default.
+    pub op_account: Option<String>,
+    /// `op://` member strings (at least one; defaults to `["op://"]`).
+    pub members: Vec<String>,
+    /// Soft TTL in seconds for discovered keys' core entries, or `None`.
+    pub soft_ttl_secs: Option<u64>,
+    /// Hard TTL in seconds for discovered keys' core entries, or `None`.
+    pub hard_ttl_secs: Option<u64>,
 }
 
 /// One `[authsock.sockets.NAME]` agent socket.
@@ -101,6 +149,12 @@ pub struct AuthsockSocketConfig {
     /// **forwarded** (we never hold the upstream's private material). Optional.
     #[serde(default)]
     pub upstreams: Vec<String>,
+    /// Name of an `[authsock.sources.*]` whose discovered keys this socket serves
+    /// (port plan Iteration 4). The source's keys are enumerated (REQUEST_IDENTITIES)
+    /// and signed by fetching each private key lazily through the core KV. Optional;
+    /// combines with `keys` / `upstreams` (one socket may bundle several routes).
+    #[serde(default)]
+    pub source: Option<String>,
     /// Key filters restricting which public keys this socket exposes and can sign
     /// with (port plan Iteration 3). Each TOML element is one **OR term**: a
     /// string is a single-rule term (`"comment=github*"`), an array is an AND
@@ -180,6 +234,8 @@ pub struct AuthsockSocket {
     /// Upstream agent socket paths (leading `~/` expanded) whose keys are merged
     /// and whose signatures are forwarded.
     pub upstreams: Vec<PathBuf>,
+    /// Name of the `[authsock.sources.*]` this socket serves, if any.
+    pub source: Option<String>,
     /// Key-filter terms (OR of AND) restricting which keys this socket exposes
     /// and can sign with. Empty means no filtering. The tokens are validated at
     /// parse time (so a bad token fails startup, naming the socket); the daemon
@@ -343,10 +399,10 @@ impl AuthsockSocketConfig {
                 "[authsock.sockets.{name}]: `path` must not be empty"
             )));
         }
-        if self.keys.is_empty() && self.upstreams.is_empty() {
+        if self.keys.is_empty() && self.upstreams.is_empty() && self.source.is_none() {
             return Err(ConfigError::new(format!(
-                "[authsock.sockets.{name}]: needs at least one of `keys` (local KV keys) or \
-                 `upstreams` (forwarded agent sockets)"
+                "[authsock.sockets.{name}]: needs at least one of `keys` (local KV keys), \
+                 `upstreams` (forwarded agent sockets), or `source` (a discovered key source)"
             )));
         }
         // Validate the filter tokens at startup so a bad pattern fails fast and
@@ -361,7 +417,51 @@ impl AuthsockSocketConfig {
             path: expand_tilde(&self.path),
             keys: self.keys.clone(),
             upstreams: self.upstreams.iter().map(|p| expand_tilde(p)).collect(),
+            source: self.source.clone(),
             filters: self.filters.clone(),
+        })
+    }
+}
+
+impl AuthsockSourceConfig {
+    /// Validate this source and produce an [`AuthsockSource`].
+    ///
+    /// Rejects an unknown `kind` (only `"op"` today) and unparseable TTLs. An
+    /// empty `members` defaults to `["op://"]` (all SSH keys), and each member is
+    /// checked to be a valid `op://` reference so a typo fails at startup.
+    fn validate(&self, name: &str) -> Result<AuthsockSource, ConfigError> {
+        if self.kind != "op" {
+            return Err(ConfigError::new(format!(
+                "[authsock.sources.{name}]: unsupported `kind` {:?} (only \"op\" is supported)",
+                self.kind
+            )));
+        }
+        let members = if self.members.is_empty() {
+            vec!["op://".to_string()]
+        } else {
+            self.members.clone()
+        };
+        for m in &members {
+            if cache_warden_authsock::OpSource::parse(m).is_none() {
+                return Err(ConfigError::new(format!(
+                    "[authsock.sources.{name}]: member {m:?} is not an `op://` reference"
+                )));
+            }
+        }
+        let parse = |label: &str, s: &Option<String>| -> Result<Option<u64>, ConfigError> {
+            match s {
+                None => Ok(None),
+                Some(v) => parse_duration(v).map(|d| Some(d.as_secs())).map_err(|e| {
+                    ConfigError::new(format!("[authsock.sources.{name}]: {label}: {e}"))
+                }),
+            }
+        };
+        Ok(AuthsockSource {
+            name: name.to_string(),
+            op_account: self.op_account.clone(),
+            members,
+            soft_ttl_secs: parse("soft-ttl", &self.soft_ttl)?,
+            hard_ttl_secs: parse("hard-ttl", &self.hard_ttl)?,
         })
     }
 }
@@ -379,9 +479,22 @@ impl Config {
         for (name, entry) in &cfg.kv {
             entry.validate(name).map_err(ConfigParseError::Content)?;
         }
-        // Validate authsock sockets too (empty path / keys fail fast at startup).
+        // Validate authsock sources (bad kind / member / TTL fail fast).
+        for (name, src) in &cfg.authsock.sources {
+            src.validate(name).map_err(ConfigParseError::Content)?;
+        }
+        // Validate authsock sockets too (empty path / keys fail fast at startup),
+        // and cross-check that any `source` reference names a declared source.
         for (name, sock) in &cfg.authsock.sockets {
             sock.validate(name).map_err(ConfigParseError::Content)?;
+            if let Some(src) = &sock.source
+                && !cfg.authsock.sources.contains_key(src)
+            {
+                return Err(ConfigParseError::Content(ConfigError::new(format!(
+                    "[authsock.sockets.{name}]: `source` {src:?} is not a declared \
+                     [authsock.sources.*]"
+                ))));
+            }
         }
         // An empty (or omitted) auth command is treated as "no command", not as
         // a configured-but-empty command; reject the misleading empty form.
@@ -423,6 +536,16 @@ impl Config {
             .sockets
             .iter()
             .filter_map(|(name, sock)| sock.validate(name).ok())
+            .collect()
+    }
+
+    /// The validated authsock key sources, in deterministic (name-sorted) order.
+    /// Pre-validated by [`Config::parse`], so this cannot fail.
+    pub fn authsock_sources(&self) -> Vec<AuthsockSource> {
+        self.authsock
+            .sources
+            .iter()
+            .filter_map(|(name, src)| src.validate(name).ok())
             .collect()
     }
 }
@@ -1056,5 +1179,198 @@ filters = [42]
         )
         .unwrap_err();
         assert!(matches!(err, ConfigParseError::Toml(_)));
+    }
+
+    // ---- authsock sources (op discovery; port plan Iteration 4) ----
+
+    #[test]
+    fn empty_config_has_no_authsock_sources() {
+        let cfg = Config::parse("").unwrap();
+        assert!(cfg.authsock_sources().is_empty());
+    }
+
+    #[test]
+    fn op_source_with_account_and_ttls_validates() {
+        let cfg = Config::parse(
+            r#"[authsock.sources.default]
+kind = "op"
+op_account = "kawaz.1password.com"
+members = ["op://", "op://Private/key"]
+soft-ttl = "1h"
+hard-ttl = "24h"
+"#,
+        )
+        .unwrap();
+        let sources = cfg.authsock_sources();
+        assert_eq!(sources.len(), 1);
+        let s = &sources[0];
+        assert_eq!(s.name, "default");
+        assert_eq!(s.op_account.as_deref(), Some("kawaz.1password.com"));
+        assert_eq!(s.members, vec!["op://", "op://Private/key"]);
+        assert_eq!(s.soft_ttl_secs, Some(3600));
+        assert_eq!(s.hard_ttl_secs, Some(86400));
+    }
+
+    #[test]
+    fn op_source_empty_members_default_to_bare_op() {
+        let cfg = Config::parse(
+            r#"[authsock.sources.default]
+kind = "op"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.authsock_sources()[0].members, vec!["op://"]);
+    }
+
+    #[test]
+    fn op_source_unknown_kind_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.sources.x]
+kind = "vault"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(e.message.contains("kind"), "msg: {}", e.message)
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn op_source_non_op_member_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.sources.x]
+kind = "op"
+members = ["agent:/tmp/agent.sock"]
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(e.message.contains("op://"), "msg: {}", e.message)
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn op_source_bad_ttl_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.sources.x]
+kind = "op"
+soft-ttl = "1day"
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigParseError::Content(_)));
+    }
+
+    #[test]
+    fn op_source_missing_kind_is_toml_error() {
+        // `kind` has no default, so omitting it is a deserialization error.
+        let err = Config::parse(
+            r#"[authsock.sources.x]
+members = ["op://"]
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigParseError::Toml(_)));
+    }
+
+    #[test]
+    fn op_source_unknown_field_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.sources.x]
+kind = "op"
+bogus = 1
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigParseError::Toml(_)));
+    }
+
+    #[test]
+    fn sources_are_sorted_by_name() {
+        let cfg = Config::parse(
+            r#"[authsock.sources.bbb]
+kind = "op"
+
+[authsock.sources.aaa]
+kind = "op"
+"#,
+        )
+        .unwrap();
+        let names: Vec<_> = cfg.authsock_sources().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["aaa", "bbb"]);
+    }
+
+    // ---- socket `source` reference ----
+
+    #[test]
+    fn socket_referencing_a_source_validates() {
+        let cfg = Config::parse(
+            r#"[authsock.sources.default]
+kind = "op"
+
+[authsock.sockets.kawaz]
+path = "/tmp/kawaz.sock"
+source = "default"
+filters = ["comment=*kawaz*"]
+"#,
+        )
+        .unwrap();
+        let socks = cfg.authsock_sockets();
+        assert_eq!(socks[0].source.as_deref(), Some("default"));
+        assert!(socks[0].keys.is_empty());
+    }
+
+    #[test]
+    fn socket_with_only_a_source_is_allowed() {
+        // A source-only socket (no local keys, no upstreams) is valid.
+        let cfg = Config::parse(
+            r#"[authsock.sources.default]
+kind = "op"
+
+[authsock.sockets.s]
+path = "/tmp/s.sock"
+source = "default"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.authsock_sockets().len(), 1);
+    }
+
+    #[test]
+    fn socket_referencing_unknown_source_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+source = "ghost"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(e.message.contains("ghost"), "msg: {}", e.message);
+                assert!(e.message.contains("source"), "msg: {}", e.message);
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn socket_with_no_keys_upstreams_or_source_is_rejected() {
+        let err = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => assert!(e.message.contains("source")),
+            other => panic!("expected content error, got {other:?}"),
+        }
     }
 }
