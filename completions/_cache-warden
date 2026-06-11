@@ -1,0 +1,236 @@
+#compdef cache-warden
+#
+# cache-warden のコンテキスト対応補完。
+# help (crates/cache-warden-cli/src/help.rs の HelpSpec) と実バイナリの
+# 各レベル --help を正本に手書き。ロングオプションのみ。
+#
+# 設計メモ:
+#   - `--socket PATH` はトップの「コマンド名」より後ならどこでも有効
+#     (main.rs: take_socket_flag が tail 全域を走査)。なので各サブコマンドの
+#     _arguments に共通で混ぜる。リーディングの --socket は不可。
+#   - `--help` / `--version` はトップではリーディング時のみ意味を持つが、
+#     深い階層では各レベルで効くため広めに許可する。
+#   - KEY は daemon の `kv list` を叩いて動的補完。daemon 不達なら静かに候補なし。
+#
+# 注意: zsh の変数名にハイフンは使えない (`${a-b}` は default 演算子になる)。
+#       内部の変数・ヘルパ関数名は `_cw_*` (アンダースコア) で統一する。
+
+# --socket をコマンドラインから拾う (動的 KEY 補完で daemon を引き継ぐため)。
+# `--socket P` と `--socket=P` の両形式に対応。reply 配列に格納して返す。
+_cw_current_socket() {
+  reply=()
+  local i
+  for (( i = 1; i <= $#words; i++ )); do
+    case "$words[i]" in
+      --socket=*) reply=(--socket "${words[i]#--socket=}") ;;
+      --socket)
+        if (( i + 1 <= $#words )) && [[ -n "$words[i+1]" ]]; then
+          reply=(--socket "$words[i+1]")
+        fi
+        ;;
+    esac
+  done
+}
+
+# 既存キー名を daemon から取得して補完候補にする。
+# daemon 不達 / エラー時は静かに何も出さない (補完 UI にエラーを漏らさない)。
+_cw_keys() {
+  local -a reply keys
+  _cw_current_socket
+  local out
+  # stderr を捨て、失敗時は空。kv list は daemon 不達でも即時 (数ms) に
+  # 失敗するためタイムアウトは不要だが、UI を止めないよう失敗は握りつぶす。
+  out="$(command cache-warden kv list "${reply[@]}" 2>/dev/null)" || return 0
+  keys=( ${(f)out} )
+  (( $#keys )) || return 0
+  _describe -t cw-keys 'cached key' keys
+}
+
+_cache-warden() {
+  local context state state_descr line
+  typeset -A opt_args
+
+  # 共通 --socket オプション (コマンド名の後ならどこでも有効)。
+  local socket_opt='--socket[Control socket path]:socket:_files'
+
+  # 共通 TTL/OTP オプション (kv define / kv set 共有)。
+  local -a ttl_otp_opts
+  ttl_otp_opts=(
+    '--soft-ttl[Soft TTL (re-auth to extend). e.g. 1h, 30m, 45s, 86400]:duration'
+    '--hard-ttl[Hard TTL (value zeroized at expiry)]:duration'
+    '--type[Mark the value as a TOTP seed]:type:(otp)'
+    '--otp-digits[OTP code length (default 6)]:digits'
+    '--otp-period[OTP time step in seconds (default 30)]:seconds'
+    '--otp-algorithm[OTP hash algorithm]:algorithm:(sha1 sha256 sha512)'
+  )
+
+  local -a top_commands
+  top_commands=(
+    'daemon:Manage the cache-warden daemon process'
+    'ping:Check that the daemon is alive'
+    'status:Show daemon info and the (value-free) entry list'
+    'kv:Manage cached key/value secrets'
+    'run:Resolve env references then exec a command'
+    'inject:Substitute references in a template stream'
+    'config:Inspect and edit the configuration'
+  )
+
+  _arguments -C \
+    '(- *)--version[Show version]' \
+    '(- *)--help[Show this help message]' \
+    "$socket_opt" \
+    '1: :->command' \
+    '*::arg:->args'
+
+  case "$state" in
+    command)
+      _describe -t commands 'cache-warden command' top_commands
+      ;;
+    args)
+      case "$words[1]" in
+        daemon)
+          local -a daemon_commands
+          daemon_commands=( 'run:Start the daemon in the foreground' )
+          _arguments -C \
+            "$socket_opt" \
+            '--help[Show this help message]' \
+            '1: :->dcmd' \
+            '*::darg:->dargs'
+          case "$state" in
+            dcmd) _describe -t commands 'daemon subcommand' daemon_commands ;;
+            dargs)
+              case "$words[1]" in
+                run) _arguments "$socket_opt" '--help[Show this help message]' ;;
+              esac
+              ;;
+          esac
+          ;;
+
+        kv)
+          local -a kv_commands
+          kv_commands=(
+            'define:Register a regenerable definition (lazy)'
+            'set:Cache a static value'
+            'get:Fetch a cached value (regenerates if defined)'
+            'del:Delete a cached value (--with-define drops the definition)'
+            'list:List cached key names'
+            'pin:Hold a value Active for DUR, ignoring its TTL (re-auth)'
+            'unpin:Drop a pin, returning the value to normal TTL evaluation'
+          )
+          _arguments -C \
+            "$socket_opt" \
+            '--help[Show this help message]' \
+            '1: :->kvcmd' \
+            '*::kvarg:->kvargs'
+          case "$state" in
+            kvcmd) _describe -t commands 'kv subcommand' kv_commands ;;
+            kvargs)
+              case "$words[1]" in
+                define)
+                  # --command は ARGV... を末尾まで消費し、以降は _normal。
+                  # define は新規キー登録なので位置 KEY は補完しない (自由入力)。
+                  _arguments -C \
+                    "$socket_opt" \
+                    '--help[Show this help message]' \
+                    '--source[A source URI (op:// is built in)]:uri' \
+                    '*--defs[Register every kv.NAME table in a TOML defs file]:file:_files' \
+                    "$ttl_otp_opts[@]" \
+                    '*--command[Run ARGV; its stdout is the value (must come last)]:argv:_normal' \
+                    '1:key:'
+                  ;;
+                set)
+                  _arguments \
+                    "$socket_opt" \
+                    '--help[Show this help message]' \
+                    '--value[Use the literal string V as the value]:value' \
+                    '--value-stdin[Read the value from stdin (binary safe)]' \
+                    "$ttl_otp_opts[@]" \
+                    '1:key:_cw_keys'
+                  ;;
+                get)
+                  _arguments \
+                    "$socket_opt" \
+                    '--help[Show this help message]' \
+                    '(--reveal)--dry-run[Verify retrieval WITHOUT emitting the value]' \
+                    '(--dry-run)--reveal[Force real-value output]' \
+                    '1:key:_cw_keys'
+                  ;;
+                del)
+                  _arguments \
+                    "$socket_opt" \
+                    '--help[Show this help message]' \
+                    '--with-define[Also drop the registered definition]' \
+                    '1:key:_cw_keys'
+                  ;;
+                list)
+                  _arguments "$socket_opt" '--help[Show this help message]'
+                  ;;
+                pin)
+                  _arguments \
+                    "$socket_opt" \
+                    '--help[Show this help message]' \
+                    '1:key:_cw_keys' \
+                    '2:duration:(1h 30m 8h)'
+                  ;;
+                unpin)
+                  _arguments \
+                    "$socket_opt" \
+                    '--help[Show this help message]' \
+                    '1:key:_cw_keys'
+                  ;;
+              esac
+              ;;
+          esac
+          ;;
+
+        run)
+          # `--` 以降は外部コマンドとして補完 (_normal)。
+          _arguments \
+            "$socket_opt" \
+            '--help[Show this help message]' \
+            '*--env[Add/override a child env var (NAME=VALUE)]:env:' \
+            '*--defs[Register a TOML defs file before resolving]:file:_files' \
+            '(--reveal)--dry-run[Verify WITHOUT real values (masked env)]' \
+            '(--dry-run)--reveal[Force real values]' \
+            '(-)--[command]:: :_normal'
+          ;;
+
+        inject)
+          _arguments \
+            "$socket_opt" \
+            '--help[Show this help message]' \
+            '--in[Read the template from FILE (default: stdin)]:file:_files' \
+            '--out[Write the result to FILE, created 0600 (default: stdout)]:file:_files' \
+            '*--defs[Register a TOML defs file before resolving]:file:_files' \
+            '(--reveal)--dry-run[Verify WITHOUT real values (emit masks)]' \
+            '(--dry-run)--reveal[Force real values]'
+          ;;
+
+        config)
+          local -a config_commands
+          config_commands=(
+            'show:Show the effective configuration'
+            'path:Show the config file path (or the search order)'
+            'edit:Open the config in $EDITOR'
+          )
+          _arguments -C \
+            "$socket_opt" \
+            '--help[Show this help message]' \
+            '1: :->ccmd' \
+            '*::carg:->cargs'
+          case "$state" in
+            ccmd) _describe -t commands 'config subcommand' config_commands ;;
+            cargs) _arguments "$socket_opt" '--help[Show this help message]' ;;
+          esac
+          ;;
+
+        ping|status)
+          # サブコマンドなし。--socket / --help のみ。
+          _arguments "$socket_opt" '--help[Show this help message]'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_cache-warden "$@"
