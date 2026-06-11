@@ -294,6 +294,88 @@ pub fn parse_kv_define(args: &[String]) -> Result<Request, String> {
     })
 }
 
+/// The two shapes of a `kv define` invocation (DR-0014 §1 / §4).
+///
+/// Either a **single** definition (`<KEY> --command ... | --source URI`) or a
+/// **batch** of definition files (`--defs FILE` repeatable). The two are
+/// mutually exclusive: a `--defs` cannot be mixed with `--command` / `--source`
+/// / a positional KEY (one form registers one key, the other registers a file's
+/// worth at once).
+#[derive(Debug, PartialEq, Eq)]
+pub enum DefinePlan {
+    /// One definition, built into a ready-to-send request.
+    Single(Request),
+    /// One or more defs files to load and register in bulk (DR-0014 §4).
+    Defs(Vec<PathBuf>),
+}
+
+/// Parse the arguments to `kv define ...` into a [`DefinePlan`].
+///
+/// Grammar:
+/// - single: `<KEY> (--command ARGV... | --source URI) [--soft-ttl D] [--hard-ttl D]`
+/// - batch:  `--defs FILE [--defs FILE]...`
+///
+/// `--defs` is repeatable and never mixes with the single-definition flags
+/// (`--command` / `--source` / a positional KEY): the two are different modes
+/// (DR-0014 §4). There is no automatic discovery — only the explicit files
+/// given here are loaded.
+pub fn parse_kv_define_plan(args: &[String]) -> Result<DefinePlan, String> {
+    // Detect the batch mode by the presence of any `--defs` flag, then collect
+    // every `--defs FILE` while rejecting any single-definition flag / KEY mixed
+    // in (so the user gets a clear "pick one mode" error, not a half-applied
+    // command).
+    let uses_defs = args
+        .iter()
+        .any(|a| a == "--defs" || a.starts_with("--defs="));
+    if !uses_defs {
+        return parse_kv_define(args).map(DefinePlan::Single);
+    }
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--defs" => {
+                let v = args.get(i + 1).ok_or("--defs requires a FILE argument")?;
+                files.push(PathBuf::from(v));
+                i += 2;
+            }
+            s if s.starts_with("--defs=") => {
+                files.push(PathBuf::from(s.strip_prefix("--defs=").unwrap()));
+                i += 1;
+            }
+            "--command" | "--source" => {
+                return Err(
+                    "`kv define --defs FILE` registers a whole file at once; it cannot be \
+                     combined with --command / --source (use one or the other)"
+                        .to_string(),
+                );
+            }
+            s if s.starts_with("--source=") => {
+                return Err(
+                    "`kv define --defs FILE` cannot be combined with --source (use one or \
+                     the other)"
+                        .to_string(),
+                );
+            }
+            s if s.starts_with("--") => {
+                return Err(format!("unknown option for `kv define --defs`: {s}"));
+            }
+            other => {
+                return Err(format!(
+                    "`kv define --defs FILE` takes no positional KEY (got {other:?}); \
+                     the keys come from the file(s)"
+                ));
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return Err("--defs requires a FILE argument".to_string());
+    }
+    Ok(DefinePlan::Defs(files))
+}
+
 /// Parse `kv get|unpin <KEY>` into the corresponding [`Request`].
 pub fn parse_kv_single_key(verb: &str, args: &[String]) -> Result<Request, String> {
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
@@ -544,6 +626,68 @@ mod tests {
     #[test]
     fn kv_define_empty_command_is_rejected() {
         assert!(parse_kv_define(&["K".into(), "--command".into()]).is_err());
+    }
+
+    // ---- kv define --defs (batch; DR-0014 §4) ----
+
+    #[test]
+    fn define_plan_single_without_defs_is_a_single_request() {
+        let plan =
+            parse_kv_define_plan(&["TOK".into(), "--source".into(), "op://v/i/f".into()]).unwrap();
+        match plan {
+            DefinePlan::Single(Request::KvDefine { key, argv, .. }) => {
+                assert_eq!(key, "TOK");
+                assert_eq!(argv, vec!["op", "read", "op://v/i/f"]);
+            }
+            other => panic!("expected Single KvDefine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn define_plan_collects_repeated_defs_files() {
+        let plan =
+            parse_kv_define_plan(&["--defs".into(), "a.toml".into(), "--defs=b.toml".into()])
+                .unwrap();
+        assert_eq!(
+            plan,
+            DefinePlan::Defs(vec![PathBuf::from("a.toml"), PathBuf::from("b.toml")])
+        );
+    }
+
+    #[test]
+    fn define_plan_defs_with_command_is_rejected() {
+        let err = parse_kv_define_plan(&[
+            "--defs".into(),
+            "a.toml".into(),
+            "--command".into(),
+            "echo".into(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("cannot be combined"), "msg: {err}");
+    }
+
+    #[test]
+    fn define_plan_defs_with_source_is_rejected() {
+        let err = parse_kv_define_plan(&[
+            "--defs".into(),
+            "a.toml".into(),
+            "--source".into(),
+            "op://a/b".into(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("cannot be combined"), "msg: {err}");
+    }
+
+    #[test]
+    fn define_plan_defs_with_positional_key_is_rejected() {
+        let err =
+            parse_kv_define_plan(&["KEY".into(), "--defs".into(), "a.toml".into()]).unwrap_err();
+        assert!(err.contains("no positional KEY"), "msg: {err}");
+    }
+
+    #[test]
+    fn define_plan_defs_missing_file_arg_is_rejected() {
+        assert!(parse_kv_define_plan(&["--defs".into()]).is_err());
     }
 
     #[test]

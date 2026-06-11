@@ -318,7 +318,7 @@ pub fn kv_define() -> HelpSpec {
         summary: "Register a regenerable definition for a key (lazy; DR-0014).",
         usage: concat!(
             "cache-warden",
-            " kv define <KEY> [OPTIONS] (--command ARGV... | --source URI)"
+            " kv define (<KEY> (--command ARGV... | --source URI) | --defs FILE...) [OPTIONS]"
         ),
         subcommands: &[],
         options: &[
@@ -333,6 +333,12 @@ pub fn kv_define() -> HelpSpec {
                        (expands to `op read <URI>`)",
             },
             Row {
+                name: "--defs FILE",
+                desc: "Register every [kv.NAME] in a TOML defs file at once\n\
+                       (repeatable). Cannot be combined with KEY /\n\
+                       --command / --source",
+            },
+            Row {
                 name: "--soft-ttl DUR",
                 desc: "Soft TTL (re-auth to extend). e.g. 1h, 30m, 45s, 86400",
             },
@@ -345,7 +351,13 @@ pub fn kv_define() -> HelpSpec {
 The command is NOT run at define time; the value is produced lazily on the
 first `kv get`. Defining is idempotent under an exact match (same argv/URI +
 TTL is a no-op); a conflicting redefinition is rejected — delete it first with
-`kv del KEY --with-define`, then re-define.",
+`kv del KEY --with-define`, then re-define.
+
+--defs FILE bulk-registers every [kv.NAME] in a TOML file (same grammar as the
+config [kv.*] section: command + soft-ttl / hard-ttl; no inline values, no
+preload). Each clashing key is reported on its own; one conflict does not stop
+the others. There is no automatic discovery — only the files you pass are read
+(a conventional name is .cache-warden.toml, but it is never loaded implicitly).",
         show_global: true,
     }
 }
@@ -588,10 +600,13 @@ mod tests {
         assert!(h.contains("Options:"));
         assert!(h.contains("--command ARGV..."));
         assert!(h.contains("--source URI"));
+        assert!(h.contains("--defs FILE"));
         assert!(h.contains("--soft-ttl DUR"));
         // The lazy + idempotency explanation lives here.
         assert!(h.contains("lazily"));
         assert!(h.contains("--with-define"));
+        // The bulk-define note mentions no implicit discovery.
+        assert!(h.contains(".cache-warden.toml"));
     }
 
     #[test]

@@ -337,6 +337,19 @@ pub struct DaemonConfig {
     /// leading `~/` (see [`expand_tilde`]); omit to use the built-in default.
     #[serde(default)]
     pub socket: Option<String>,
+    /// Persist online (`kv define` / `kv del --with-define`) definitions to a
+    /// state file so they survive a daemon restart (DR-0014 §4). Default
+    /// `false`. When `true` the daemon writes the definition registry (KEY /
+    /// argv / TTL — **never** values) to `$XDG_STATE_HOME/cache-warden/definitions.toml`
+    /// (0600, atomic) on every definition change and restores it at startup
+    /// (config-priority merge). When `false` the state file is never read or
+    /// written, even if one already exists.
+    ///
+    /// Note: if a user embeds a literal token directly in a definition's argv,
+    /// that argv is written to disk (shell-history-equivalent risk; the file is
+    /// 0600). The persisted file holds definitions only, never secret values.
+    #[serde(default, rename = "persist-definitions")]
+    pub persist_definitions: bool,
 }
 
 /// `[auth]` section.
@@ -413,7 +426,10 @@ pub struct ConfigError {
 }
 
 impl ConfigError {
-    fn new(message: impl Into<String>) -> Self {
+    /// Build a content error from a human-readable (secret-free) message. Used
+    /// by the config parser and the defs-file parser (`defs.rs`), which share
+    /// the `[kv.*]` grammar.
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -638,6 +654,11 @@ impl Config {
         self.daemon.socket.as_deref().map(expand_tilde)
     }
 
+    /// Whether online definitions are persisted across restarts (DR-0014 §4).
+    pub fn persist_definitions(&self) -> bool {
+        self.daemon.persist_definitions
+    }
+
     /// The validated authsock agent sockets, in deterministic (name-sorted)
     /// order. Pre-validated by [`Config::parse`], so this cannot fail.
     pub fn authsock_sockets(&self) -> Vec<AuthsockSocket> {
@@ -846,6 +867,21 @@ socket = "~/.local/state/cache-warden/control.sock"
             Some(v) => unsafe { std::env::set_var("HOME", v) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    #[test]
+    fn persist_definitions_defaults_to_false() {
+        let cfg = Config::parse("").unwrap();
+        assert!(!cfg.persist_definitions());
+        // Also when [daemon] is present but the flag is omitted.
+        let cfg = Config::parse("[daemon]\nsocket = \"/tmp/x.sock\"\n").unwrap();
+        assert!(!cfg.persist_definitions());
+    }
+
+    #[test]
+    fn persist_definitions_is_read_when_true() {
+        let cfg = Config::parse("[daemon]\npersist-definitions = true\n").unwrap();
+        assert!(cfg.persist_definitions());
     }
 
     #[test]

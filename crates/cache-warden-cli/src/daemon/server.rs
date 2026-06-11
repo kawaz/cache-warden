@@ -121,8 +121,27 @@ pub(crate) struct Shared {
     /// "now", so per-request clocks would make every entry look freshly
     /// activated and defeat TTL evaluation entirely.
     pub(crate) clock: SystemClock,
+    /// Persistence settings for online definitions, or `None` when
+    /// `[daemon].persist-definitions` is off (DR-0014 §4). When `Some`, every
+    /// `kv.define` / `kv.del --with-define` that changes the definition registry
+    /// rewrites the state file atomically (0600), persisting **online**
+    /// definitions only (config `[kv.*]` definitions are excluded — the config
+    /// is their source of truth, not the state file).
+    persist: Option<PersistSettings>,
     socket_path: String,
     pid: u32,
+}
+
+/// Where and what to persist for online definitions (DR-0014 §4).
+struct PersistSettings {
+    /// The state file path (`$XDG_STATE_HOME/cache-warden/definitions.toml`).
+    path: PathBuf,
+    /// Names defined by the config `[kv.*]` section. These are **excluded** from
+    /// the persisted file: the config is their source of truth, so writing them
+    /// to the state file would leak config definitions into the online layer (and
+    /// resurrect them as stale "online" definitions if persistence is later
+    /// turned off). Only genuinely online definitions are persisted.
+    config_names: std::collections::HashSet<String>,
 }
 
 #[cfg(test)]
@@ -136,6 +155,7 @@ impl Shared {
             runner: CommandRunner::new(),
             auth,
             clock,
+            persist: None,
             socket_path: String::new(),
             pid: std::process::id(),
         }
@@ -186,19 +206,47 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
         .iter()
         .flat_map(|s| s.keys.iter().cloned())
         .collect();
-    register_definitions(
-        &mut store,
-        &runner,
-        &clock,
-        &config.kv_definitions(),
-        &authsock_keys,
-    );
+    let config_defs = config.kv_definitions();
+    register_definitions(&mut store, &runner, &clock, &config_defs, &authsock_keys);
+
+    // Restore persisted online definitions when `[daemon].persist-definitions`
+    // is on (DR-0014 §4). The restore is a **config-priority merge**: a key the
+    // config already defines wins, and a clashing persisted entry is dropped
+    // with a warning. Keys the config does not define are restored as-is. When
+    // persistence is off, the state file is neither read nor written (even if it
+    // exists). After restoring we rewrite the file so it becomes the current
+    // truth (dropping the entries that lost the merge from disk too).
+    let persist = if config.persist_definitions() {
+        let path = crate::defs::definitions_state_path();
+        let config_names: std::collections::HashSet<String> =
+            config_defs.iter().map(|d| d.name.clone()).collect();
+        match crate::defs::load_definitions(&path) {
+            Ok(persisted) => {
+                restore_persisted_definitions(&mut store, persisted, &config_names);
+            }
+            Err(e) => {
+                // A corrupt state file is non-fatal: warn and start without it
+                // (the file is rewritten from the in-memory registry below).
+                eprintln!("cache-warden: {e}; ignoring persisted definitions");
+            }
+        }
+        let settings = PersistSettings { path, config_names };
+        // Rewrite the file from the merged registry (online definitions only) so
+        // disk == current truth: entries that lost the config-priority merge are
+        // removed from disk, and any config keys that leaked into an older file
+        // are dropped (config keys are never persisted).
+        write_online_definitions(&settings, &store);
+        Some(settings)
+    } else {
+        None
+    };
 
     let shared = Arc::new(Shared {
         store: Mutex::new(store),
         runner,
         auth: build_authenticator(&config),
         clock,
+        persist,
         socket_path: socket_path.display().to_string(),
         pid: std::process::id(),
     });
@@ -323,6 +371,99 @@ fn register_definitions<R, C>(
     }
 }
 
+/// Merge persisted online definitions into `store` under the config-priority
+/// rule (DR-0014 §4).
+///
+/// For each persisted definition:
+/// - if `config_names` already defines that key, the config wins: the persisted
+///   entry is **dropped** with a secret-free stderr warning (this is what keeps
+///   "I edited the config but the stale persisted def keeps winning" from
+///   happening). It is also absent from the post-merge snapshot, so the caller's
+///   rewrite removes it from disk.
+/// - otherwise the persisted definition is registered. A bad TTL bound or a
+///   conflict with an already-registered definition (should not happen since
+///   config keys are filtered out first) is warned and skipped, never fatal.
+fn restore_persisted_definitions(
+    store: &mut Store,
+    persisted: Vec<KvDefinition>,
+    config_names: &std::collections::HashSet<String>,
+) {
+    for def in persisted {
+        if config_names.contains(&def.name) {
+            eprintln!(
+                "cache-warden: persisted definition `{}` dropped (the config defines \
+                 it; config wins)",
+                def.name
+            );
+            continue;
+        }
+        let ttl = match Ttl::new(
+            def.soft_ttl_secs.map(std::time::Duration::from_secs),
+            def.hard_ttl_secs.map(std::time::Duration::from_secs),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "cache-warden: persisted definition `{}` skipped: {e}",
+                    def.name
+                );
+                continue;
+            }
+        };
+        let source = ValueSource::command(def.command.clone());
+        match store.define(def.name.clone(), source, ttl) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!(
+                    "cache-warden: persisted definition `{}` skipped: {e}",
+                    def.name
+                );
+            }
+        }
+    }
+}
+
+/// The store's **online** definition registry: every definition minus the names
+/// the config defines (DR-0014 §4).
+///
+/// Config `[kv.*]` definitions are the config's responsibility, not the state
+/// file's, so they are excluded — persisting them would resurrect them as stale
+/// "online" definitions if persistence is later turned off.
+fn online_definitions(settings: &PersistSettings, store: &Store) -> Vec<KvDefinition> {
+    crate::defs::snapshot_definitions(store)
+        .into_iter()
+        .filter(|d| !settings.config_names.contains(&d.name))
+        .collect()
+}
+
+/// Atomically rewrite the state file from the store's online definitions,
+/// warning (non-fatal) on failure. Used at startup to normalize the file.
+fn write_online_definitions(settings: &PersistSettings, store: &Store) {
+    if let Err(e) =
+        crate::defs::save_definitions(&settings.path, &online_definitions(settings, store))
+    {
+        eprintln!(
+            "cache-warden: warning: could not write persisted definitions {}: {e}",
+            settings.path.display()
+        );
+    }
+}
+
+/// Persist the store's online definition registry if persistence is on.
+///
+/// Called from the request path after a definition-changing command
+/// (`kv.define` / `kv.del --with-define`) succeeds. A write failure is returned
+/// so the caller can surface it (an in-memory/disk divergence is the dangerous
+/// case — DR-0014 §4); when persistence is off this is a no-op `Ok(())`.
+fn persist_if_enabled(shared: &Shared, store: &Store) -> std::io::Result<()> {
+    match &shared.persist {
+        Some(settings) => {
+            crate::defs::save_definitions(&settings.path, &online_definitions(settings, store))
+        }
+        None => Ok(()),
+    }
+}
+
 /// The accept loop: serve connections until the shutdown signal flips.
 async fn serve(
     listener: UnixListener,
@@ -426,6 +567,17 @@ fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Respons
         Err(_) => return Response::error(ErrorKind::Internal, "store lock poisoned"),
     };
 
+    // A command that can change the definition registry triggers a persist on
+    // success (DR-0014 §4). Capture this before `req` is moved into the handler.
+    let may_change_definitions = matches!(
+        req,
+        Request::KvDefine { .. }
+            | Request::KvDel {
+                with_define: true,
+                ..
+            }
+    );
+
     let ctx = HandlerCtx {
         auth,
         runner: &shared.runner,
@@ -435,7 +587,26 @@ fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Respons
         socket: &shared.socket_path,
         requester: requester.as_deref(),
     };
-    handler::handle_request(&mut store, &ctx, req)
+    let response = handler::handle_request(&mut store, &ctx, req);
+
+    // Persist the (possibly changed) definition registry while still holding the
+    // store lock, so the on-disk file is a consistent snapshot of the registry
+    // that just mutated (DR-0014 §4). The write is synchronous on the blocking
+    // pool (the whole locked section already runs there, DR-0008); `define` /
+    // `del --with-define` are low-frequency, so the added latency is acceptable.
+    // A write failure becomes an Internal error response rather than silently
+    // diverging the in-memory registry from disk (codex review: the divergence
+    // is the dangerous failure mode).
+    if may_change_definitions
+        && matches!(response, Response::Ok(_))
+        && let Err(e) = persist_if_enabled(shared, &store)
+    {
+        return Response::error(
+            ErrorKind::Internal,
+            format!("definition applied but could not be persisted: {e}"),
+        );
+    }
+    response
 }
 
 /// Wait for SIGINT or SIGTERM (Unix); Ctrl+C only elsewhere.
@@ -475,6 +646,7 @@ mod tests {
             runner: CommandRunner::new(),
             auth: Box::new(AllowAll),
             clock: SystemClock::new(),
+            persist: None,
             socket_path: "/tmp/test.sock".into(),
             pid: std::process::id(),
         })
@@ -693,6 +865,84 @@ mod tests {
         register_definitions(&mut store, &runner, &clock, &entries, &eager);
         assert!(store.is_defined("AGENT_KEY"), "definition survives");
         assert!(!store.has_value("AGENT_KEY"), "no value after failed run");
+    }
+
+    // ---- restore_persisted_definitions (config-priority merge; DR-0014 §4) ----
+
+    fn pdef(name: &str, argv: &[&str], soft: Option<u64>, hard: Option<u64>) -> KvDefinition {
+        KvDefinition {
+            name: name.into(),
+            command: argv.iter().map(|s| s.to_string()).collect(),
+            soft_ttl_secs: soft,
+            hard_ttl_secs: hard,
+            preload: false,
+        }
+    }
+
+    #[test]
+    fn restore_registers_keys_not_in_config() {
+        let mut store = Store::new();
+        let config_names = std::collections::HashSet::new();
+        restore_persisted_definitions(
+            &mut store,
+            vec![pdef("TOK", &["printf", "v"], Some(3600), Some(86400))],
+            &config_names,
+        );
+        assert!(store.is_defined("TOK"), "persisted def restored");
+        let d = store.definition_of("TOK").unwrap();
+        assert_eq!(
+            d.source().command_argv().unwrap(),
+            &["printf".to_string(), "v".to_string()]
+        );
+        assert_eq!(d.ttl().soft(), Some(std::time::Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn restore_drops_persisted_key_that_config_already_defines() {
+        // Config wins: a clashing persisted entry must not overwrite the config
+        // definition, even if its argv differs.
+        let mut store = Store::new();
+        let runner = CommandRunner::new();
+        let clock = cache_warden::FakeClock::new();
+        register_definitions(
+            &mut store,
+            &runner,
+            &clock,
+            &[pdef("DB", &["config-cmd"], None, None)],
+            &no_eager(),
+        );
+        let config_names: std::collections::HashSet<String> =
+            ["DB".to_string()].into_iter().collect();
+        // Persisted DB has a DIFFERENT argv; it must be dropped, not applied.
+        restore_persisted_definitions(
+            &mut store,
+            vec![pdef("DB", &["persisted-cmd"], None, None)],
+            &config_names,
+        );
+        let d = store.definition_of("DB").unwrap();
+        assert_eq!(
+            d.source().command_argv().unwrap(),
+            &["config-cmd".to_string()],
+            "config definition wins the merge"
+        );
+    }
+
+    #[test]
+    fn restore_skips_bad_ttl_without_aborting_others() {
+        let mut store = Store::new();
+        let config_names = std::collections::HashSet::new();
+        // First entry has soft > hard (invalid Ttl); it must be skipped while the
+        // second still registers.
+        restore_persisted_definitions(
+            &mut store,
+            vec![
+                pdef("BAD", &["echo"], Some(100), Some(10)),
+                pdef("GOOD", &["echo"], None, None),
+            ],
+            &config_names,
+        );
+        assert!(!store.is_defined("BAD"), "invalid TTL entry skipped");
+        assert!(store.is_defined("GOOD"), "subsequent entry still restored");
     }
 
     #[tokio::test]

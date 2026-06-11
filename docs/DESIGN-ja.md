@@ -373,9 +373,10 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
   定義レジストリを値ストアと分けて持つ。設計は
   [DR-0014](./decisions/DR-0014-kv-definition-model.md) で確定済み。**実装済み**: `kv define` 動詞 /
   `--source URI`（op:// 糖衣）/ 値ストアと分離した定義レジストリ / `kv get` の lazy 生成 /
-  `kv del --with-define` / config `[kv.*]` の lazy デフォルト + `preload` opt-in（authsock 参照鍵は自動 eager）。
-  **未着手**: defs ファイル（`--defs`）/ オンライン定義の永続化（opt-in、値は書かない）/
-  参照のインライン define（`cache-warden://KEY?argv=...`）。
+  `kv del --with-define` / config `[kv.*]` の lazy デフォルト + `preload` opt-in（authsock 参照鍵は自動 eager）/
+  defs ファイル（`kv define --defs FILE`、自動探索なし）/ オンライン定義の永続化
+  （`[daemon].persist-definitions` opt-in、値は書かない、起動時は config 優先マージ + 正規化 re-write）。
+  **未着手**: 参照のインライン define（`cache-warden://KEY?argv=...`）。
 
 - **OTP 値型（`--type otp`）**: TOTP の seed をキャッシュし、`kv get` / 参照解決のたびに
   デーモン側で 6 桁コードを導出して返す。seed は write-only（デーモンから出ない）。

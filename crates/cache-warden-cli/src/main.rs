@@ -11,6 +11,7 @@ use std::process;
 mod commands;
 mod config;
 mod daemon;
+mod defs;
 mod help;
 mod protocol;
 
@@ -295,8 +296,17 @@ fn dispatch_kv(rest: &[String], socket: &std::path::Path) -> Result<(), CliError
         return Ok(());
     }
 
+    // `define` has two modes (single vs. `--defs` batch), so it is dispatched
+    // specially before the single-request path below.
+    if sub == "define" {
+        let plan = or_usage(commands::parse_kv_define_plan(kv_args), leaf_help)?;
+        return match plan {
+            commands::DefinePlan::Single(req) => Ok(run_client(socket, &req)?),
+            commands::DefinePlan::Defs(files) => run_define_defs(socket, &files),
+        };
+    }
+
     let req = match sub {
-        "define" => or_usage(commands::parse_kv_define(kv_args), leaf_help)?,
         "set" => or_usage(
             commands::parse_kv_set(kv_args, || {
                 let mut buf = Vec::new();
@@ -321,6 +331,66 @@ fn dispatch_kv(rest: &[String], socket: &std::path::Path) -> Result<(), CliError
         _ => unreachable!("leaf_help match covers all known subcommands"),
     };
     Ok(run_client(socket, &req)?)
+}
+
+/// Register every definition in one or more `--defs` files in bulk (DR-0014 §4).
+///
+/// Each file is parsed (a parse error for a file is fatal for that file but does
+/// not stop the others), then every definition is sent as a `kv.define`. A
+/// per-key conflict (an existing different definition) is collected, **not**
+/// fatal to the rest: all keys are attempted, and the failures are reported
+/// together at the end with a non-zero exit. This keeps one clashing key from
+/// taking the rest of a batch registration down with it.
+fn run_define_defs(socket: &std::path::Path, files: &[PathBuf]) -> Result<(), CliError> {
+    let mut failures: Vec<String> = Vec::new();
+    let mut ok_count = 0usize;
+
+    for file in files {
+        let defs = match defs::parse_defs_file(file) {
+            Ok(d) => d,
+            Err(e) => {
+                // A whole unreadable / invalid file is one failure; keep going so
+                // a second `--defs` still applies.
+                failures.push(e);
+                continue;
+            }
+        };
+        for def in defs {
+            let req = protocol::wire::Request::KvDefine {
+                key: def.name.clone(),
+                argv: def.command.clone(),
+                soft_ttl_secs: def.soft_ttl_secs,
+                hard_ttl_secs: def.hard_ttl_secs,
+            };
+            match client::round_trip(socket, &req) {
+                Ok(Response::Ok(_)) => ok_count += 1,
+                Ok(Response::Err(e)) => {
+                    failures.push(format!("{}: {}", def.name, e.error.message));
+                }
+                Err(e) => {
+                    // A transport error (daemon down) is not per-key; surface it
+                    // immediately rather than repeating it for every key.
+                    return Err(CliError::Message(e));
+                }
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        println!("defined {ok_count}");
+        Ok(())
+    } else {
+        // Report every failure together (stderr), then exit non-zero. The ok
+        // count goes to stdout so a partial success is still visible.
+        if ok_count > 0 {
+            println!("defined {ok_count}");
+        }
+        let mut msg = format!("{} definition(s) failed:", failures.len());
+        for f in &failures {
+            msg.push_str(&format!("\n  {f}"));
+        }
+        Err(CliError::Message(msg))
+    }
 }
 
 fn main() {

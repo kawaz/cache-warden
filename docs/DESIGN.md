@@ -380,8 +380,9 @@ See DR-0004 for the core/adapter assignment of assets being ported.
   in [DR-0014](./decisions/DR-0014-kv-definition-model.md). **Implemented**: the `kv define` verb /
   `--source URI` (op:// sugar) / a definition registry separate from the value store / lazy generation in
   `kv get` / `kv del --with-define` / `[kv.*]` lazy-by-default + `preload` opt-in (authsock-referenced keys
-  are auto-eager). **Not started**: defs files (`--defs`) / opt-in persistence of online definitions
-  (values are never written) / inline define on references (`cache-warden://KEY?argv=...`).
+  are auto-eager) / defs files (`kv define --defs FILE`, no auto-discovery) / opt-in persistence of online
+  definitions (`[daemon].persist-definitions`; values are never written; startup merges config-wins with a
+  normalizing re-write). **Not started**: inline define on references (`cache-warden://KEY?argv=...`).
 
 - **OTP value type (`--type otp`)**: Cache the TOTP seed and derive the 6-digit code daemon-side on
   every `kv get` / reference resolution. The seed is write-only (it never leaves the daemon).

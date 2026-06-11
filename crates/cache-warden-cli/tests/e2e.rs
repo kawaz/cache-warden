@@ -647,6 +647,384 @@ fn config_rejects_inline_static_value() {
     );
 }
 
+/// Run the CLI binary as a client (`cache-warden <args> --socket <socket>`),
+/// returning its captured output. Used to drive the client-side `--defs` batch
+/// logic (which lives in the binary, not on the raw wire).
+fn run_cli(socket: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .args(args)
+        .arg("--socket")
+        .arg(socket)
+        .output()
+        .expect("run cli")
+}
+
+#[test]
+fn define_defs_file_then_get_lazily_generates() {
+    // `kv define --defs FILE` bulk-registers a file's definitions (lazy); a
+    // later get produces each value on demand (DR-0014 §4).
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+
+    let defs_path = dir.path().join("my.cache-warden.toml");
+    std::fs::write(
+        &defs_path,
+        r#"[kv.ALPHA]
+command = ["printf", "alpha-value"]
+
+[kv.BETA]
+command = ["printf", "beta-value"]
+soft-ttl = "1h"
+"#,
+    )
+    .unwrap();
+
+    // Wait for the daemon to be reachable before issuing the client command.
+    let resp = request(&socket, r#"{"cmd":"ping"}"#);
+    assert_eq!(resp["ok"], true);
+
+    let out = run_cli(
+        &socket,
+        &["kv", "define", "--defs", defs_path.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "define --defs failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Both keys are defined (no value yet — lazy).
+    let resp = request(&socket, r#"{"cmd":"status"}"#);
+    let entries = resp["entries"].as_array().unwrap();
+    for name in ["ALPHA", "BETA"] {
+        let e = entries.iter().find(|e| e["name"] == name).expect("defined");
+        assert_eq!(e["defined"], true, "{name} defined");
+        assert_eq!(e["has_value"], false, "{name} lazy (no value)");
+    }
+
+    // First get lazily produces each value.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"ALPHA"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"alpha-value"
+    );
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"BETA"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"beta-value"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
+fn define_defs_conflict_is_aggregated_not_fatal() {
+    // A defs file whose key clashes with an existing different definition must
+    // report that key as a failure (non-zero exit) while still registering the
+    // non-clashing keys (DR-0014 §4: one conflict does not stop the batch).
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+
+    let resp = request(&socket, r#"{"cmd":"ping"}"#);
+    assert_eq!(resp["ok"], true);
+
+    // Pre-register CLASH with one argv.
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.define","key":"CLASH","argv":["printf","original"]}"#,
+    );
+    assert_eq!(resp["ok"], true);
+
+    // defs file: CLASH (different argv => conflict) + FRESH (ok).
+    let defs_path = dir.path().join("defs.toml");
+    std::fs::write(
+        &defs_path,
+        r#"[kv.CLASH]
+command = ["printf", "different"]
+
+[kv.FRESH]
+command = ["printf", "fresh-value"]
+"#,
+    )
+    .unwrap();
+
+    let out = run_cli(
+        &socket,
+        &["kv", "define", "--defs", defs_path.to_str().unwrap()],
+    );
+    assert!(
+        !out.status.success(),
+        "a conflicting key must make the batch exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("CLASH"), "conflict names the key: {stderr}");
+
+    // FRESH still got registered despite CLASH's failure.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"FRESH"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"fresh-value"
+    );
+    // CLASH keeps its original definition.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"CLASH"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"original"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
+fn persisted_definition_survives_daemon_restart() {
+    // With `[daemon].persist-definitions = true`, an online `kv define` is
+    // written to the state file and restored on a fresh daemon process, so a get
+    // can regenerate the value after a restart (DR-0014 §4).
+    let dir = tempfile::tempdir().unwrap();
+    let state_home = dir.path().join("state");
+    let socket = dir.path().join("control.sock");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[daemon]\nsocket = \"{}\"\npersist-definitions = true\n",
+            socket.display()
+        ),
+    )
+    .unwrap();
+
+    // --- First daemon: define an online definition, confirm it works. ---
+    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
+        .arg("run")
+        .env("CACHE_WARDEN_CONFIG", &config_path)
+        .env("XDG_STATE_HOME", &state_home)
+        .spawn()
+        .expect("spawn daemon 1");
+    let mut daemon = Daemon { child };
+
+    let resp = request(&socket, r#"{"cmd":"ping"}"#);
+    assert_eq!(resp["ok"], true);
+
+    // Define a key whose *value* (the command's stdout) is NOT present in its
+    // argv, so we can assert the produced value never reaches disk. The argv
+    // runs `sh -c 'cat <file>'` where the file holds the real secret; the argv
+    // itself only references the path, never the secret bytes.
+    let secret_file = dir.path().join("secret.txt");
+    std::fs::write(&secret_file, b"top-secret-output").unwrap();
+    let define = format!(
+        r#"{{"cmd":"kv.define","key":"PERSISTED","argv":["sh","-c","cat {}"]}}"#,
+        secret_file.display()
+    );
+    let resp = request(&socket, &define);
+    assert_eq!(resp["ok"], true, "define: {resp}");
+
+    // Produce the value once so a secret is resident in memory (and could, if
+    // the invariant were broken, leak to disk).
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"PERSISTED"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"top-secret-output"
+    );
+
+    // The state file now exists under XDG_STATE_HOME (definitions only).
+    let state_file = state_home.join("cache-warden").join("definitions.toml");
+    let persisted_text = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(t) = std::fs::read_to_string(&state_file) {
+                if t.contains("PERSISTED") {
+                    break t;
+                }
+            }
+            assert!(Instant::now() < deadline, "state file never appeared");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    // The produced value must never be written — only the definition (argv).
+    assert!(
+        !persisted_text.contains("top-secret-output"),
+        "state file must hold definitions only, never the produced value: {persisted_text}"
+    );
+    assert!(
+        persisted_text.contains("command"),
+        "state file uses the defs grammar: {persisted_text}"
+    );
+
+    // --- Stop the first daemon. ---
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+    // Socket cleaned on shutdown.
+    let cleaned = Instant::now() + Duration::from_secs(5);
+    while socket.exists() && Instant::now() < cleaned {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // --- Second daemon: same config + state dir. It restores PERSISTED. ---
+    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
+        .arg("run")
+        .env("CACHE_WARDEN_CONFIG", &config_path)
+        .env("XDG_STATE_HOME", &state_home)
+        .spawn()
+        .expect("spawn daemon 2");
+    let mut daemon2 = Daemon { child };
+
+    let resp = request(&socket, r#"{"cmd":"ping"}"#);
+    assert_eq!(resp["ok"], true);
+
+    // status shows PERSISTED as a restored (lazy) definition.
+    let resp = request(&socket, r#"{"cmd":"status"}"#);
+    let p = resp["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "PERSISTED")
+        .expect("PERSISTED restored after restart");
+    assert_eq!(p["defined"], true, "restored as a definition: {p}");
+
+    // get regenerates the value from the restored definition.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"PERSISTED"}"#);
+    assert_eq!(resp["ok"], true, "regenerate after restart: {resp}");
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"top-secret-output"
+    );
+
+    let pid = daemon2.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon2, Duration::from_secs(10));
+}
+
+#[test]
+fn persistence_off_ignores_existing_state_file() {
+    // With persistence off (the default), a pre-existing state file is neither
+    // read nor written: its definitions are NOT restored (DR-0014 §4).
+    let dir = tempfile::tempdir().unwrap();
+    let state_home = dir.path().join("state");
+    let state_file = state_home.join("cache-warden").join("definitions.toml");
+    std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &state_file,
+        "[kv.GHOST]\ncommand = [\"printf\", \"ghost\"]\n",
+    )
+    .unwrap();
+
+    let socket = dir.path().join("control.sock");
+    let config_path = dir.path().join("config.toml");
+    // No persist-definitions key => off.
+    std::fs::write(
+        &config_path,
+        format!("[daemon]\nsocket = \"{}\"\n", socket.display()),
+    )
+    .unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
+        .arg("run")
+        .env("CACHE_WARDEN_CONFIG", &config_path)
+        .env("XDG_STATE_HOME", &state_home)
+        .spawn()
+        .expect("spawn daemon");
+    let mut daemon = Daemon { child };
+
+    let resp = request(&socket, r#"{"cmd":"ping"}"#);
+    assert_eq!(resp["ok"], true);
+
+    // GHOST must NOT be present (persistence is off, so the file was ignored).
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"GHOST"}"#);
+    assert_eq!(resp["ok"], false, "GHOST must not be restored: {resp}");
+    assert_eq!(resp["error"]["kind"], "not_found");
+
+    // And the state file is left untouched (still our hand-written content).
+    let after = std::fs::read_to_string(&state_file).unwrap();
+    assert!(
+        after.contains("GHOST"),
+        "state file must be left as-is: {after}"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
+fn persisted_config_priority_merge_drops_clashing_persisted_entry() {
+    // DR-0014 §4: if a persisted definition clashes with a config `[kv.X]`, the
+    // config wins; the persisted entry is dropped (and removed from disk on the
+    // post-restore rewrite). Set up a stale persisted DB (different argv), then
+    // start with a config that defines DB differently.
+    let dir = tempfile::tempdir().unwrap();
+    let state_home = dir.path().join("state");
+    let state_file = state_home.join("cache-warden").join("definitions.toml");
+    std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &state_file,
+        "[kv.DB]\ncommand = [\"printf\", \"stale-persisted\"]\n",
+    )
+    .unwrap();
+
+    let socket = dir.path().join("control.sock");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[daemon]\nsocket = \"{}\"\npersist-definitions = true\n\n[kv.DB]\ncommand = [\"printf\", \"from-config\"]\n",
+            socket.display()
+        ),
+    )
+    .unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
+        .arg("run")
+        .env("CACHE_WARDEN_CONFIG", &config_path)
+        .env("XDG_STATE_HOME", &state_home)
+        .spawn()
+        .expect("spawn daemon");
+    let mut daemon = Daemon { child };
+
+    let resp = request(&socket, r#"{"cmd":"ping"}"#);
+    assert_eq!(resp["ok"], true);
+
+    // DB resolves to the CONFIG definition, not the stale persisted one.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"DB"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"from-config",
+        "config definition wins the merge"
+    );
+
+    // The rewrite normalized the state file to current truth: DB's persisted
+    // argv must now be the config's (config-priority), not the stale one.
+    let after = std::fs::read_to_string(&state_file).unwrap();
+    assert!(
+        !after.contains("stale-persisted"),
+        "stale persisted entry must be removed from disk: {after}"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
 #[test]
 fn double_start_is_refused() {
     let dir = tempfile::tempdir().unwrap();
