@@ -44,6 +44,11 @@
 //!   ([`private_key_argv`] as a [`cache_warden::ValueSource::Command`]); the
 //!   registry's [`KeySource::Op`] carries that fetch spec. The op CLI sits behind
 //!   the [`OpClient`] trait so discovery is tested with a fake (no `op` in CI).
+//! - [`chain_allowed`]: socket-level process access policy (port plan Iteration 5).
+//!   Decides whether a connecting peer's process ancestry is admitted by a socket's
+//!   `allowed_processes` list (empty = unrestricted; otherwise an OR over the chain
+//!   on exact executable basename). The generic ancestry walk lives in the core;
+//!   this is the policy interpretation half (DR-0004).
 
 mod codec;
 mod error;
@@ -52,6 +57,7 @@ mod message;
 mod op;
 mod op_cache;
 mod op_discovery;
+mod process_policy;
 mod registry;
 mod signer;
 mod upstream;
@@ -67,6 +73,7 @@ pub use message::{AgentMessage, Identity, MessageType, SignRequestFields};
 pub use op::{OpClient, OpKeyInfo, OpSource, RealOpClient, private_key_argv, validate_item_id};
 pub use op_cache::{CachedKey, OpKeyCache, default_cache_path};
 pub use op_discovery::{DiscoveredKey, discover_keys};
+pub use process_policy::chain_allowed;
 pub use registry::{KeySource, PublicKeyRegistry, RegisteredKey};
 pub use signer::sign;
 pub use upstream::{Upstream, UpstreamConnection};

@@ -508,13 +508,27 @@ authsock-warden は一切触らない（DR-0004「authsock リポは保守のみ
   - **DR / journal 起票**: 上記新規判断は本 plan の Iteration 4 実績に集約。独立 DR は kawaz 判断
     （config 新スキーマ / op 抽象置き場は DR-0004 判断 2・8 の具体化の範囲内で、設計方針の新規追加なし）。
 
-### Iteration 5: ポリシー（3 層）+ プロセス認証配線
+### Iteration 5: socket 層プロセスアクセス制御（`allowed_processes`）✅ 完了
 
-- スコープ: `policy/engine.rs`（keys ∩ socket、most restrictive wins）移植。
-  peer pid → `SystemInspector::ancestry`（コア）→ `allowed_processes` 照合（アダプタ）。
-  cache-warden は peer.rs + ancestry を既に持つので結線するだけ。
+- 実績スコープ: **socket 層のみ**実装（key 層 `[[keys]].allowed_processes` は見送り、下記理由）。
+  peer pid → `SystemInspector::ancestry`（コア）→ `chain_allowed`（アダプタ `process_policy.rs`）照合。
+  cache-warden は peer.rs + ancestry を既に持つので結線のみ。`handle_connection` で接続冒頭に 1 回判定し、
+  不許可ならその接続の全リクエストを `SSH_AGENT_FAILURE` で返す（列挙も署名も一律拒否）。
+- **確定した設計判断（DR-0012 起票）**:
+  - **socket 層のみ実装**: cache-warden は op キーを `[authsock.sources.*]` で持ち warden の `[[keys]]`
+    構造が無く、kawaz の実 config は全 socket `allowed_processes = []`（空）なので socket 層だけで実害ゼロ。
+    key 層はパリティ後の追加。
+  - **空配列 = 全プロセス許可（制限なし）** = 必須の不変条件（実 config が全空なので移植後も挙動不変）。
+    空なら祖先遡上自体をスキップして許可。
+  - **照合 = 全祖先 OR + 実行ファイル basename の完全一致**（glob / regex なし、warden 踏襲）。
+    `name()==None`（path 未解決）の祖先はスキップ。
+  - **peer pid 取得失敗 / 祖先遡上失敗時は fail-closed（拒否）**（kawaz 確定）。warden は fail-open だが
+    cache-warden は安全側に倒す差異を DR に明記。空 allowed_processes の socket には影響させない。
+  - key 層を将来足す時は「交差空 = 全拒否」にする（warden の `matches_any(&[])==true` で全許可に転落する
+    罠を踏襲しない）。
 - 依存: Iteration 1。
-- 検証: allowed_processes に無いプロセスからの SIGN が拒否される（warden と突き合わせ）。
+- 検証: process_policy 単体（fake チェーン網羅）+ `process_gate_passes` 単体（allow/deny/pid 不明）+
+  実 ssh E2E（自プロセス祖先名を allowed に入れて列挙が通る / 偽名で列挙・署名とも FAILURE）。
 
 ### Iteration 6: config（authsock 節）+ Phase 1 並走達成
 

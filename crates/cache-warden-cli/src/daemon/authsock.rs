@@ -59,7 +59,7 @@ use cache_warden::{
 use cache_warden_authsock::{
     AgentCodec, AgentMessage, DiscoveredKey, FilterEvaluator, GithubFetcher, GithubMatcher,
     Identity, KeySource, MessageType, OpKeyCache, OpSource, PublicKeyRegistry, RealGithubFetcher,
-    RealOpClient, RegisteredKey, Upstream, discover_keys, private_key_argv, sign,
+    RealOpClient, RegisteredKey, Upstream, chain_allowed, discover_keys, private_key_argv, sign,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
@@ -122,6 +122,12 @@ struct SocketState {
     /// this socket enumerates (REQUEST_IDENTITIES) and can sign with
     /// (SIGN_REQUEST). An empty evaluator matches every key (no filtering).
     filter: FilterEvaluator,
+    /// Executable basenames allowed to use this socket (port plan Iteration 5).
+    /// Empty means no restriction (the connection-time process gate is skipped).
+    /// Otherwise a connection is admitted only when some process in the peer's
+    /// ancestry chain has a matching basename; an unattributable peer (no pid /
+    /// ancestry failure) is refused (fail-closed). See [`process_gate_passes`].
+    allowed_processes: Vec<String>,
     /// The shared process core (Store / auth / runner / clock).
     shared: Arc<Shared>,
 }
@@ -322,6 +328,7 @@ pub fn spawn_listeners(
             registry,
             upstreams,
             filter,
+            allowed_processes: socket.allowed_processes.clone(),
             shared: Arc::clone(&shared),
         });
         let path = socket.path.clone();
@@ -489,18 +496,56 @@ async fn handle_connection(stream: UnixStream, state: Arc<SocketState>) -> std::
     use std::os::unix::io::AsRawFd;
     let peer = peer_pid(stream.as_raw_fd());
 
+    // Connection-time process gate (port plan Iteration 5). A socket with a
+    // non-empty `allowed_processes` admits a connection only when the peer's
+    // ancestry chain names an allowed executable; otherwise *every* request on
+    // this connection is answered with SSH_AGENT_FAILURE (enumeration and signing
+    // alike — the client learns nothing about which keys exist). The peer pid is
+    // fixed for a connection, so this is judged once here rather than per message.
+    // An empty list short-circuits to "admitted" without resolving ancestry.
+    let admitted = process_gate_passes(peer, &state.allowed_processes);
+
     let (mut read_half, mut write_half) = stream.into_split();
     let mut routes: UpstreamRoutes = HashMap::new();
     while let Some(msg) = AgentCodec::read(&mut read_half)
         .await
         .map_err(std::io::Error::other)?
     {
-        let response = respond(&state, peer, &msg, &mut routes).await;
+        let response = if admitted {
+            respond(&state, peer, &msg, &mut routes).await
+        } else {
+            // Rejected connection: a uniform FAILURE for every message type.
+            AgentMessage::failure()
+        };
         AgentCodec::write(&mut write_half, &response)
             .await
             .map_err(std::io::Error::other)?;
     }
     Ok(())
+}
+
+/// Whether a connection from peer process `peer` is admitted by `allowed`.
+///
+/// - `allowed` empty → admitted unconditionally (no restriction; the ancestry is
+///   never resolved, so an unattributable peer is still admitted — the existing
+///   "no policy" behaviour is preserved exactly).
+/// - `allowed` non-empty → resolve the peer's ancestry and admit only when
+///   [`chain_allowed`] passes. **Fail-closed**: a missing peer pid or an ancestry
+///   lookup failure denies the connection (we cannot identify who is asking, so a
+///   restricted socket refuses).
+///
+/// Design rationale: cache-warden deliberately fails *closed* here where
+/// authsock-warden failed *open* (it logged "could not determine client process,
+/// allowing by default"). On a socket whose operator explicitly restricted the
+/// callers, an unidentifiable peer is exactly the case to refuse — DR-0012.
+fn process_gate_passes(peer: Option<u32>, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    match peer.and_then(|pid| SystemInspector::new().ancestry(pid).ok()) {
+        Some(chain) => chain_allowed(&chain, allowed),
+        None => false, // fail-closed: cannot identify the peer.
+    }
 }
 
 /// Produce the agent response for one request message.
@@ -1648,6 +1693,11 @@ mod tests {
             registry,
             upstreams: upstream_paths.iter().map(Upstream::new).collect(),
             filter,
+            // The unit tests here exercise the per-message respond/sign paths; the
+            // process gate (allowed_processes) is judged once at connect time and
+            // covered separately by the process_gate_passes tests, so it is
+            // unrestricted in this fixture.
+            allowed_processes: Vec::new(),
             shared,
         })
     }
@@ -2098,16 +2148,93 @@ mod tests {
             fetcher,
             rx,
         ));
-        // Yield so the task's initial fetch runs.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-            if matcher.matches(&github_identity(ED25519_PUB)) {
-                break;
-            }
-        }
-        assert!(matcher.matches(&github_identity(ED25519_PUB)));
+        // The initial fetch runs on the blocking pool, so its completion is not
+        // bounded by a fixed number of yields — on a slow CI the cache write can
+        // lag behind. Poll with a generous timeout instead of a fixed sleep /
+        // yield count (otherwise this is a timing-dependent flake: green locally,
+        // red on a slow runner).
+        let m = matcher.clone();
+        poll_until(Duration::from_secs(2), move || {
+            m.matches(&github_identity(ED25519_PUB))
+        })
+        .await;
+        assert!(
+            matcher.matches(&github_identity(ED25519_PUB)),
+            "refresh task should have populated the matcher within the timeout"
+        );
         // Shutdown stops the task cleanly.
         tx.send(true).unwrap();
         handle.await.unwrap();
+    }
+
+    // ---- process gate (port plan Iteration 5) ----
+
+    #[test]
+    fn process_gate_empty_list_admits_even_unknown_peer() {
+        // No restriction: a peer with no resolvable pid is still admitted (the
+        // pre-Iteration-5 "no policy" behaviour is unchanged).
+        assert!(process_gate_passes(None, &[]));
+        assert!(process_gate_passes(Some(std::process::id()), &[]));
+    }
+
+    #[test]
+    fn process_gate_nonempty_list_denies_unknown_peer_fail_closed() {
+        // A restriction is set but the peer pid is unknown: fail-closed.
+        assert!(!process_gate_passes(None, &["anything".to_string()]));
+    }
+
+    #[test]
+    fn process_gate_nonempty_list_denies_absent_pid_fail_closed() {
+        // A restricted socket with a definitely-absent pid (ancestry lookup fails)
+        // is denied — cannot identify the caller, so refuse.
+        let mut absent = 4_000_000u32;
+        while SystemInspector::new().inspect(absent).is_ok() {
+            absent += 1;
+        }
+        assert!(!process_gate_passes(
+            Some(absent),
+            &["anything".to_string()]
+        ));
+    }
+
+    #[test]
+    fn process_gate_admits_when_a_real_ancestor_name_is_allowed() {
+        // Resolve our own ancestry, take a genuinely-present executable basename,
+        // and assert the gate admits a list containing it (no fakery: the chain is
+        // this live test process).
+        let me = std::process::id();
+        let chain = SystemInspector::new()
+            .ancestry(me)
+            .expect("self ancestry resolves");
+        let a_real_name = chain
+            .iter()
+            .find_map(|p| p.name().map(str::to_string))
+            .expect("at least one process in our ancestry has a resolvable name");
+        assert!(process_gate_passes(Some(me), &[a_real_name]));
+    }
+
+    #[test]
+    fn process_gate_denies_when_no_ancestor_name_matches() {
+        // A name that cannot be any real executable basename: the live ancestry
+        // chain has nothing matching it, so a restricted socket refuses.
+        let bogus = "cw-no-such-process-name-iteration5".to_string();
+        assert!(!process_gate_passes(Some(std::process::id()), &[bogus]));
+    }
+
+    /// Poll `cond` every 10ms until it returns `true` or `timeout` elapses.
+    ///
+    /// Replaces fixed sleeps / bounded `yield_now` loops in tests that wait on a
+    /// background task (e.g. the github refresh task's blocking-pool fetch) so they
+    /// do not flake on a slow CI runner: the work-completion observation point is
+    /// polled with real time budget rather than assumed to land within N yields.
+    /// On timeout the caller's subsequent assertion fails with a clear message.
+    async fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

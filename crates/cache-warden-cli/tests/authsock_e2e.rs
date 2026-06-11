@@ -273,6 +273,40 @@ fn config_content_with_upstream(sock_path: &Path, key_path: &Path, upstream: &Pa
     s
 }
 
+/// Like [`config_content`] but the authsock socket restricts callers to the
+/// process basenames in `allowed` (port plan Iteration 5 `allowed_processes`).
+fn config_content_with_allowed_processes(
+    sock_path: &Path,
+    key_path: &Path,
+    allowed: &[&str],
+) -> String {
+    let mut s = config_content(sock_path, key_path, None, false);
+    let list = allowed
+        .iter()
+        .map(|p| format!("\"{p}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    s.push_str(&format!("allowed_processes = [{list}]\n"));
+    s
+}
+
+/// A real executable basename from *this test process's* own ancestry chain.
+///
+/// The agent client in these tests is the test binary itself, so its peer pid's
+/// ancestry contains this name — putting it in `allowed_processes` must admit the
+/// connection. Resolved from the live process table (not hard-coded) so the test
+/// works on any runner.
+fn a_real_ancestor_name() -> String {
+    use cache_warden::ProcessInspector;
+    let chain = cache_warden::SystemInspector::new()
+        .ancestry(std::process::id())
+        .expect("self ancestry resolves");
+    chain
+        .iter()
+        .find_map(|p| p.name().map(str::to_string))
+        .expect("our ancestry has at least one named process")
+}
+
 /// Parse an IDENTITIES_ANSWER payload into a list of (key_blob, comment).
 fn parse_identities(payload: &[u8]) -> Vec<(Vec<u8>, String)> {
     let mut out = Vec::new();
@@ -913,4 +947,86 @@ fn op_source_sign_with_denied_auth_is_failure() {
         "denied lazy-load auth must yield FAILURE, got type {resp_type}"
     );
     assert!(resp_payload.is_empty(), "FAILURE must carry no detail");
+}
+
+// ---- allowed_processes process gate (port plan Iteration 5) ----
+
+#[test]
+fn allowed_process_in_ancestry_permits_enumeration() {
+    // A socket restricted to a process basename that *is* in this test process's
+    // ancestry must admit the connection: REQUEST_IDENTITIES returns the key.
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("id_ed25519");
+    let agent_sock = dir.path().join("agent.sock");
+    let config_path = dir.path().join("config.toml");
+    ssh_keygen_ed25519(&key_path, "cw-e2e-allowed@host");
+    let allowed = a_real_ancestor_name();
+    std::fs::write(
+        &config_path,
+        config_content_with_allowed_processes(&agent_sock, &key_path, &[&allowed]),
+    )
+    .unwrap();
+
+    let (_daemon, _control) = spawn_daemon(dir.path(), &config_path);
+    wait_for_socket(&agent_sock);
+
+    let (resp_type, payload) = agent_round_trip(&agent_sock, SSH_AGENTC_REQUEST_IDENTITIES, &[]);
+    assert_eq!(
+        resp_type, SSH_AGENT_IDENTITIES_ANSWER,
+        "an allowed caller must get the identities answer"
+    );
+    let ids = parse_identities(&payload);
+    assert_eq!(ids.len(), 1, "the one configured key should enumerate");
+    assert!(
+        ids[0].1.contains("cw-e2e-allowed@host"),
+        "the enumerated key's comment should carry the ssh-keygen comment, got: {}",
+        ids[0].1
+    );
+}
+
+#[test]
+fn disallowed_process_is_refused_and_hides_keys() {
+    // A socket restricted to a process basename that cannot be in any ancestry
+    // refuses the connection: REQUEST_IDENTITIES returns SSH_AGENT_FAILURE (the
+    // key is hidden, not merely unsignable), and a SIGN_REQUEST likewise fails.
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("id_ed25519");
+    let agent_sock = dir.path().join("agent.sock");
+    let config_path = dir.path().join("config.toml");
+    let pub_line = ssh_keygen_ed25519(&key_path, "cw-e2e-denied@host");
+    std::fs::write(
+        &config_path,
+        config_content_with_allowed_processes(
+            &agent_sock,
+            &key_path,
+            &["cw-no-such-process-name-iteration5"],
+        ),
+    )
+    .unwrap();
+
+    let (_daemon, _control) = spawn_daemon(dir.path(), &config_path);
+    wait_for_socket(&agent_sock);
+
+    // Enumeration is refused (keys hidden from a disallowed caller).
+    let (enum_type, enum_payload) =
+        agent_round_trip(&agent_sock, SSH_AGENTC_REQUEST_IDENTITIES, &[]);
+    assert_eq!(
+        enum_type, SSH_AGENT_FAILURE,
+        "a disallowed caller must not learn which keys exist"
+    );
+    assert!(enum_payload.is_empty(), "FAILURE must carry no detail");
+
+    // Signing is refused too.
+    let blob = public_key_blob(&pub_line);
+    let mut payload = Vec::new();
+    put_string(&mut payload, &blob);
+    put_string(&mut payload, b"challenge");
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    let (sign_type, sign_payload) =
+        agent_round_trip(&agent_sock, SSH_AGENTC_SIGN_REQUEST, &payload);
+    assert_eq!(
+        sign_type, SSH_AGENT_FAILURE,
+        "a disallowed caller must not be able to sign"
+    );
+    assert!(sign_payload.is_empty(), "FAILURE must carry no detail");
 }

@@ -217,6 +217,15 @@ pub struct AuthsockSocketConfig {
     /// (all keys are exposed). See [`deserialize_filters`].
     #[serde(default, deserialize_with = "deserialize_filters")]
     pub filters: Vec<Vec<String>>,
+    /// Process names (executable basenames) allowed to use this socket (port plan
+    /// Iteration 5). When non-empty, a connecting client is admitted only if some
+    /// process in its ancestry chain has a matching executable basename; otherwise
+    /// every REQUEST_IDENTITIES / SIGN_REQUEST on that connection is refused
+    /// (SSH_AGENT_FAILURE). An empty / omitted list means **no restriction** (all
+    /// processes are allowed). Matching is exact (no globs / regexes). See
+    /// [`cache_warden_authsock::chain_allowed`].
+    #[serde(default)]
+    pub allowed_processes: Vec<String>,
 }
 
 /// Deserialize `filters` from a TOML array of strings and/or arrays of strings.
@@ -295,6 +304,10 @@ pub struct AuthsockSocket {
     /// parse time (so a bad token fails startup, naming the socket); the daemon
     /// builds a `FilterEvaluator` from them.
     pub filters: Vec<Vec<String>>,
+    /// Executable basenames allowed to use this socket (port plan Iteration 5).
+    /// Empty means no restriction; otherwise a connection is admitted only when
+    /// some process in the peer's ancestry chain has a matching basename.
+    pub allowed_processes: Vec<String>,
 }
 
 /// `[daemon]` section.
@@ -473,6 +486,7 @@ impl AuthsockSocketConfig {
             upstreams: self.upstreams.iter().map(|p| expand_tilde(p)).collect(),
             source: self.source.clone(),
             filters: self.filters.clone(),
+            allowed_processes: self.allowed_processes.clone(),
         })
     }
 }
@@ -1150,6 +1164,52 @@ bogus = 1
         )
         .unwrap_err();
         assert!(matches!(err, ConfigParseError::Toml(_)));
+    }
+
+    // ---- authsock allowed_processes (port plan Iteration 5) ----
+
+    #[test]
+    fn authsock_socket_omitting_allowed_processes_defaults_to_empty() {
+        let cfg = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+keys = ["K"]
+"#,
+        )
+        .unwrap();
+        // The common case (kawaz's real config): no restriction.
+        assert!(cfg.authsock_sockets()[0].allowed_processes.is_empty());
+    }
+
+    #[test]
+    fn authsock_socket_allowed_processes_are_read() {
+        let cfg = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+keys = ["K"]
+allowed_processes = ["ssh", "git"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.authsock_sockets()[0].allowed_processes,
+            vec!["ssh".to_string(), "git".to_string()]
+        );
+    }
+
+    #[test]
+    fn authsock_socket_empty_allowed_processes_list_is_no_restriction() {
+        // An explicit empty list is valid and means "no restriction" (same as
+        // omitting the key) — it does not turn the socket into a deny-all.
+        let cfg = Config::parse(
+            r#"[authsock.sockets.s]
+path = "/tmp/s.sock"
+keys = ["K"]
+allowed_processes = []
+"#,
+        )
+        .unwrap();
+        assert!(cfg.authsock_sockets()[0].allowed_processes.is_empty());
     }
 
     // ---- authsock filters ----

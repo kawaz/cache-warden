@@ -190,6 +190,7 @@ path = "~/.ssh/cache-warden.sock"            # agent socket (leading ~/ is expan
 keys = ["GITHUB_KEY"]                        # KV key names this socket signs with locally
 upstreams = ["~/.1password/agent.sock"]      # upstream agents to merge keys from / forward to (optional)
 filters = ["github=kawaz"]                   # restrict which keys this socket shows / signs (github= matches a published key list; optional)
+allowed_processes = ["ssh"]                  # processes allowed to use this socket (executable basenames; empty = unrestricted; optional)
 ```
 
 - **cache-warden creates the socket**: one listener task per `[authsock.sockets.NAME]` (DR-0008,
@@ -240,6 +241,21 @@ filters = ["github=kawaz"]                   # restrict which keys this socket s
     shutdown), which writes the cache back. **Fail-closed**: a fetch failure (network down / timeout /
     non-2xx / parse error) or an unfetched cache admits *no* key (safe side). `[authsock.github]`
     configures `cache_ttl` (default 1h) and `timeout` (default 10s); combinable with an op `source`.
+- **Process access control (`allowed_processes`, Iteration 5)**: a socket can list `allowed_processes`
+  (executable basenames) to restrict which processes may use it. **Empty / omitted = unrestricted** (all
+  processes admitted — a load-bearing invariant: a socket that leaves it unset behaves exactly as
+  before). When non-empty, the connecting peer pid's **ancestry chain** (the core's
+  `SystemInspector::ancestry`, walked to init/launchd) is resolved and the connection is admitted only
+  if **some** process in that chain has a basename that **exactly** matches an entry (no globs / regexes,
+  authsock-warden parity). The decision is made **once per connection** (the peer pid is fixed for a
+  connection, so `handle_connection` judges it once; a disallowed connection answers every request with
+  `SSH_AGENT_FAILURE` — enumeration and signing alike, so a rejected caller cannot even learn which keys
+  exist). The matching is in the adapter layer (DR-0004, policy interpretation is an adapter concern);
+  the ancestry walk is in the core. A process with an unresolved path (`name() == None`) is skipped.
+  **A missing peer pid or an ancestry-lookup failure fails closed (denied)** — if the caller cannot be
+  identified, a restricted socket refuses (DR-0012; authsock-warden fails *open* here, cache-warden
+  deliberately fails *closed*). A socket with an empty `allowed_processes` never resolves ancestry at
+  all, so an unidentifiable peer still passes through as before.
 - **Failures leak nothing**: an unknown key, a filtered-out key, denied re-auth, hard-expired static
   key, malformed request, signing error, or all-upstreams-failed all return `SSH_AGENT_FAILURE` (empty
   payload). No error detail reaches the agent protocol.
@@ -248,8 +264,9 @@ filters = ["github=kawaz"]                   # restrict which keys this socket s
   async (non-blocking sockets) on the runtime.
 
 > The current state covers signing with static / command-preloaded KV keys, merging keys from /
-> forwarding signatures to upstream agents, per-socket key filters (including `github=`), and op key
-> discovery. The three-layer policy is a later iteration (port plan §2).
+> forwarding signatures to upstream agents, per-socket key filters (including `github=`), op key
+> discovery, and per-socket process access control (`allowed_processes`). Per-key `allowed_processes`
+> (the key layer) is a later iteration (port plan §2).
 
 ### Workspace Structure (DR-0002)
 

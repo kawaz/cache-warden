@@ -11,6 +11,15 @@ repository = "https://github.com/kawaz/cache-warden"
 publish = false
 
 [dependencies]
+# The secure-secret-cache core. The adapter sits on top of it (DR-0003/DR-0004):
+# it borrows the generic process-authentication facts (`ProcessInfo` / its derived
+# `name()`) to interpret the socket-level `allowed_processes` policy here, in the
+# adapter, while the ancestry *walk* stays in the core. This is an
+# adapter→core dependency only (the core never depends back on the adapter).
+# Path-only (no version req): the adapter is publish=false and lives in this
+# workspace, so it must not pin a core version that `just bump-version` would
+# then have to chase on every release.
+cache-warden = { path = "../cache-warden" }
 # SSH agent wire format: length-prefixed binary fields. `bytes` mirrors the
 # upstream authsock-warden codec (zero-copy `Bytes` / `BytesMut`).
 bytes = "1"

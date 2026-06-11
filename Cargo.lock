@@ -87,6 +87,7 @@ version = "0.7.0"
 dependencies = [
  "base64",
  "bytes",
+ "cache-warden",
  "ed25519-dalek",
  "globset",
  "pkcs8",
