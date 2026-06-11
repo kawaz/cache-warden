@@ -146,24 +146,31 @@ SSH_AUTH_SOCK=<sockN>        ssh -T git@github.com
 
 ### 2.6 TouchID 回数比較 (最重要 UX 指標) **[同席要]**
 
-**warden と cache-warden で署名モデルが構造的に違う** (draft の `[auth]` コメント参照)。
-TouchID の出るタイミングと回数を実測して突き合わせる。
+**署名モデルは両者とも「op 発見鍵 = PEM を fetch してローカル署名」で同型** (warden の
+`[auth] method=command` は署名委譲ではなく**ユーザ定義の認証フロー** = cache-warden の
+`[auth].command` と同概念)。違うのは**キャッシュ寿命**: warden は鍵キャッシュの TTL が
+実質無期限 (TTL コア未配線、port plan §1.3) なのに対し、cache-warden は実 TTL
+(soft = idle extend / hard = 絶対寿命) が効く。TouchID の出るタイミングと回数を実測して
+この差を確認する。
 
 | シナリオ | warden の想定 | cache-warden の想定 |
 |---|---|---|
-| 初回 op 鍵発見 + 初回署名 | op 署名で TouchID 1 回 | op item get (鍵 fetch) で TouchID 1 回 |
-| soft TTL 内の連続署名 | op が都度 TouchID? (要実測) | キャッシュヒットで TouchID 0 回 |
-| soft TTL 切れ後の署名 | (要実測) | hard 内なら extend、再認証コマンド未設定なら TouchID 0 回 |
+| 初回 op 鍵 fetch + 初回署名 | fetch 時に認証 1 回、以降キャッシュ | 同じく fetch 時 1 回 (op item get) |
+| キャッシュ生存中の連続署名 | 0 回 (無期限キャッシュ) | 0 回 (soft TTL 内、使うたび extend) |
+| soft TTL 切れ後の署名 | 発生しない (TTL なし) | `[auth].command` の認証 1 回で extend (warden と同じスクリプトを draft に設定) |
+| hard TTL 切れ後の署名 | 発生しない (TTL なし) | op 再 fetch で TouchID 1 回 (値の絶対寿命、設計どおり) |
 
 ```bash
 # 各シナリオで ssh -T git@github.com を打ち、TouchID プロンプトが出た回数を数える。
 # 連続署名は短時間で複数回 ssh -T を打つ。soft 切れは draft の soft-ttl 経過後に再実行。
 ```
 
-期待結果: cache-warden の TouchID 回数が warden 以下 (キャッシュにより同等か削減)。
+期待結果: キャッシュ生存中は両者とも 0 回 (= 日常体感は同等)。cache-warden だけ
+soft/hard 失効時に認証が**増える**が、これは warden で未配線だった TTL が設計どおり
+効いている正常動作 (バグではない)。
 
-差異記録: cache-warden の TouchID 回数が **warden より増えていたら** キャッシュ / TTL
-配線のバグ (port plan §1.3 / §1.4)。記録 = シナリオごとの回数、draft の soft-ttl /
+差異記録: キャッシュ生存中 (soft TTL 内) に cache-warden が TouchID / 認証を要求したら
+extend 配線のバグ (port plan §1.3 / §1.4)。記録 = シナリオごとの回数、draft の soft-ttl /
 hard-ttl 値、cache-warden daemon ログ (鍵 fetch / extend / regenerate のログ行)。
 
 ### 2.7 並走 daemon 停止 **[無人可]**
