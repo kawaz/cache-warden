@@ -10,8 +10,8 @@
 //! every control-socket command maps onto a [`Store`] operation here.
 
 use cache_warden::{
-    Authenticator, Clock, EntryState, ExtendAuthOutcome, PinAuthOutcome, ProcessInfo,
-    RegenerateOutcome, SecretBytes, SourceRunner, Store, Ttl, ValueSource,
+    Authenticator, Clock, DefineError, EntryState, ExtendAuthOutcome, PinAuthOutcome, ProcessInfo,
+    RegenerateDefOutcome, RegenerateOutcome, SecretBytes, SourceRunner, Store, Ttl, ValueSource,
 };
 
 use crate::protocol::wire::{EntryInfo, ErrorKind, Request, Response, SetSource};
@@ -58,14 +58,29 @@ where
     match req {
         Request::Ping => Response::pong(),
         Request::Status => handle_status(store, ctx),
-        Request::KvList => Response::list(store.list().iter().map(|s| s.to_string()).collect()),
-        Request::KvDel { key } => Response::deleted(store.delete(&key)),
+        // `kv.list` surfaces definition-only keys too (DR-0014 §6): use the union
+        // `keys()` rather than `list()` (value entries only).
+        Request::KvList => Response::list(store.keys().iter().map(|s| s.to_string()).collect()),
+        Request::KvDel { key, with_define } => {
+            let removed = if with_define {
+                store.delete_with_definition(&key)
+            } else {
+                store.delete(&key)
+            };
+            Response::deleted(removed)
+        }
         Request::KvSet {
             key,
             source,
             soft_ttl_secs,
             hard_ttl_secs,
         } => handle_set(store, ctx, key, source, soft_ttl_secs, hard_ttl_secs),
+        Request::KvDefine {
+            key,
+            argv,
+            soft_ttl_secs,
+            hard_ttl_secs,
+        } => handle_define(store, key, argv, soft_ttl_secs, hard_ttl_secs),
         Request::KvGet { key } => handle_get(store, ctx, key),
         Request::KvPin { key, duration_secs } => handle_pin(store, ctx, key, duration_secs),
         Request::KvUnpin { key } => {
@@ -92,18 +107,31 @@ where
     C: Clock,
 {
     // Collect names first to avoid holding an immutable borrow across the
-    // mutable `state_of` calls.
-    let names: Vec<String> = store.list().iter().map(|s| s.to_string()).collect();
+    // mutable `state_of` calls. `keys()` is the union of value entries and
+    // definitions, so definition-only keys are surfaced too (DR-0014 §6).
+    let names: Vec<String> = store.keys().iter().map(|s| s.to_string()).collect();
     let now = ctx.clock.now();
     let mut entries = Vec::with_capacity(names.len());
     for name in names {
-        let Some(state) = store.state_of(&name, ctx.clock) else {
-            continue;
+        let has_value = store.has_value(&name);
+        let defined = store.is_defined(&name);
+        // A definition-only key (no value entry yet) has no lifecycle state; it
+        // reports the synthetic `"defined"` state. Otherwise use the value's
+        // real state.
+        let state = match store.state_of(&name, ctx.clock) {
+            Some(s) => state_str(s).to_string(),
+            None if defined => "defined".to_string(),
+            // Neither a value nor a definition: nothing to report (shouldn't
+            // happen for a name `keys()` returned, but skip defensively).
+            None => continue,
         };
-        let regenerable = store
-            .source_of(&name)
-            .map(|s| s.is_regenerable())
-            .unwrap_or(false);
+        // A defined key is always command-backed (regenerable); for a value-only
+        // entry, ask its source. Either presence implies regenerability here.
+        let regenerable = defined
+            || store
+                .source_of(&name)
+                .map(|s| s.is_regenerable())
+                .unwrap_or(false);
         // Remaining pin seconds (None when not pinned; 0 once the deadline has
         // passed). Never exposes the value.
         let pin_remaining_secs = store
@@ -111,8 +139,10 @@ where
             .map(|deadline| deadline.saturating_duration_since(now).as_secs());
         entries.push(EntryInfo {
             name,
-            state: state_str(state).to_string(),
+            state,
             regenerable,
+            defined,
+            has_value,
             pin_remaining_secs,
         });
     }
@@ -145,32 +175,61 @@ where
         Err(e) => return Response::error(ErrorKind::BadRequest, e.to_string()),
     };
 
-    let (value_source, value) = match source {
-        SetSource::Static { value_b64 } => {
-            let bytes = match decode_b64(&value_b64) {
-                Ok(b) => b,
-                Err(_) => {
-                    return Response::error(ErrorKind::BadRequest, "value_b64 is not valid base64");
-                }
-            };
-            (ValueSource::Static, SecretBytes::new(bytes))
-        }
-        SetSource::Command { argv } => {
-            if argv.is_empty() {
-                return Response::error(ErrorKind::BadRequest, "command argv must not be empty");
-            }
-            // For a command source we run it once now to populate the cache, so
-            // the first `get` is a hit. Regeneration after hard expiry re-runs it.
-            let value = match ctx.runner.run(&argv) {
-                Ok(v) => v,
-                Err(e) => return Response::error(ErrorKind::UpstreamFailed, e.to_string()),
-            };
-            (ValueSource::command(argv), value)
+    let SetSource::Static { value_b64 } = source;
+    let bytes = match decode_b64(&value_b64) {
+        Ok(b) => b,
+        Err(_) => {
+            return Response::error(ErrorKind::BadRequest, "value_b64 is not valid base64");
         }
     };
 
-    store.set(key, value_source, value, ttl, ctx.clock);
+    store.set(
+        key,
+        ValueSource::Static,
+        SecretBytes::new(bytes),
+        ttl,
+        ctx.clock,
+    );
     Response::set_ack()
+}
+
+/// Register a command-source definition (DR-0014 §1).
+///
+/// Idempotent under exact match; a conflicting redefinition is reported as
+/// [`ErrorKind::BadRequest`] with a hint to `kv del --with-define` first. No
+/// upstream runs here — the value is produced lazily on the first `kv.get`.
+fn handle_define(
+    store: &mut Store,
+    key: String,
+    argv: Vec<String>,
+    soft_ttl_secs: Option<u64>,
+    hard_ttl_secs: Option<u64>,
+) -> Response {
+    if argv.is_empty() {
+        return Response::error(ErrorKind::BadRequest, "command argv must not be empty");
+    }
+    let ttl = match Ttl::new(
+        soft_ttl_secs.map(std::time::Duration::from_secs),
+        hard_ttl_secs.map(std::time::Duration::from_secs),
+    ) {
+        Ok(t) => t,
+        Err(e) => return Response::error(ErrorKind::BadRequest, e.to_string()),
+    };
+
+    match store.define(key, ValueSource::command(argv), ttl) {
+        Ok(()) => Response::defined_ack(),
+        Err(DefineError::Conflict) => Response::error(
+            ErrorKind::BadRequest,
+            "a different definition already exists for this key; \
+             delete it with `kv del KEY --with-define`, then re-define",
+        ),
+        // A command argv always builds a command source, so this is unreachable;
+        // map defensively to a bad request rather than panicking.
+        Err(DefineError::StaticNotDefinable) => Response::error(
+            ErrorKind::BadRequest,
+            "static sources cannot be defined; use `kv set` instead",
+        ),
+    }
 }
 
 fn handle_get<A, R, C>(store: &mut Store, ctx: &HandlerCtx<'_, A, R, C>, key: String) -> Response
@@ -186,7 +245,16 @@ where
 
     // Not directly readable. Decide why and try to recover.
     match store.state_of(&key, ctx.clock) {
-        None => Response::error(ErrorKind::NotFound, "no such key"),
+        // No value entry. If a definition exists, lazily produce the value via
+        // the regenerate path (re-auth gated inside get_or_regenerate); else the
+        // key truly does not exist (DR-0014 §1).
+        None => {
+            if store.is_defined(&key) {
+                lazy_generate(store, ctx, &key)
+            } else {
+                Response::error(ErrorKind::NotFound, "no such key")
+            }
+        }
         Some(EntryState::Active) => {
             // Should not happen (get() returned None but state is Active); treat
             // as internal to avoid a silent inconsistency.
@@ -212,6 +280,12 @@ where
             }
         }
         Some(EntryState::HardExpired) => {
+            // A registered definition is the source of truth for regeneration
+            // (it works even when the value entry's own source is static), so
+            // prefer the definition path when one exists (DR-0014 §2).
+            if store.is_defined(&key) {
+                return lazy_generate(store, ctx, &key);
+            }
             match store.regenerate(&key, ctx.runner, ctx.auth, ctx.requester, ctx.clock) {
                 Ok(()) => match store.get(&key, ctx.clock) {
                     Some(secret) => Response::get(encode_b64(secret.expose_secret())),
@@ -235,6 +309,39 @@ where
                     Response::error(ErrorKind::AuthFailed, e.to_string())
                 }
             }
+        }
+    }
+}
+
+/// Produce `key`'s value from its registered definition (DR-0014 lazy path).
+///
+/// Runs the definition's command and re-authenticates inside
+/// [`Store::get_or_regenerate`] (a single auth — callers must not pre-authenticate,
+/// to avoid double prompting), then returns the freshly produced value. A
+/// `ValueResident` outcome means the value became readable concurrently; fall
+/// back to a plain get.
+fn lazy_generate<A, R, C>(store: &mut Store, ctx: &HandlerCtx<'_, A, R, C>, key: &str) -> Response
+where
+    A: Authenticator + ?Sized,
+    R: SourceRunner,
+    C: Clock,
+{
+    match store.get_or_regenerate(key, ctx.runner, ctx.auth, ctx.requester, ctx.clock) {
+        Ok(()) => match store.get(key, ctx.clock) {
+            Some(secret) => Response::get(encode_b64(secret.expose_secret())),
+            None => Response::error(ErrorKind::Internal, "value gone after lazy generation"),
+        },
+        Err(RegenerateDefOutcome::Undefined) => Response::error(ErrorKind::NotFound, "no such key"),
+        // A usable value is resident after all; read it directly.
+        Err(RegenerateDefOutcome::ValueResident) => match store.get(key, ctx.clock) {
+            Some(secret) => Response::get(encode_b64(secret.expose_secret())),
+            None => Response::error(ErrorKind::Internal, "value resident but unreadable"),
+        },
+        Err(RegenerateDefOutcome::RunFailed(e)) => {
+            Response::error(ErrorKind::UpstreamFailed, e.to_string())
+        }
+        Err(RegenerateDefOutcome::AuthFailed(e)) => {
+            Response::error(ErrorKind::AuthFailed, e.to_string())
         }
     }
 }
@@ -337,6 +444,15 @@ mod tests {
         }
     }
 
+    fn define_cmd(key: &str, argv: &[&str]) -> Request {
+        Request::KvDefine {
+            key: key.into(),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            soft_ttl_secs: Some(SOFT),
+            hard_ttl_secs: Some(HARD),
+        }
+    }
+
     fn get_value(resp: &Response) -> Vec<u8> {
         match resp {
             Response::Ok(ok) => match &ok.payload {
@@ -393,34 +509,46 @@ mod tests {
     }
 
     #[test]
-    fn set_command_source_populates_and_counts_run() {
+    fn define_defers_run_until_first_get() {
+        // DR-0014: define registers but does not run; the first get lazily
+        // produces the value (one run), and a second get is a cache hit (no run).
         let clock = FakeClock::new();
         let mut store = Store::new();
         let runner = CountingRunner::new(b"from-cmd");
         let c = ctx(&AllowAll, &runner, &clock);
-        let req = Request::KvSet {
-            key: "K".into(),
-            source: SetSource::Command {
-                argv: vec!["echo".into(), "x".into()],
-            },
-            soft_ttl_secs: Some(SOFT),
-            hard_ttl_secs: Some(HARD),
-        };
-        assert!(handle_request(&mut store, &c, req).is_ok());
-        assert_eq!(runner.runs(), 1, "command runs once at set time");
+        assert!(handle_request(&mut store, &c, define_cmd("K", &["echo", "x"])).is_ok());
+        assert_eq!(runner.runs(), 0, "define must not run the command");
         let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
         assert_eq!(get_value(&resp), b"from-cmd");
+        assert_eq!(runner.runs(), 1, "first get runs once (lazy)");
+        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        assert_eq!(get_value(&resp), b"from-cmd");
+        assert_eq!(runner.runs(), 1, "second get is a cache hit");
     }
 
     #[test]
-    fn set_empty_command_argv_is_bad_request() {
+    fn define_idempotent_same_def_is_ok_conflict_is_bad_request() {
         let clock = FakeClock::new();
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
-        let req = Request::KvSet {
+        assert!(handle_request(&mut store, &c, define_cmd("K", &["op", "read", "a"])).is_ok());
+        // Identical definition: idempotent no-op.
+        assert!(handle_request(&mut store, &c, define_cmd("K", &["op", "read", "a"])).is_ok());
+        // Different argv: conflict.
+        let resp = handle_request(&mut store, &c, define_cmd("K", &["op", "read", "b"]));
+        assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+    }
+
+    #[test]
+    fn define_empty_argv_is_bad_request() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        let req = Request::KvDefine {
             key: "K".into(),
-            source: SetSource::Command { argv: vec![] },
+            argv: vec![],
             soft_ttl_secs: None,
             hard_ttl_secs: None,
         };
@@ -428,6 +556,17 @@ mod tests {
             err_kind(&handle_request(&mut store, &c, req)),
             ErrorKind::BadRequest
         );
+    }
+
+    #[test]
+    fn lazy_generate_is_denied_when_auth_fails() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&DenyAll, &runner, &clock);
+        handle_request(&mut store, &c, define_cmd("K", &["echo", "x"]));
+        let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
     }
 
     #[test]
@@ -495,24 +634,25 @@ mod tests {
     }
 
     #[test]
-    fn get_hard_expired_command_regenerates() {
+    fn get_hard_expired_defined_key_regenerates() {
         let clock = FakeClock::new();
         let mut store = Store::new();
         let runner = CountingRunner::new(b"fresh");
         let c = ctx(&AllowAll, &runner, &clock);
-        let req = Request::KvSet {
-            key: "K".into(),
-            source: SetSource::Command {
-                argv: vec!["echo".into()],
-            },
-            soft_ttl_secs: Some(SOFT),
-            hard_ttl_secs: Some(HARD),
-        };
-        handle_request(&mut store, &c, req);
+        handle_request(&mut store, &c, define_cmd("K", &["echo"]));
+        // First get lazily produces the value (run 1).
+        assert_eq!(
+            get_value(&handle_request(
+                &mut store,
+                &c,
+                Request::KvGet { key: "K".into() }
+            )),
+            b"fresh"
+        );
         clock.advance(Duration::from_secs(HARD)); // hard-expired
         let resp = handle_request(&mut store, &c, Request::KvGet { key: "K".into() });
         assert_eq!(get_value(&resp), b"fresh");
-        assert_eq!(runner.runs(), 2, "set ran once, regenerate ran once");
+        assert_eq!(runner.runs(), 2, "first get ran once, regenerate ran once");
     }
 
     #[test]
@@ -531,22 +671,19 @@ mod tests {
     fn get_hard_expired_command_upstream_failure_is_reported() {
         let clock = FakeClock::new();
         let mut store = Store::new();
-        // First a runner that succeeds at set, then swap to a failing runner for
-        // regenerate by setting with a counting runner but regenerating with a
-        // failing one. Simplest: set via counting, then build a ctx with failing.
+        // Define + first get produces the value via a succeeding runner; then
+        // swap to a failing runner so the post-hard-expiry regeneration fails.
         let ok_runner = CountingRunner::new(b"v");
         let c_ok = ctx(&AllowAll, &ok_runner, &clock);
-        handle_request(
-            &mut store,
-            &c_ok,
-            Request::KvSet {
-                key: "K".into(),
-                source: SetSource::Command {
-                    argv: vec!["echo".into()],
-                },
-                soft_ttl_secs: Some(SOFT),
-                hard_ttl_secs: Some(HARD),
-            },
+        handle_request(&mut store, &c_ok, define_cmd("K", &["echo"]));
+        // First get lazily produces the value.
+        assert_eq!(
+            get_value(&handle_request(
+                &mut store,
+                &c_ok,
+                Request::KvGet { key: "K".into() }
+            )),
+            b"v"
         );
         clock.advance(Duration::from_secs(HARD));
         let fail = FailingRunner;
@@ -592,7 +729,14 @@ mod tests {
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
         handle_request(&mut store, &c, set_static(b"v"));
-        let resp = handle_request(&mut store, &c, Request::KvDel { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvDel {
+                key: "K".into(),
+                with_define: false,
+            },
+        );
         match resp {
             Response::Ok(ok) => match ok.payload {
                 OkPayload::Deleted { deleted } => assert!(deleted),
@@ -601,7 +745,14 @@ mod tests {
             _ => panic!("expected ok"),
         }
         // Second delete reports false.
-        let resp = handle_request(&mut store, &c, Request::KvDel { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvDel {
+                key: "K".into(),
+                with_define: false,
+            },
+        );
         match resp {
             Response::Ok(ok) => match ok.payload {
                 OkPayload::Deleted { deleted } => assert!(!deleted),

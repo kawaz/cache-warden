@@ -2,7 +2,8 @@
 //!
 //! cache-warden runs fine with **no** configuration at all (every field has a
 //! default). A config file lets the user pin the control socket path, wire a
-//! re-authentication command, and declare entries to preload at daemon start.
+//! re-authentication command, and declare command-source definitions
+//! registered at daemon start (DR-0014).
 //!
 //! # Schema (v1)
 //!
@@ -13,11 +14,28 @@
 //! [auth]
 //! command = ["/path/to/reauth-prompt"]   # omitted => no re-auth (AllowAll)
 //!
-//! [kv.DB_PASSWORD]                        # an entry to preload at startup
+//! [kv.DB_PASSWORD]                        # a command-source definition
 //! command = ["op", "read", "op://vault/item/password"]
 //! soft-ttl = "1h"
 //! hard-ttl = "24h"
+//! preload = true                          # run at startup (default: lazy)
 //! ```
+//!
+//! # Definitions are lazy by default (DR-0014 §4)
+//!
+//! A `[kv.*]` entry registers a *definition* (KEY ↔ command + TTL) at startup
+//! but does **not** run the command then — the value is produced lazily on the
+//! first `kv get`. Set `preload = true` to opt back into the old behaviour
+//! (run the command at startup so the first get is a cache hit). A failed
+//! preload is a warning, never fatal: the definition stays registered and the
+//! value regenerates on the next get.
+//!
+//! Exception: a key referenced by any `[authsock.sockets.*].keys` list is
+//! preloaded automatically, regardless of its `preload` flag — the agent
+//! registry derives the public key from the resident PEM at startup
+//! (REQUEST_IDENTITIES needs it), and the socket declaration already expresses
+//! that intent. Requiring a second `preload = true` on the same key would be a
+//! silent footgun: a forgotten flag would drop the key from the agent.
 //!
 //! # Why a `command`-only `[kv.*]` (no inline value)
 //!
@@ -61,8 +79,9 @@ pub struct Config {
     /// Re-authentication settings.
     #[serde(default)]
     pub auth: AuthConfig,
-    /// Entries to preload at startup, keyed by entry name. A `BTreeMap` keeps a
-    /// deterministic (sorted) preload order for predictable startup logging.
+    /// Command-source definitions registered at startup, keyed by entry name. A
+    /// `BTreeMap` keeps a deterministic (sorted) registration order for
+    /// predictable startup logging.
     #[serde(default)]
     pub kv: BTreeMap<String, KvEntryConfig>,
     /// SSH agent adapter settings (the authsock adapter; port plan Iteration 1).
@@ -330,7 +349,7 @@ pub struct AuthConfig {
     pub command: Option<Vec<String>>,
 }
 
-/// One `[kv.NAME]` preload entry.
+/// One `[kv.NAME]` command-source definition entry.
 ///
 /// Only a `command` source is permitted (see the module note on why inline
 /// values are forbidden). The `value` / `value-stdin` / `static` keys exist in
@@ -348,6 +367,13 @@ pub struct KvEntryConfig {
     /// Hard TTL string (e.g. `"24h"`). Parsed via [`parse_duration`].
     #[serde(default, rename = "hard-ttl")]
     pub hard_ttl: Option<String>,
+    /// Run the command at startup (eager) rather than lazily on first get
+    /// (DR-0014 §4). Defaults to `false`: the definition is registered but the
+    /// value is produced on the first `kv get`. A key referenced by an
+    /// `[authsock.sockets.*].keys` list is preloaded automatically regardless of
+    /// this flag (the agent registry needs the PEM resident at startup).
+    #[serde(default)]
+    pub preload: bool,
 
     // --- Forbidden-on-purpose keys (see KvEntryConfig::validate) ---
     /// Present only to reject inline literal values with a clear error.
@@ -361,17 +387,21 @@ pub struct KvEntryConfig {
     r#static: Option<toml::Value>,
 }
 
-/// A preload entry validated into a ready-to-run shape.
+/// A `[kv.*]` command-source definition validated into a ready-to-register
+/// shape (DR-0014 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreloadEntry {
+pub struct KvDefinition {
     /// The entry name (the `[kv.NAME]` key).
     pub name: String,
-    /// The command argv to run at startup (program first).
+    /// The command argv (program first) whose stdout is the value.
     pub command: Vec<String>,
     /// Parsed soft TTL in seconds, or `None`.
     pub soft_ttl_secs: Option<u64>,
     /// Parsed hard TTL in seconds, or `None`.
     pub hard_ttl_secs: Option<u64>,
+    /// Whether to run the command at startup (eager) instead of lazily on first
+    /// get. Defaults to `false` (lazy).
+    pub preload: bool,
 }
 
 /// An error in the configuration file's *content* (distinct from I/O / TOML
@@ -399,11 +429,11 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl KvEntryConfig {
-    /// Validate this entry against the schema rules and produce a [`PreloadEntry`].
+    /// Validate this entry against the schema rules and produce a [`KvDefinition`].
     ///
     /// Rejects inline literal values (`value` / `value-stdin` / `static`), a
     /// missing `command`, and unparseable TTL strings.
-    fn validate(&self, name: &str) -> Result<PreloadEntry, ConfigError> {
+    fn validate(&self, name: &str) -> Result<KvDefinition, ConfigError> {
         if self.value.is_some() {
             return Err(ConfigError::new(format!(
                 "[kv.{name}]: inline `value` is not allowed — secrets must not be stored in config; use a `command` source or inject the value at runtime with `cache-warden kv set --value-stdin`"
@@ -416,7 +446,7 @@ impl KvEntryConfig {
         }
         if self.r#static.is_some() {
             return Err(ConfigError::new(format!(
-                "[kv.{name}]: a `static` source cannot be preloaded from config — only `command` entries may be preloaded"
+                "[kv.{name}]: a `static` source cannot be defined from config — only `command` entries may be defined"
             )));
         }
 
@@ -429,7 +459,7 @@ impl KvEntryConfig {
             }
             None => {
                 return Err(ConfigError::new(format!(
-                    "[kv.{name}]: a preload entry requires a `command` source"
+                    "[kv.{name}]: a definition entry requires a `command` source"
                 )));
             }
         };
@@ -445,11 +475,12 @@ impl KvEntryConfig {
         let soft_ttl_secs = parse("soft-ttl", &self.soft_ttl)?;
         let hard_ttl_secs = parse("hard-ttl", &self.hard_ttl)?;
 
-        Ok(PreloadEntry {
+        Ok(KvDefinition {
             name: name.to_string(),
             command,
             soft_ttl_secs,
             hard_ttl_secs,
+            preload: self.preload,
         })
     }
 }
@@ -542,7 +573,7 @@ impl Config {
     /// `toml::de::Error` arm.
     pub fn parse(text: &str) -> Result<Config, ConfigParseError> {
         let cfg: Config = toml::from_str(text).map_err(ConfigParseError::Toml)?;
-        // Eagerly validate every preload entry so a bad entry fails fast at
+        // Eagerly validate every definition entry so a bad entry fails fast at
         // startup rather than at first `get`.
         for (name, entry) in &cfg.kv {
             entry.validate(name).map_err(ConfigParseError::Content)?;
@@ -591,11 +622,11 @@ impl Config {
         self.auth.command.as_deref()
     }
 
-    /// The validated preload entries, in deterministic (name-sorted) order.
+    /// The validated `[kv.*]` definitions, in deterministic (name-sorted) order.
     ///
     /// Pre-validated by [`Config::parse`], so this cannot fail; it re-runs the
     /// (cheap, infallible-at-this-point) conversion.
-    pub fn preload_entries(&self) -> Vec<PreloadEntry> {
+    pub fn kv_definitions(&self) -> Vec<KvDefinition> {
         self.kv
             .iter()
             .filter_map(|(name, entry)| entry.validate(name).ok())
@@ -792,7 +823,7 @@ mod tests {
         let cfg = Config::parse("").unwrap();
         assert_eq!(cfg, Config::default());
         assert!(cfg.auth_command().is_none());
-        assert!(cfg.preload_entries().is_empty());
+        assert!(cfg.kv_definitions().is_empty());
         assert!(cfg.socket_path().is_none());
     }
 
@@ -855,7 +886,7 @@ hard-ttl = "24h"
 "#,
         )
         .unwrap();
-        let entries = cfg.preload_entries();
+        let entries = cfg.kv_definitions();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.name, "DB_PASSWORD");
@@ -875,7 +906,7 @@ command = ["echo", "a"]
 "#,
         )
         .unwrap();
-        let names: Vec<_> = cfg.preload_entries().into_iter().map(|e| e.name).collect();
+        let names: Vec<_> = cfg.kv_definitions().into_iter().map(|e| e.name).collect();
         assert_eq!(names, vec!["A", "B"]);
     }
 

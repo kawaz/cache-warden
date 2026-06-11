@@ -32,13 +32,33 @@ pub enum Request {
     /// Ask for daemon information and the (value-free) entry list.
     #[serde(rename = "status")]
     Status,
-    /// Insert or replace a key.
+    /// Insert or replace a static key (literal value only; DR-0014 §1).
     #[serde(rename = "kv.set")]
     KvSet {
         /// The key to set.
         key: String,
-        /// Where the value comes from (literal bytes or an upstream command).
+        /// The literal value (base64-encoded). `set` is static-only since
+        /// DR-0014; command sources are registered with `kv.define` instead.
         source: SetSource,
+        /// Soft TTL in seconds, or `None` for "never soft-expires".
+        #[serde(default)]
+        soft_ttl_secs: Option<u64>,
+        /// Hard TTL in seconds, or `None` for "never hard-expires".
+        #[serde(default)]
+        hard_ttl_secs: Option<u64>,
+    },
+    /// Register a command-source *definition* for a key (DR-0014 §1).
+    ///
+    /// Idempotent under exact match (same argv + TTL is a no-op); a mismatch is
+    /// rejected with [`ErrorKind::BadRequest`]. No upstream runs at define time —
+    /// the value is produced lazily on the first `kv.get`.
+    #[serde(rename = "kv.define")]
+    KvDefine {
+        /// The key to define.
+        key: String,
+        /// The command line as already-split argv (program first). For `op://`
+        /// sources the CLI has already expanded the URI into `["op", "read", ...]`.
+        argv: Vec<String>,
         /// Soft TTL in seconds, or `None` for "never soft-expires".
         #[serde(default)]
         soft_ttl_secs: Option<u64>,
@@ -52,11 +72,15 @@ pub enum Request {
         /// The key to fetch.
         key: String,
     },
-    /// Delete a key.
+    /// Delete a key's value, and (with `with_define`) its definition too.
     #[serde(rename = "kv.del")]
     KvDel {
         /// The key to delete.
         key: String,
+        /// When `true`, also drop the registered definition so the key will not
+        /// regenerate on a later get (DR-0014 §2). Default `false` = value only.
+        #[serde(default)]
+        with_define: bool,
     },
     /// List all key names (no values, no state).
     #[serde(rename = "kv.list")]
@@ -80,6 +104,12 @@ pub enum Request {
 }
 
 /// The value source for a [`Request::KvSet`].
+///
+/// Static-only since DR-0014 §1: `kv.set` exists purely to inject a literal
+/// value. Command sources are registered with `kv.define` (lazy regeneration),
+/// not set eagerly. The enum keeps its `kind` tag so the wire stays
+/// forward-compatible and a stray `{"kind":"command"}` is rejected as an unknown
+/// variant rather than silently mis-parsed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum SetSource {
@@ -88,12 +118,6 @@ pub enum SetSource {
     Static {
         /// The secret value, base64-encoded (binary safe).
         value_b64: String,
-    },
-    /// An upstream command whose stdout produces the value.
-    #[serde(rename = "command")]
-    Command {
-        /// The command line as already-split argv (program first).
-        argv: Vec<String>,
     },
 }
 
@@ -170,6 +194,11 @@ pub enum OkPayload {
         /// Always `true`; lets `untagged` disambiguate from `Pong`.
         set: bool,
     },
+    /// Reply to [`Request::KvDefine`] (acknowledgement, no payload).
+    Defined {
+        /// Always `true`; lets `untagged` disambiguate the reply.
+        defined: bool,
+    },
     /// Reply to [`Request::KvPin`] (acknowledgement with the resolved deadline).
     Pinned {
         /// Always `true`; lets `untagged` disambiguate the reply.
@@ -186,16 +215,27 @@ pub enum OkPayload {
 
 /// Value-free description of a stored entry, for `status`.
 ///
-/// Carries the name, lifecycle state, regenerability, and (if pinned) the pin's
-/// remaining seconds — never the value.
+/// Carries the name, lifecycle state, regenerability, whether a definition /
+/// value is present, and (if pinned) the pin's remaining seconds — never the
+/// value itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryInfo {
     /// The key name.
     pub name: String,
-    /// The lifecycle state: `"active"` / `"soft_expired"` / `"hard_expired"`.
+    /// The lifecycle state: `"active"` / `"soft_expired"` / `"hard_expired"`,
+    /// or `"defined"` for a definition-only key whose value has not been
+    /// produced yet (DR-0014 §6).
     pub state: String,
-    /// Whether the entry's source can be regenerated after hard expiry.
+    /// Whether the entry's source can be regenerated after hard expiry. A
+    /// definition-only key is regenerable (it has a command source).
     pub regenerable: bool,
+    /// Whether a command-source definition is registered for this key (DR-0014).
+    /// A definition-only key (no value yet) reports `true` here and `false` for
+    /// [`Self::has_value`].
+    pub defined: bool,
+    /// Whether a value entry currently exists for this key (regardless of TTL
+    /// state). `false` for a definition-only key. Never exposes the value.
+    pub has_value: bool,
     /// Seconds until an active pin lapses, or `None` when the entry is not pinned
     /// (DR-0011). A pin already past its deadline reports `0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,6 +288,14 @@ impl Response {
         Response::Ok(OkResponse {
             ok: true,
             payload: OkPayload::Set { set: true },
+        })
+    }
+
+    /// Construct a `define` acknowledgement response.
+    pub fn defined_ack() -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::Defined { defined: true },
         })
     }
 
@@ -366,16 +414,45 @@ mod tests {
     }
 
     #[test]
-    fn kv_set_command_roundtrips() {
-        let req = Request::KvSet {
+    fn kv_define_roundtrips_and_uses_cmd_tag() {
+        let req = Request::KvDefine {
             key: "TOK".into(),
-            source: SetSource::Command {
-                argv: vec!["op".into(), "read".into()],
-            },
-            soft_ttl_secs: None,
-            hard_ttl_secs: None,
+            argv: vec!["op".into(), "read".into(), "op://v/i/f".into()],
+            soft_ttl_secs: Some(3600),
+            hard_ttl_secs: Some(86400),
         };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains(r#""cmd":"kv.define""#), "{line}");
+        assert!(
+            line.contains(r#""argv":["op","read","op://v/i/f"]"#),
+            "{line}"
+        );
         roundtrip_request(&req);
+    }
+
+    #[test]
+    fn kv_define_ttls_default_to_none_when_absent() {
+        let line = r#"{"cmd":"kv.define","key":"K","argv":["echo","x"]}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        match req {
+            Request::KvDefine {
+                soft_ttl_secs,
+                hard_ttl_secs,
+                ..
+            } => {
+                assert_eq!(soft_ttl_secs, None);
+                assert_eq!(hard_ttl_secs, None);
+            }
+            _ => panic!("expected KvDefine"),
+        }
+    }
+
+    #[test]
+    fn kv_set_command_kind_is_rejected_as_unknown_variant() {
+        // DR-0014: `kv.set` is static-only; a `{"kind":"command"}` source must no
+        // longer parse (it routes to `kv.define` now).
+        let line = r#"{"cmd":"kv.set","key":"K","source":{"kind":"command","argv":["op"]}}"#;
+        assert!(serde_json::from_str::<Request>(line).is_err());
     }
 
     #[test]
@@ -398,9 +475,35 @@ mod tests {
     #[test]
     fn get_request_roundtrips() {
         roundtrip_request(&Request::KvGet { key: "K".into() });
-        roundtrip_request(&Request::KvDel { key: "K".into() });
+        roundtrip_request(&Request::KvDel {
+            key: "K".into(),
+            with_define: false,
+        });
+        roundtrip_request(&Request::KvDel {
+            key: "K".into(),
+            with_define: true,
+        });
         roundtrip_request(&Request::KvList);
         roundtrip_request(&Request::Status);
+    }
+
+    #[test]
+    fn kv_del_with_define_defaults_to_false_when_absent() {
+        let line = r#"{"cmd":"kv.del","key":"K"}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        match req {
+            Request::KvDel { with_define, .. } => assert!(!with_define),
+            _ => panic!("expected KvDel"),
+        }
+    }
+
+    #[test]
+    fn defined_ack_response_roundtrips() {
+        let resp = Response::defined_ack();
+        assert!(resp.is_ok());
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""defined":true"#), "{line}");
+        roundtrip_response(&resp);
     }
 
     #[test]
@@ -444,12 +547,16 @@ mod tests {
                     name: "K".into(),
                     state: "active".into(),
                     regenerable: true,
+                    defined: true,
+                    has_value: true,
                     pin_remaining_secs: None,
                 },
                 EntryInfo {
                     name: "P".into(),
                     state: "active".into(),
                     regenerable: false,
+                    defined: false,
+                    has_value: true,
                     pin_remaining_secs: Some(3600),
                 },
             ],
@@ -464,6 +571,8 @@ mod tests {
             name: "K".into(),
             state: "active".into(),
             regenerable: false,
+            defined: false,
+            has_value: true,
             pin_remaining_secs: None,
         };
         let line = serde_json::to_string(&info).unwrap();

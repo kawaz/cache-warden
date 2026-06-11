@@ -100,11 +100,25 @@ fn full_lifecycle_over_control_socket() {
     let got = resp["value_b64"].as_str().expect("value_b64");
     assert_eq!(B64.decode(got).unwrap(), b"hunter2");
 
-    // --- kv.set a second key (command source) ---
-    let set2 =
-        r#"{"cmd":"kv.set","key":"TOK","source":{"kind":"command","argv":["printf","tok-value"]}}"#;
-    let resp = request(&socket, set2);
-    assert_eq!(resp["ok"], true, "set cmd: {resp}");
+    // --- kv.define a second key (command source; lazy, value produced on get) ---
+    let def = r#"{"cmd":"kv.define","key":"TOK","argv":["printf","tok-value"]}"#;
+    let resp = request(&socket, def);
+    assert_eq!(resp["ok"], true, "define: {resp}");
+    // Right after define, status shows TOK as defined with no value yet.
+    let resp = request(&socket, r#"{"cmd":"status"}"#);
+    let tok = resp["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "TOK")
+        .expect("TOK in status");
+    assert_eq!(tok["defined"], true, "TOK is defined: {tok}");
+    assert_eq!(tok["has_value"], false, "TOK has no value yet: {tok}");
+    assert_eq!(
+        tok["state"], "defined",
+        "TOK reports the defined state: {tok}"
+    );
+    // The first get lazily produces the value.
     let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
     let got = resp["value_b64"].as_str().expect("value_b64");
     assert_eq!(B64.decode(got).unwrap(), b"tok-value");
@@ -214,19 +228,21 @@ fn spawn_with_config(dir: &Path, config_toml: &str) -> (Daemon, std::path::PathB
 #[test]
 fn config_preload_and_reauth_command_allow() {
     let dir = tempfile::tempdir().unwrap();
-    // Preload TOK (no TTL => always Active) to verify startup preload, and EXT
-    // with a 1s soft TTL so it soft-expires and triggers the re-auth command.
-    // `[auth].command = ["true"]` approves, so the extend succeeds.
+    // Preload TOK with `preload = true` (no TTL => always Active) to verify
+    // startup preload, and EXT with a 1s soft TTL so it soft-expires and
+    // triggers the re-auth command. `[auth].command = ["true"]` approves.
     let cfg = r#"
 [auth]
 command = ["true"]
 
 [kv.TOK]
 command = ["printf", "preloaded-tok"]
+preload = true
 
 [kv.EXT]
 command = ["printf", "ext-value"]
 soft-ttl = "1s"
+preload = true
 "#;
     let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
 
@@ -262,6 +278,7 @@ soft-ttl = "1s"
 fn config_reauth_command_deny_blocks_extend() {
     let dir = tempfile::tempdir().unwrap();
     // `[auth].command = ["false"]` denies, so a soft-expired extend fails.
+    // EXT is preloaded so it starts Active (it soft-expires after 1s).
     let cfg = r#"
 [auth]
 command = ["false"]
@@ -269,6 +286,7 @@ command = ["false"]
 [kv.EXT]
 command = ["printf", "ext-value"]
 soft-ttl = "1s"
+preload = true
 "#;
     let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
 
@@ -309,6 +327,7 @@ command = ["false"]
 [kv.EXT]
 command = ["printf", "ext-value"]
 soft-ttl = "1s"
+preload = true
 "#;
     let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
 
@@ -347,6 +366,7 @@ command = ["true"]
 command = ["printf", "ext-value"]
 soft-ttl = "1s"
 hard-ttl = "2s"
+preload = true
 "#;
     let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
 
@@ -423,6 +443,175 @@ fn pin_missing_key_is_not_found() {
     let resp = request(&socket, r#"{"cmd":"kv.unpin","key":"ghost"}"#);
     assert_eq!(resp["ok"], false);
     assert_eq!(resp["error"]["kind"], "not_found");
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+/// Spawn a daemon with no config, control socket pinned via `--socket`.
+fn spawn_plain(dir: &Path) -> (Daemon, std::path::PathBuf) {
+    let socket = dir.join("control.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .arg("daemon")
+        .arg("run")
+        .arg("--socket")
+        .arg(&socket)
+        .spawn()
+        .expect("spawn daemon");
+    (Daemon { child }, socket)
+}
+
+#[test]
+fn define_get_lazy_del_value_only_then_get_regenerates() {
+    // DR-0014: define registers but does not run; the first get lazily produces
+    // the value; `kv.del` (value only) keeps the definition so the next get
+    // regenerates the value again.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+
+    // define (no upstream run yet) — status shows defined, no value.
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","lazy-value"]}"#,
+    );
+    assert_eq!(resp["ok"], true, "define: {resp}");
+    let resp = request(&socket, r#"{"cmd":"status"}"#);
+    let tok = resp["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "TOK")
+        .expect("TOK present");
+    assert_eq!(tok["defined"], true);
+    assert_eq!(tok["has_value"], false);
+
+    // first get lazily produces the value.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    assert_eq!(resp["ok"], true, "lazy get: {resp}");
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"lazy-value"
+    );
+
+    // del (value only): the definition survives.
+    let resp = request(&socket, r#"{"cmd":"kv.del","key":"TOK"}"#);
+    assert_eq!(resp["deleted"], true, "del value: {resp}");
+    let resp = request(&socket, r#"{"cmd":"status"}"#);
+    let tok = resp["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "TOK")
+        .expect("TOK still defined after value del");
+    assert_eq!(tok["defined"], true, "definition survives value-only del");
+    assert_eq!(tok["has_value"], false);
+
+    // get again: regenerated from the surviving definition.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    assert_eq!(resp["ok"], true, "regenerated get: {resp}");
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"lazy-value"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
+fn del_with_define_drops_definition_so_get_is_not_found() {
+    // DR-0014 §2: `kv.del --with-define` forgets the key entirely, so a later get
+    // cannot regenerate it.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","v"]}"#,
+    );
+    assert_eq!(resp["ok"], true, "define: {resp}");
+    // produce the value once.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    assert_eq!(resp["ok"], true);
+
+    // del with_define: drops both value and definition.
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.del","key":"TOK","with_define":true}"#,
+    );
+    assert_eq!(resp["deleted"], true, "del with_define: {resp}");
+
+    // get: the key is gone entirely (no definition to regenerate from).
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    assert_eq!(resp["ok"], false, "get after with-define del: {resp}");
+    assert_eq!(resp["error"]["kind"], "not_found");
+
+    // status no longer lists the key.
+    let resp = request(&socket, r#"{"cmd":"status"}"#);
+    assert!(
+        resp["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["name"] != "TOK"),
+        "TOK should be gone from status: {resp}"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
+fn define_conflict_then_del_with_define_allows_redefine() {
+    // A conflicting redefinition is rejected; deleting the definition first
+    // clears the way for the new one (DR-0014 §1).
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","a"]}"#,
+    );
+    assert_eq!(resp["ok"], true);
+    // identical define is an idempotent no-op.
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","a"]}"#,
+    );
+    assert_eq!(resp["ok"], true, "identical define is a no-op: {resp}");
+    // conflicting define is rejected with a redefine hint.
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","b"]}"#,
+    );
+    assert_eq!(resp["ok"], false, "conflict rejected: {resp}");
+    assert_eq!(resp["error"]["kind"], "bad_request");
+
+    // del --with-define then redefine succeeds.
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.del","key":"TOK","with_define":true}"#,
+    );
+    assert_eq!(resp["deleted"], true);
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","b"]}"#,
+    );
+    assert_eq!(resp["ok"], true, "redefine after del succeeds: {resp}");
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"b"
+    );
 
     let pid = daemon.child.id();
     unsafe {

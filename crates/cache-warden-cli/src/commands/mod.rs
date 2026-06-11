@@ -73,11 +73,12 @@ pub fn resolve_socket(cli_socket: Option<PathBuf>, config_socket: Option<PathBuf
 
 /// Parse the arguments to `kv set <KEY> ...` into a [`Request::KvSet`].
 ///
-/// Grammar:
-/// `<KEY> (--value V | --value-stdin | --command ARGV...) [--soft-ttl D] [--hard-ttl D]`
+/// Grammar (static-only since DR-0014):
+/// `<KEY> (--value V | --value-stdin) [--soft-ttl D] [--hard-ttl D]`
 ///
 /// `stdin` provides the bytes for `--value-stdin`; it is read only when that
-/// flag is present (kept as a parameter so the parse is testable).
+/// flag is present (kept as a parameter so the parse is testable). Command
+/// sources moved to `kv define` (see [`parse_kv_define`]).
 pub fn parse_kv_set(
     args: &[String],
     stdin: impl FnOnce() -> std::io::Result<Vec<u8>>,
@@ -85,7 +86,6 @@ pub fn parse_kv_set(
     let mut key: Option<String> = None;
     let mut value: Option<Vec<u8>> = None;
     let mut value_stdin = false;
-    let mut command: Option<Vec<String>> = None;
     let mut soft_ttl_secs: Option<u64> = None;
     let mut hard_ttl_secs: Option<u64> = None;
 
@@ -105,14 +105,134 @@ pub fn parse_kv_set(
                 value_stdin = true;
                 i += 1;
             }
+            "--soft-ttl" => {
+                let v = args.get(i + 1).ok_or("--soft-ttl requires an argument")?;
+                soft_ttl_secs = Some(parse_duration(v).map_err(|e| e.to_string())?.as_secs());
+                i += 2;
+            }
+            s if s.starts_with("--soft-ttl=") => {
+                soft_ttl_secs = Some(
+                    parse_duration(s.strip_prefix("--soft-ttl=").unwrap())
+                        .map_err(|e| e.to_string())?
+                        .as_secs(),
+                );
+                i += 1;
+            }
+            "--hard-ttl" => {
+                let v = args.get(i + 1).ok_or("--hard-ttl requires an argument")?;
+                hard_ttl_secs = Some(parse_duration(v).map_err(|e| e.to_string())?.as_secs());
+                i += 2;
+            }
+            s if s.starts_with("--hard-ttl=") => {
+                hard_ttl_secs = Some(
+                    parse_duration(s.strip_prefix("--hard-ttl=").unwrap())
+                        .map_err(|e| e.to_string())?
+                        .as_secs(),
+                );
+                i += 1;
+            }
             "--command" => {
-                // Everything after --command is the argv.
+                return Err(
+                    "`--command` was removed from `kv set`; use `kv define KEY --command ...`"
+                        .to_string(),
+                );
+            }
+            s if s.starts_with("--") => {
+                return Err(format!("unknown option for `kv set`: {s}"));
+            }
+            other => {
+                if key.is_none() {
+                    key = Some(other.to_string());
+                    i += 1;
+                } else {
+                    return Err(format!("unexpected argument: {other}"));
+                }
+            }
+        }
+    }
+
+    let key = key.ok_or("kv set requires a KEY")?;
+
+    // Exactly one value source must be chosen.
+    let chosen = [value.is_some(), value_stdin]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if chosen == 0 {
+        return Err("kv set requires one of --value or --value-stdin".to_string());
+    }
+    if chosen > 1 {
+        return Err("kv set accepts only one of --value, --value-stdin".to_string());
+    }
+
+    let bytes = if value_stdin {
+        stdin().map_err(|e| format!("failed to read stdin: {e}"))?
+    } else {
+        value.unwrap()
+    };
+    let source = SetSource::Static {
+        value_b64: encode_b64(&bytes),
+    };
+
+    Ok(Request::KvSet {
+        key,
+        source,
+        soft_ttl_secs,
+        hard_ttl_secs,
+    })
+}
+
+/// Expand a `--source URI` into a command argv (DR-0014 §3).
+///
+/// Only `op://` is built in: it maps to `["op", "read", "<URI>"]`. Any other
+/// scheme is an "unsupported source scheme" error. (Future vendor schemes are a
+/// config-driven follow-up; the table lives outside the core.)
+pub fn expand_source_uri(uri: &str) -> Result<Vec<String>, String> {
+    if uri.starts_with("op://") {
+        Ok(vec!["op".to_string(), "read".to_string(), uri.to_string()])
+    } else {
+        let scheme = uri.split("://").next().unwrap_or(uri);
+        Err(format!(
+            "unsupported source scheme `{scheme}` in --source {uri:?} (only op:// is built in)"
+        ))
+    }
+}
+
+/// Parse the arguments to `kv define <KEY> ...` into a [`Request::KvDefine`].
+///
+/// Grammar (DR-0014 §1):
+/// `<KEY> (--command ARGV... | --source URI) [--soft-ttl D] [--hard-ttl D]`
+///
+/// `--command` and `--source` are mutually exclusive and exactly one is
+/// required. A `--source op://...` URI is expanded into `["op", "read", URI]`
+/// at parse time (see [`expand_source_uri`]); the daemon only ever sees argv.
+pub fn parse_kv_define(args: &[String]) -> Result<Request, String> {
+    let mut key: Option<String> = None;
+    let mut command: Option<Vec<String>> = None;
+    let mut source: Option<Vec<String>> = None;
+    let mut soft_ttl_secs: Option<u64> = None;
+    let mut hard_ttl_secs: Option<u64> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--command" => {
+                // Everything after --command is the argv (consumes the rest).
                 let argv: Vec<String> = args[i + 1..].to_vec();
                 if argv.is_empty() {
                     return Err("--command requires at least a program".to_string());
                 }
                 command = Some(argv);
-                i = args.len(); // consume the rest
+                i = args.len();
+            }
+            "--source" => {
+                let v = args.get(i + 1).ok_or("--source requires a URI argument")?;
+                source = Some(expand_source_uri(v)?);
+                i += 2;
+            }
+            s if s.starts_with("--source=") => {
+                source = Some(expand_source_uri(s.strip_prefix("--source=").unwrap())?);
+                i += 1;
             }
             "--soft-ttl" => {
                 let v = args.get(i + 1).ok_or("--soft-ttl requires an argument")?;
@@ -141,7 +261,7 @@ pub fn parse_kv_set(
                 i += 1;
             }
             s if s.starts_with("--") => {
-                return Err(format!("unknown option for `kv set`: {s}"));
+                return Err(format!("unknown option for `kv define`: {s}"));
             }
             other => {
                 if key.is_none() {
@@ -154,40 +274,27 @@ pub fn parse_kv_set(
         }
     }
 
-    let key = key.ok_or("kv set requires a KEY")?;
+    let key = key.ok_or("kv define requires a KEY")?;
 
-    // Exactly one value source must be chosen.
-    let sources = [value.is_some(), value_stdin, command.is_some()];
-    let chosen = sources.iter().filter(|b| **b).count();
-    if chosen == 0 {
-        return Err("kv set requires one of --value, --value-stdin, or --command".to_string());
-    }
-    if chosen > 1 {
-        return Err("kv set accepts only one of --value, --value-stdin, --command".to_string());
-    }
-
-    let source = if let Some(argv) = command {
-        SetSource::Command { argv }
-    } else {
-        let bytes = if value_stdin {
-            stdin().map_err(|e| format!("failed to read stdin: {e}"))?
-        } else {
-            value.unwrap()
-        };
-        SetSource::Static {
-            value_b64: encode_b64(&bytes),
+    let argv = match (command, source) {
+        (Some(_), Some(_)) => {
+            return Err("kv define accepts only one of --command or --source".to_string());
+        }
+        (Some(argv), None) | (None, Some(argv)) => argv,
+        (None, None) => {
+            return Err("kv define requires one of --command ARGV... or --source URI".to_string());
         }
     };
 
-    Ok(Request::KvSet {
+    Ok(Request::KvDefine {
         key,
-        source,
+        argv,
         soft_ttl_secs,
         hard_ttl_secs,
     })
 }
 
-/// Parse `kv get|del|unpin <KEY>` into the corresponding [`Request`].
+/// Parse `kv get|unpin <KEY>` into the corresponding [`Request`].
 pub fn parse_kv_single_key(verb: &str, args: &[String]) -> Result<Request, String> {
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if let Some(bad) = args.iter().find(|a| a.starts_with("--")) {
@@ -199,10 +306,31 @@ pub fn parse_kv_single_key(verb: &str, args: &[String]) -> Result<Request, Strin
     let key = positional[0].clone();
     match verb {
         "get" => Ok(Request::KvGet { key }),
-        "del" => Ok(Request::KvDel { key }),
         "unpin" => Ok(Request::KvUnpin { key }),
         _ => Err(format!("unknown kv subcommand: {verb}")),
     }
+}
+
+/// Parse `kv del <KEY> [--with-define]` into a [`Request::KvDel`].
+pub fn parse_kv_del(args: &[String]) -> Result<Request, String> {
+    let mut key: Option<String> = None;
+    let mut with_define = false;
+    for a in args {
+        match a.as_str() {
+            "--with-define" => with_define = true,
+            s if s.starts_with("--") => {
+                return Err(format!("unknown option for `kv del`: {s}"));
+            }
+            other => {
+                if key.is_some() {
+                    return Err(format!("unexpected argument: {other}"));
+                }
+                key = Some(other.to_string());
+            }
+        }
+    }
+    let key = key.ok_or("kv del requires exactly one KEY")?;
+    Ok(Request::KvDel { key, with_define })
 }
 
 /// Parse `kv pin <KEY> <DURATION>` into a [`Request::KvPin`].
@@ -303,16 +431,15 @@ mod tests {
     fn kv_set_value_inline() {
         let req = parse_kv_set(&["DB".into(), "--value".into(), "pw".into()], no_stdin).unwrap();
         match req {
-            Request::KvSet { key, source, .. } => {
+            Request::KvSet {
+                key,
+                source: SetSource::Static { value_b64 },
+                ..
+            } => {
                 assert_eq!(key, "DB");
-                match source {
-                    SetSource::Static { value_b64 } => {
-                        assert_eq!(decode_b64(&value_b64).unwrap(), b"pw")
-                    }
-                    _ => panic!("expected static"),
-                }
+                assert_eq!(decode_b64(&value_b64).unwrap(), b"pw");
             }
-            _ => panic!("expected KvSet"),
+            _ => panic!("expected KvSet static"),
         }
     }
 
@@ -332,31 +459,91 @@ mod tests {
     }
 
     #[test]
-    fn kv_set_command_consumes_rest_as_argv() {
-        let req = parse_kv_set(
-            &[
-                "TOK".into(),
-                "--soft-ttl".into(),
-                "1h".into(),
-                "--command".into(),
-                "op".into(),
-                "read".into(),
-                "op://v/i".into(),
-            ],
-            no_stdin,
-        )
+    fn kv_set_command_is_rejected_with_define_hint() {
+        let err =
+            parse_kv_set(&["K".into(), "--command".into(), "op".into()], no_stdin).unwrap_err();
+        assert!(err.contains("kv define"), "msg: {err}");
+    }
+
+    #[test]
+    fn kv_define_command_consumes_rest_as_argv() {
+        let req = parse_kv_define(&[
+            "TOK".into(),
+            "--soft-ttl".into(),
+            "1h".into(),
+            "--command".into(),
+            "op".into(),
+            "read".into(),
+            "op://v/i".into(),
+        ])
         .unwrap();
         match req {
-            Request::KvSet {
-                source: SetSource::Command { argv },
+            Request::KvDefine {
+                key,
+                argv,
                 soft_ttl_secs,
                 ..
             } => {
+                assert_eq!(key, "TOK");
                 assert_eq!(argv, vec!["op", "read", "op://v/i"]);
                 assert_eq!(soft_ttl_secs, Some(3600));
             }
-            _ => panic!("expected command"),
+            _ => panic!("expected KvDefine"),
         }
+    }
+
+    #[test]
+    fn kv_define_source_op_expands_to_op_read() {
+        let req = parse_kv_define(&[
+            "TOK".into(),
+            "--source".into(),
+            "op://vault/item/field".into(),
+        ])
+        .unwrap();
+        match req {
+            Request::KvDefine { argv, .. } => {
+                assert_eq!(argv, vec!["op", "read", "op://vault/item/field"]);
+            }
+            _ => panic!("expected KvDefine"),
+        }
+    }
+
+    #[test]
+    fn kv_define_source_non_op_scheme_is_rejected() {
+        let err =
+            parse_kv_define(&["K".into(), "--source".into(), "vault://x/y".into()]).unwrap_err();
+        assert!(err.contains("unsupported source scheme"), "msg: {err}");
+        assert!(err.contains("vault"), "msg: {err}");
+    }
+
+    #[test]
+    fn kv_define_command_and_source_are_mutually_exclusive() {
+        let err = parse_kv_define(&[
+            "K".into(),
+            "--source".into(),
+            "op://a/b".into(),
+            "--command".into(),
+            "echo".into(),
+            "x".into(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("only one"), "msg: {err}");
+    }
+
+    #[test]
+    fn kv_define_requires_a_source() {
+        let err = parse_kv_define(&["K".into()]).unwrap_err();
+        assert!(err.contains("requires one of"), "msg: {err}");
+    }
+
+    #[test]
+    fn kv_define_requires_key() {
+        assert!(parse_kv_define(&["--source".into(), "op://a/b".into()]).is_err());
+    }
+
+    #[test]
+    fn kv_define_empty_command_is_rejected() {
+        assert!(parse_kv_define(&["K".into(), "--command".into()]).is_err());
     }
 
     #[test]
@@ -418,15 +605,48 @@ mod tests {
     }
 
     #[test]
-    fn kv_get_and_del_parse() {
+    fn kv_get_parses() {
         assert_eq!(
             parse_kv_single_key("get", &["K".into()]).unwrap(),
             Request::KvGet { key: "K".into() }
         );
+    }
+
+    #[test]
+    fn kv_del_parses_value_only_by_default() {
         assert_eq!(
-            parse_kv_single_key("del", &["K".into()]).unwrap(),
-            Request::KvDel { key: "K".into() }
+            parse_kv_del(&["K".into()]).unwrap(),
+            Request::KvDel {
+                key: "K".into(),
+                with_define: false,
+            }
         );
+    }
+
+    #[test]
+    fn kv_del_with_define_flag_sets_with_define() {
+        assert_eq!(
+            parse_kv_del(&["K".into(), "--with-define".into()]).unwrap(),
+            Request::KvDel {
+                key: "K".into(),
+                with_define: true,
+            }
+        );
+        // Flag order does not matter.
+        assert_eq!(
+            parse_kv_del(&["--with-define".into(), "K".into()]).unwrap(),
+            Request::KvDel {
+                key: "K".into(),
+                with_define: true,
+            }
+        );
+    }
+
+    #[test]
+    fn kv_del_requires_a_key_and_rejects_unknown_options() {
+        assert!(parse_kv_del(&[]).is_err());
+        assert!(parse_kv_del(&["K".into(), "--bogus".into()]).is_err());
+        assert!(parse_kv_del(&["A".into(), "B".into()]).is_err());
     }
 
     #[test]

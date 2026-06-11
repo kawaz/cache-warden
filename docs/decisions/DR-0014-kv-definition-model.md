@@ -71,7 +71,7 @@ v0.8.1 時点の KV 動詞には 3 つの構造的な不満があった:
 
 | レイヤ | 場所 | タイミング |
 |---|---|---|
-| グローバル定義 | daemon config `[kv.*]` | 起動時に定義登録。**実行はデフォルト lazy**（初回 get）。`preload = true` で従来の起動時実行を opt-in（DR-0010 の挙動変更） |
+| グローバル定義 | daemon config `[kv.*]` | 起動時に定義登録。**実行はデフォルト lazy**（初回 get）。`preload = true` で従来の起動時実行を opt-in（DR-0010 の挙動変更）。**例外: `[authsock.sockets.*].keys` に参照されている鍵は `preload` フラグに関わらず自動 eager 実体化する**（agent レジストリが起動時に PEM から公開鍵を導出する必要があるため。socket 宣言自体が「起動時に公開鍵が要る」の意思表示であり、二重書きを要求すると書き忘れで鍵が socket から黙って消える footgun になる = DR-0004 不変条件違反） |
 | 永続化されたオンライン定義 | state dir の定義ファイル（0600） | opt-in（config `[daemon]` のフラグ）。`kv define` / static でない `kv set` 由来の定義を daemon が書き出し、起動時に restore |
 | プロジェクト defs | `--defs FILE`（`run` / `inject` / `kv define --defs FILE`） | 呼び出し時にファイル内の全定義を一括 define（実行は lazy なので全件登録してもコストゼロ） |
 | 純オンライン | `kv define` / `kv set`（永続化 off 時） | プロセス生存中のみ |

@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cache_warden::{
-    AllowAll, Authenticator, CommandAuthenticator, CommandRunner, ProcessInfo, ProcessInspector,
-    SourceRunner, Store, SystemClock, SystemInspector, Ttl, ValueSource,
+    AllowAll, Authenticator, CommandAuthenticator, CommandRunner, DefineError, ProcessInfo,
+    ProcessInspector, SourceRunner, Store, SystemClock, SystemInspector, Ttl, ValueSource,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -24,7 +24,7 @@ use tokio::sync::watch;
 
 use super::handler::{self, HandlerCtx};
 use super::peer::peer_pid;
-use crate::config::{Config, PreloadEntry};
+use crate::config::{Config, KvDefinition};
 use crate::protocol::wire::{ErrorKind, Request, Response};
 use crate::protocol::{decode_request, encode_response};
 
@@ -144,8 +144,10 @@ impl Shared {
 
 /// Run the daemon in the foreground until SIGINT / SIGTERM, using `config`.
 ///
-/// Binds `socket_path`, preloads the config's `[kv.*]` command entries, serves
-/// the control socket, and removes the socket file on clean shutdown.
+/// Binds `socket_path`, registers the config's `[kv.*]` command definitions
+/// (running eagerly only the `preload = true` ones and those referenced by an
+/// `[authsock.sockets.*].keys` list), serves the control socket, and removes
+/// the socket file on clean shutdown.
 ///
 /// `socket_path` is already resolved by the caller (CLI `--socket` > env >
 /// `[daemon].socket` > built-in default); the daemon does not re-derive it.
@@ -167,10 +169,30 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
     let clock = SystemClock::new();
     let mut store = Store::new();
 
-    // Preload `[kv.*]` command entries before serving. A failed preload is a
-    // warning, not fatal: the daemon stays up and the entry is simply absent
-    // until a later `kv set` (DR-0010).
-    preload_entries(&mut store, &runner, &clock, &config.preload_entries());
+    // Register `[kv.*]` command definitions before serving (DR-0014 §4). Each is
+    // registered as a definition (lazy by default); a `preload = true` entry is
+    // also run eagerly so its first `get` is a cache hit. A failed eager preload
+    // is a warning, not fatal: the definition stays registered and the value
+    // regenerates on the next `get`.
+    //
+    // Keys referenced by any `[authsock.sockets.*].keys` are force-eager
+    // regardless of `preload`: the agent registry derives their public halves at
+    // startup (REQUEST_IDENTITIES needs the PEM resident), and the socket
+    // declaration itself is the intent — requiring a second `preload = true` on
+    // the same key would be a silent-footgun (a forgotten flag would drop the
+    // key from the agent; DR-0004's "never interrupt key use" invariant).
+    let authsock_keys: std::collections::HashSet<String> = config
+        .authsock_sockets()
+        .iter()
+        .flat_map(|s| s.keys.iter().cloned())
+        .collect();
+    register_definitions(
+        &mut store,
+        &runner,
+        &clock,
+        &config.kv_definitions(),
+        &authsock_keys,
+    );
 
     let shared = Arc::new(Shared {
         store: Mutex::new(store),
@@ -228,15 +250,25 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
     Ok(())
 }
 
-/// Preload command-source entries into `store` at startup (DR-0010).
+/// Register command-source definitions into `store` at startup (DR-0014 §4).
 ///
-/// Each entry's command is run once now so the first `get` is a cache hit. A
-/// failure (spawn error, non-zero exit, bad TTL bounds) is reported as a single
-/// stderr warning line — **never** including the command's output, and never
-/// fatal: the entry is left unregistered and can be set later via `kv set`. The
-/// daemon must come up even if an upstream secret source is temporarily down.
-fn preload_entries<R, C>(store: &mut Store, runner: &R, clock: &C, entries: &[PreloadEntry])
-where
+/// Every entry is registered as a definition (KEY ↔ command + TTL) — no upstream
+/// runs unless the entry is eager, in which case the command is also run so the
+/// first `get` is a cache hit. An entry is eager when `preload = true` **or**
+/// when its name is in `force_eager` (keys referenced by an
+/// `[authsock.sockets.*].keys` list: the agent registry needs the PEM resident at
+/// startup to enumerate the public key, so the socket declaration implies
+/// preload — no second flag required). A bad TTL bound skips the whole entry; a
+/// failed eager run is a single secret-free stderr warning and leaves the
+/// definition in place (the value regenerates on the next `get`). The daemon must
+/// come up even if an upstream secret source is temporarily down.
+fn register_definitions<R, C>(
+    store: &mut Store,
+    runner: &R,
+    clock: &C,
+    entries: &[KvDefinition],
+    force_eager: &std::collections::HashSet<String>,
+) where
     R: SourceRunner,
     C: cache_warden::Clock,
 {
@@ -247,18 +279,45 @@ where
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("cache-warden: preload `{}` skipped: {e}", entry.name);
+                eprintln!("cache-warden: definition `{}` skipped: {e}", entry.name);
                 continue;
             }
         };
-        match runner.run(&entry.command) {
-            Ok(value) => {
-                let source = ValueSource::command(entry.command.clone());
-                store.set(entry.name.clone(), source, value, ttl, clock);
+
+        // Register the definition so a later `get` can regenerate the value. A
+        // conflict (the same name already defined differently) should not happen
+        // at startup from a single config, but is reported defensively.
+        let source = ValueSource::command(entry.command.clone());
+        match store.define(entry.name.clone(), source.clone(), ttl) {
+            Ok(()) => {}
+            Err(DefineError::Conflict) => {
+                eprintln!(
+                    "cache-warden: definition `{}` conflicts with an existing definition; skipped",
+                    entry.name
+                );
+                continue;
             }
-            Err(e) => {
-                // The RunError Display is already secret-free (stderr redacted).
-                eprintln!("cache-warden: preload `{}` failed: {e}", entry.name);
+            Err(DefineError::StaticNotDefinable) => {
+                // Unreachable: a command source is never static.
+                eprintln!(
+                    "cache-warden: definition `{}` skipped: static source",
+                    entry.name
+                );
+                continue;
+            }
+        }
+
+        // Lazy by default; `preload = true` or an authsock-referenced key runs
+        // the command eagerly.
+        if entry.preload || force_eager.contains(&entry.name) {
+            match runner.run(&entry.command) {
+                Ok(value) => {
+                    store.set(entry.name.clone(), source, value, ttl, clock);
+                }
+                Err(e) => {
+                    // The RunError Display is already secret-free (stderr redacted).
+                    eprintln!("cache-warden: preload `{}` failed: {e}", entry.name);
+                }
             }
         }
     }
@@ -486,53 +545,154 @@ mod tests {
         );
     }
 
-    // ---- preload_entries ----
+    // ---- register_definitions (DR-0014 §4) ----
+
+    /// An empty force-eager set (no authsock-referenced keys).
+    fn no_eager() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
 
     #[test]
-    fn preload_populates_command_entries() {
+    fn definition_without_preload_is_lazy_no_value_yet() {
+        // Default (preload = false): the definition is registered but the
+        // command is NOT run, so no value is resident until the first get.
         use cache_warden::FakeClock;
         let runner = CommandRunner::new();
         let clock = FakeClock::new();
         let mut store = Store::new();
-        let entries = vec![PreloadEntry {
+        let entries = vec![KvDefinition {
             name: "TOK".into(),
             command: vec!["printf".into(), "tok-value".into()],
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
+            preload: false,
         }];
-        preload_entries(&mut store, &runner, &clock, &entries);
+        register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
+        assert!(store.is_defined("TOK"), "definition registered");
+        assert!(!store.has_value("TOK"), "value not produced eagerly (lazy)");
+    }
+
+    #[test]
+    fn definition_with_preload_runs_eagerly() {
+        // preload = true keeps the old behaviour: run the command at startup so
+        // the first get is a cache hit.
+        use cache_warden::FakeClock;
+        let runner = CommandRunner::new();
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let entries = vec![KvDefinition {
+            name: "TOK".into(),
+            command: vec!["printf".into(), "tok-value".into()],
+            soft_ttl_secs: Some(3600),
+            hard_ttl_secs: Some(86400),
+            preload: true,
+        }];
+        register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
         let secret = store.get("TOK", &clock).expect("entry preloaded");
         assert_eq!(secret.expose_secret(), b"tok-value");
     }
 
     #[test]
-    fn preload_failure_is_non_fatal_and_leaves_entry_absent() {
+    fn authsock_referenced_key_is_eager_even_without_preload() {
+        // A key listed in an `[authsock.sockets.*].keys` must be resident at
+        // startup (the agent registry derives its public key then), so it is
+        // force-eager regardless of `preload` — no second flag required.
         use cache_warden::FakeClock;
         let runner = CommandRunner::new();
         let clock = FakeClock::new();
         let mut store = Store::new();
         let entries = vec![
-            PreloadEntry {
+            KvDefinition {
+                name: "AGENT_KEY".into(),
+                command: vec!["printf".into(), "pem-bytes".into()],
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+                preload: false, // not preloaded by flag…
+            },
+            KvDefinition {
+                name: "OTHER".into(),
+                command: vec!["printf".into(), "other".into()],
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+                preload: false,
+            },
+        ];
+        let eager: std::collections::HashSet<String> =
+            ["AGENT_KEY".to_string()].into_iter().collect();
+        register_definitions(&mut store, &runner, &clock, &entries, &eager);
+        // …but the authsock reference forces it resident.
+        assert_eq!(
+            store.get("AGENT_KEY", &clock).unwrap().expose_secret(),
+            b"pem-bytes",
+            "authsock-referenced key is eagerly materialized"
+        );
+        // The unreferenced key stays lazy.
+        assert!(store.is_defined("OTHER"));
+        assert!(!store.has_value("OTHER"), "unreferenced key stays lazy");
+    }
+
+    #[test]
+    fn preload_failure_is_non_fatal_and_keeps_definition() {
+        // A failed eager preload must not abort startup; the definition stays
+        // registered (so a later get regenerates), and other entries still load.
+        use cache_warden::FakeClock;
+        let runner = CommandRunner::new();
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let entries = vec![
+            KvDefinition {
                 name: "BAD".into(),
                 command: vec!["this-binary-does-not-exist-cw-preload".into()],
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
+                preload: true,
             },
-            PreloadEntry {
+            KvDefinition {
                 name: "GOOD".into(),
                 command: vec!["printf".into(), "ok".into()],
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
+                preload: true,
             },
         ];
-        // Must not panic; the bad entry is skipped, the good one still loads.
-        preload_entries(&mut store, &runner, &clock, &entries);
-        assert!(store.get("BAD", &clock).is_none(), "failed preload absent");
+        register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
+        // BAD's eager run failed, but its definition survives for regeneration.
+        assert!(
+            store.is_defined("BAD"),
+            "definition kept after failed preload"
+        );
+        assert!(
+            store.get("BAD", &clock).is_none(),
+            "no value after failed preload"
+        );
         assert_eq!(
             store.get("GOOD", &clock).unwrap().expose_secret(),
             b"ok",
             "subsequent preload still runs"
         );
+    }
+
+    #[test]
+    fn authsock_forced_eager_failure_is_non_fatal_and_keeps_definition() {
+        // The force-eager path shares the preload failure contract: warn,
+        // continue, keep the definition (the agent socket simply starts without
+        // that key until the upstream recovers).
+        use cache_warden::FakeClock;
+        let runner = CommandRunner::new();
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let entries = vec![KvDefinition {
+            name: "AGENT_KEY".into(),
+            command: vec!["this-binary-does-not-exist-cw-preload".into()],
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            preload: false,
+        }];
+        let eager: std::collections::HashSet<String> =
+            ["AGENT_KEY".to_string()].into_iter().collect();
+        register_definitions(&mut store, &runner, &clock, &entries, &eager);
+        assert!(store.is_defined("AGENT_KEY"), "definition survives");
+        assert!(!store.has_value("AGENT_KEY"), "no value after failed run");
     }
 
     #[tokio::test]

@@ -30,6 +30,7 @@ fn render_response(resp: Response) -> Result<(), String> {
             match ok.payload {
                 OkPayload::Pong { .. } => println!("pong"),
                 OkPayload::Set { .. } => println!("ok"),
+                OkPayload::Defined { .. } => println!("defined"),
                 OkPayload::Deleted { deleted } => {
                     println!("{}", if deleted { "deleted" } else { "not found" })
                 }
@@ -64,17 +65,33 @@ fn render_response(resp: Response) -> Result<(), String> {
                     } else {
                         println!("entries:");
                         for e in entries {
-                            let regen = if e.regenerable {
-                                "regenerable"
-                            } else {
-                                "static"
-                            };
-                            match e.pin_remaining_secs {
-                                Some(secs) => {
-                                    println!("  {} [{}] ({regen}, pinned {secs}s)", e.name, e.state)
+                            // Build a value-free attribute list: regenerability,
+                            // whether a definition is registered, whether a value
+                            // is resident, and any active pin (never the value).
+                            let mut attrs: Vec<String> = Vec::new();
+                            attrs.push(
+                                if e.regenerable {
+                                    "regenerable"
+                                } else {
+                                    "static"
                                 }
-                                None => println!("  {} [{}] ({regen})", e.name, e.state),
+                                .to_string(),
+                            );
+                            if e.defined {
+                                attrs.push("defined".to_string());
                             }
+                            attrs.push(
+                                if e.has_value {
+                                    "value present"
+                                } else {
+                                    "no value"
+                                }
+                                .to_string(),
+                            );
+                            if let Some(secs) = e.pin_remaining_secs {
+                                attrs.push(format!("pinned {secs}s"));
+                            }
+                            println!("  {} [{}] ({})", e.name, e.state, attrs.join(", "));
                         }
                     }
                 }
@@ -260,6 +277,7 @@ fn dispatch_kv(rest: &[String], socket: &std::path::Path) -> Result<(), CliError
     let kv_args = &rest[1..];
 
     let leaf_help: fn() -> help::HelpSpec = match sub {
+        "define" => help::kv_define,
         "set" => help::kv_set,
         "get" => help::kv_get,
         "del" => help::kv_del,
@@ -278,6 +296,7 @@ fn dispatch_kv(rest: &[String], socket: &std::path::Path) -> Result<(), CliError
     }
 
     let req = match sub {
+        "define" => or_usage(commands::parse_kv_define(kv_args), leaf_help)?,
         "set" => or_usage(
             commands::parse_kv_set(kv_args, || {
                 let mut buf = Vec::new();
@@ -287,7 +306,7 @@ fn dispatch_kv(rest: &[String], socket: &std::path::Path) -> Result<(), CliError
             leaf_help,
         )?,
         "get" => or_usage(commands::parse_kv_single_key("get", kv_args), leaf_help)?,
-        "del" => or_usage(commands::parse_kv_single_key("del", kv_args), leaf_help)?,
+        "del" => or_usage(commands::parse_kv_del(kv_args), leaf_help)?,
         "unpin" => or_usage(commands::parse_kv_single_key("unpin", kv_args), leaf_help)?,
         "pin" => or_usage(commands::parse_kv_pin(kv_args), leaf_help)?,
         "list" => {

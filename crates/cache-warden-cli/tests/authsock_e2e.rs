@@ -259,6 +259,9 @@ fn config_content(
     if let Some(t) = soft_ttl {
         s.push_str(&format!("soft-ttl = \"{t}\"\n"));
     }
+    // Deliberately NO `preload = true`: a key referenced by the socket's `keys`
+    // below must be materialized at startup automatically (DR-0014 §4 authsock
+    // exception). These tests pin that no extra flag is required.
     s.push('\n');
     s.push_str("[authsock.sockets.default]\n");
     s.push_str(&format!("path = \"{}\"\n", sock_path.display()));
@@ -532,6 +535,9 @@ fn config_two_sockets_one_filtered(
     all_sock: &Path,
 ) -> String {
     let mut s = String::new();
+    // No `preload = true` here: both keys are referenced by the sockets' `keys`
+    // lists below, which force-eager them at startup (DR-0014 §4 authsock
+    // exception) so the registry can derive their public halves.
     s.push_str("[kv.GITHUB_KEY]\n");
     s.push_str(&format!(
         "command = [\"cat\", \"{}\"]\n\n",

@@ -194,16 +194,20 @@ pub fn top() -> HelpSpec {
                 desc: "Show daemon info and the (value-free) entry list",
             },
             Row {
+                name: "kv define <KEY> ...",
+                desc: "Register a regenerable definition (lazy)",
+            },
+            Row {
                 name: "kv set <KEY> ...",
-                desc: "Cache a value (static or command source)",
+                desc: "Cache a static value",
             },
             Row {
                 name: "kv get <KEY>",
-                desc: "Fetch a cached value",
+                desc: "Fetch a cached value (regenerates if defined)",
             },
             Row {
                 name: "kv del <KEY>",
-                desc: "Delete a cached value",
+                desc: "Delete a cached value (--with-define drops the definition)",
             },
             Row {
                 name: "kv list",
@@ -273,16 +277,20 @@ pub fn kv() -> HelpSpec {
         usage: concat!("cache-warden", " kv <COMMAND> [OPTIONS]"),
         subcommands: &[
             Row {
+                name: "define",
+                desc: "Register a regenerable definition (lazy)",
+            },
+            Row {
                 name: "set",
-                desc: "Cache a value (static or command source)",
+                desc: "Cache a static value",
             },
             Row {
                 name: "get",
-                desc: "Fetch a cached value",
+                desc: "Fetch a cached value (regenerates if defined)",
             },
             Row {
                 name: "del",
-                desc: "Delete a cached value",
+                desc: "Delete a cached value (--with-define drops the definition)",
             },
             Row {
                 name: "list",
@@ -303,14 +311,53 @@ pub fn kv() -> HelpSpec {
     }
 }
 
+/// `kv define` leaf page (carries the per-flag option detail).
+pub fn kv_define() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " kv define"),
+        summary: "Register a regenerable definition for a key (lazy; DR-0014).",
+        usage: concat!(
+            "cache-warden",
+            " kv define <KEY> [OPTIONS] (--command ARGV... | --source URI)"
+        ),
+        subcommands: &[],
+        options: &[
+            Row {
+                name: "--command ARGV...",
+                desc: "Run ARGV; its stdout is the value (regenerable).\n\
+                       Consumes everything after it, so it must come last",
+            },
+            Row {
+                name: "--source URI",
+                desc: "A source URI; only op:// is built in\n\
+                       (expands to `op read <URI>`)",
+            },
+            Row {
+                name: "--soft-ttl DUR",
+                desc: "Soft TTL (re-auth to extend). e.g. 1h, 30m, 45s, 86400",
+            },
+            Row {
+                name: "--hard-ttl DUR",
+                desc: "Hard TTL (value zeroized at expiry)",
+            },
+        ],
+        detail: "\
+The command is NOT run at define time; the value is produced lazily on the
+first `kv get`. Defining is idempotent under an exact match (same argv/URI +
+TTL is a no-op); a conflicting redefinition is rejected — delete it first with
+`kv del KEY --with-define`, then re-define.",
+        show_global: true,
+    }
+}
+
 /// `kv set` leaf page (carries the per-flag option detail).
 pub fn kv_set() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " kv set"),
-        summary: "Cache a value (static or command source).",
+        summary: "Cache a static value.",
         usage: concat!(
             "cache-warden",
-            " kv set <KEY> (--value V | --value-stdin | --command ARGV...) [OPTIONS]"
+            " kv set <KEY> (--value V | --value-stdin) [OPTIONS]"
         ),
         subcommands: &[],
         options: &[
@@ -323,10 +370,6 @@ pub fn kv_set() -> HelpSpec {
                 desc: "Read the value from stdin (binary safe)",
             },
             Row {
-                name: "--command ARGV...",
-                desc: "Run ARGV; its stdout is the value (regenerable)",
-            },
-            Row {
                 name: "--soft-ttl DUR",
                 desc: "Soft TTL (re-auth to extend). e.g. 1h, 30m, 45s, 86400",
             },
@@ -335,7 +378,9 @@ pub fn kv_set() -> HelpSpec {
                 desc: "Hard TTL (value zeroized at expiry)",
             },
         ],
-        detail: "",
+        detail: "\
+`kv set` injects a literal value only. To register a regenerable command
+source, use `kv define` instead.",
         show_global: true,
     }
 }
@@ -357,10 +402,14 @@ pub fn kv_get() -> HelpSpec {
 pub fn kv_del() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " kv del"),
-        summary: "Delete a cached value.",
-        usage: concat!("cache-warden", " kv del <KEY>"),
+        summary: "Delete a cached value (optionally its definition too).",
+        usage: concat!("cache-warden", " kv del <KEY> [--with-define]"),
         subcommands: &[],
-        options: &[],
+        options: &[Row {
+            name: "--with-define",
+            desc: "Also drop the registered definition so the key will not\n\
+                   regenerate on a later get (default: value only)",
+        }],
         detail: "",
         show_global: true,
     }
@@ -526,10 +575,29 @@ mod tests {
         let h = kv_set().render();
         assert!(h.contains("Options:"));
         assert!(h.contains("--value-stdin"));
-        assert!(h.contains("--command ARGV..."));
+        // `--command` moved to `kv define`; `kv set` is static-only now.
+        assert!(!h.contains("--command"));
         assert!(h.contains("--soft-ttl DUR"));
         assert!(h.contains("Global options:"));
         assert!(h.contains("Environment:"));
+    }
+
+    #[test]
+    fn kv_define_help_carries_command_and_source_options() {
+        let h = kv_define().render();
+        assert!(h.contains("Options:"));
+        assert!(h.contains("--command ARGV..."));
+        assert!(h.contains("--source URI"));
+        assert!(h.contains("--soft-ttl DUR"));
+        // The lazy + idempotency explanation lives here.
+        assert!(h.contains("lazily"));
+        assert!(h.contains("--with-define"));
+    }
+
+    #[test]
+    fn kv_del_help_carries_with_define() {
+        let h = kv_del().render();
+        assert!(h.contains("--with-define"));
     }
 
     #[test]
@@ -559,20 +627,20 @@ mod tests {
     fn rows_in_a_section_share_one_description_column() {
         let h = kv().render();
         // Within the Commands: section, all one-liner descriptions align to the
-        // same column (auto-fit to the widest short name, here `unpin`).
+        // same column (auto-fit to the widest short name, here `define`).
         let set_col = h
             .lines()
             .find(|l| l.trim_start().starts_with("set"))
-            .and_then(|l| l.find("Cache a value"))
+            .and_then(|l| l.find("Cache a static value"))
             .unwrap();
-        let unpin_col = h
+        let define_col = h
             .lines()
-            .find(|l| l.trim_start().starts_with("unpin"))
-            .and_then(|l| l.find("Drop a pin"))
+            .find(|l| l.trim_start().starts_with("define"))
+            .and_then(|l| l.find("Register a regenerable"))
             .unwrap();
-        assert_eq!(set_col, unpin_col);
-        // `unpin` is the widest name here, so its description sits right after it.
-        assert_eq!(unpin_col, INDENT.len() + "unpin".len() + NAME_GAP);
+        assert_eq!(set_col, define_col);
+        // `define` is the widest name here, so its description sits right after it.
+        assert_eq!(define_col, INDENT.len() + "define".len() + NAME_GAP);
     }
 
     #[test]

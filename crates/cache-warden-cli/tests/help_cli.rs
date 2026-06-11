@@ -40,8 +40,10 @@ fn help_flag_goes_to_stdout_exit_zero_at_every_level() {
         &["daemon", "--help"][..],
         &["daemon", "run", "--help"][..],
         &["kv", "--help"][..],
+        &["kv", "define", "--help"][..],
         &["kv", "set", "--help"][..],
         &["kv", "get", "--help"][..],
+        &["kv", "del", "--help"][..],
         &["kv", "pin", "--help"][..],
         &["config", "--help"][..],
         &["config", "show", "--help"][..],
@@ -68,6 +70,20 @@ fn top_help_lists_commands_not_per_flag_detail() {
 fn kv_set_help_carries_options_and_kv_pin_carries_detail() {
     assert!(stdout(&cw(&["kv", "set", "--help"])).contains("--value-stdin"));
     assert!(stdout(&cw(&["kv", "pin", "--help"])).contains("Hold the value Active"));
+}
+
+#[test]
+fn kv_define_help_carries_command_and_source() {
+    let out = stdout(&cw(&["kv", "define", "--help"]));
+    assert!(out.contains("--command ARGV..."));
+    assert!(out.contains("--source URI"));
+    assert!(out.contains("lazily"));
+}
+
+#[test]
+fn kv_top_help_lists_define_subcommand() {
+    let out = stdout(&cw(&["kv"]));
+    assert!(out.contains("define"));
 }
 
 // ---- group with no subcommand: stdout, exit 0 ---------------------------

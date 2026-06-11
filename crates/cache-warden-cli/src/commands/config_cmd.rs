@@ -70,11 +70,11 @@ pub fn render_show(loaded: &LoadedConfig) -> String {
         None => out.push_str("auth command: (none; no re-authentication)\n"),
     }
 
-    let entries = loaded.config.preload_entries();
+    let entries = loaded.config.kv_definitions();
     if entries.is_empty() {
-        out.push_str("preload entries: (none)\n");
+        out.push_str("kv definitions: (none)\n");
     } else {
-        out.push_str("preload entries:\n");
+        out.push_str("kv definitions:\n");
         for e in entries {
             let soft = e
                 .soft_ttl_secs
@@ -84,8 +84,9 @@ pub fn render_show(loaded: &LoadedConfig) -> String {
                 .hard_ttl_secs
                 .map(|s| format!("{s}s"))
                 .unwrap_or_else(|| "-".to_string());
+            let preload = if e.preload { " preload=true" } else { "" };
             out.push_str(&format!(
-                "  {}: command={:?} soft-ttl={soft} hard-ttl={hard}\n",
+                "  {}: command={:?} soft-ttl={soft} hard-ttl={hard}{preload}\n",
                 e.name, e.command
             ));
         }
@@ -181,7 +182,7 @@ mod tests {
         let out = render_show(&l);
         assert!(out.contains("config: (none found"));
         assert!(out.contains("auth command: (none"));
-        assert!(out.contains("preload entries: (none)"));
+        assert!(out.contains("kv definitions: (none)"));
         assert!(out.contains("authsock sockets: (none)"));
         assert!(out.contains("(default)"));
     }
@@ -219,7 +220,7 @@ command = ["reauth"]
     }
 
     #[test]
-    fn show_lists_preload_entries() {
+    fn show_lists_kv_definitions() {
         let l = loaded(
             r#"[kv.DB]
 command = ["op", "read", "op://v/i"]
@@ -229,10 +230,26 @@ hard-ttl = "24h"
             None,
         );
         let out = render_show(&l);
-        assert!(out.contains("preload entries:"));
+        assert!(out.contains("kv definitions:"));
         assert!(out.contains("DB: command="));
         assert!(out.contains("soft-ttl=3600s"));
         assert!(out.contains("hard-ttl=86400s"));
+        // Lazy by default: no preload marker.
+        assert!(!out.contains("preload=true"));
+    }
+
+    #[test]
+    fn show_marks_preload_true_definitions() {
+        let l = loaded(
+            r#"[kv.DB]
+command = ["op", "read", "op://v/i"]
+preload = true
+"#,
+            None,
+        );
+        let out = render_show(&l);
+        assert!(out.contains("DB: command="));
+        assert!(out.contains("preload=true"));
     }
 
     #[test]
