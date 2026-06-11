@@ -101,6 +101,15 @@ cache-warden daemon run (single process / tokio runtime)
 - **Service registration (launchd / systemd) uses the single binary + a `daemon run` argument** (later wrapped by
   `daemon register` / `daemon unregister`).
 - **Synchronous work (e.g. op CLI invocations) is isolated via `spawn_blocking`**.
+- **Startup hardening (process-wide, port plan §3 judgement 5)**: before any secret enters the Store the
+  daemon applies two defence layers. (a) **Core-dump suppression** (`RLIMIT_CORE=0`) keeps a crash from
+  leaking in-memory secrets to disk, and (b) **debugger-attach refusal** (`ptrace(PT_DENY_ATTACH)` on macOS,
+  `prctl(PR_SET_DUMPABLE, 0)` on Linux — since core dumps are already handled by (a), the dumpable flag is
+  used purely for its attach side effect: refusing unprivileged `PTRACE_ATTACH` with EPERM and reparenting
+  `/proc/<pid>/mem` ownership to root) blocks a live inspector from reading process memory. Both are
+  **fail-open** (a failure warns in one line and continues, matching the DR-0007 mlock policy). Layer (b) is
+  **opt-out** via `[daemon].allow-debug-attach = true` (development / profiling); opting out prints a single
+  stderr warning so the weakened state is never silent.
 
 ### Control Socket Protocol v1 (DR-0009)
 

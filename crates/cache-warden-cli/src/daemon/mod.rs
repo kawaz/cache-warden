@@ -13,7 +13,9 @@
 //! - [`upstream_path`]: resolve an upstream agent socket path around the macOS
 //!   TCC privacy prompt (state-dir symlink for Group Container sockets).
 //! - [`hardening`]: process-wide startup hardening — suppress core dumps so a
-//!   crash cannot leak in-memory secrets to disk (design §3 judgement 5a).
+//!   crash cannot leak in-memory secrets to disk (5a) and refuse debugger
+//!   attachment so a live inspector cannot read them (5b, opt-out via
+//!   `[daemon].allow-debug-attach`); design §3 judgement 5.
 
 pub mod authsock;
 pub mod handler;

@@ -10,6 +10,7 @@
 //! ```toml
 //! [daemon]
 //! socket = "~/.local/state/cache-warden/control.sock"  # overridable; CLI --socket wins
+//! allow-debug-attach = false   # default: refuse debugger attachment at startup (5b)
 //!
 //! [auth]
 //! command = ["/path/to/reauth-prompt"]   # omitted => no re-auth (AllowAll)
@@ -382,6 +383,17 @@ pub struct DaemonConfig {
     /// 0600). The persisted file holds definitions only, never secret values.
     #[serde(default, rename = "persist-definitions")]
     pub persist_definitions: bool,
+    /// Opt out of the startup anti-debug hardening (design §3 judgement 5b).
+    /// Default `false` = the daemon refuses debugger attachment at startup
+    /// (`ptrace(PT_DENY_ATTACH)` on macOS, `prctl(PR_SET_DUMPABLE, 0)` on Linux),
+    /// so a debugger cannot attach and read in-memory secrets (DR-0007).
+    ///
+    /// Set to `true` only when you need to attach a debugger/profiler to the
+    /// daemon (development, or a vendor CLI like `op` that itself wants to
+    /// introspect the process). When `true` the daemon prints a single stderr
+    /// warning at startup so the weakened state is never silent.
+    #[serde(default, rename = "allow-debug-attach")]
+    pub allow_debug_attach: bool,
 }
 
 /// `[auth]` section.
@@ -836,6 +848,13 @@ impl Config {
         self.daemon.persist_definitions
     }
 
+    /// Whether the operator opted out of startup anti-debug hardening
+    /// (`[daemon].allow-debug-attach`, design §3 judgement 5b). Default `false`
+    /// = debugger attachment is refused at startup.
+    pub fn allow_debug_attach(&self) -> bool {
+        self.daemon.allow_debug_attach
+    }
+
     /// The configured default reveal/dry-run [`Mode`](crate::mode::Mode), or
     /// `None` when `[cli].default-mode` is unset (DR-0015 §4).
     pub fn cli_default_mode(&self) -> Option<crate::mode::Mode> {
@@ -1094,6 +1113,22 @@ socket = "~/.local/state/cache-warden/control.sock"
     fn persist_definitions_is_read_when_true() {
         let cfg = Config::parse("[daemon]\npersist-definitions = true\n").unwrap();
         assert!(cfg.persist_definitions());
+    }
+
+    #[test]
+    fn allow_debug_attach_defaults_to_false() {
+        // No config at all => hardening on (refuse attach).
+        let cfg = Config::parse("").unwrap();
+        assert!(!cfg.allow_debug_attach());
+        // [daemon] present but the flag omitted => still on.
+        let cfg = Config::parse("[daemon]\nsocket = \"/tmp/x.sock\"\n").unwrap();
+        assert!(!cfg.allow_debug_attach());
+    }
+
+    #[test]
+    fn allow_debug_attach_is_read_when_true() {
+        let cfg = Config::parse("[daemon]\nallow-debug-attach = true\n").unwrap();
+        assert!(cfg.allow_debug_attach());
     }
 
     #[test]

@@ -113,6 +113,14 @@ cache-warden daemon run（単一プロセス / tokio ランタイム）
 - **サービス登録（launchd / systemd）は単一バイナリ + `daemon run` 引数**で行う（将来は
   `daemon register` / `daemon unregister` でラップ）。
 - **同期処理（op CLI 呼び出し等）は `spawn_blocking` で隔離**する。
+- **起動時ハードニング（プロセス全体保護、port plan §3 判断 5）**: 秘密値が Store に入る前に
+  2 段の防御を適用する。(a) **コアダンプ抑制**（`RLIMIT_CORE=0`）でクラッシュ時の秘密値ディスク
+  流出を防ぎ、(b) **デバッガアタッチ拒否**（macOS は `ptrace(PT_DENY_ATTACH)`、Linux は
+  `prctl(PR_SET_DUMPABLE, 0)`。コアダンプは (a) で別途抑止済みなので dumpable=0 は「非特権
+  `PTRACE_ATTACH` を EPERM 拒否 + `/proc/<pid>/mem` 所有者を root 化」という attach 防御目的で使う）で
+  稼働中プロセスのメモリ読み取りを塞ぐ。両者とも **fail-open**（失敗は警告 1 行で続行、DR-0007 の
+  mlock と同方針）。(b) は `[daemon].allow-debug-attach = true` で **opt-out 可能**（開発・プロファイル
+  用途）だが、無効化時は stderr に警告 1 行を出し、静かに弱体化しない。
 
 ### control socket プロトコル v1（DR-0009）
 

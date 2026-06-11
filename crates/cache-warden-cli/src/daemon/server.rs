@@ -191,6 +191,23 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
         );
     }
 
+    // Refuse debugger attachment so a live process inspector cannot read
+    // in-memory secrets (DR-0007), defeating the mlock + core-dump layers.
+    // Opt-out via `[daemon].allow-debug-attach = true`; never weaken silently —
+    // a single stderr warning is printed either way (opt-out or syscall refusal).
+    if config.allow_debug_attach() {
+        eprintln!(
+            "cache-warden: warning: anti-debug hardening disabled \
+             ([daemon].allow-debug-attach = true); a debugger can attach and read \
+             in-memory secrets"
+        );
+    } else if !super::hardening::deny_debugger_attach() {
+        eprintln!(
+            "cache-warden: warning: could not refuse debugger attachment; \
+             a debugger could attach and read in-memory secrets"
+        );
+    }
+
     let listener = bind_control_socket(&socket_path)?;
 
     let runner = CommandRunner::new();
