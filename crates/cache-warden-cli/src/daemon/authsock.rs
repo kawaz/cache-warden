@@ -187,6 +187,7 @@ fn discover_all_sources(sources: &[AuthsockSource]) -> BTreeMap<String, Vec<Disc
 /// logged and skipped. Returns how many keys were registered.
 fn register_op_keys(
     socket_name: &str,
+    exe: &str,
     source: &AuthsockSource,
     keys: &[DiscoveredKey],
     registry: &mut PublicKeyRegistry,
@@ -194,7 +195,7 @@ fn register_op_keys(
     let mut n = 0;
     for key in keys {
         let kv_key = op_kv_key(&key.item_id);
-        let argv = private_key_argv(&key.item_id, source.op_account.as_deref());
+        let argv = private_key_argv(exe, &key.item_id, source.op_account.as_deref());
         let src = KeySource::Op {
             argv,
             soft_ttl_secs: source.soft_ttl_secs,
@@ -240,6 +241,21 @@ pub fn spawn_listeners(
     let source_by_name: BTreeMap<&str, &AuthsockSource> =
         sources.iter().map(|s| (s.name.as_str(), s)).collect();
 
+    // Resolve this binary's path once: op keys lazily re-execute it (the
+    // `__authsock-op-private-key` subcommand) to fetch their PEM via op's JSON
+    // output. If we cannot resolve it, op keys cannot be served — register none
+    // (fail-closed) rather than building a broken argv.
+    let exe = match std::env::current_exe() {
+        Ok(p) => Some(p.to_string_lossy().into_owned()),
+        Err(e) => {
+            eprintln!(
+                "cache-warden: authsock: cannot resolve own binary path ({e}); op-sourced keys \
+                 will be unavailable for signing"
+            );
+            None
+        }
+    };
+
     // Collect every `github=<user>` matcher across all sockets so the refresh
     // task can populate (and periodically re-fetch) their published key sets.
     // Clones share each matcher's cache, so updates here reach the synchronous
@@ -266,14 +282,16 @@ pub fn spawn_listeners(
         };
 
         // Add op-sourced keys (lazily loaded at sign time; see [`KeySource::Op`]).
+        // Skipped entirely when the binary path is unknown (fail-closed above).
         let mut op_key_count = 0;
-        if let Some(source_name) = &socket.source
+        if let Some(exe) = &exe
+            && let Some(source_name) = &socket.source
             && let (Some(source), Some(keys)) = (
                 source_by_name.get(source_name.as_str()),
                 discovered.get(source_name),
             )
         {
-            op_key_count = register_op_keys(&socket.name, source, keys, &mut registry);
+            op_key_count = register_op_keys(&socket.name, exe, source, keys, &mut registry);
         }
 
         let listener = match bind_control_socket(&socket.path) {
@@ -1468,7 +1486,7 @@ mod tests {
     /// empty store. The op key's KV name is namespaced like the production path.
     fn op_fixture(soft: u64, hard: u64) -> (Mutex<Store>, PublicKeyRegistry) {
         let mut registry = PublicKeyRegistry::new();
-        let argv = private_key_argv("itemABC", Some("kawaz.1password.com"));
+        let argv = private_key_argv("/path/cache-warden", "itemABC", Some("kawaz.1password.com"));
         registry
             .register_op_key(
                 op_kv_key("itemABC"),
@@ -1705,7 +1723,7 @@ mod tests {
             vault: "Private".into(),
         }];
         let mut registry = PublicKeyRegistry::new();
-        let n = register_op_keys("sock", &source, &keys, &mut registry);
+        let n = register_op_keys("sock", "/path/cache-warden", &source, &keys, &mut registry);
         assert_eq!(n, 1);
         let reg = registry.lookup(&blob_of(ED25519_PUB)).unwrap();
         assert_eq!(reg.kv_key, "__authsock_op:itemABC");
@@ -1718,9 +1736,13 @@ mod tests {
             } => {
                 assert_eq!(*soft_ttl_secs, Some(3600));
                 assert_eq!(*hard_ttl_secs, Some(86400));
+                // The argv re-executes this binary's hidden private-key
+                // subcommand (not `op` directly), threading the item id and
+                // account through.
+                assert_eq!(argv[0], "/path/cache-warden");
+                assert!(argv.contains(&"__authsock-op-private-key".to_string()));
                 assert!(argv.contains(&"--account".to_string()));
                 assert!(argv.contains(&"kawaz.1password.com".to_string()));
-                assert!(argv.contains(&"--reveal".to_string()));
                 assert!(argv.contains(&"itemABC".to_string()));
             }
             other => panic!("expected Op source, got {other:?}"),
@@ -1753,7 +1775,7 @@ mod tests {
             },
         ];
         let mut registry = PublicKeyRegistry::new();
-        let n = register_op_keys("sock", &source, &keys, &mut registry);
+        let n = register_op_keys("sock", "/path/cache-warden", &source, &keys, &mut registry);
         assert_eq!(n, 1, "the unparseable key is skipped");
     }
 

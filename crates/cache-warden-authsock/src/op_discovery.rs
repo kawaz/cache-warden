@@ -182,6 +182,12 @@ mod tests {
                 .map(String::into_bytes)
                 .ok_or_else(|| Error::KeyStore(format!("no public key for {item_id}")))
         }
+        fn item_get_private_key_json(&self, item_id: &str) -> Result<Vec<u8>> {
+            // Discovery never fetches the private key; fail loudly if it does.
+            Err(Error::KeyStore(format!(
+                "private key fetch is not part of discovery: {item_id}"
+            )))
+        }
     }
 
     const LIST_TWO: &str = r#"[

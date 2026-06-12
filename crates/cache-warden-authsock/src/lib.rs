@@ -72,7 +72,10 @@ pub use filter::{
     parse_keys,
 };
 pub use message::{AgentMessage, Identity, MessageType, SignRequestFields};
-pub use op::{OpClient, OpKeyInfo, OpSource, RealOpClient, private_key_argv, validate_item_id};
+pub use op::{
+    OP_PRIVATE_KEY_SUBCOMMAND, OpClient, OpKeyInfo, OpSource, RealOpClient, fetch_op_private_key,
+    private_key_argv, validate_item_id,
+};
 pub use op_cache::{CachedKey, OpKeyCache, default_cache_path};
 pub use op_discovery::{DiscoveredKey, discover_keys};
 pub use process_policy::{chain_allowed, chain_gate_passes};

@@ -755,8 +755,12 @@ fn ssh_fingerprint(pub_path: &Path) -> String {
 /// - `op ... item list ... --format json` → a one-item SSH-key array with the
 ///   key's fingerprint (so discovery enumerates it).
 /// - `op ... item get ITEM --fields public_key --format json` → `{"value": pub}`.
-/// - `op ... item get ITEM --fields private_key --reveal` → the **plain** PEM
-///   (no JSON), matching `private_key_argv` (the core captures stdout verbatim).
+/// - `op ... item get ITEM --fields private_key --reveal --format json` →
+///   `{"value": <PEM>}`, matching real op: the multi-line PEM is a JSON string
+///   value (with embedded `\n`). The cache-warden internal subcommand parses
+///   this JSON and extracts the PEM — the same path the production code takes.
+///   (Real op's *plain* output quotes a multi-line field, which is why the
+///   private-key fetch goes through op's JSON output, not plain.)
 ///
 /// `item_id` is the synthetic id the script answers for. The `--account` flag the
 /// daemon passes is accepted and ignored.
@@ -766,12 +770,18 @@ fn write_fake_op(bin_dir: &Path, item_id: &str, fingerprint: &str, key_path: &Pa
         .unwrap()
         .trim()
         .to_string();
+    // The private key PEM, embedded as a JSON-string value exactly as op returns
+    // it: a multi-line value with `\n`-escaped newlines inside a JSON object.
+    let pem = std::fs::read_to_string(key_path).unwrap();
+    let priv_json =
+        serde_json::json!({ "id": "private_key", "type": "SSHKEY", "value": pem }).to_string();
     let op_path = bin_dir.join("op");
     // The script greps its own argv for the subcommand + field, then prints the
-    // canned response from the real key files.
+    // canned response. Single-quoted heredoc-free `printf` keeps the JSON literal
+    // verbatim (no shell expansion of the PEM's `$`/`\`).
     let script = format!(
         r#"#!/bin/sh
-# fake op CLI for cache-warden e2e (Iteration 4)
+# fake op CLI for cache-warden e2e (JSON private-key fetch)
 args="$*"
 case "$args" in
   *"item list"*)
@@ -786,7 +796,9 @@ JSON
     printf '{{"id":"public_key","type":"STRING","value":"%s"}}' "{pub_line}"
     ;;
   *"item get"*"private_key"*)
-    cat "{key_file}"
+    cat <<'PRIVJSON'
+{priv_json}
+PRIVJSON
     ;;
   *)
     echo "fake op: unhandled args: $args" >&2
@@ -797,7 +809,7 @@ esac
         item_id = item_id,
         fingerprint = fingerprint,
         pub_line = pub_line,
-        key_file = key_path.display(),
+        priv_json = priv_json,
     );
     std::fs::write(&op_path, script).unwrap();
     #[cfg(unix)]
@@ -953,6 +965,94 @@ fn op_source_sign_with_denied_auth_is_failure() {
         "denied lazy-load auth must yield FAILURE, got type {resp_type}"
     );
     assert!(resp_payload.is_empty(), "FAILURE must carry no detail");
+}
+
+/// Direct contract test for the hidden `__authsock-op-private-key` subcommand:
+/// invoking the cache-warden binary with it (PATH pointing at a fake op that
+/// returns JSON) must print the plain PEM to stdout. This is the JSON→PEM
+/// extraction the production lazy-load path relies on.
+#[test]
+fn op_private_key_subcommand_extracts_pem_from_op_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+
+    let key_path = dir.path().join("op_key");
+    ssh_keygen_ed25519(&key_path, "e2e-op-cli-key");
+    let fp = ssh_fingerprint(&key_path.with_extension("pub"));
+    write_fake_op(&bin, "itemcli", &fp, &key_path);
+    let expected_pem = std::fs::read_to_string(&key_path).unwrap();
+
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_os = std::ffi::OsString::from(bin.as_os_str());
+    path_os.push(":");
+    path_os.push(&inherited);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .args(["__authsock-op-private-key", "itemcli"])
+        .env("PATH", &path_os)
+        .output()
+        .expect("run __authsock-op-private-key");
+
+    assert!(
+        out.status.success(),
+        "subcommand must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The extracted PEM matches the real key file (the core's TrimOne later
+    // strips the single trailing newline we normalize to).
+    assert_eq!(
+        stdout.trim_end_matches('\n'),
+        expected_pem.trim_end_matches('\n')
+    );
+    assert!(stdout.contains("BEGIN OPENSSH PRIVATE KEY"));
+}
+
+/// Regression: if op returns *plain* output (the old, broken path — a quoted
+/// multi-line string, NOT JSON), the subcommand must fail (and never emit it as
+/// a "PEM"). Fixes the bug where the daemon fed quoted plain output to the signer
+/// and got SSH_AGENT_FAILURE with nothing in the log.
+#[test]
+fn op_private_key_subcommand_rejects_plain_quoted_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let op_path = bin.join("op");
+    // A fake op that emits real op's *plain* quoted multi-line output for the
+    // private_key field (what broke before the fix). This is not valid JSON.
+    std::fs::write(
+        &op_path,
+        "#!/bin/sh\nprintf '\"line1\\nline2\\nline3\"\\n'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&op_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_os = std::ffi::OsString::from(bin.as_os_str());
+    path_os.push(":");
+    path_os.push(&inherited);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .args(["__authsock-op-private-key", "itemcli"])
+        .env("PATH", &path_os)
+        .output()
+        .expect("run __authsock-op-private-key");
+
+    assert!(
+        !out.status.success(),
+        "plain quoted (non-JSON) op output must fail, not be served as a PEM"
+    );
+    // A secret-free diagnostic line reaches stderr (the daemon log).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("itemcli"),
+        "stderr should name the item for diagnosis; got: {stderr}"
+    );
 }
 
 // ---- allowed_processes process gate (port plan Iteration 5) ----

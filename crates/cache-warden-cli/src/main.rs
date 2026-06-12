@@ -195,6 +195,14 @@ fn run() -> Result<(), CliError> {
     let command = args[0].clone();
     let tail = &args[1..];
 
+    // Hidden internal subcommand: the daemon re-executes its own binary with
+    // this to fetch an op item's private-key PEM (it calls op with --format json
+    // and prints the extracted `.value`). Dispatched before config loading and
+    // socket resolution, which it does not need. Never shown in help.
+    if command == cache_warden_authsock::OP_PRIVATE_KEY_SUBCOMMAND {
+        return commands::op_private_key::run(tail).map_err(CliError::Message);
+    }
+
     // Resolve --socket (anywhere in the tail) once; None means "not on the CLI".
     let (cli_socket, rest) = commands::take_socket_flag(tail)?;
 

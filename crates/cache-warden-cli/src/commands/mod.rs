@@ -9,6 +9,7 @@ pub mod client;
 pub mod config_cmd;
 pub mod daemon_cmd;
 pub mod inject_cmd;
+pub mod op_private_key;
 pub mod run_cmd;
 
 use std::path::PathBuf;

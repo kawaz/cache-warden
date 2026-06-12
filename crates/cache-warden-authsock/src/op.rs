@@ -22,6 +22,7 @@
 use std::process::Command;
 
 use serde::Deserialize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 
@@ -107,6 +108,14 @@ pub trait OpClient {
     /// Run `op item get ITEM --fields public_key --format json` and return its
     /// raw stdout JSON bytes.
     fn item_get_public_key_json(&self, item_id: &str) -> Result<Vec<u8>>;
+
+    /// Run `op item get ITEM --fields private_key --reveal --format json` and
+    /// return its raw stdout JSON bytes.
+    ///
+    /// The returned buffer holds secret material (the JSON-wrapped PEM); the
+    /// caller is responsible for zeroizing it after extracting `.value` (see
+    /// [`fetch_op_private_key`]).
+    fn item_get_private_key_json(&self, item_id: &str) -> Result<Vec<u8>>;
 }
 
 /// The production [`OpClient`]: spawns the `op` CLI synchronously.
@@ -190,6 +199,27 @@ impl OpClient for RealOpClient {
             "op item get (public key)",
         )
     }
+
+    fn item_get_private_key_json(&self, item_id: &str) -> Result<Vec<u8>> {
+        validate_item_id(item_id)?;
+        // `--reveal` is required so the concealed SSH key field is returned; the
+        // JSON wrapper (`{"value": ...}`) is parsed by the caller. We must use
+        // `--format json` rather than plain output: real op (2.34.0) quotes a
+        // multi-line field value in plain mode, which is not a valid PEM.
+        self.run(
+            &[
+                "item",
+                "get",
+                item_id,
+                "--fields",
+                "private_key",
+                "--reveal",
+                "--format",
+                "json",
+            ],
+            "op item get (private key)",
+        )
+    }
 }
 
 /// Validate that an item id is safe to pass to the `op` CLI as a bare argument.
@@ -238,49 +268,87 @@ pub fn parse_item_list(json: &[u8], item: Option<&str>) -> Result<Vec<OpKeyInfo>
 
 /// Extract the `value` of an `op item get --fields ... --format json` object.
 ///
-/// Used for the **public** key field only; the private key is never fetched in
-/// this module (it flows through the core command source at sign time).
+/// Used for both the public-key field (discovery) and the private-key field
+/// ([`fetch_op_private_key`], via the internal subcommand).
 pub fn parse_field_value(json: &[u8]) -> Result<String> {
     let field: OpFieldValue = serde_json::from_slice(json)
         .map_err(|e| Error::KeyStore(format!("failed to parse op field value: {e}")))?;
     Ok(field.value)
 }
 
+/// The hidden internal subcommand that fetches one op item's private-key PEM.
+///
+/// The cache-warden binary re-executes itself with this subcommand as the
+/// [`cache_warden::ValueSource::Command`] argv (see [`private_key_argv`]); the
+/// subcommand calls op with `--format json` and extracts `.value`, emitting the
+/// plain PEM on stdout (see [`fetch_op_private_key`]).
+pub const OP_PRIVATE_KEY_SUBCOMMAND: &str = "__authsock-op-private-key";
+
 /// Build the argv the **core** runs (as a [`cache_warden::ValueSource::Command`])
 /// to fetch one key's private-key PEM at sign time.
 ///
-/// # Why no `--format json` (plain output) — port plan §1.4 / §3-11
+/// # Why an internal subcommand rather than `op` directly
 ///
-/// authsock-warden fetched the private key as JSON and extracted `.value`. The
-/// cache-warden core's `CommandRunner` captures **raw stdout** as the secret, so
-/// a JSON wrapper would store `{"value":"<PEM>"}` instead of the PEM. We instead
-/// run `op item get ITEM --fields private_key --reveal` *without* `--format
-/// json`, which prints the field value (the PEM) plainly. The core's default
-/// `TrailingNewline::TrimOne` then strips op's single trailing newline, leaving
-/// the exact PEM the signer parses. `--reveal` is required so the concealed SSH
-/// key field is returned (DR-011).
+/// The cache-warden core's `CommandRunner` captures **raw stdout** as the secret
+/// value. Real op (2.34.0) quotes a multi-line field in plain output, so
+/// `op item get --fields private_key --reveal` (plain) yields a quoted, non-PEM
+/// string that the signer rejects (SSH_AGENT_FAILURE). authsock-warden avoided
+/// this by fetching as JSON and extracting `.value`, but the cache-warden core
+/// has no place to parse JSON — it stores stdout verbatim.
 ///
-/// An optional `account` is threaded through as `--account ACCOUNT` so the core
-/// command targets the same 1Password account discovery used.
-pub fn private_key_argv(item_id: &str, account: Option<&str>) -> Vec<String> {
-    let mut argv: Vec<String> = vec!["op".to_string()];
+/// So instead of pointing the argv at `op`, we point it at **cache-warden's own
+/// binary** (`exe`) running the hidden [`OP_PRIVATE_KEY_SUBCOMMAND`]. That
+/// subcommand calls op with `--format json`, extracts `.value`, and prints the
+/// plain PEM — which the core then captures verbatim (the same JSON-extraction
+/// the warden's `get_private_key` does, just relocated to a child process so the
+/// core's command-source model is untouched). Regeneration after hard expiry
+/// re-runs the same argv, so the JSON path applies to refreshes too.
+///
+/// An optional `account` is threaded through as `--account ACCOUNT` so the
+/// subcommand targets the same 1Password account discovery used.
+pub fn private_key_argv(exe: &str, item_id: &str, account: Option<&str>) -> Vec<String> {
+    let mut argv: Vec<String> = vec![exe.to_string(), OP_PRIVATE_KEY_SUBCOMMAND.to_string()];
+    argv.push(item_id.to_string());
     if let Some(a) = account {
         argv.push("--account".to_string());
         argv.push(a.to_string());
     }
-    argv.extend(
-        [
-            "item",
-            "get",
-            item_id,
-            "--fields",
-            "private_key",
-            "--reveal",
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
     argv
+}
+
+/// Fetch one op item's private-key PEM via op's JSON output, returning the plain
+/// PEM bytes ready to write to stdout (with exactly one trailing newline).
+///
+/// # Secret hygiene
+///
+/// Mirrors authsock-warden's `get_private_key`: the raw op JSON stdout is
+/// zeroized after `.value` is extracted (and on the parse-failure path), and the
+/// extracted PEM lives only in a [`Zeroizing`] buffer that erases on drop. The
+/// returned buffer is itself a `Zeroizing<Vec<u8>>` so the caller never holds a
+/// non-zeroizing plaintext copy.
+///
+/// # Trailing newline
+///
+/// The PEM `.value` may or may not end in `\n` depending on the op version. We
+/// normalize to **exactly one** trailing `\n`. The core captures this verbatim
+/// and its default `TrailingNewline::TrimOne` strips that single newline, leaving
+/// the exact PEM the signer parses.
+pub fn fetch_op_private_key(client: &impl OpClient, item_id: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let mut json = client.item_get_private_key_json(item_id)?;
+    let value: Zeroizing<String> = match parse_field_value(&json) {
+        Ok(v) => Zeroizing::new(v),
+        Err(e) => {
+            json.zeroize();
+            return Err(e);
+        }
+    };
+    json.zeroize();
+
+    let mut pem: Zeroizing<Vec<u8>> = Zeroizing::new(value.as_bytes().to_vec());
+    if pem.last() != Some(&b'\n') {
+        pem.push(b'\n');
+    }
+    Ok(pem)
 }
 
 #[cfg(test)]
@@ -436,41 +504,100 @@ mod tests {
     // ---- private_key_argv ----
 
     #[test]
-    fn private_key_argv_is_plain_reveal_without_json() {
-        // Plain output (no --format json) so the core CommandRunner captures the
-        // PEM directly; --reveal so the concealed key field is returned.
-        let argv = private_key_argv("itemABC", None);
+    fn private_key_argv_builds_internal_subcommand() {
+        // The argv points at cache-warden's own binary running the hidden
+        // private-key subcommand — not `op` directly — so the JSON `.value`
+        // extraction happens in a child process the core captures verbatim.
+        let argv = private_key_argv("/usr/local/bin/cache-warden", "itemABC", None);
         assert_eq!(
             argv,
             vec![
-                "op",
-                "item",
-                "get",
+                "/usr/local/bin/cache-warden",
+                "__authsock-op-private-key",
                 "itemABC",
-                "--fields",
-                "private_key",
-                "--reveal"
             ]
         );
-        assert!(!argv.iter().any(|a| a == "json"));
     }
 
     #[test]
     fn private_key_argv_threads_account() {
-        let argv = private_key_argv("itemABC", Some("kawaz.1password.com"));
+        let argv = private_key_argv("/path/cw", "itemABC", Some("kawaz.1password.com"));
         assert_eq!(
             argv,
             vec![
-                "op",
+                "/path/cw",
+                "__authsock-op-private-key",
+                "itemABC",
                 "--account",
                 "kawaz.1password.com",
-                "item",
-                "get",
-                "itemABC",
-                "--fields",
-                "private_key",
-                "--reveal",
             ]
         );
+    }
+
+    // ---- fetch_op_private_key ----
+
+    /// A fake op returning a fixed `item get --fields private_key --format json`
+    /// body. The list / public-key methods are unused here.
+    struct FakePrivOp {
+        private_json: Vec<u8>,
+    }
+    impl OpClient for FakePrivOp {
+        fn item_list_json(&self, _vault: Option<&str>) -> Result<Vec<u8>> {
+            unreachable!("not used in fetch_op_private_key tests")
+        }
+        fn item_get_public_key_json(&self, _item_id: &str) -> Result<Vec<u8>> {
+            unreachable!("not used in fetch_op_private_key tests")
+        }
+        fn item_get_private_key_json(&self, _item_id: &str) -> Result<Vec<u8>> {
+            Ok(self.private_json.clone())
+        }
+    }
+
+    const PEM_BODY: &str =
+        "-----BEGIN PRIVATE KEY-----\nMFMCAQEwBQYDK2Vw\n-----END PRIVATE KEY-----";
+
+    #[test]
+    fn fetch_private_key_extracts_pem_from_json_with_one_trailing_newline() {
+        // op JSON: a multi-line PEM as a single JSON string value (no trailing
+        // newline inside the value).
+        let json = serde_json::json!({
+            "id": "private_key",
+            "type": "SSHKEY",
+            "value": PEM_BODY,
+        })
+        .to_string()
+        .into_bytes();
+        let op = FakePrivOp { private_json: json };
+        let pem = fetch_op_private_key(&op, "itemX").unwrap();
+        // Exactly one trailing newline appended; PEM body intact.
+        assert_eq!(pem.as_slice(), format!("{PEM_BODY}\n").as_bytes());
+    }
+
+    #[test]
+    fn fetch_private_key_does_not_double_trailing_newline() {
+        // If op's value already ends in a newline, we keep exactly one.
+        let json = serde_json::json!({ "value": format!("{PEM_BODY}\n") })
+            .to_string()
+            .into_bytes();
+        let op = FakePrivOp { private_json: json };
+        let pem = fetch_op_private_key(&op, "itemX").unwrap();
+        assert_eq!(pem.as_slice(), format!("{PEM_BODY}\n").as_bytes());
+    }
+
+    #[test]
+    fn fetch_private_key_rejects_plain_quoted_output_as_non_json() {
+        // Regression: the old implementation ran op WITHOUT `--format json` and
+        // fed the plain output straight to the PEM parser. Real op (2.34.0)
+        // quotes a multi-line field, so the plain output is a quoted, multi-line
+        // string — NOT a JSON object. Feeding that here must fail to parse (it
+        // would never reach the signer as a valid `.value`).
+        let plain_quoted = format!("\"{}\"", PEM_BODY.replace('\n', "\n"));
+        let op = FakePrivOp {
+            private_json: plain_quoted.into_bytes(),
+        };
+        assert!(matches!(
+            fetch_op_private_key(&op, "itemX").unwrap_err(),
+            Error::KeyStore(_)
+        ));
     }
 }
