@@ -1,0 +1,293 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.current }}
+      changed: ${{ steps.version.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check version change
+        id: version
+        run: |
+          CURRENT_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          # Check if a GitHub release with this version already exists
+          if gh release view "v${CURRENT_VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "Version unchanged: v${CURRENT_VERSION} already released"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "New version detected: v${CURRENT_VERSION}"
+          fi
+          echo "current=${CURRENT_VERSION}" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build-release:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl tools
+        if: endsWith(matrix.target, '-musl') && !matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p cache-warden-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p cache-warden-cli
+          fi
+
+      - name: Create .app bundle (macOS)
+        if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          cd target/${{ matrix.target }}/release
+          mkdir -p CacheWarden.app/Contents/MacOS
+          cp cache-warden CacheWarden.app/Contents/MacOS/
+          cat > CacheWarden.app/Contents/Info.plist << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>cache-warden</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.github.kawaz.cache-warden</string>
+            <key>CFBundleName</key>
+            <string>cache-warden</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>LSBackgroundOnly</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Import signing certificate (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          echo -n "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $CERTIFICATE_PATH -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+      - name: Sign .app bundle (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          # Sign bottom-up: binary first, then .app bundle
+          codesign --sign "$APPLE_SIGNING_IDENTITY" \
+            --options runtime \
+            --force \
+            --timestamp \
+            target/${{ matrix.target }}/release/CacheWarden.app/Contents/MacOS/cache-warden
+
+          codesign --sign "$APPLE_SIGNING_IDENTITY" \
+            --options runtime \
+            --force \
+            --timestamp \
+            target/${{ matrix.target }}/release/CacheWarden.app
+
+          echo "Signed .app bundle:"
+          codesign -dv --verbose=2 target/${{ matrix.target }}/release/CacheWarden.app
+
+      - name: Notarize binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool store-credentials "notary-profile" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --keychain $RUNNER_TEMP/app-signing.keychain-db
+
+          cd target/${{ matrix.target }}/release
+          ditto -c -k --keepParent CacheWarden.app notarize.zip
+
+          xcrun notarytool submit notarize.zip \
+            --keychain-profile "notary-profile" \
+            --keychain $RUNNER_TEMP/app-signing.keychain-db \
+            --wait \
+            --timeout 10m
+
+          xcrun stapler staple CacheWarden.app
+
+          rm notarize.zip
+          echo "Notarization complete"
+
+      - name: Clean up keychain (macOS)
+        if: always() && runner.os == 'macOS'
+        run: |
+          if [ -f "$RUNNER_TEMP/app-signing.keychain-db" ]; then
+            security delete-keychain $RUNNER_TEMP/app-signing.keychain-db
+          fi
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          if [ -d "CacheWarden.app" ]; then
+            # Include both .app bundle and bare binary so Homebrew doesn't
+            # auto-strip the single top-level directory (CacheWarden.app)
+            tar czf ../../../cache-warden-${{ matrix.target }}.tar.gz CacheWarden.app cache-warden
+          else
+            tar czf ../../../cache-warden-${{ matrix.target }}.tar.gz cache-warden
+          fi
+          cd ../../..
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cache-warden-${{ matrix.target }}
+          path: cache-warden-${{ matrix.target }}.tar.gz
+
+  publish-release:
+    needs: [check-version, build-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release with tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          gh release create "v${VERSION}" \
+            cache-warden-*.tar.gz \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "v${VERSION}" \
+            --target "$COMMIT_SHA" \
+            --generate-notes
+
+  update-homebrew:
+    needs: [check-version, publish-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Calculate checksums
+        id: checksums
+        run: |
+          echo "darwin_arm64=$(sha256sum artifacts/cache-warden-aarch64-apple-darwin/*.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "darwin_amd64=$(sha256sum artifacts/cache-warden-x86_64-apple-darwin/*.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "linux_amd64=$(sha256sum artifacts/cache-warden-x86_64-unknown-linux-gnu/*.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "linux_arm64=$(sha256sum artifacts/cache-warden-aarch64-unknown-linux-gnu/*.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+
+      - name: Get version
+        id: version
+        run: echo "version=${{ needs.check-version.outputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: kawaz/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: homebrew-tap
+
+      - name: "Remove stale formula (Cask only)"
+        run: rm -f homebrew-tap/Formula/cache-warden.rb
+
+      - name: Update cask
+        run: |
+          mkdir -p homebrew-tap/Casks
+          cat > homebrew-tap/Casks/cache-warden.rb << 'CASK'
+          cask "cache-warden" do
+            version "${{ steps.version.outputs.version }}"
+
+            on_arm do
+              sha256 "${{ steps.checksums.outputs.darwin_arm64 }}"
+              url "https://github.com/kawaz/cache-warden/releases/download/v#{version}/cache-warden-aarch64-apple-darwin.tar.gz"
+            end
+            on_intel do
+              sha256 "${{ steps.checksums.outputs.darwin_amd64 }}"
+              url "https://github.com/kawaz/cache-warden/releases/download/v#{version}/cache-warden-x86_64-apple-darwin.tar.gz"
+            end
+
+            name "cache-warden"
+            desc "Securely caches secrets with TTL, process-aware access control, and reauth"
+            homepage "https://github.com/kawaz/cache-warden"
+
+            app "CacheWarden.app"
+            binary "#{appdir}/CacheWarden.app/Contents/MacOS/cache-warden"
+          end
+          CASK
+
+      - name: Commit and push formula
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A Formula/ Casks/cache-warden.rb
+          git diff --staged --quiet || git commit -m "Update cache-warden to ${{ steps.version.outputs.version }}"
+          git push
