@@ -249,11 +249,12 @@ fn config_content(
 ) -> String {
     let mut s = String::new();
     if auth_false {
-        s.push_str("[auth]\ncommand = [\"false\"]\n\n");
+        s.push_str("[auth]\ntype = \"command\"\ncommand = [\"false\"]\n\n");
     }
     s.push_str("[kv.GITHUB_KEY]\n");
+    s.push_str("source = \"command\"\n");
     s.push_str(&format!(
-        "command = [\"cat\", \"{}\"]\n",
+        "command.argv = [\"cat\", \"{}\"]\n",
         key_path.display()
     ));
     if let Some(t) = soft_ttl {
@@ -539,13 +540,15 @@ fn config_two_sockets_one_filtered(
     // lists below, which force-eager them at startup (DR-0014 §4 authsock
     // exception) so the registry can derive their public halves.
     s.push_str("[kv.GITHUB_KEY]\n");
+    s.push_str("source = \"command\"\n");
     s.push_str(&format!(
-        "command = [\"cat\", \"{}\"]\n\n",
+        "command.argv = [\"cat\", \"{}\"]\n\n",
         github_key_path.display()
     ));
     s.push_str("[kv.OTHER_KEY]\n");
+    s.push_str("source = \"command\"\n");
     s.push_str(&format!(
-        "command = [\"cat\", \"{}\"]\n\n",
+        "command.argv = [\"cat\", \"{}\"]\n\n",
         other_key_path.display()
     ));
 
@@ -824,7 +827,7 @@ esac
 fn op_source_config(sock_path: &Path, soft_ttl: &str, hard_ttl: &str, auth_false: bool) -> String {
     let mut s = String::new();
     if auth_false {
-        s.push_str("[auth]\ncommand = [\"false\"]\n\n");
+        s.push_str("[auth]\ntype = \"command\"\ncommand = [\"false\"]\n\n");
     }
     s.push_str("[authsock.sources.default]\n");
     s.push_str("kind = \"op\"\n");

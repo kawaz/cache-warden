@@ -984,8 +984,9 @@ where
         Ok(t) => t,
         Err(_) => return false,
     };
-    // Fetch the PEM first (before bothering the user for biometrics).
-    let value = match runner.run(argv) {
+    // Fetch the PEM first (before bothering the user for biometrics). This op
+    // fetch needs no cwd / env overlay (DR-0018: the authsock op path is internal).
+    let value = match runner.run(argv, None, &std::collections::BTreeMap::new()) {
         Ok(v) => v,
         // The RunError Display is secret-free; we drop it silently (FAILURE).
         Err(_) => return false,
@@ -1117,7 +1118,12 @@ mod tests {
 
     struct NoRunner;
     impl SourceRunner for NoRunner {
-        fn run(&self, _argv: &[String]) -> Result<SecretBytes, RunError> {
+        fn run(
+            &self,
+            _argv: &[String],
+            _cwd: Option<&std::path::Path>,
+            _env: &std::collections::BTreeMap<String, String>,
+        ) -> Result<SecretBytes, RunError> {
             Err(RunError::EmptyOutput)
         }
     }
@@ -1476,7 +1482,12 @@ mod tests {
         }
     }
     impl SourceRunner for PemRunner {
-        fn run(&self, _argv: &[String]) -> Result<SecretBytes, RunError> {
+        fn run(
+            &self,
+            _argv: &[String],
+            _cwd: Option<&std::path::Path>,
+            _env: &std::collections::BTreeMap<String, String>,
+        ) -> Result<SecretBytes, RunError> {
             self.runs.set(self.runs.get() + 1);
             Ok(SecretBytes::from(ED25519_PEM))
         }

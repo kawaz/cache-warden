@@ -16,7 +16,7 @@ use crate::auth::{AuthContext, AuthError, AuthOperation, Authenticator};
 use crate::clock::{Clock, Monotonic};
 use crate::definition::{DefineError, Definition};
 use crate::entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl};
-use crate::meta::ValueMeta;
+use crate::meta::{SourceMeta, ValueMeta};
 use crate::process::ProcessInfo;
 use crate::secret::SecretBytes;
 use crate::source::{RunError, SourceRunner, ValueSource};
@@ -195,8 +195,8 @@ impl Store {
             .get_mut(key)
             .ok_or(RegenerateOutcome::NotFound)?;
 
-        let argv = match entry.source() {
-            ValueSource::Command { argv } => argv.clone(),
+        let (argv, cwd, env) = match entry.source() {
+            ValueSource::Command { argv, cwd, env } => (argv.clone(), cwd.clone(), env.clone()),
             ValueSource::Static => return Err(RegenerateOutcome::NotRegenerable),
         };
 
@@ -209,7 +209,9 @@ impl Store {
         let source = entry.source().clone();
 
         // 2. Re-run upstream. On failure nothing is mutated.
-        let value = runner.run(&argv).map_err(RegenerateOutcome::RunFailed)?;
+        let value = runner
+            .run(&argv, cwd.as_deref(), &env)
+            .map_err(RegenerateOutcome::RunFailed)?;
 
         // 3. Re-authenticate. `value` is dropped (zeroized) on the error path.
         auth.authenticate(&auth_context(key, AuthOperation::Regenerate, requester))
@@ -353,23 +355,29 @@ impl Store {
         source: ValueSource,
         ttl: Ttl,
     ) -> Result<(), DefineError> {
-        self.define_with_meta(key, source, ttl, ValueMeta::new())
+        self.define_with_meta(key, source, ttl, ValueMeta::new(), SourceMeta::new())
     }
 
-    /// Register a definition with opaque type metadata (DR-0016).
+    /// Register a definition with opaque type metadata (DR-0016) and an opaque
+    /// typed-source-origin slot (DR-0018 §2).
     ///
-    /// Same idempotency rule as [`Store::define`], but the [`ValueMeta`] is part
-    /// of the definition's identity: a redefine that differs only in its type
-    /// metadata is a [`DefineError::Conflict`] (a key cannot quietly change type).
-    /// The metadata is copied onto each value produced from this definition.
+    /// Same idempotency rule as [`Store::define`], but both the [`ValueMeta`] and
+    /// the [`SourceMeta`] are part of the definition's identity: a redefine that
+    /// differs only in its value-type metadata *or* in its typed source origin is
+    /// a [`DefineError::Conflict`] (a key cannot quietly change type or source).
+    /// The value metadata is copied onto each value produced from this definition;
+    /// the source metadata is preserved for `status` / persistence.
     pub fn define_with_meta(
         &mut self,
         key: impl Into<String>,
         source: ValueSource,
         ttl: Ttl,
         meta: ValueMeta,
+        source_meta: SourceMeta,
     ) -> Result<(), DefineError> {
-        let candidate = Definition::new(source, ttl)?.with_meta(meta);
+        let candidate = Definition::new(source, ttl)?
+            .with_meta(meta)
+            .with_source_meta(source_meta);
         let key = key.into();
         match self.definitions.get(&key) {
             Some(existing) if *existing == candidate => Ok(()), // idempotent no-op
@@ -469,8 +477,8 @@ impl Store {
             return Err(RegenerateDefOutcome::ValueResident);
         }
 
-        let argv = match definition.source() {
-            ValueSource::Command { argv } => argv.clone(),
+        let (argv, cwd, env) = match definition.source() {
+            ValueSource::Command { argv, cwd, env } => (argv.clone(), cwd.clone(), env.clone()),
             // Definitions are command-only by construction (`define` rejects
             // static), so this is unreachable; treated defensively.
             ValueSource::Static => return Err(RegenerateDefOutcome::Undefined),
@@ -479,7 +487,9 @@ impl Store {
         let ttl = definition.ttl();
 
         // 1. Re-run upstream. On failure nothing is mutated.
-        let value = runner.run(&argv).map_err(RegenerateDefOutcome::RunFailed)?;
+        let value = runner
+            .run(&argv, cwd.as_deref(), &env)
+            .map_err(RegenerateDefOutcome::RunFailed)?;
 
         // 2. Re-authenticate. `value` is dropped (zeroized) on the error path.
         auth.authenticate(&auth_context(key, AuthOperation::Regenerate, requester))
@@ -710,7 +720,12 @@ mod tests {
         }
     }
     impl SourceRunner for CountingRunner {
-        fn run(&self, _argv: &[String]) -> Result<SecretBytes, RunError> {
+        fn run(
+            &self,
+            _argv: &[String],
+            _cwd: Option<&std::path::Path>,
+            _env: &std::collections::BTreeMap<String, String>,
+        ) -> Result<SecretBytes, RunError> {
             self.runs.set(self.runs.get() + 1);
             Ok(SecretBytes::new(self.value.clone()))
         }
@@ -719,7 +734,12 @@ mod tests {
     /// A test runner that always fails (without running anything externally).
     struct FailingRunner;
     impl SourceRunner for FailingRunner {
-        fn run(&self, _argv: &[String]) -> Result<SecretBytes, RunError> {
+        fn run(
+            &self,
+            _argv: &[String],
+            _cwd: Option<&std::path::Path>,
+            _env: &std::collections::BTreeMap<String, String>,
+        ) -> Result<SecretBytes, RunError> {
             Err(RunError::EmptyOutput)
         }
     }
@@ -1575,7 +1595,7 @@ mod tests {
         // stores it on the definition and never copies it onto a produced value
         // (a value is always opaque bytes; DR-0016).
         let mut s = Store::new();
-        s.define_with_meta("OTP", cmd_source(), ttl(), otp_meta())
+        s.define_with_meta("OTP", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
         assert_eq!(s.definition_of("OTP").unwrap().meta(), &otp_meta());
         assert_eq!(
@@ -1594,7 +1614,7 @@ mod tests {
         // definition remains the source of truth for the key's type (DR-0016).
         let clock = FakeClock::new();
         let mut s = Store::new();
-        s.define_with_meta("K", cmd_source(), ttl(), otp_meta())
+        s.define_with_meta("K", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
         let runner = CountingRunner::new(b"seed-bytes");
         s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
@@ -1613,7 +1633,7 @@ mod tests {
         // definition's type survives, so the key stays otp-typed (DR-0016).
         let clock = FakeClock::new();
         let mut s = Store::new();
-        s.define_with_meta("K", cmd_source(), ttl(), otp_meta())
+        s.define_with_meta("K", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
         s.get_or_regenerate("K", &CountingRunner::new(b"orig"), &AllowAll, None, &clock)
             .unwrap();
@@ -1632,10 +1652,10 @@ mod tests {
         // A redefine that only changes the type metadata conflicts (a key cannot
         // silently change type; DR-0016).
         let mut s = Store::new();
-        s.define_with_meta("K", cmd_source(), ttl(), otp_meta())
+        s.define_with_meta("K", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
         // Same definition + same meta: idempotent no-op.
-        s.define_with_meta("K", cmd_source(), ttl(), otp_meta())
+        s.define_with_meta("K", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
         // Same source/ttl but no meta: a different definition -> conflict.
         assert_eq!(

@@ -122,8 +122,9 @@ fn stderr(o: &Output) -> String {
 /// Define a key (in the default namespace) whose value is the given literal
 /// (via `printf`). The wire key is the composed `default/KEY` (DR-0017).
 fn define(socket: &Path, key: &str, value: &str) {
-    let json =
-        format!(r#"{{"cmd":"kv.define","key":"default/{key}","argv":["printf","{value}"]}}"#);
+    let json = format!(
+        r#"{{"cmd":"kv.define","key":"default/{key}","source":"command","command":{{"argv":["printf","{value}"]}}}}"#
+    );
     let resp = request(socket, &json);
     assert_eq!(resp["ok"], true, "define {key}: {resp}");
 }
@@ -455,7 +456,7 @@ fn run_defs_registers_then_injects() {
     let defs = dir.path().join("defs.toml");
     std::fs::write(
         &defs,
-        "[kv.FROM_DEFS]\ncommand = [\"printf\", \"defs-value\"]\n",
+        "[kv.FROM_DEFS]\nsource = \"command\"\ncommand.argv = [\"printf\", \"defs-value\"]\n",
     )
     .unwrap();
 

@@ -101,7 +101,7 @@ fn full_lifecycle_over_control_socket() {
     assert_eq!(B64.decode(got).unwrap(), b"hunter2");
 
     // --- kv.define a second key (command source; lazy, value produced on get) ---
-    let def = r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","tok-value"]}"#;
+    let def = r#"{"cmd":"kv.define","key":"default/TOK","source":"command","command":{"argv":["printf","tok-value"]}}"#;
     let resp = request(&socket, def);
     assert_eq!(resp["ok"], true, "define: {resp}");
     // Right after define, status shows TOK as defined with no value yet.
@@ -255,16 +255,19 @@ fn kv_get_allowed_processes_admits_matching_ancestor_and_denies_others() {
     let cfg = format!(
         r#"
 [kv.OPEN]
-command = ["printf", "open-value"]
+source = "command"
+command.argv = ["printf", "open-value"]
 preload = true
 
 [kv.RESTRICT]
-command = ["printf", "restricted-value"]
+source = "command"
+command.argv = ["printf", "restricted-value"]
 preload = true
 allowed_processes = ["{allowed}"]
 
 [kv.DENIED]
-command = ["printf", "denied-value"]
+source = "command"
+command.argv = ["printf", "denied-value"]
 preload = true
 allowed_processes = ["no-such-process-name-xyz"]
 "#
@@ -330,14 +333,17 @@ fn config_preload_and_reauth_command_allow() {
     // triggers the re-auth command. `[auth].command = ["true"]` approves.
     let cfg = r#"
 [auth]
+type = "command"
 command = ["true"]
 
 [kv.TOK]
-command = ["printf", "preloaded-tok"]
+source = "command"
+command.argv = ["printf", "preloaded-tok"]
 preload = true
 
 [kv.EXT]
-command = ["printf", "ext-value"]
+source = "command"
+command.argv = ["printf", "ext-value"]
 soft-ttl = "1s"
 preload = true
 "#;
@@ -378,10 +384,12 @@ fn config_reauth_command_deny_blocks_extend() {
     // EXT is preloaded so it starts Active (it soft-expires after 1s).
     let cfg = r#"
 [auth]
+type = "command"
 command = ["false"]
 
 [kv.EXT]
-command = ["printf", "ext-value"]
+source = "command"
+command.argv = ["printf", "ext-value"]
 soft-ttl = "1s"
 preload = true
 "#;
@@ -419,10 +427,12 @@ fn pin_holds_value_past_soft_expiry_then_unpin_restores_gating() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = r#"
 [auth]
+type = "command"
 command = ["false"]
 
 [kv.EXT]
-command = ["printf", "ext-value"]
+source = "command"
+command.argv = ["printf", "ext-value"]
 soft-ttl = "1s"
 preload = true
 "#;
@@ -457,10 +467,12 @@ fn pin_with_approving_auth_survives_soft_expiry_and_unpin_restores_gating() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = r#"
 [auth]
+type = "command"
 command = ["true"]
 
 [kv.EXT]
-command = ["printf", "ext-value"]
+source = "command"
+command.argv = ["printf", "ext-value"]
 soft-ttl = "1s"
 hard-ttl = "2s"
 preload = true
@@ -572,7 +584,7 @@ fn define_get_lazy_del_value_only_then_get_regenerates() {
     // define (no upstream run yet) — status shows defined, no value.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","lazy-value"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","source":"command","command":{"argv":["printf","lazy-value"]}}"#,
     );
     assert_eq!(resp["ok"], true, "define: {resp}");
     let resp = request(&socket, r#"{"cmd":"status"}"#);
@@ -622,6 +634,43 @@ fn define_get_lazy_del_value_only_then_get_regenerates() {
 }
 
 #[test]
+fn define_command_cwd_and_env_take_effect_on_regeneration() {
+    // DR-0018 §1: a `command` source's cwd / env are carried onto the execution
+    // primitive and applied when the daemon runs the command.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+
+    // cwd: `pwd` reflects the requested working directory (/tmp).
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.define","key":"default/CWD","source":"command","command":{"argv":["pwd"],"cwd":"/tmp"}}"#,
+    );
+    assert_eq!(resp["ok"], true, "define cwd: {resp}");
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/CWD"}"#);
+    let got = B64.decode(resp["value_b64"].as_str().unwrap()).unwrap();
+    let got = String::from_utf8(got).unwrap();
+    assert!(got == "/tmp" || got == "/private/tmp", "pwd was {got:?}");
+
+    // env: the overlaid variable is visible to the command.
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.define","key":"default/ENV","source":"command","command":{"argv":["sh","-c","printf %s \"$CW_E2E_VAR\""],"env":{"CW_E2E_VAR":"from-overlay"}}}"#,
+    );
+    assert_eq!(resp["ok"], true, "define env: {resp}");
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/ENV"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"from-overlay"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
 fn del_with_define_drops_definition_so_get_is_not_found() {
     // DR-0014 §2: `kv.del --with-define` forgets the key entirely, so a later get
     // cannot regenerate it.
@@ -630,7 +679,7 @@ fn del_with_define_drops_definition_so_get_is_not_found() {
 
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","v"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","source":"command","command":{"argv":["printf","v"]}}"#,
     );
     assert_eq!(resp["ok"], true, "define: {resp}");
     // produce the value once.
@@ -676,19 +725,19 @@ fn define_conflict_then_del_with_define_allows_redefine() {
 
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","a"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","source":"command","command":{"argv":["printf","a"]}}"#,
     );
     assert_eq!(resp["ok"], true);
     // identical define is an idempotent no-op.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","a"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","source":"command","command":{"argv":["printf","a"]}}"#,
     );
     assert_eq!(resp["ok"], true, "identical define is a no-op: {resp}");
     // conflicting define is rejected with a redefine hint.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","b"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","source":"command","command":{"argv":["printf","b"]}}"#,
     );
     assert_eq!(resp["ok"], false, "conflict rejected: {resp}");
     assert_eq!(resp["error"]["kind"], "bad_request");
@@ -701,7 +750,7 @@ fn define_conflict_then_del_with_define_allows_redefine() {
     assert_eq!(resp["deleted"], true);
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","b"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","source":"command","command":{"argv":["printf","b"]}}"#,
     );
     assert_eq!(resp["ok"], true, "redefine after del succeeds: {resp}");
     let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/TOK"}"#);
@@ -757,6 +806,48 @@ fn run_cli(socket: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn cli_command_cwd_env_sugar_takes_effect() {
+    // DR-0018 §1: the `--command-cwd` / `--command-env` CLI sugar configures the
+    // `command` source's cwd / env, applied when the daemon runs the command.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+    let resp = request(&socket, r#"{"cmd":"ping"}"#);
+    assert_eq!(resp["ok"], true);
+
+    // --command-env precedes --command (which consumes the rest as argv).
+    let out = run_cli(
+        &socket,
+        &[
+            "kv",
+            "define",
+            "ENVKEY",
+            "--command-env",
+            "CW_SUGAR=sugar-val",
+            "--command",
+            "sh",
+            "-c",
+            "printf %s \"$CW_SUGAR\"",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "define --command-env failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/ENVKEY"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"sugar-val"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+#[test]
 fn define_defs_file_then_get_lazily_generates() {
     // `kv define --defs FILE` bulk-registers a file's definitions (lazy); a
     // later get produces each value on demand (DR-0014 §4).
@@ -767,10 +858,12 @@ fn define_defs_file_then_get_lazily_generates() {
     std::fs::write(
         &defs_path,
         r#"[kv.ALPHA]
-command = ["printf", "alpha-value"]
+source = "command"
+command.argv = ["printf", "alpha-value"]
 
 [kv.BETA]
-command = ["printf", "beta-value"]
+source = "command"
+command.argv = ["printf", "beta-value"]
 soft-ttl = "1h"
 "#,
     )
@@ -832,7 +925,7 @@ fn define_defs_conflict_is_aggregated_not_fatal() {
     // Pre-register CLASH with one argv.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"default/CLASH","argv":["printf","original"]}"#,
+        r#"{"cmd":"kv.define","key":"default/CLASH","source":"command","command":{"argv":["printf","original"]}}"#,
     );
     assert_eq!(resp["ok"], true);
 
@@ -841,10 +934,12 @@ fn define_defs_conflict_is_aggregated_not_fatal() {
     std::fs::write(
         &defs_path,
         r#"[kv.CLASH]
-command = ["printf", "different"]
+source = "command"
+command.argv = ["printf", "different"]
 
 [kv.FRESH]
-command = ["printf", "fresh-value"]
+source = "command"
+command.argv = ["printf", "fresh-value"]
 "#,
     )
     .unwrap();
@@ -918,7 +1013,7 @@ fn persisted_definition_survives_daemon_restart() {
     let secret_file = dir.path().join("secret.txt");
     std::fs::write(&secret_file, b"top-secret-output").unwrap();
     let define = format!(
-        r#"{{"cmd":"kv.define","key":"default/PERSISTED","argv":["sh","-c","cat {}"]}}"#,
+        r#"{{"cmd":"kv.define","key":"default/PERSISTED","source":"command","command":{{"argv":["sh","-c","cat {}"]}}}}"#,
         secret_file.display()
     );
     let resp = request(&socket, &define);
@@ -1016,7 +1111,7 @@ fn persistence_off_ignores_existing_state_file() {
     std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
     std::fs::write(
         &state_file,
-        "[kv.GHOST]\ncommand = [\"printf\", \"ghost\"]\n",
+        "[kv.default.GHOST]\nsource = \"command\"\ncommand.argv = [\"printf\", \"ghost\"]\n",
     )
     .unwrap();
 
@@ -1072,7 +1167,7 @@ fn persisted_config_priority_merge_drops_clashing_persisted_entry() {
     std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
     std::fs::write(
         &state_file,
-        "[kv.DB]\ncommand = [\"printf\", \"stale-persisted\"]\n",
+        "[kv.default.DB]\nsource = \"command\"\ncommand.argv = [\"printf\", \"stale-persisted\"]\n",
     )
     .unwrap();
 
@@ -1081,7 +1176,7 @@ fn persisted_config_priority_merge_drops_clashing_persisted_entry() {
     std::fs::write(
         &config_path,
         format!(
-            "[daemon]\nsocket = \"{}\"\npersist-definitions = true\n\n[kv.DB]\ncommand = [\"printf\", \"from-config\"]\n",
+            "[daemon]\nsocket = \"{}\"\npersist-definitions = true\n\n[kv.DB]\nsource = \"command\"\ncommand.argv = [\"printf\", \"from-config\"]\n",
             socket.display()
         ),
     )
@@ -1227,7 +1322,7 @@ fn otp_value_type_over_control_socket() {
 
     // --- kv.define an OTP key whose command emits the seed (6 digits default) ---
     let def = format!(
-        r#"{{"cmd":"kv.define","key":"default/OTP","argv":["printf","%s","{SEED_B32}"],"meta":{{"type":"otp"}}}}"#
+        r#"{{"cmd":"kv.define","key":"default/OTP","source":"command","command":{{"argv":["printf","%s","{SEED_B32}"]}},"meta":{{"type":"otp"}}}}"#
     );
     let resp = request(&socket, &def);
     assert_eq!(resp["ok"], true, "define otp: {resp}");
@@ -1276,7 +1371,7 @@ fn otp_value_type_over_control_socket() {
 
     // --- an 8-digit otp definition via params ---
     let def = format!(
-        r#"{{"cmd":"kv.define","key":"default/OTP8","argv":["printf","%s","{SEED_B32}"],"meta":{{"type":"otp","params":{{"digits":"8"}}}}}}"#
+        r#"{{"cmd":"kv.define","key":"default/OTP8","source":"command","command":{{"argv":["printf","%s","{SEED_B32}"]}},"meta":{{"type":"otp","params":{{"digits":"8"}}}}}}"#
     );
     assert_eq!(request(&socket, &def)["ok"], true);
     let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/OTP8"}"#);
@@ -1561,10 +1656,12 @@ fn defs_namespace_field_pins_entries_absolutely() {
         &defs_path,
         r#"[kv.PINNED]
 namespace = "fixed"
-command = ["printf", "pinned-value"]
+source = "command"
+command.argv = ["printf", "pinned-value"]
 
 [kv.FLOATING]
-command = ["printf", "floating-value"]
+source = "command"
+command.argv = ["printf", "floating-value"]
 "#,
     )
     .unwrap();

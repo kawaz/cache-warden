@@ -30,7 +30,7 @@
 //! definition, then re-define).
 
 use crate::entry::Ttl;
-use crate::meta::ValueMeta;
+use crate::meta::{SourceMeta, ValueMeta};
 use crate::source::ValueSource;
 
 /// A key's value-source definition: how to (re)produce its value, plus the TTL
@@ -41,11 +41,20 @@ use crate::source::ValueSource;
 /// produced value, but never interprets it. The metadata participates in the
 /// exact-match idempotency rule (a definition that differs only in its type
 /// metadata is a *different* definition, so a redefine conflicts).
+///
+/// A definition additionally carries an opaque [`SourceMeta`] (DR-0018 §2): the
+/// **typed source origin** it was defined from (`source = "command"` / `"op"` +
+/// the selected kind's fields). This is a *second* opaque slot, orthogonal to
+/// `ValueMeta` (value type vs. source type are independent axes). The execution
+/// primitive stays the lowered [`ValueSource::Command`]; this slot preserves the
+/// original typed form for `status`, persistence, and idempotency. Like
+/// `ValueMeta`, it participates in the exact-match idempotency rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Definition {
     source: ValueSource,
     ttl: Ttl,
     meta: ValueMeta,
+    source_meta: SourceMeta,
 }
 
 impl Definition {
@@ -60,17 +69,29 @@ impl Definition {
                 source,
                 ttl,
                 meta: ValueMeta::new(),
+                source_meta: SourceMeta::new(),
             }),
             ValueSource::Static => Err(DefineError::StaticNotDefinable),
         }
     }
 
-    /// Attach opaque metadata to this definition (builder style; DR-0016).
+    /// Attach opaque value-type metadata to this definition (builder style;
+    /// DR-0016).
     ///
     /// The core stores it verbatim and copies it onto each value produced from
     /// this definition; it never interprets the contents.
     pub fn with_meta(mut self, meta: ValueMeta) -> Self {
         self.meta = meta;
+        self
+    }
+
+    /// Attach the opaque typed-source-origin slot to this definition (builder
+    /// style; DR-0018 §2).
+    ///
+    /// The core stores it verbatim for `status` / persistence / idempotency and
+    /// never interprets it.
+    pub fn with_source_meta(mut self, source_meta: SourceMeta) -> Self {
+        self.source_meta = source_meta;
         self
     }
 
@@ -84,9 +105,15 @@ impl Definition {
         self.ttl
     }
 
-    /// Borrow this definition's opaque metadata (DR-0016). Value-free.
+    /// Borrow this definition's opaque value-type metadata (DR-0016). Value-free.
     pub fn meta(&self) -> &ValueMeta {
         &self.meta
+    }
+
+    /// Borrow this definition's opaque typed-source-origin slot (DR-0018 §2).
+    /// Value-free.
+    pub fn source_meta(&self) -> &SourceMeta {
+        &self.source_meta
     }
 }
 
@@ -171,5 +198,27 @@ mod tests {
         )
         .unwrap();
         assert_ne!(base, other_ttl);
+    }
+
+    #[test]
+    fn source_meta_participates_in_equality() {
+        use crate::meta::SourceMeta;
+        // Two definitions identical but for their typed source origin are
+        // *different* definitions (DR-0018 §2: source_meta is part of identity).
+        let op = SourceMeta::with_kind("op", [("uri".to_string(), "op://v/i/f".to_string())]);
+        let with = Definition::new(cmd(), ttl())
+            .unwrap()
+            .with_source_meta(op.clone());
+        let without = Definition::new(cmd(), ttl()).unwrap();
+        assert_ne!(with, without);
+
+        let same = Definition::new(cmd(), ttl()).unwrap().with_source_meta(op);
+        assert_eq!(with, same);
+    }
+
+    #[test]
+    fn source_meta_defaults_to_empty() {
+        let d = Definition::new(cmd(), ttl()).unwrap();
+        assert!(d.source_meta().is_empty());
     }
 }

@@ -92,6 +92,11 @@ fn render_response(resp: Response) -> Result<(), String> {
                             if let Some(t) = &e.value_type {
                                 attrs.push(format!("type {t}"));
                             }
+                            // The typed source origin (DR-0018 §3): value-free
+                            // (an op source shows its uri, never the secret).
+                            if let Some(src) = &e.source {
+                                attrs.push(format!("source {src}"));
+                            }
                             if e.defined {
                                 attrs.push("defined".to_string());
                             }
@@ -529,7 +534,7 @@ fn run_define_defs(
             let full_key = def.full_key(ctx_ns);
             let req = protocol::wire::Request::KvDefine {
                 key: full_key.clone(),
-                argv: def.command.clone(),
+                source: def.source.clone(),
                 soft_ttl_secs: def.soft_ttl_secs,
                 hard_ttl_secs: def.hard_ttl_secs,
                 meta: def.meta.clone(),
@@ -644,7 +649,7 @@ fn register_defs(
         for def in defs {
             let req = Request::KvDefine {
                 key: def.full_key(ctx_ns),
-                argv: def.command.clone(),
+                source: def.source.clone(),
                 soft_ttl_secs: def.soft_ttl_secs,
                 hard_ttl_secs: def.hard_ttl_secs,
                 meta: def.meta.clone(),

@@ -85,9 +85,14 @@ pub fn render_show(loaded: &LoadedConfig) -> String {
                 .map(|s| format!("{s}s"))
                 .unwrap_or_else(|| "-".to_string());
             let preload = if e.preload { " preload=true" } else { "" };
+            // Show the typed source origin (DR-0018 §3): value-free (an op source
+            // shows its uri reference, never a fetched secret).
+            let source =
+                crate::protocol::wire::source_meta_display_verbose(&e.source.to_source_meta())
+                    .unwrap_or_else(|| "(none)".to_string());
             out.push_str(&format!(
-                "  {}: command={:?} soft-ttl={soft} hard-ttl={hard}{preload}\n",
-                e.name, e.command
+                "  {}: source={source} soft-ttl={soft} hard-ttl={hard}{preload}\n",
+                e.name
             ));
         }
     }
@@ -209,6 +214,7 @@ keys = ["GITHUB_KEY"]
 socket = "/run/cw.sock"
 
 [auth]
+type = "command"
 command = ["reauth"]
 "#,
             Some(PathBuf::from("/etc/cache-warden/config.toml")),
@@ -223,7 +229,8 @@ command = ["reauth"]
     fn show_lists_kv_definitions() {
         let l = loaded(
             r#"[kv.DB]
-command = ["op", "read", "op://v/i"]
+source = "op"
+op.uri = "op://v/i/f"
 soft-ttl = "1h"
 hard-ttl = "24h"
 "#,
@@ -231,7 +238,8 @@ hard-ttl = "24h"
         );
         let out = render_show(&l);
         assert!(out.contains("kv definitions:"));
-        assert!(out.contains("DB: command="));
+        // The typed source origin (DR-0018 §3) shows the op reference.
+        assert!(out.contains("DB: source=op://v/i/f"), "out: {out}");
         assert!(out.contains("soft-ttl=3600s"));
         assert!(out.contains("hard-ttl=86400s"));
         // Lazy by default: no preload marker.
@@ -242,13 +250,17 @@ hard-ttl = "24h"
     fn show_marks_preload_true_definitions() {
         let l = loaded(
             r#"[kv.DB]
-command = ["op", "read", "op://v/i"]
+source = "command"
+command.argv = ["op", "read", "op://v/i"]
 preload = true
 "#,
             None,
         );
         let out = render_show(&l);
-        assert!(out.contains("DB: command="));
+        assert!(
+            out.contains("DB: source=command: op read op://v/i"),
+            "out: {out}"
+        );
         assert!(out.contains("preload=true"));
     }
 

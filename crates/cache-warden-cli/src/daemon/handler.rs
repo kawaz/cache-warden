@@ -16,7 +16,9 @@ use cache_warden::{
 };
 
 use crate::otp_type;
-use crate::protocol::wire::{EntryInfo, ErrorKind, Request, Response, SetSource, ValueMetaWire};
+use crate::protocol::wire::{
+    EntryInfo, ErrorKind, Request, Response, SetSource, SourceSpecWire, ValueMetaWire,
+};
 use crate::protocol::{decode_b64, encode_b64};
 
 /// Convert wire metadata into the core's opaque [`ValueMeta`].
@@ -98,11 +100,11 @@ where
         } => handle_set(store, ctx, key, source, soft_ttl_secs, hard_ttl_secs),
         Request::KvDefine {
             key,
-            argv,
+            source,
             soft_ttl_secs,
             hard_ttl_secs,
             meta,
-        } => handle_define(store, key, argv, soft_ttl_secs, hard_ttl_secs, meta),
+        } => handle_define(store, key, source, soft_ttl_secs, hard_ttl_secs, meta),
         Request::KvGet { key, dry_run } => handle_get(store, ctx, key, dry_run),
         Request::KvPin { key, duration_secs } => handle_pin(store, ctx, key, duration_secs),
         Request::KvUnpin { key } => {
@@ -167,6 +169,11 @@ where
             .and_then(|m| m.type_label())
             .filter(|t| !t.is_empty())
             .map(|t| t.to_string());
+        // The typed source origin (DR-0018 §2/§3), value-free: for an `op`
+        // source the reference (uri) is shown, never the fetched secret.
+        let source = store
+            .definition_of(&name)
+            .and_then(|d| crate::protocol::wire::source_meta_display(d.source_meta()));
         entries.push(EntryInfo {
             name,
             state,
@@ -175,6 +182,7 @@ where
             has_value,
             pin_remaining_secs,
             value_type,
+            source,
         });
     }
     Response::status(
@@ -256,7 +264,7 @@ where
 fn handle_define(
     store: &mut Store,
     key: String,
-    argv: Vec<String>,
+    source: SourceSpecWire,
     soft_ttl_secs: Option<u64>,
     hard_ttl_secs: Option<u64>,
     meta: ValueMetaWire,
@@ -264,8 +272,10 @@ fn handle_define(
     if let Err(resp) = validate_protocol_key(&key) {
         return resp;
     }
-    if argv.is_empty() {
-        return Response::error(ErrorKind::BadRequest, "command argv must not be empty");
+    // Validate the selected kind's required fields (DR-0018 §1: a kind-specific
+    // required check, e.g. `source = "command"` with no `command.argv`).
+    if let Err(e) = source.validate() {
+        return Response::error(ErrorKind::BadRequest, e);
     }
     let ttl = match Ttl::new(
         soft_ttl_secs.map(std::time::Duration::from_secs),
@@ -275,7 +285,12 @@ fn handle_define(
         Err(e) => return Response::error(ErrorKind::BadRequest, e.to_string()),
     };
 
-    match store.define_with_meta(key, ValueSource::command(argv), ttl, meta_from_wire(meta)) {
+    // Lower the typed source to the execution primitive (argv + cwd/env) while
+    // preserving the typed origin in the definition's opaque source slot so
+    // status / persistence / idempotency see the typed form (DR-0018 §1/§2).
+    let lowered = source.lower();
+    let source_meta = source.to_source_meta();
+    match store.define_with_meta(key, lowered, ttl, meta_from_wire(meta), source_meta) {
         Ok(()) => Response::defined_ack(),
         Err(DefineError::Conflict) => Response::error(
             ErrorKind::BadRequest,
@@ -563,7 +578,12 @@ mod tests {
         }
     }
     impl SourceRunner for CountingRunner {
-        fn run(&self, _argv: &[String]) -> Result<SecretBytes, RunError> {
+        fn run(
+            &self,
+            _argv: &[String],
+            _cwd: Option<&std::path::Path>,
+            _env: &std::collections::BTreeMap<String, String>,
+        ) -> Result<SecretBytes, RunError> {
             self.runs.set(self.runs.get() + 1);
             Ok(SecretBytes::new(self.value.clone()))
         }
@@ -571,7 +591,12 @@ mod tests {
 
     struct FailingRunner;
     impl SourceRunner for FailingRunner {
-        fn run(&self, _argv: &[String]) -> Result<SecretBytes, RunError> {
+        fn run(
+            &self,
+            _argv: &[String],
+            _cwd: Option<&std::path::Path>,
+            _env: &std::collections::BTreeMap<String, String>,
+        ) -> Result<SecretBytes, RunError> {
             Err(RunError::EmptyOutput)
         }
     }
@@ -623,10 +648,43 @@ mod tests {
         }
     }
 
+    /// A `command` typed source from a plain argv (test helper).
+    fn cmd_spec(argv: &[&str]) -> SourceSpecWire {
+        use crate::protocol::wire::CommandSpecWire;
+        SourceSpecWire::Command {
+            command: CommandSpecWire {
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+            },
+        }
+    }
+
     fn define_cmd(key: &str, argv: &[&str]) -> Request {
         Request::KvDefine {
             key: key.into(),
-            argv: argv.iter().map(|s| s.to_string()).collect(),
+            source: cmd_spec(argv),
+            soft_ttl_secs: Some(SOFT),
+            hard_ttl_secs: Some(HARD),
+            meta: Default::default(),
+        }
+    }
+
+    /// An `op` typed source from a uri (+ optional account) — test helper.
+    fn op_spec(uri: &str, account: Option<&str>) -> SourceSpecWire {
+        use crate::protocol::wire::OpSpecWire;
+        SourceSpecWire::Op {
+            op: OpSpecWire {
+                uri: uri.into(),
+                account: account.map(|s| s.to_string()),
+            },
+        }
+    }
+
+    fn define_with(key: &str, source: SourceSpecWire) -> Request {
+        Request::KvDefine {
+            key: key.into(),
+            source,
             soft_ttl_secs: Some(SOFT),
             hard_ttl_secs: Some(HARD),
             meta: Default::default(),
@@ -641,6 +699,112 @@ mod tests {
             },
             Response::Err(e) => panic!("expected ok, got error: {e:?}"),
         }
+    }
+
+    /// Read the `source` field of the single status entry for `key`.
+    fn status_source_of<A, R>(
+        store: &mut Store,
+        c: &HandlerCtx<'_, A, R, FakeClock>,
+        key: &str,
+    ) -> Option<String>
+    where
+        A: Authenticator + ?Sized,
+        R: SourceRunner,
+    {
+        let resp = handle_request(store, c, Request::Status);
+        match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::Status { entries, .. } => entries
+                    .into_iter()
+                    .find(|e| e.name == key)
+                    .and_then(|e| e.source),
+                _ => panic!("not status"),
+            },
+            _ => panic!("expected ok"),
+        }
+    }
+
+    #[test]
+    fn op_define_shows_uri_in_status_not_a_secret() {
+        // DR-0018 §3: an op source's status `source` is its uri reference.
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        assert!(
+            handle_request(
+                &mut store,
+                &c,
+                define_with(
+                    "default/GH",
+                    op_spec("op://vault/item/field", Some("acct.1password.com"))
+                )
+            )
+            .is_ok()
+        );
+        let src = status_source_of(&mut store, &c, "default/GH").unwrap();
+        assert_eq!(src, "op://vault/item/field (account acct.1password.com)");
+    }
+
+    #[test]
+    fn command_define_status_source_hides_argv() {
+        // DR-0018 §3 secret hygiene: a command source's status `source` is just
+        // the discriminant (the argv may carry a secret, e.g. `printf %s <seed>`).
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        assert!(
+            handle_request(
+                &mut store,
+                &c,
+                define_with("default/K", cmd_spec(&["printf", "%s", "SECRET_SEED"]))
+            )
+            .is_ok()
+        );
+        let src = status_source_of(&mut store, &c, "default/K").unwrap();
+        assert_eq!(src, "command");
+        // The status response as a whole must not leak the argv secret.
+        let resp = handle_request(&mut store, &c, Request::Status);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(!line.contains("SECRET_SEED"), "status leaked argv: {line}");
+    }
+
+    #[test]
+    fn op_redefine_identical_is_idempotent() {
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        let def = || define_with("default/GH", op_spec("op://v/i/f", None));
+        assert!(handle_request(&mut store, &c, def()).is_ok());
+        // Exact same typed source + TTL is a no-op (DR-0018 §1 idempotency).
+        assert!(handle_request(&mut store, &c, def()).is_ok());
+    }
+
+    #[test]
+    fn redefine_changing_only_typed_source_conflicts() {
+        // Idempotency compares the typed source origin (DR-0018 §2): switching the
+        // same key from a command source to an op source is a conflict, even if
+        // the lowered argv would coincide.
+        let clock = FakeClock::new();
+        let mut store = Store::new();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock);
+        assert!(
+            handle_request(
+                &mut store,
+                &c,
+                define_with("default/K", cmd_spec(&["op", "read", "op://v/i/f"]))
+            )
+            .is_ok()
+        );
+        let resp = handle_request(
+            &mut store,
+            &c,
+            define_with("default/K", op_spec("op://v/i/f", None)),
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
     }
 
     fn err_kind(resp: &Response) -> ErrorKind {
@@ -847,9 +1011,11 @@ mod tests {
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
+        // An empty `command.argv` is a kind-specific required-field violation
+        // (DR-0018 §1): source = "command" requires a non-empty argv.
         let req = Request::KvDefine {
             key: "default/K".into(),
-            argv: vec![],
+            source: cmd_spec(&[]),
             soft_ttl_secs: None,
             hard_ttl_secs: None,
             meta: Default::default(),
@@ -1289,7 +1455,7 @@ mod tests {
     fn define_otp_seed(key: &str, seed: &str, params: &[(&str, &str)]) -> Request {
         Request::KvDefine {
             key: key.into(),
-            argv: vec!["printf".into(), "%s".into(), seed.into()],
+            source: cmd_spec(&["printf", "%s", seed]),
             soft_ttl_secs: None,
             hard_ttl_secs: None,
             meta: otp_wire_meta(params),
@@ -1365,7 +1531,7 @@ mod tests {
         let c = ctx(&AllowAll, &runner, &clock);
         let define = Request::KvDefine {
             key: "default/OTP".into(),
-            argv: vec!["printf".into(), "%s".into(), OTP_SEED_B32.into()],
+            source: cmd_spec(&["printf", "%s", OTP_SEED_B32]),
             soft_ttl_secs: Some(SOFT),
             hard_ttl_secs: Some(HARD),
             meta: otp_wire_meta(&[("digits", "8")]),

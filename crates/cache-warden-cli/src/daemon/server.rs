@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use cache_warden::{
     AllowAll, Authenticator, CommandAuthenticator, CommandRunner, DefineError, ProcessInfo,
-    ProcessInspector, SourceRunner, Store, SystemClock, SystemInspector, Ttl, ValueSource,
+    ProcessInspector, SourceRunner, Store, SystemClock, SystemInspector, Ttl,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -367,10 +367,19 @@ fn register_definitions<R, C>(
         // Register the definition so a later `get` can regenerate the value. A
         // conflict (the same name already defined differently) should not happen
         // at startup from a single config, but is reported defensively. The
+        // typed source is lowered to the execution primitive while its typed
+        // origin is preserved in the opaque source slot (DR-0018 §1/§2). The
         // opaque value-type metadata (DR-0016) rides along with the definition.
-        let source = ValueSource::command(entry.command.clone());
+        let source = entry.source.lower();
+        let source_meta = entry.source.to_source_meta();
         let meta = crate::daemon::handler::meta_from_wire(entry.meta.clone());
-        match store.define_with_meta(full_key.clone(), source.clone(), ttl, meta.clone()) {
+        match store.define_with_meta(
+            full_key.clone(),
+            source.clone(),
+            ttl,
+            meta.clone(),
+            source_meta,
+        ) {
             Ok(()) => {}
             Err(DefineError::Conflict) => {
                 eprintln!(
@@ -391,7 +400,11 @@ fn register_definitions<R, C>(
         // `force_eager` holds composed keys (authsock `keys` are normalized at
         // config validation), so the comparison is composed-to-composed.
         if entry.preload || force_eager.contains(&full_key) {
-            match runner.run(&entry.command) {
+            // Run the lowered execution primitive (argv + cwd/env; DR-0018 §1).
+            let argv = source.command_argv().unwrap_or(&[]).to_vec();
+            let cwd = source.command_cwd().map(|p| p.to_path_buf());
+            let env = source.command_env().clone();
+            match runner.run(&argv, cwd.as_deref(), &env) {
                 Ok(value) => {
                     store.set(full_key.clone(), source, value, ttl, clock);
                 }
@@ -440,9 +453,10 @@ fn restore_persisted_definitions(
                 continue;
             }
         };
-        let source = ValueSource::command(def.command.clone());
+        let source = def.source.lower();
+        let source_meta = def.source.to_source_meta();
         let meta = crate::daemon::handler::meta_from_wire(def.meta.clone());
-        match store.define_with_meta(full_key.clone(), source, ttl, meta) {
+        match store.define_with_meta(full_key.clone(), source, ttl, meta, source_meta) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("cache-warden: persisted definition `{full_key}` skipped: {e}");
@@ -740,7 +754,7 @@ mod tests {
     #[test]
     fn build_authenticator_with_failing_command_denies() {
         // `[auth].command = ["false"]` => CommandAuthenticator that always denies.
-        let cfg = Config::parse("[auth]\ncommand = [\"false\"]\n").unwrap();
+        let cfg = Config::parse("[auth]\ntype = \"command\"\ncommand = [\"false\"]\n").unwrap();
         let auth = build_authenticator(&cfg);
         assert_eq!(
             auth.authenticate(&cache_warden::AuthContext::extend("K")),
@@ -750,7 +764,7 @@ mod tests {
 
     #[test]
     fn build_authenticator_with_passing_command_allows() {
-        let cfg = Config::parse("[auth]\ncommand = [\"true\"]\n").unwrap();
+        let cfg = Config::parse("[auth]\ntype = \"command\"\ncommand = [\"true\"]\n").unwrap();
         let auth = build_authenticator(&cfg);
         assert!(
             auth.authenticate(&cache_warden::AuthContext::extend("K"))
@@ -776,7 +790,13 @@ mod tests {
         let entries = vec![KvDefinition {
             name: "TOK".into(),
             namespace: None,
-            command: vec!["printf".into(), "tok-value".into()],
+            source: crate::protocol::wire::SourceSpecWire::Command {
+                command: crate::protocol::wire::CommandSpecWire {
+                    argv: vec!["printf".into(), "tok-value".into()],
+                    cwd: None,
+                    env: Default::default(),
+                },
+            },
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
             preload: false,
@@ -801,7 +821,13 @@ mod tests {
         let entries = vec![KvDefinition {
             name: "TOK".into(),
             namespace: None,
-            command: vec!["printf".into(), "tok-value".into()],
+            source: crate::protocol::wire::SourceSpecWire::Command {
+                command: crate::protocol::wire::CommandSpecWire {
+                    argv: vec!["printf".into(), "tok-value".into()],
+                    cwd: None,
+                    env: Default::default(),
+                },
+            },
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
             preload: true,
@@ -825,7 +851,13 @@ mod tests {
             KvDefinition {
                 name: "AGENT_KEY".into(),
                 namespace: None,
-                command: vec!["printf".into(), "pem-bytes".into()],
+                source: crate::protocol::wire::SourceSpecWire::Command {
+                    command: crate::protocol::wire::CommandSpecWire {
+                        argv: vec!["printf".into(), "pem-bytes".into()],
+                        cwd: None,
+                        env: Default::default(),
+                    },
+                },
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 preload: false, // not preloaded by flag…
@@ -834,7 +866,13 @@ mod tests {
             KvDefinition {
                 name: "OTHER".into(),
                 namespace: None,
-                command: vec!["printf".into(), "other".into()],
+                source: crate::protocol::wire::SourceSpecWire::Command {
+                    command: crate::protocol::wire::CommandSpecWire {
+                        argv: vec!["printf".into(), "other".into()],
+                        cwd: None,
+                        env: Default::default(),
+                    },
+                },
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 preload: false,
@@ -873,7 +911,13 @@ mod tests {
             KvDefinition {
                 name: "BAD".into(),
                 namespace: None,
-                command: vec!["this-binary-does-not-exist-cw-preload".into()],
+                source: crate::protocol::wire::SourceSpecWire::Command {
+                    command: crate::protocol::wire::CommandSpecWire {
+                        argv: vec!["this-binary-does-not-exist-cw-preload".into()],
+                        cwd: None,
+                        env: Default::default(),
+                    },
+                },
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 preload: true,
@@ -882,7 +926,13 @@ mod tests {
             KvDefinition {
                 name: "GOOD".into(),
                 namespace: None,
-                command: vec!["printf".into(), "ok".into()],
+                source: crate::protocol::wire::SourceSpecWire::Command {
+                    command: crate::protocol::wire::CommandSpecWire {
+                        argv: vec!["printf".into(), "ok".into()],
+                        cwd: None,
+                        env: Default::default(),
+                    },
+                },
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 preload: true,
@@ -918,7 +968,13 @@ mod tests {
         let entries = vec![KvDefinition {
             name: "AGENT_KEY".into(),
             namespace: None,
-            command: vec!["this-binary-does-not-exist-cw-preload".into()],
+            source: crate::protocol::wire::SourceSpecWire::Command {
+                command: crate::protocol::wire::CommandSpecWire {
+                    argv: vec!["this-binary-does-not-exist-cw-preload".into()],
+                    cwd: None,
+                    env: Default::default(),
+                },
+            },
             soft_ttl_secs: None,
             hard_ttl_secs: None,
             preload: false,
@@ -936,11 +992,22 @@ mod tests {
 
     // ---- restore_persisted_definitions (config-priority merge; DR-0014 §4) ----
 
+    fn cmd_src(argv: &[&str]) -> crate::protocol::wire::SourceSpecWire {
+        use crate::protocol::wire::{CommandSpecWire, SourceSpecWire};
+        SourceSpecWire::Command {
+            command: CommandSpecWire {
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+            },
+        }
+    }
+
     fn pdef(name: &str, argv: &[&str], soft: Option<u64>, hard: Option<u64>) -> KvDefinition {
         KvDefinition {
             name: name.into(),
             namespace: None,
-            command: argv.iter().map(|s| s.to_string()).collect(),
+            source: cmd_src(argv),
             soft_ttl_secs: soft,
             hard_ttl_secs: hard,
             preload: false,

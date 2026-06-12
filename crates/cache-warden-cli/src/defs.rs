@@ -68,13 +68,17 @@ fn meta_to_wire(meta: &ValueMeta) -> ValueMetaWire {
 /// source (which cannot happen for a registered definition) is skipped
 /// defensively. The result feeds [`serialize_definitions`] / [`save_definitions`].
 pub fn snapshot_definitions(store: &Store) -> Vec<KvDefinition> {
+    use crate::protocol::wire::SourceSpecWire;
     let mut out = Vec::new();
     for key in store.keys() {
         let Some(def) = store.definition_of(key) else {
             continue; // value-only key: nothing to persist
         };
-        let Some(argv) = def.source().command_argv() else {
-            continue; // defensively skip a non-command definition
+        // Persist the **typed source origin** (DR-0018 §2), not the lowered argv:
+        // the persisted file round-trips the typed form. A definition without a
+        // recorded typed origin (e.g. an internal authsock op key) is skipped.
+        let Some(source) = SourceSpecWire::from_source_meta(def.source_meta()) else {
+            continue;
         };
         let ttl = def.ttl();
         // Store keys are composed `NS/KEY` (DR-0017 §1); split so the
@@ -87,7 +91,7 @@ pub fn snapshot_definitions(store: &Store) -> Vec<KvDefinition> {
         out.push(KvDefinition {
             name: key_name.to_string(),
             namespace: Some(ns.to_string()),
-            command: argv.to_vec(),
+            source,
             soft_ttl_secs: ttl.soft().map(|d| d.as_secs()),
             hard_ttl_secs: ttl.hard().map(|d| d.as_secs()),
             preload: false,
@@ -110,9 +114,16 @@ pub fn snapshot_definitions(store: &Store) -> Vec<KvDefinition> {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DefEntry {
-    /// The command argv (program first) whose stdout is the value.
+    /// The source discriminant: `"command"` or `"op"` (DR-0018 §1).
     #[serde(default)]
-    command: Option<Vec<String>>,
+    source: Option<String>,
+    /// The `command` kind. Raw value so the bare array form can be rejected with
+    /// a steer (DR-0018 §1); a table is parsed into a [`CommandTable`].
+    #[serde(default)]
+    command: Option<toml::Value>,
+    /// The `op` kind table (used when `source = "op"`).
+    #[serde(default)]
+    op: Option<crate::config::OpTable>,
     /// Soft TTL string (e.g. `"1h"`).
     #[serde(default, rename = "soft-ttl")]
     soft_ttl: Option<String>,
@@ -176,7 +187,7 @@ impl DefEntry {
         if self.value.is_some() {
             return Err(ConfigError::new(format!(
                 "[kv.{name}]: inline `value` is not allowed — defs files declare \
-                 regenerable command definitions only, never literal secrets"
+                 regenerable typed-source definitions only, never literal secrets"
             )));
         }
         if self.value_stdin.is_some() {
@@ -188,23 +199,11 @@ impl DefEntry {
         if self.r#static.is_some() {
             return Err(ConfigError::new(format!(
                 "[kv.{name}]: a `static` source cannot be defined — only `command` \
-                 entries may be defined"
+                 / `op` sources may be defined"
             )));
         }
 
-        let command = match &self.command {
-            Some(argv) if !argv.is_empty() => argv.clone(),
-            Some(_) => {
-                return Err(ConfigError::new(format!(
-                    "[kv.{name}]: `command` must not be empty"
-                )));
-            }
-            None => {
-                return Err(ConfigError::new(format!(
-                    "[kv.{name}]: a definition entry requires a `command` source"
-                )));
-            }
-        };
+        let source = crate::config::build_kv_source(name, &self.source, &self.command, &self.op)?;
 
         let parse = |label: &str, s: &Option<String>| -> Result<Option<u64>, ConfigError> {
             match s {
@@ -227,7 +226,7 @@ impl DefEntry {
         Ok(KvDefinition {
             name: key_name,
             namespace,
-            command,
+            source,
             soft_ttl_secs: parse("soft-ttl", &self.soft_ttl)?,
             hard_ttl_secs: parse("hard-ttl", &self.hard_ttl)?,
             // Defs / persisted definitions are always lazy — `preload` is
@@ -329,7 +328,9 @@ pub fn serialize_definitions(defs: &[KvDefinition]) -> String {
             .as_deref()
             .unwrap_or(crate::namespace::DEFAULT_NAMESPACE);
         out.push_str(&format!("[kv.{ns}.{}]\n", def.name));
-        out.push_str(&format!("command = {}\n", toml_string_array(&def.command)));
+        // Write the typed source origin (DR-0018 §1): `source = "<kind>"` + the
+        // selected kind's table. Round-trips back through `build_kv_source`.
+        out.push_str(&serialize_source(&def.source));
         if let Some(secs) = def.soft_ttl_secs {
             out.push_str(&format!("soft-ttl = \"{secs}s\"\n"));
         }
@@ -354,6 +355,68 @@ pub fn serialize_definitions(defs: &[KvDefinition]) -> String {
         }
     }
     out
+}
+
+/// Serialize a typed source spec into TOML lines (`source = "<kind>"` + the
+/// selected kind's table) for the persisted-definitions file (DR-0018 §1).
+///
+/// Mirrors the human-authored grammar exactly so the persisted file round-trips
+/// back through [`crate::config::build_kv_source`]. Only the selected kind's
+/// table is emitted.
+fn serialize_source(source: &crate::protocol::wire::SourceSpecWire) -> String {
+    use crate::protocol::wire::SourceSpecWire;
+    let mut out = String::new();
+    match source {
+        SourceSpecWire::Command { command } => {
+            out.push_str("source = \"command\"\n");
+            out.push_str(&format!(
+                "command.argv = {}\n",
+                toml_string_array(&command.argv)
+            ));
+            if let Some(cwd) = &command.cwd {
+                out.push_str(&format!("command.cwd = {}\n", toml_basic_string(cwd)));
+            }
+            // `env` is a map; emit each entry as `command.env.NAME = "VALUE"`.
+            // Keys are the identifier-ish env names; quote them defensively as a
+            // basic string when they would not be a bare key. Env values may
+            // contain arbitrary characters, so always quote.
+            for (k, v) in &command.env {
+                out.push_str(&format!(
+                    "command.env.{} = {}\n",
+                    toml_bare_or_quoted_key(k),
+                    toml_basic_string(v)
+                ));
+            }
+        }
+        SourceSpecWire::Op { op } => {
+            out.push_str("source = \"op\"\n");
+            out.push_str(&format!("op.uri = {}\n", toml_basic_string(&op.uri)));
+            if let Some(acct) = &op.account {
+                out.push_str(&format!("op.account = {}\n", toml_basic_string(acct)));
+            }
+        }
+    }
+    out
+}
+
+/// Render a string as a TOML basic (double-quoted) string with the minimal
+/// escaping the rest of this file uses.
+fn toml_basic_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Render a map key as a TOML bare key when it matches `[A-Za-z0-9_-]+`, else a
+/// quoted basic-string key. Env names are usually bare, but values from the wire
+/// are not charset-constrained.
+fn toml_bare_or_quoted_key(k: &str) -> String {
+    if !k.is_empty()
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        k.to_string()
+    } else {
+        toml_basic_string(k)
+    }
 }
 
 /// Render a string slice as a TOML array of basic (double-quoted) strings.
@@ -437,11 +500,22 @@ pub fn save_definitions(path: &Path, defs: &[KvDefinition]) -> std::io::Result<(
 mod tests {
     use super::*;
 
+    fn cmd_src(argv: &[&str]) -> crate::protocol::wire::SourceSpecWire {
+        use crate::protocol::wire::{CommandSpecWire, SourceSpecWire};
+        SourceSpecWire::Command {
+            command: CommandSpecWire {
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+            },
+        }
+    }
+
     fn def(name: &str, argv: &[&str], soft: Option<u64>, hard: Option<u64>) -> KvDefinition {
         KvDefinition {
             name: name.to_string(),
             namespace: None,
-            command: argv.iter().map(|s| s.to_string()).collect(),
+            source: cmd_src(argv),
             soft_ttl_secs: soft,
             hard_ttl_secs: hard,
             preload: false,
@@ -455,7 +529,8 @@ mod tests {
     fn parses_a_single_command_entry_with_ttls() {
         let defs = parse_defs(
             r#"[kv.DB_PASSWORD]
-command = ["op", "read", "op://vault/item/password"]
+source = "command"
+command.argv = ["op", "read", "op://vault/item/password"]
 soft-ttl = "1h"
 hard-ttl = "24h"
 "#,
@@ -464,7 +539,12 @@ hard-ttl = "24h"
         assert_eq!(defs.len(), 1);
         let d = &defs[0];
         assert_eq!(d.name, "DB_PASSWORD");
-        assert_eq!(d.command, vec!["op", "read", "op://vault/item/password"]);
+        match &d.source {
+            crate::protocol::wire::SourceSpecWire::Command { command } => {
+                assert_eq!(command.argv, vec!["op", "read", "op://vault/item/password"]);
+            }
+            _ => panic!("expected command source"),
+        }
         assert_eq!(d.soft_ttl_secs, Some(3600));
         assert_eq!(d.hard_ttl_secs, Some(86400));
         assert!(!d.preload, "defs definitions are always lazy");
@@ -474,10 +554,12 @@ hard-ttl = "24h"
     fn parses_multiple_entries_name_sorted() {
         let defs = parse_defs(
             r#"[kv.B]
-command = ["echo", "b"]
+source = "command"
+command.argv = ["echo", "b"]
 
 [kv.A]
-command = ["echo", "a"]
+source = "command"
+command.argv = ["echo", "a"]
 "#,
         )
         .unwrap();
@@ -494,7 +576,8 @@ command = ["echo", "a"]
     fn preload_in_defs_is_rejected() {
         let err = parse_defs(
             r#"[kv.X]
-command = ["echo", "x"]
+source = "command"
+command.argv = ["echo", "x"]
 preload = true
 "#,
         )
@@ -526,14 +609,19 @@ soft-ttl = "1h"
 "#,
         )
         .unwrap_err();
-        assert!(err.message.contains("requires a `command`"));
+        assert!(
+            err.message.contains("requires") || err.message.contains("source"),
+            "msg: {}",
+            err.message
+        );
     }
 
     #[test]
     fn empty_command_is_rejected() {
         let err = parse_defs(
             r#"[kv.X]
-command = []
+source = "command"
+command.argv = []
 "#,
         )
         .unwrap_err();
@@ -544,7 +632,8 @@ command = []
     fn bad_ttl_is_rejected_naming_the_field() {
         let err = parse_defs(
             r#"[kv.X]
-command = ["echo", "x"]
+source = "command"
+command.argv = ["echo", "x"]
 soft-ttl = "1day"
 "#,
         )
@@ -556,7 +645,8 @@ soft-ttl = "1day"
     fn unknown_field_is_rejected() {
         let err = parse_defs(
             r#"[kv.X]
-command = ["echo", "x"]
+source = "command"
+command.argv = ["echo", "x"]
 bogus = 1
 "#,
         )
@@ -575,7 +665,8 @@ bogus = 1
     fn parses_an_otp_typed_entry_with_params() {
         let defs = parse_defs(
             r#"[kv.OTP]
-command = ["op", "read", "op://vault/item/field"]
+source = "command"
+command.argv = ["op", "read", "op://vault/item/field"]
 type = "otp"
 otp-digits = 8
 otp-period = 60
@@ -599,7 +690,8 @@ otp-algorithm = "SHA256"
     fn otp_params_without_type_are_rejected() {
         let err = parse_defs(
             r#"[kv.X]
-command = ["echo", "x"]
+source = "command"
+command.argv = ["echo", "x"]
 otp-digits = 8
 "#,
         )
@@ -615,7 +707,8 @@ otp-digits = 8
     fn unknown_type_in_defs_is_rejected() {
         let err = parse_defs(
             r#"[kv.X]
-command = ["echo", "x"]
+source = "command"
+command.argv = ["echo", "x"]
 type = "magic"
 "#,
         )
@@ -647,6 +740,7 @@ type = "magic"
         // Persisted entries come back with an absolute namespace (the dotted
         // table path); the composed key round-trips exactly.
         assert_eq!(back[0].full_key("ignored"), d.full_key("default"));
+        assert_eq!(back[0].source, d.source, "source round-trips");
         assert_eq!(back[0].meta, d.meta, "otp meta round-trips");
     }
 
@@ -662,10 +756,10 @@ type = "magic"
         let back = parse_persisted(&text).unwrap();
         assert_eq!(back.len(), 2);
         // The persisted form pins the absolute namespace; the composed key,
-        // argv, and TTLs round-trip exactly (DR-0017 §5).
+        // source, and TTLs round-trip exactly (DR-0017 §5).
         for (b, d) in back.iter().zip(defs.iter()) {
             assert_eq!(b.full_key("ignored"), d.full_key("default"));
-            assert_eq!(b.command, d.command);
+            assert_eq!(b.source, d.source);
             assert_eq!(b.soft_ttl_secs, d.soft_ttl_secs);
             assert_eq!(b.hard_ttl_secs, d.hard_ttl_secs);
         }
@@ -683,11 +777,11 @@ type = "magic"
         let able = text.find("[kv.default.ABLE]").expect("ABLE table");
         let zed = text.find("[kv.default.ZED]").expect("ZED table");
         assert!(able < zed, "name-sorted: {text}");
-        // No value field can ever appear.
-        assert!(!text.contains("value"));
+        // No inline value field can ever appear (there is no `value = ...` line).
+        assert!(!text.contains("\nvalue "), "no value field: {text}");
         // And no quoted table names: the identifier charset (DR-0017 §1.5)
         // makes every segment a TOML bare key.
-        assert!(!text.contains('"') || !text.contains("[kv.\""), "{text}");
+        assert!(!text.contains("[kv.\""), "{text}");
     }
 
     #[test]
@@ -703,6 +797,7 @@ type = "magic"
         let back = parse_persisted(&text).unwrap();
         assert_eq!(back[0].name, "c");
         assert_eq!(back[0].namespace.as_deref(), Some("projA"));
+        assert_eq!(back[0].source, d.source);
     }
 
     #[test]
@@ -713,6 +808,8 @@ type = "magic"
         a.namespace = Some("projA".into());
         let mut b = def("DB", &["echo", "b"], None, None);
         b.namespace = Some("projB".into());
+        let src_a = a.source.clone();
+        let src_b = b.source.clone();
         let text = serialize_definitions(&[a, b]);
         assert!(text.contains("[kv.projA.DB]"), "{text}");
         assert!(text.contains("[kv.projB.DB]"), "{text}");
@@ -720,13 +817,25 @@ type = "magic"
         assert_eq!(back.len(), 2);
         let keys: Vec<String> = back.iter().map(|d| d.full_key("ignored")).collect();
         assert_eq!(keys, vec!["projA/DB", "projB/DB"]);
+        // Sources round-trip
+        let back_a = back
+            .iter()
+            .find(|d| d.namespace.as_deref() == Some("projA"))
+            .unwrap();
+        let back_b = back
+            .iter()
+            .find(|d| d.namespace.as_deref() == Some("projB"))
+            .unwrap();
+        assert_eq!(back_a.source, src_a);
+        assert_eq!(back_b.source, src_b);
     }
 
     #[test]
     fn persisted_parser_rejects_flat_entries() {
         // The persisted grammar is uniformly two-level; a flat `[kv.KEY]`
         // table (the user-defs shape) does not parse.
-        let err = parse_persisted("[kv.K]\ncommand = [\"echo\"]\n").unwrap_err();
+        let err = parse_persisted("[kv.K]\nsource = \"command\"\ncommand.argv = [\"echo\"]\n")
+            .unwrap_err();
         assert!(err.message.contains("invalid TOML"), "msg: {}", err.message);
     }
 
@@ -752,7 +861,8 @@ type = "magic"
         // The old persisted shape (`[kv."NS/KEY"]`) is gone: a user-defs table
         // name is a plain identifier; the namespace travels in the per-entry
         // field only.
-        let err = parse_defs("[kv.\"projA/c\"]\ncommand = [\"echo\"]\n").unwrap_err();
+        let err = parse_defs("[kv.\"projA/c\"]\nsource = \"command\"\ncommand.argv = [\"echo\"]\n")
+            .unwrap_err();
         assert!(err.message.contains("A-Za-z0-9_"), "msg: {}", err.message);
     }
 
@@ -769,7 +879,12 @@ type = "magic"
         let defs = vec![def("K", &["echo", "a\"b"], None, None)];
         let text = serialize_definitions(&defs);
         let back = parse_persisted(&text).unwrap();
-        assert_eq!(back[0].command, vec!["echo", "a\"b"]);
+        match &back[0].source {
+            crate::protocol::wire::SourceSpecWire::Command { command } => {
+                assert_eq!(command.argv, vec!["echo", "a\"b"]);
+            }
+            _ => panic!("expected command source"),
+        }
     }
 
     // ---- load / save (atomic, 0600) ----
@@ -794,7 +909,7 @@ type = "magic"
         assert_eq!(back.len(), defs.len());
         for (b, d) in back.iter().zip(defs.iter()) {
             assert_eq!(b.full_key("ignored"), d.full_key("default"));
-            assert_eq!(b.command, d.command);
+            assert_eq!(b.source, d.source);
             assert_eq!(b.soft_ttl_secs, d.soft_ttl_secs);
             assert_eq!(b.hard_ttl_secs, d.hard_ttl_secs);
         }
@@ -851,7 +966,7 @@ type = "magic"
 
     #[test]
     fn snapshot_returns_only_definitions_name_sorted() {
-        use cache_warden::{FakeClock, SecretBytes, Ttl, ValueSource};
+        use cache_warden::{FakeClock, SecretBytes, Ttl, ValueMeta, ValueSource};
         use std::time::Duration;
         let mut store = Store::new();
         let ttl = Ttl::new(
@@ -859,18 +974,27 @@ type = "magic"
             Some(Duration::from_secs(86400)),
         )
         .unwrap();
+        // Build typed source specs and their corresponding SourceMeta for
+        // snapshot_definitions to reconstruct the typed origin.
+        let zed_argv = vec!["op".to_string(), "read".to_string(), "op://z".to_string()];
+        let zed_src = cmd_src(&["op", "read", "op://z"]);
         store
-            .define(
+            .define_with_meta(
                 "default/ZED",
-                ValueSource::command(vec!["op".into(), "read".into(), "op://z".into()]),
+                ValueSource::command(zed_argv),
                 ttl,
+                ValueMeta::new(),
+                zed_src.to_source_meta(),
             )
             .unwrap();
+        let able_src = cmd_src(&["printf", "x"]);
         store
-            .define(
+            .define_with_meta(
                 "default/ABLE",
                 ValueSource::command(vec!["printf".into(), "x".into()]),
                 Ttl::new(None, None).unwrap(),
+                ValueMeta::new(),
+                able_src.to_source_meta(),
             )
             .unwrap();
         // A static value-only entry must NOT appear in the snapshot.
@@ -892,20 +1016,28 @@ type = "magic"
                 .all(|d| d.namespace.as_deref() == Some("default"))
         );
         let zed = snap.iter().find(|d| d.name == "ZED").unwrap();
-        assert_eq!(zed.command, vec!["op", "read", "op://z"]);
+        match &zed.source {
+            crate::protocol::wire::SourceSpecWire::Command { command } => {
+                assert_eq!(command.argv, vec!["op", "read", "op://z"]);
+            }
+            _ => panic!("expected command source for ZED"),
+        }
         assert_eq!(zed.soft_ttl_secs, Some(3600));
         assert_eq!(zed.hard_ttl_secs, Some(86400));
     }
 
     #[test]
     fn snapshot_round_trips_through_serialize() {
-        use cache_warden::{Ttl, ValueSource};
+        use cache_warden::{Ttl, ValueMeta, ValueSource};
         let mut store = Store::new();
+        let src = cmd_src(&["echo", "x"]);
         store
-            .define(
+            .define_with_meta(
                 "default/K",
                 ValueSource::command(vec!["echo".into(), "x".into()]),
                 Ttl::new(None, None).unwrap(),
+                ValueMeta::new(),
+                src.to_source_meta(),
             )
             .unwrap();
         let snap = snapshot_definitions(&store);
@@ -926,5 +1058,171 @@ type = "magic"
             Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
         }
+    }
+
+    // ---- DR-0018: typed source schema new tests ----
+
+    #[test]
+    fn defs_op_source_parses_to_op_spec_wire() {
+        let defs = parse_defs(
+            r#"[kv.GH_KEY]
+source = "op"
+op.uri = "op://vault/github/private_key"
+op.account = "my.1password.com"
+"#,
+        )
+        .unwrap();
+        assert_eq!(defs.len(), 1);
+        match &defs[0].source {
+            crate::protocol::wire::SourceSpecWire::Op { op } => {
+                assert_eq!(op.uri, "op://vault/github/private_key");
+                assert_eq!(op.account.as_deref(), Some("my.1password.com"));
+            }
+            _ => panic!("expected op source"),
+        }
+    }
+
+    #[test]
+    fn defs_command_source_missing_argv_is_rejected() {
+        let err = parse_defs(
+            r#"[kv.KEY]
+source = "command"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("command.argv"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn defs_op_source_missing_uri_is_rejected() {
+        let err = parse_defs(
+            r#"[kv.KEY]
+source = "op"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("op.uri"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn defs_bare_command_array_is_rejected_with_steer() {
+        let err = parse_defs(
+            r#"[kv.KEY]
+command = ["op", "read", "op://v/i/f"]
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("bare") || err.message.contains("array"),
+            "msg: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn defs_unknown_source_kind_is_rejected() {
+        let err = parse_defs(
+            r#"[kv.KEY]
+source = "magic"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("unknown"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn defs_unselected_kind_table_is_ignored() {
+        // DR-0018 §1: an unselected kind table is ignored, not an error.
+        let defs = parse_defs(
+            r#"[kv.KEY]
+source = "op"
+op.uri = "op://v/i/f"
+command.argv = ["ignored"]
+"#,
+        )
+        .unwrap();
+        match &defs[0].source {
+            crate::protocol::wire::SourceSpecWire::Op { op } => {
+                assert_eq!(op.uri, "op://v/i/f");
+            }
+            _ => panic!("expected op source"),
+        }
+    }
+
+    #[test]
+    fn defs_command_source_with_cwd_and_env_parses() {
+        let defs = parse_defs(
+            r#"[kv.KEY]
+source = "command"
+command.argv = ["prog", "arg"]
+command.cwd = "/tmp"
+command.env.MY_VAR = "my_val"
+"#,
+        )
+        .unwrap();
+        match &defs[0].source {
+            crate::protocol::wire::SourceSpecWire::Command { command } => {
+                assert_eq!(command.argv, vec!["prog", "arg"]);
+                assert_eq!(command.cwd.as_deref(), Some("/tmp"));
+                assert_eq!(
+                    command.env.get("MY_VAR").map(String::as_str),
+                    Some("my_val")
+                );
+            }
+            _ => panic!("expected command source"),
+        }
+    }
+
+    #[test]
+    fn defs_round_trip_command_with_cwd_env() {
+        // serialize_definitions → parse_persisted: command kind with cwd/env round-trips.
+        use crate::protocol::wire::{CommandSpecWire, SourceSpecWire};
+        let d = KvDefinition {
+            name: "KEY".to_string(),
+            namespace: Some("default".to_string()),
+            source: SourceSpecWire::Command {
+                command: CommandSpecWire {
+                    argv: vec!["prog".to_string(), "arg".to_string()],
+                    cwd: Some("/tmp".to_string()),
+                    env: [("MY_VAR".to_string(), "my_val".to_string())]
+                        .into_iter()
+                        .collect(),
+                },
+            },
+            soft_ttl_secs: Some(3600),
+            hard_ttl_secs: None,
+            preload: false,
+            meta: Default::default(),
+        };
+        let text = serialize_definitions(std::slice::from_ref(&d));
+        let back = parse_persisted(&text).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].source, d.source);
+        assert_eq!(back[0].soft_ttl_secs, d.soft_ttl_secs);
+    }
+
+    #[test]
+    fn defs_round_trip_op_with_account() {
+        // serialize_definitions → parse_persisted: op kind with account round-trips.
+        use crate::protocol::wire::{OpSpecWire, SourceSpecWire};
+        let d = KvDefinition {
+            name: "KEY".to_string(),
+            namespace: Some("default".to_string()),
+            source: SourceSpecWire::Op {
+                op: OpSpecWire {
+                    uri: "op://vault/item/field".to_string(),
+                    account: Some("my.1password.com".to_string()),
+                },
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: Some(86400),
+            preload: false,
+            meta: Default::default(),
+        };
+        let text = serialize_definitions(std::slice::from_ref(&d));
+        let back = parse_persisted(&text).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].source, d.source);
+        assert_eq!(back[0].hard_ttl_secs, d.hard_ttl_secs);
     }
 }

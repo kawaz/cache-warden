@@ -351,9 +351,16 @@ pub fn kv_define() -> HelpSpec {
                        Consumes everything after it, so it must come last",
             },
             Row {
+                name: "--command-cwd PATH",
+                desc: "Working directory for --command (place before --command)",
+            },
+            Row {
+                name: "--command-env N=V",
+                desc: "Env overlay for --command (repeatable; before --command)",
+            },
+            Row {
                 name: "--source URI",
-                desc: "A source URI; only op:// is built in\n\
-                       (expands to `op read <URI>`)",
+                desc: "An op:// source URI (lowered to `op read <URI>`)",
             },
             Row {
                 name: "--defs FILE",

@@ -12,14 +12,23 @@
 //! socket = "~/.local/state/cache-warden/control.sock"  # overridable; CLI --socket wins
 //! allow-debug-attach = false   # default: refuse debugger attachment at startup (5b)
 //!
-//! [auth]
-//! command = ["/path/to/reauth-prompt"]   # omitted => no re-auth (AllowAll)
+//! [auth]                                  # omit [auth] entirely => no re-auth (AllowAll)
+//! type = "command"                        # required when [auth] is present (DR-0018 §3)
+//! command = ["/path/to/reauth-prompt"]    # required for type = "command"
 //!
-//! [kv.DB_PASSWORD]                        # a command-source definition
-//! command = ["op", "read", "op://vault/item/password"]
+//! [kv.DB_PASSWORD]                        # a command-source definition (DR-0018 §1)
+//! source = "command"
+//! command.argv = ["op", "read", "op://vault/item/password"]
+//! command.cwd  = "/tmp"                   # optional
+//! command.env.K1 = "V1"                   # optional env overlay
 //! soft-ttl = "1h"
 //! hard-ttl = "24h"
 //! preload = true                          # run at startup (default: lazy)
+//!
+//! [kv.GITHUB_KEY]                         # an op-source definition (DR-0018 §1)
+//! source = "op"
+//! op.uri = "op://vault/github/private_key"
+//! op.account = "my.1password.com"         # optional
 //! ```
 //!
 //! # Definitions are lazy by default (DR-0014 §4)
@@ -77,9 +86,10 @@ pub struct Config {
     /// Daemon-level settings (socket path).
     #[serde(default)]
     pub daemon: DaemonConfig,
-    /// Re-authentication settings.
+    /// Re-authentication settings (DR-0018 §3). `None` = `[auth]` omitted =
+    /// AllowAll (no re-auth). `Some` = `[auth]` present, which requires `type`.
     #[serde(default)]
-    pub auth: AuthConfig,
+    pub auth: Option<AuthConfig>,
     /// Command-source definitions registered at startup, keyed by entry name. A
     /// `BTreeMap` keeps a deterministic (sorted) registration order for
     /// predictable startup logging.
@@ -401,28 +411,76 @@ pub struct DaemonConfig {
     pub allow_debug_attach: bool,
 }
 
-/// `[auth]` section.
+/// `[auth]` section (typed since DR-0018 §3).
+///
+/// `[auth]` omitted entirely => AllowAll (no re-auth). When `[auth]` is present,
+/// `type` is **required** (`type = "command"` is the only kind in v1); the
+/// `command` argv is required only for `type = "command"`. The `type`枠 is the
+/// receptacle for future kinds (`touchid` / `push`).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    /// The re-authentication command argv (program first). Absent => no re-auth
-    /// (the daemon wires `AllowAll`).
+    /// The auth kind discriminant. Required when `[auth]` is present.
+    #[serde(default, rename = "type")]
+    pub auth_type: Option<String>,
+    /// The re-authentication command argv (program first). Required for
+    /// `type = "command"`.
     #[serde(default)]
     pub command: Option<Vec<String>>,
 }
 
-/// One `[kv.NAME]` command-source definition entry.
+/// The `command` kind table of a `[kv.NAME]` entry (DR-0018 §1).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandTable {
+    /// The command argv (program first) whose stdout is the value. Required when
+    /// `source = "command"`.
+    #[serde(default)]
+    pub argv: Option<Vec<String>>,
+    /// Working directory to spawn the command in (optional).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Environment overlay merged onto the daemon's environment (optional).
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// The `op` kind table of a `[kv.NAME]` entry (DR-0018 §1).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpTable {
+    /// The `op://vault/item/field` reference. Required when `source = "op"`.
+    #[serde(default)]
+    pub uri: Option<String>,
+    /// 1Password account (`op --account ...`), optional.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// One `[kv.NAME]` typed-source definition entry (DR-0018 §1).
 ///
-/// Only a `command` source is permitted (see the module note on why inline
-/// values are forbidden). The `value` / `value-stdin` / `static` keys exist in
-/// the schema *only* so a friendly error can be raised when a user tries to
-/// write a literal secret; they are otherwise unused.
+/// `source = "<kind>"` is the discriminant; the selected kind's table
+/// (`command.*` / `op.*`) holds the spec. An unselected kind table is ignored,
+/// not an error. The bare `command = [...]` array form is **rejected** (it is
+/// ambiguous with the `command` kind table; DR-0018 §1). The `value` /
+/// `value-stdin` / `static` keys exist in the schema *only* so a friendly error
+/// can be raised when a user tries to write a literal secret.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KvEntryConfig {
-    /// The upstream command argv (program first) whose stdout is the value.
+    /// The source discriminant: `"command"` or `"op"`. Required to declare a
+    /// definition (DR-0018 §1).
     #[serde(default)]
-    pub command: Option<Vec<String>>,
+    pub source: Option<String>,
+    /// The `command` kind. Received as a raw value so the bare array form
+    /// (`command = [...]`, DR-0018 §1) can be rejected with a friendly steer
+    /// rather than an opaque TOML type error; a table is parsed into
+    /// [`CommandTable`] at validation time.
+    #[serde(default)]
+    pub command: Option<toml::Value>,
+    /// The `op` kind table (used when `source = "op"`).
+    #[serde(default)]
+    pub op: Option<OpTable>,
     /// Soft TTL string (e.g. `"1h"`). Parsed via [`parse_duration`].
     #[serde(default, rename = "soft-ttl")]
     pub soft_ttl: Option<String>,
@@ -490,8 +548,10 @@ pub struct KvDefinition {
     /// for "the context default" (the daemon config context is `"default"`, a
     /// `kv define --defs` context is its `--namespace` value).
     pub namespace: Option<String>,
-    /// The command argv (program first) whose stdout is the value.
-    pub command: Vec<String>,
+    /// The typed source spec (DR-0018 §1): the discriminant + the selected kind's
+    /// fields. Lowered to an execution argv at registration; the typed form is
+    /// preserved for `status` / persistence / idempotency.
+    pub source: crate::protocol::wire::SourceSpecWire,
     /// Parsed soft TTL in seconds, or `None`.
     pub soft_ttl_secs: Option<u64>,
     /// Parsed hard TTL in seconds, or `None`.
@@ -593,6 +653,115 @@ pub fn build_kv_meta(
     }
 }
 
+/// Build a [`SourceSpecWire`](crate::protocol::wire::SourceSpecWire) from the
+/// `source` discriminant + the kind tables (`command` / `op`) of a `[kv.NAME]`
+/// entry (DR-0018 §1). Shared by the config `[kv.*]` parser and the defs-file
+/// parser so both speak the same grammar.
+///
+/// Rules (DR-0018 §1):
+/// - `source` is required (a definition must name its kind).
+/// - The bare array form (`command = [...]`) is rejected with a steer to
+///   `command.argv = [...]`.
+/// - Only the **selected** kind's required fields are checked; an unselected kind
+///   table is ignored (not an error).
+pub fn build_kv_source(
+    name: &str,
+    source: &Option<String>,
+    command: &Option<toml::Value>,
+    op: &Option<OpTable>,
+) -> Result<crate::protocol::wire::SourceSpecWire, ConfigError> {
+    use crate::protocol::wire::{CommandSpecWire, OpSpecWire, SourceSpecWire};
+
+    // A bare `command = [...]` array is the retired shorthand; steer to the table
+    // form. Detect it regardless of the chosen source so the message is helpful
+    // even if `source` is also missing.
+    if let Some(toml::Value::Array(_)) = command {
+        return Err(ConfigError::new(format!(
+            "[kv.{name}]: the bare `command = [...]` array form was removed; \
+             write `source = \"command\"` with `command.argv = [...]` instead (DR-0018)"
+        )));
+    }
+
+    // Parse the `command` table (if a table was given) into its fields.
+    let command_table: Option<CommandTable> =
+        match command {
+            None => None,
+            Some(v @ toml::Value::Table(_)) => Some(v.clone().try_into().map_err(|e| {
+                ConfigError::new(format!("[kv.{name}]: invalid `command` table: {e}"))
+            })?),
+            Some(_) => {
+                return Err(ConfigError::new(format!(
+                    "[kv.{name}]: `command` must be a table (`command.argv = [...]`), not a scalar"
+                )));
+            }
+        };
+
+    let source = source.as_deref().ok_or_else(|| {
+        ConfigError::new(format!(
+            "[kv.{name}]: a definition entry requires `source = \"command\"` or `source = \"op\"`"
+        ))
+    })?;
+
+    match source {
+        "command" => {
+            let table = command_table.ok_or_else(|| {
+                ConfigError::new(format!(
+                    "[kv.{name}]: source = \"command\" requires a `command.argv = [...]`"
+                ))
+            })?;
+            let argv = match table.argv {
+                Some(argv) if !argv.is_empty() => argv,
+                Some(_) => {
+                    return Err(ConfigError::new(format!(
+                        "[kv.{name}]: `command.argv` must not be empty"
+                    )));
+                }
+                None => {
+                    return Err(ConfigError::new(format!(
+                        "[kv.{name}]: source = \"command\" requires a `command.argv = [...]`"
+                    )));
+                }
+            };
+            Ok(SourceSpecWire::Command {
+                command: CommandSpecWire {
+                    argv,
+                    cwd: table.cwd,
+                    env: table.env,
+                },
+            })
+        }
+        "op" => {
+            let table = op.as_ref().ok_or_else(|| {
+                ConfigError::new(format!(
+                    "[kv.{name}]: source = \"op\" requires an `op.uri = \"op://...\"`"
+                ))
+            })?;
+            let uri = match &table.uri {
+                Some(uri) if uri.starts_with("op://") => uri.clone(),
+                Some(uri) => {
+                    return Err(ConfigError::new(format!(
+                        "[kv.{name}]: `op.uri` must be an op:// reference (got {uri:?})"
+                    )));
+                }
+                None => {
+                    return Err(ConfigError::new(format!(
+                        "[kv.{name}]: source = \"op\" requires an `op.uri = \"op://...\"`"
+                    )));
+                }
+            };
+            Ok(SourceSpecWire::Op {
+                op: OpSpecWire {
+                    uri,
+                    account: table.account.clone(),
+                },
+            })
+        }
+        other => Err(ConfigError::new(format!(
+            "[kv.{name}]: unknown `source` {other:?} (the source kinds are \"command\" and \"op\")"
+        ))),
+    }
+}
+
 /// The TOML-writable form of value-type metadata: `(type, digits, period,
 /// algorithm)`, each an already-stringified field ready to serialize.
 pub type MetaTomlFields = (String, Option<String>, Option<String>, Option<String>);
@@ -625,7 +794,7 @@ impl KvEntryConfig {
     fn validate(&self, name: &str) -> Result<KvDefinition, ConfigError> {
         if self.value.is_some() {
             return Err(ConfigError::new(format!(
-                "[kv.{name}]: inline `value` is not allowed — secrets must not be stored in config; use a `command` source or pipe the value in at runtime (`... | cache-warden kv set {name}`)"
+                "[kv.{name}]: inline `value` is not allowed — secrets must not be stored in config; use a typed source (`source = \"command\"` / `\"op\"`) or pipe the value in at runtime (`... | cache-warden kv set {name}`)"
             )));
         }
         if self.value_stdin.is_some() {
@@ -635,23 +804,11 @@ impl KvEntryConfig {
         }
         if self.r#static.is_some() {
             return Err(ConfigError::new(format!(
-                "[kv.{name}]: a `static` source cannot be defined from config — only `command` entries may be defined"
+                "[kv.{name}]: a `static` source cannot be defined from config — only `command` / `op` sources may be defined"
             )));
         }
 
-        let command = match &self.command {
-            Some(argv) if !argv.is_empty() => argv.clone(),
-            Some(_) => {
-                return Err(ConfigError::new(format!(
-                    "[kv.{name}]: `command` must not be empty"
-                )));
-            }
-            None => {
-                return Err(ConfigError::new(format!(
-                    "[kv.{name}]: a definition entry requires a `command` source"
-                )));
-            }
-        };
+        let source = build_kv_source(name, &self.source, &self.command, &self.op)?;
 
         let parse = |label: &str, s: &Option<String>| -> Result<Option<u64>, ConfigError> {
             match s {
@@ -675,7 +832,7 @@ impl KvEntryConfig {
         Ok(KvDefinition {
             name: key_name,
             namespace,
-            command,
+            source,
             soft_ttl_secs,
             hard_ttl_secs,
             preload: self.preload,
@@ -867,21 +1024,47 @@ impl Config {
                 "[cli]: {e}"
             ))));
         }
-        // An empty (or omitted) auth command is treated as "no command", not as
-        // a configured-but-empty command; reject the misleading empty form.
-        if let Some(argv) = &cfg.auth.command
-            && argv.is_empty()
-        {
-            return Err(ConfigParseError::Content(ConfigError::new(
-                "[auth]: `command` must not be empty (omit the key for no re-authentication)",
-            )));
+        // Typed auth (DR-0018 §3): `[auth]` present requires `type`. `type =
+        // "command"` requires a non-empty `command`; an unknown / missing type is
+        // an error (omit `[auth]` entirely for no re-authentication = AllowAll).
+        if let Some(auth) = &cfg.auth {
+            match auth.auth_type.as_deref() {
+                None => {
+                    return Err(ConfigParseError::Content(ConfigError::new(
+                        "[auth]: `type` is required when [auth] is present \
+                         (use `type = \"command\"`; omit [auth] entirely for no re-authentication)",
+                    )));
+                }
+                Some("command") => match &auth.command {
+                    Some(argv) if !argv.is_empty() => {}
+                    Some(_) => {
+                        return Err(ConfigParseError::Content(ConfigError::new(
+                            "[auth]: `command` must not be empty for type = \"command\"",
+                        )));
+                    }
+                    None => {
+                        return Err(ConfigParseError::Content(ConfigError::new(
+                            "[auth]: type = \"command\" requires a `command = [...]` argv",
+                        )));
+                    }
+                },
+                Some(other) => {
+                    return Err(ConfigParseError::Content(ConfigError::new(format!(
+                        "[auth]: unknown `type` {other:?} (the only auth type is \"command\")"
+                    ))));
+                }
+            }
         }
         Ok(cfg)
     }
 
-    /// The resolved re-authentication command argv, if any.
+    /// The resolved re-authentication command argv, if any (DR-0018 §3:
+    /// `type = "command"`). `None` when `[auth]` is omitted (AllowAll).
     pub fn auth_command(&self) -> Option<&[String]> {
-        self.auth.command.as_deref()
+        self.auth
+            .as_ref()
+            .filter(|a| a.auth_type.as_deref() == Some("command"))
+            .and_then(|a| a.command.as_deref())
     }
 
     /// The validated `[kv.*]` definitions, in deterministic (name-sorted) order.
@@ -1225,6 +1408,7 @@ socket = "~/.local/state/cache-warden/control.sock"
     fn auth_command_is_read_as_argv() {
         let cfg = Config::parse(
             r#"[auth]
+type = "command"
 command = ["/usr/local/bin/reauth", "--prompt"]
 "#,
         )
@@ -1239,6 +1423,7 @@ command = ["/usr/local/bin/reauth", "--prompt"]
     fn empty_auth_command_is_rejected() {
         let err = Config::parse(
             r#"[auth]
+type = "command"
 command = []
 "#,
         )
@@ -1250,10 +1435,43 @@ command = []
     }
 
     #[test]
+    fn auth_without_type_is_rejected() {
+        let err = Config::parse(
+            r#"[auth]
+command = ["/usr/local/bin/reauth"]
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(e.message.contains("type"), "msg: {}", e.message)
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_unknown_type_is_rejected() {
+        let err = Config::parse(
+            r#"[auth]
+type = "touchid"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(e.message.contains("unknown"), "msg: {}", e.message)
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn kv_command_entry_with_ttls_validates() {
         let cfg = Config::parse(
             r#"[kv.DB_PASSWORD]
-command = ["op", "read", "op://vault/item/password"]
+source = "command"
+command.argv = ["op", "read", "op://vault/item/password"]
 soft-ttl = "1h"
 hard-ttl = "24h"
 "#,
@@ -1263,7 +1481,12 @@ hard-ttl = "24h"
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.name, "DB_PASSWORD");
-        assert_eq!(e.command, vec!["op", "read", "op://vault/item/password"]);
+        match &e.source {
+            crate::protocol::wire::SourceSpecWire::Command { command } => {
+                assert_eq!(command.argv, vec!["op", "read", "op://vault/item/password"]);
+            }
+            _ => panic!("expected command source"),
+        }
         assert_eq!(e.soft_ttl_secs, Some(3600));
         assert_eq!(e.hard_ttl_secs, Some(86400));
     }
@@ -1272,7 +1495,8 @@ hard-ttl = "24h"
     fn kv_otp_typed_entry_validates_and_carries_meta() {
         let cfg = Config::parse(
             r#"[kv.OTP]
-command = ["op", "read", "op://vault/item/field"]
+source = "command"
+command.argv = ["op", "read", "op://vault/item/field"]
 type = "otp"
 otp-digits = 8
 otp-algorithm = "sha256"
@@ -1294,7 +1518,8 @@ otp-algorithm = "sha256"
     fn kv_otp_params_without_type_are_rejected() {
         let err = Config::parse(
             r#"[kv.X]
-command = ["echo", "x"]
+source = "command"
+command.argv = ["echo", "x"]
 otp-period = 30
 "#,
         )
@@ -1311,7 +1536,8 @@ otp-period = 30
     fn kv_unknown_type_is_rejected() {
         let err = Config::parse(
             r#"[kv.X]
-command = ["echo", "x"]
+source = "command"
+command.argv = ["echo", "x"]
 type = "magic"
 "#,
         )
@@ -1323,10 +1549,12 @@ type = "magic"
     fn kv_entries_are_sorted_by_name() {
         let cfg = Config::parse(
             r#"[kv.B]
-command = ["echo", "b"]
+source = "command"
+command.argv = ["echo", "b"]
 
 [kv.A]
-command = ["echo", "a"]
+source = "command"
+command.argv = ["echo", "a"]
 "#,
         )
         .unwrap();
@@ -1382,7 +1610,13 @@ soft-ttl = "1h"
         )
         .unwrap_err();
         match err {
-            ConfigParseError::Content(e) => assert!(e.message.contains("requires a `command`")),
+            ConfigParseError::Content(e) => {
+                assert!(
+                    e.message.contains("requires") || e.message.contains("source"),
+                    "msg: {}",
+                    e.message
+                )
+            }
             other => panic!("expected content error, got {other:?}"),
         }
     }
@@ -1391,7 +1625,8 @@ soft-ttl = "1h"
     fn kv_entry_with_empty_command_is_rejected() {
         let err = Config::parse(
             r#"[kv.X]
-command = []
+source = "command"
+command.argv = []
 "#,
         )
         .unwrap_err();
@@ -1402,7 +1637,8 @@ command = []
     fn kv_entry_with_bad_ttl_is_rejected() {
         let err = Config::parse(
             r#"[kv.X]
-command = ["echo", "x"]
+source = "command"
+command.argv = ["echo", "x"]
 soft-ttl = "1d"
 "#,
         )
@@ -1633,7 +1869,8 @@ bogus = 1
         // restriction and does not appear in the policy table at all.
         let cfg = Config::parse(
             r#"[kv.TOK]
-command = ["printf", "x"]
+source = "command"
+command.argv = ["printf", "x"]
 "#,
         )
         .unwrap();
@@ -1644,7 +1881,8 @@ command = ["printf", "x"]
     fn kv_entry_allowed_processes_are_read_into_the_policy_table() {
         let cfg = Config::parse(
             r#"[kv.TOK]
-command = ["printf", "x"]
+source = "command"
+command.argv = ["printf", "x"]
 allowed_processes = ["ssh", "git"]
 "#,
         )
@@ -1665,7 +1903,8 @@ allowed_processes = ["ssh", "git"]
         // "empty == allow-all" footgun is avoided by simply not storing it).
         let cfg = Config::parse(
             r#"[kv.TOK]
-command = ["printf", "x"]
+source = "command"
+command.argv = ["printf", "x"]
 allowed_processes = []
 "#,
         )
@@ -1680,7 +1919,8 @@ allowed_processes = []
         // state file. A client must never be able to self-declare its own policy.
         let cfg = Config::parse(
             r#"[kv.TOK]
-command = ["printf", "x"]
+source = "command"
+command.argv = ["printf", "x"]
 allowed_processes = ["ssh"]
 "#,
         )
@@ -2107,6 +2347,186 @@ path = "/tmp/s.sock"
         match err {
             ConfigParseError::Content(e) => assert!(e.message.contains("source")),
             other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    // ---- DR-0018: typed source schema new tests ----
+
+    #[test]
+    fn kv_op_source_parses_to_op_spec_wire() {
+        let cfg = Config::parse(
+            r#"[kv.GH_KEY]
+source = "op"
+op.uri = "op://vault/github/private_key"
+op.account = "my.1password.com"
+"#,
+        )
+        .unwrap();
+        let entries = cfg.kv_definitions();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        match &e.source {
+            crate::protocol::wire::SourceSpecWire::Op { op } => {
+                assert_eq!(op.uri, "op://vault/github/private_key");
+                assert_eq!(op.account.as_deref(), Some("my.1password.com"));
+            }
+            _ => panic!("expected op source"),
+        }
+    }
+
+    #[test]
+    fn kv_op_source_without_account_is_allowed() {
+        let cfg = Config::parse(
+            r#"[kv.KEY]
+source = "op"
+op.uri = "op://v/i/f"
+"#,
+        )
+        .unwrap();
+        let entries = cfg.kv_definitions();
+        match &entries[0].source {
+            crate::protocol::wire::SourceSpecWire::Op { op } => {
+                assert_eq!(op.uri, "op://v/i/f");
+                assert!(op.account.is_none());
+            }
+            _ => panic!("expected op source"),
+        }
+    }
+
+    #[test]
+    fn kv_op_source_missing_uri_is_rejected() {
+        let err = Config::parse(
+            r#"[kv.KEY]
+source = "op"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(e.message.contains("op.uri"), "msg: {}", e.message)
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_command_source_missing_argv_is_rejected() {
+        let err = Config::parse(
+            r#"[kv.KEY]
+source = "command"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(e.message.contains("command.argv"), "msg: {}", e.message)
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_bare_command_array_is_rejected_with_steer() {
+        // The bare `command = [...]` array form is removed (DR-0018 §1).
+        let err = Config::parse(
+            r#"[kv.KEY]
+command = ["op", "read", "op://v/i/f"]
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(
+                    e.message.contains("bare") || e.message.contains("array"),
+                    "msg: {}",
+                    e.message
+                )
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_bare_command_array_rejected_even_with_source_present() {
+        // Even if `source` is set, the bare array form is rejected first.
+        let err = Config::parse(
+            r#"[kv.KEY]
+source = "command"
+command = ["op", "read", "op://v/i/f"]
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(
+                    e.message.contains("bare") || e.message.contains("array"),
+                    "msg: {}",
+                    e.message
+                )
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_unknown_source_kind_is_rejected() {
+        let err = Config::parse(
+            r#"[kv.KEY]
+source = "magic"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigParseError::Content(e) => {
+                assert!(e.message.contains("unknown"), "msg: {}", e.message)
+            }
+            other => panic!("expected content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_unselected_kind_table_is_ignored() {
+        // DR-0018 §1: only the selected kind's fields are required;
+        // an unselected kind table is ignored, not an error.
+        let cfg = Config::parse(
+            r#"[kv.KEY]
+source = "op"
+op.uri = "op://v/i/f"
+command.argv = ["ignored"]
+"#,
+        )
+        .unwrap();
+        let entries = cfg.kv_definitions();
+        match &entries[0].source {
+            crate::protocol::wire::SourceSpecWire::Op { op } => {
+                assert_eq!(op.uri, "op://v/i/f");
+            }
+            _ => panic!("expected op source"),
+        }
+    }
+
+    #[test]
+    fn kv_command_source_with_cwd_and_env_parses() {
+        let cfg = Config::parse(
+            r#"[kv.KEY]
+source = "command"
+command.argv = ["prog", "arg"]
+command.cwd = "/tmp"
+command.env.MY_VAR = "my_val"
+"#,
+        )
+        .unwrap();
+        let entries = cfg.kv_definitions();
+        match &entries[0].source {
+            crate::protocol::wire::SourceSpecWire::Command { command } => {
+                assert_eq!(command.argv, vec!["prog", "arg"]);
+                assert_eq!(command.cwd.as_deref(), Some("/tmp"));
+                assert_eq!(
+                    command.env.get("MY_VAR").map(String::as_str),
+                    Some("my_val")
+                );
+            }
+            _ => panic!("expected command source"),
         }
     }
 }

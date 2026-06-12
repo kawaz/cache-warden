@@ -47,6 +47,235 @@ impl ValueMetaWire {
     }
 }
 
+/// A typed source spec carried on `kv.define` (DR-0018 §1).
+///
+/// The `source` field is the discriminant (`"command"` / `"op"`), and the
+/// selected kind's table travels alongside it (`command` / `op`). This mirrors
+/// the TOML config / defs grammar (`source = "command"` + `command.{...}`) on the
+/// wire as `{"source":"command","command":{...}}`. The CLI sends it verbatim; the
+/// daemon lowers it to an execution argv (DR-0018 §1 "lowering") while preserving
+/// the typed origin in the definition's opaque source slot (DR-0018 §2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum SourceSpecWire {
+    /// `source = "command"`: run an argv (optionally in a cwd, with an env
+    /// overlay). The execution primitive.
+    Command {
+        /// The `command` kind table.
+        command: CommandSpecWire,
+    },
+    /// `source = "op"`: a 1Password `op://` reference (lowered to an `op read`
+    /// argv at the daemon). The verbatim origin is preserved for `status`.
+    Op {
+        /// The `op` kind table.
+        op: OpSpecWire,
+    },
+}
+
+/// The `command` kind table (DR-0018 §1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSpecWire {
+    /// The command line as already-split argv (program first). Required.
+    pub argv: Vec<String>,
+    /// Working directory to spawn the command in. Omitted on the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Environment overlay merged onto the daemon's environment (same-named keys
+    /// override). Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+/// The `op` kind table (DR-0018 §1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpSpecWire {
+    /// The `op://vault/item/field` reference. Required.
+    pub uri: String,
+    /// 1Password account (`op --account ...`). Omitted on the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
+/// Render a definition's opaque [`cache_warden::SourceMeta`] into a value-free,
+/// human-readable origin string for the **`status` IPC response** (DR-0018 §3),
+/// or `None` for an empty slot.
+///
+/// # Secret hygiene (why `command` does not show its argv here)
+///
+/// `status` is an IPC reply that crosses a process boundary. A `command` source's
+/// argv can legitimately carry a literal secret (e.g. `printf %s <seed>`), so
+/// surfacing it over the wire would leak it. The `op` source's `uri` is a
+/// *reference* (never the fetched value), so it is safe to show. Therefore:
+///
+/// - `op` → the `op.uri` (with ` (account ACCOUNT)` appended when set).
+/// - `command` → just `"command"` (the discriminant; never the argv).
+/// - any other / future kind → `kind: <kind>` as a safe fallback.
+///
+/// `config show` deliberately reveals the argv (the config file is on-disk
+/// plaintext the operator already owns); it uses [`source_meta_display_verbose`].
+pub fn source_meta_display(meta: &cache_warden::SourceMeta) -> Option<String> {
+    let kind = meta.kind()?;
+    match kind {
+        "op" => {
+            let uri = meta.field("uri").unwrap_or("");
+            Some(match meta.field("account") {
+                Some(acct) => format!("{uri} (account {acct})"),
+                None => uri.to_string(),
+            })
+        }
+        "command" => Some("command".to_string()),
+        other => Some(format!("kind: {other}")),
+    }
+}
+
+/// Like [`source_meta_display`] but reveals a `command` source's argv. Used only
+/// by `config show`, where the argv is read straight from the on-disk config the
+/// operator owns (no new exposure). Never used on an IPC boundary.
+pub fn source_meta_display_verbose(meta: &cache_warden::SourceMeta) -> Option<String> {
+    match meta.kind()? {
+        "command" => {
+            // argv is newline-joined in the opaque slot; show it space-joined.
+            let argv = meta.field("argv").unwrap_or("");
+            Some(format!("command: {}", argv.replace('\n', " ")))
+        }
+        _ => source_meta_display(meta),
+    }
+}
+
+impl SourceSpecWire {
+    /// Validate the selected kind's required fields (DR-0018 §1).
+    ///
+    /// `command` requires a non-empty `argv`; `op` requires a non-empty `uri`.
+    /// Returns a secret-free message naming the kind on violation.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            SourceSpecWire::Command { command } => {
+                if command.argv.is_empty() {
+                    return Err("source = \"command\" requires a non-empty `command.argv`".into());
+                }
+            }
+            SourceSpecWire::Op { op } => {
+                if op.uri.trim().is_empty() {
+                    return Err("source = \"op\" requires a non-empty `op.uri`".into());
+                }
+                if !op.uri.starts_with("op://") {
+                    return Err(format!(
+                        "source = \"op\": `op.uri` must be an op:// reference (got {:?})",
+                        op.uri
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Lower this typed source to the core execution primitive
+    /// ([`cache_warden::ValueSource::Command`]) — the argv (+ cwd / env) the
+    /// daemon actually runs (DR-0018 §1 "lowering").
+    ///
+    /// - `command` → the argv verbatim, with its cwd / env carried onto the
+    ///   primitive.
+    /// - `op` → `["op", "read", uri]`, plus `--account ACCOUNT` after `op` when an
+    ///   account is set (matching the authsock `op_account` convention).
+    pub fn lower(&self) -> cache_warden::ValueSource {
+        match self {
+            SourceSpecWire::Command { command } => cache_warden::ValueSource::command_with(
+                command.argv.clone(),
+                command.cwd.as_ref().map(std::path::PathBuf::from),
+                command.env.clone(),
+            ),
+            SourceSpecWire::Op { op } => {
+                let mut argv = vec!["op".to_string()];
+                if let Some(acct) = &op.account {
+                    argv.push("--account".to_string());
+                    argv.push(acct.clone());
+                }
+                argv.push("read".to_string());
+                argv.push(op.uri.clone());
+                cache_warden::ValueSource::command(argv)
+            }
+        }
+    }
+
+    /// Reconstruct a typed source from the core's opaque
+    /// [`cache_warden::SourceMeta`] slot (the inverse of [`Self::to_source_meta`]).
+    ///
+    /// Returns `None` when the slot is empty or its kind is unknown (e.g. an
+    /// internal authsock op key that was registered without a typed origin), so a
+    /// snapshot of such a definition is skipped rather than mis-rendered.
+    pub fn from_source_meta(meta: &cache_warden::SourceMeta) -> Option<Self> {
+        match meta.kind()? {
+            "command" => {
+                let argv: Vec<String> = match meta.field("argv") {
+                    Some(s) if !s.is_empty() => s.split('\n').map(|s| s.to_string()).collect(),
+                    _ => return None, // a command source always has a non-empty argv
+                };
+                let cwd = meta.field("cwd").map(|s| s.to_string());
+                let env: BTreeMap<String, String> = meta
+                    .field("env")
+                    .map(|s| {
+                        s.split('\n')
+                            .filter_map(|line| {
+                                line.split_once('=')
+                                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(SourceSpecWire::Command {
+                    command: CommandSpecWire { argv, cwd, env },
+                })
+            }
+            "op" => {
+                let uri = meta.field("uri")?.to_string();
+                let account = meta.field("account").map(|s| s.to_string());
+                Some(SourceSpecWire::Op {
+                    op: OpSpecWire { uri, account },
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Render this typed source into the core's opaque [`cache_warden::SourceMeta`]
+    /// slot (DR-0018 §2): the discriminant plus the selected kind's verbatim
+    /// fields. Only the chosen kind's fields are recorded.
+    ///
+    /// Multi-valued fields are rendered into deterministic, round-trippable string
+    /// forms (newline-joined argv; `name=value` newline-joined env) so the opaque
+    /// slot stays a flat string→string bag while still distinguishing every
+    /// origin for the idempotency comparison.
+    pub fn to_source_meta(&self) -> cache_warden::SourceMeta {
+        match self {
+            SourceSpecWire::Command { command } => {
+                let mut fields = BTreeMap::new();
+                fields.insert("argv".to_string(), command.argv.join("\n"));
+                if let Some(cwd) = &command.cwd {
+                    fields.insert("cwd".to_string(), cwd.clone());
+                }
+                if !command.env.is_empty() {
+                    let rendered = command
+                        .env
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    fields.insert("env".to_string(), rendered);
+                }
+                cache_warden::SourceMeta::with_kind("command", fields)
+            }
+            SourceSpecWire::Op { op } => {
+                let mut fields = BTreeMap::new();
+                fields.insert("uri".to_string(), op.uri.clone());
+                if let Some(acct) = &op.account {
+                    fields.insert("account".to_string(), acct.clone());
+                }
+                cache_warden::SourceMeta::with_kind("op", fields)
+            }
+        }
+    }
+}
+
 /// A request from the management client to the daemon.
 ///
 /// The `cmd` field is the discriminant. Unknown commands are rejected by the
@@ -79,18 +308,23 @@ pub enum Request {
         #[serde(default)]
         hard_ttl_secs: Option<u64>,
     },
-    /// Register a command-source *definition* for a key (DR-0014 §1).
+    /// Register a *typed source* definition for a key (DR-0014 §1 / DR-0018 §1).
     ///
-    /// Idempotent under exact match (same argv + TTL is a no-op); a mismatch is
-    /// rejected with [`ErrorKind::BadRequest`]. No upstream runs at define time —
-    /// the value is produced lazily on the first `kv.get`.
+    /// Idempotent under exact match (same typed source + TTL + value meta is a
+    /// no-op); a mismatch is rejected with [`ErrorKind::BadRequest`]. No upstream
+    /// runs at define time — the value is produced lazily on the first `kv.get`.
+    ///
+    /// The `source` carries the typed origin verbatim (`{"source":"command",
+    /// "command":{...}}` or `{"source":"op","op":{...}}`); the daemon lowers it to
+    /// an execution argv while preserving the typed form in the definition's
+    /// opaque source slot (DR-0018 §2).
     #[serde(rename = "kv.define")]
     KvDefine {
         /// The key to define.
         key: String,
-        /// The command line as already-split argv (program first). For `op://`
-        /// sources the CLI has already expanded the URI into `["op", "read", ...]`.
-        argv: Vec<String>,
+        /// The typed source spec (the discriminant + the selected kind's table).
+        #[serde(flatten)]
+        source: SourceSpecWire,
         /// Soft TTL in seconds, or `None` for "never soft-expires".
         #[serde(default)]
         soft_ttl_secs: Option<u64>,
@@ -299,6 +533,13 @@ pub struct EntryInfo {
     /// from the value's metadata, or the definition's for a definition-only key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_type: Option<String>,
+    /// A value-free, human-readable rendering of the definition's **typed source
+    /// origin** (DR-0018 §2/§3): e.g. `op://vault/item/field` for an `op` source,
+    /// or `command: op read …` for a `command` source. `None` for a value-only
+    /// key (no definition) or a definition with no recorded typed origin. Never
+    /// exposes the secret — for `op` it is the reference, never the fetched value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// A structured error returned in a failed [`Response`].
@@ -484,17 +725,29 @@ mod tests {
         roundtrip_request(&req);
     }
 
+    /// A `command`-kind source spec from a plain argv (test helper).
+    fn cmd_spec(argv: &[&str]) -> SourceSpecWire {
+        SourceSpecWire::Command {
+            command: CommandSpecWire {
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+                cwd: None,
+                env: BTreeMap::new(),
+            },
+        }
+    }
+
     #[test]
-    fn kv_define_roundtrips_and_uses_cmd_tag() {
+    fn kv_define_command_roundtrips_and_uses_typed_source() {
         let req = Request::KvDefine {
             key: "TOK".into(),
-            argv: vec!["op".into(), "read".into(), "op://v/i/f".into()],
+            source: cmd_spec(&["op", "read", "op://v/i/f"]),
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
             meta: Default::default(),
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""cmd":"kv.define""#), "{line}");
+        assert!(line.contains(r#""source":"command""#), "{line}");
         assert!(
             line.contains(r#""argv":["op","read","op://v/i/f"]"#),
             "{line}"
@@ -503,8 +756,56 @@ mod tests {
     }
 
     #[test]
+    fn kv_define_op_source_roundtrips() {
+        let req = Request::KvDefine {
+            key: "GH".into(),
+            source: SourceSpecWire::Op {
+                op: OpSpecWire {
+                    uri: "op://vault/github/private_key".into(),
+                    account: Some("my.1password.com".into()),
+                },
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            meta: Default::default(),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains(r#""source":"op""#), "{line}");
+        assert!(
+            line.contains(r#""uri":"op://vault/github/private_key""#),
+            "{line}"
+        );
+        assert!(line.contains(r#""account":"my.1password.com""#), "{line}");
+        roundtrip_request(&req);
+    }
+
+    #[test]
+    fn kv_define_command_carries_cwd_and_env() {
+        let mut env = BTreeMap::new();
+        env.insert("K1".to_string(), "V1".to_string());
+        let req = Request::KvDefine {
+            key: "K".into(),
+            source: SourceSpecWire::Command {
+                command: CommandSpecWire {
+                    argv: vec!["prog".into()],
+                    cwd: Some("/tmp".into()),
+                    env,
+                },
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            meta: Default::default(),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains(r#""cwd":"/tmp""#), "{line}");
+        assert!(line.contains(r#""K1":"V1""#), "{line}");
+        roundtrip_request(&req);
+    }
+
+    #[test]
     fn kv_define_ttls_default_to_none_when_absent() {
-        let line = r#"{"cmd":"kv.define","key":"K","argv":["echo","x"]}"#;
+        let line =
+            r#"{"cmd":"kv.define","key":"K","source":"command","command":{"argv":["echo","x"]}}"#;
         let req: Request = serde_json::from_str(line).unwrap();
         match req {
             Request::KvDefine {
@@ -674,6 +975,7 @@ mod tests {
                     has_value: true,
                     pin_remaining_secs: None,
                     value_type: None,
+                    source: None,
                 },
                 EntryInfo {
                     name: "P".into(),
@@ -683,6 +985,7 @@ mod tests {
                     has_value: true,
                     pin_remaining_secs: Some(3600),
                     value_type: Some("otp".into()),
+                    source: None,
                 },
             ],
         );
@@ -700,6 +1003,7 @@ mod tests {
             has_value: true,
             pin_remaining_secs: None,
             value_type: None,
+            source: None,
         };
         let line = serde_json::to_string(&info).unwrap();
         assert!(!line.contains("pin_remaining_secs"), "{line}");

@@ -141,7 +141,9 @@ _cache-warden() {
                     "$socket_opt" \
                     "$ns_opt" \
                     '--help[Show this help message]' \
-                    '--source[A source URI (op:// is built in)]:uri' \
+                    '--source[An op:// source URI]:uri' \
+                    '--command-cwd[Working directory for --command (place before --command)]:dir:_files -/' \
+                    '*--command-env[Env overlay for --command (NAME=VALUE; before --command)]:env' \
                     '*--defs[Register every kv.NAME table in a TOML defs file]:file:_files' \
                     "$ttl_otp_opts[@]" \
                     '*--command[Run ARGV; its stdout is the value (must come last)]:argv:_normal' \

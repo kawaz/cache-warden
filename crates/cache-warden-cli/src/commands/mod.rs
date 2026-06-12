@@ -368,14 +368,16 @@ pub fn parse_kv_set(
     })
 }
 
-/// Expand a `--source URI` into a command argv (DR-0014 §3).
+/// Parse a `--source URI` into the `op` typed source (DR-0018 §1).
 ///
-/// Only `op://` is built in: it maps to `["op", "read", "<URI>"]`. Any other
-/// scheme is an "unsupported source scheme" error. (Future vendor schemes are a
-/// config-driven follow-up; the table lives outside the core.)
-pub fn expand_source_uri(uri: &str) -> Result<Vec<String>, String> {
+/// Only `op://` is built in. Any other scheme is an "unsupported source scheme"
+/// error. (Future vendor schemes are a config-driven follow-up.)
+pub fn parse_source_uri(uri: &str) -> Result<crate::protocol::wire::OpSpecWire, String> {
     if uri.starts_with("op://") {
-        Ok(vec!["op".to_string(), "read".to_string(), uri.to_string()])
+        Ok(crate::protocol::wire::OpSpecWire {
+            uri: uri.to_string(),
+            account: None,
+        })
     } else {
         let scheme = uri.split("://").next().unwrap_or(uri);
         Err(format!(
@@ -384,17 +386,78 @@ pub fn expand_source_uri(uri: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// The extracted command flags: `(cwd, env overlay, remaining args)`.
+type CommandFlags = (
+    Option<String>,
+    std::collections::BTreeMap<String, String>,
+    Vec<String>,
+);
+
+/// Extract the `--command-cwd PATH` and repeatable `--command-env NAME=VALUE`
+/// prefix-grouping flags from `args` (DR-0018 §1), returning `(cwd, env, rest)`
+/// with those flags removed.
+///
+/// These configure the `command` source and must precede `--command` (which
+/// consumes the rest of the line as the literal argv). They are extracted from
+/// the option head only, so a literal `--command-env` inside the command argv is
+/// never consumed (same handling as `--otp-*`; see [`take_otp_flags`]).
+pub fn take_command_flags(args: &[String]) -> Result<CommandFlags, String> {
+    let mut cwd: Option<String> = None;
+    let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--command-cwd" || a.starts_with("--command-cwd=") {
+            let inline = a.strip_prefix("--command-cwd=");
+            let v = match inline {
+                Some(v) => v.to_string(),
+                None => args
+                    .get(i + 1)
+                    .cloned()
+                    .ok_or("--command-cwd requires a PATH argument")?,
+            };
+            cwd = Some(v);
+            i += if inline.is_some() { 1 } else { 2 };
+        } else if a == "--command-env" || a.starts_with("--command-env=") {
+            let inline = a.strip_prefix("--command-env=");
+            let v = match inline {
+                Some(v) => v.to_string(),
+                None => args
+                    .get(i + 1)
+                    .cloned()
+                    .ok_or("--command-env requires a NAME=VALUE argument")?,
+            };
+            let (name, value) = v
+                .split_once('=')
+                .ok_or_else(|| format!("--command-env must be NAME=VALUE (got {v:?})"))?;
+            if name.is_empty() {
+                return Err(format!("--command-env name must not be empty (got {v:?})"));
+            }
+            env.insert(name.to_string(), value.to_string());
+            i += if inline.is_some() { 1 } else { 2 };
+        } else {
+            rest.push(a.clone());
+            i += 1;
+        }
+    }
+    Ok((cwd, env, rest))
+}
+
 /// Parse the arguments to `kv define <KEY> ...` into a [`Request::KvDefine`].
 ///
-/// Grammar (DR-0014 §1):
-/// `<KEY> (--command ARGV... | --source URI) [--soft-ttl D] [--hard-ttl D]`
+/// Grammar (DR-0014 §1 / DR-0018 §1):
+/// `<KEY> (--command [--command-cwd P] [--command-env N=V]... ARGV... | --source URI)
+///  [--soft-ttl D] [--hard-ttl D]`
 ///
 /// `ns` is the already-resolved namespace (DR-0017 §4); the request key is the
 /// composed `NS/KEY`. `--command` and `--source` are mutually exclusive and
-/// exactly one is required. A `--source op://...` URI is expanded into
-/// `["op", "read", URI]` at parse time (see [`expand_source_uri`]); the daemon
-/// only ever sees argv.
+/// exactly one is required. `--command ARGV...` is the `source = "command"` sugar
+/// (with `--command-cwd` / `--command-env` configuring its cwd / env);
+/// `--source URI` is the `source = "op"` sugar. The daemon receives the typed
+/// source verbatim (DR-0018 §1).
 pub fn parse_kv_define(args: &[String], ns: &str) -> Result<Request, String> {
+    use crate::protocol::wire::{CommandSpecWire, SourceSpecWire};
     // Two consume-the-rest markers can appear: `--command` (rest = literal
     // argv) and `--` (rest = positionals). Whichever comes **first** wins:
     //
@@ -424,14 +487,18 @@ pub fn parse_kv_define(args: &[String], ns: &str) -> Result<Request, String> {
     // Pull the value-type flags from the option head only (never from the
     // command argv or the positionals after `--`).
     let (meta, head_rest) = take_otp_flags(head)?;
-    // Reassemble: the otp-stripped head, then the untouched `--command ...` tail.
+    // Pull the command cwd/env prefix-grouping flags from the head too (they
+    // configure the `command` source and must precede the consume-the-rest
+    // `--command`). A literal `--command-env` in the argv tail is untouched.
+    let (command_cwd, command_env, head_rest) = take_command_flags(&head_rest)?;
+    // Reassemble: the stripped head, then the untouched `--command ...` tail.
     let mut reassembled: Vec<String> = head_rest;
     reassembled.extend_from_slice(cmd_tail);
     let args = reassembled.as_slice();
 
     let mut positional: Vec<String> = Vec::new();
     let mut command: Option<Vec<String>> = None;
-    let mut source: Option<Vec<String>> = None;
+    let mut source: Option<crate::protocol::wire::OpSpecWire> = None;
     let mut soft_ttl_secs: Option<u64> = None;
     let mut hard_ttl_secs: Option<u64> = None;
 
@@ -449,11 +516,11 @@ pub fn parse_kv_define(args: &[String], ns: &str) -> Result<Request, String> {
             }
             "--source" => {
                 let v = args.get(i + 1).ok_or("--source requires a URI argument")?;
-                source = Some(expand_source_uri(v)?);
+                source = Some(parse_source_uri(v)?);
                 i += 2;
             }
             s if s.starts_with("--source=") => {
-                source = Some(expand_source_uri(s.strip_prefix("--source=").unwrap())?);
+                source = Some(parse_source_uri(s.strip_prefix("--source=").unwrap())?);
                 i += 1;
             }
             "--soft-ttl" => {
@@ -500,11 +567,26 @@ pub fn parse_kv_define(args: &[String], ns: &str) -> Result<Request, String> {
     }
     validate_cli_key(&key, "define")?;
 
-    let argv = match (command, source) {
+    // A cwd/env flag only makes sense with a `command` source.
+    if source.is_some() && (command_cwd.is_some() || !command_env.is_empty()) {
+        return Err(
+            "--command-cwd / --command-env only apply to a `--command` source, not `--source`"
+                .to_string(),
+        );
+    }
+
+    let typed_source = match (command, source) {
         (Some(_), Some(_)) => {
             return Err("kv define accepts only one of --command or --source".to_string());
         }
-        (Some(argv), None) | (None, Some(argv)) => argv,
+        (Some(argv), None) => SourceSpecWire::Command {
+            command: CommandSpecWire {
+                argv,
+                cwd: command_cwd,
+                env: command_env,
+            },
+        },
+        (None, Some(op)) => SourceSpecWire::Op { op },
         (None, None) => {
             return Err("kv define requires one of --command ARGV... or --source URI".to_string());
         }
@@ -514,22 +596,27 @@ pub fn parse_kv_define(args: &[String], ns: &str) -> Result<Request, String> {
     // structural error — `?attribute=otp` makes op compute a 30s code, so caching
     // it (a TTL'd, already-dead value) and then deriving from it is doubly wrong.
     // An otp seed must point at the seed field (plain `op://vault/item/field`).
-    if crate::otp_type::is_otp(&meta)
-        && argv
-            .iter()
-            .any(|a| a.to_ascii_lowercase().contains("attribute=otp"))
-    {
-        return Err(
-            "`--type otp` with an `?attribute=otp` source is invalid: that returns a \
-             computed 30s code, not the seed. Point the source at the seed field \
-             (plain op://vault/item/field) instead"
-                .to_string(),
-        );
+    if crate::otp_type::is_otp(&meta) {
+        let has_attr_otp = match &typed_source {
+            SourceSpecWire::Op { op } => op.uri.to_ascii_lowercase().contains("attribute=otp"),
+            SourceSpecWire::Command { command } => command
+                .argv
+                .iter()
+                .any(|a| a.to_ascii_lowercase().contains("attribute=otp")),
+        };
+        if has_attr_otp {
+            return Err(
+                "`--type otp` with an `?attribute=otp` source is invalid: that returns a \
+                 computed 30s code, not the seed. Point the source at the seed field \
+                 (plain op://vault/item/field) instead"
+                    .to_string(),
+            );
+        }
     }
 
     Ok(Request::KvDefine {
         key: crate::namespace::compose(ns, &key),
-        argv,
+        source: typed_source,
         soft_ttl_secs,
         hard_ttl_secs,
         meta,
@@ -727,6 +814,30 @@ mod tests {
 
     fn no_stdin() -> std::io::Result<Vec<u8>> {
         panic!("stdin should not be read")
+    }
+
+    use crate::protocol::wire::SourceSpecWire;
+
+    /// Extract the `command` argv from a `KvDefine` request (panics otherwise).
+    fn define_command_argv(req: &Request) -> &[String] {
+        match req {
+            Request::KvDefine {
+                source: SourceSpecWire::Command { command },
+                ..
+            } => &command.argv,
+            other => panic!("expected KvDefine command source, got {other:?}"),
+        }
+    }
+
+    /// Extract the `op` uri from a `KvDefine` request (panics otherwise).
+    fn define_op_uri(req: &Request) -> &str {
+        match req {
+            Request::KvDefine {
+                source: SourceSpecWire::Op { op },
+                ..
+            } => &op.uri,
+            other => panic!("expected KvDefine op source, got {other:?}"),
+        }
     }
 
     #[test]
@@ -984,13 +1095,11 @@ mod tests {
     #[test]
     fn kv_define_double_dash_key_stays_positional() {
         let req = parse_kv_define(&s(&["--source", "op://v/i/f", "--", "K"]), "default").unwrap();
-        match req {
-            Request::KvDefine { key, argv, .. } => {
-                assert_eq!(key, "default/K");
-                assert_eq!(argv, s(&["op", "read", "op://v/i/f"]));
-            }
+        match &req {
+            Request::KvDefine { key, .. } => assert_eq!(key, "default/K"),
             _ => panic!("expected KvDefine"),
         }
+        assert_eq!(define_op_uri(&req), "op://v/i/f");
     }
 
     // ---- KEY charset enforcement (DR-0017 §1.5 / §2) ----
@@ -1053,12 +1162,7 @@ mod tests {
         // Known intersection (documented): `--command` consumes the rest of the
         // argv, so a `--` after it belongs to the command, not to our parser.
         let req = parse_kv_define(&s(&["K", "--command", "prog", "--", "x"]), "default").unwrap();
-        match req {
-            Request::KvDefine { argv, .. } => {
-                assert_eq!(argv, s(&["prog", "--", "x"]));
-            }
-            _ => panic!("expected KvDefine"),
-        }
+        assert_eq!(define_command_argv(&req), s(&["prog", "--", "x"]));
     }
 
     #[test]
@@ -1088,23 +1192,23 @@ mod tests {
             "default",
         )
         .unwrap();
-        match req {
+        match &req {
             Request::KvDefine {
-                key,
-                argv,
-                soft_ttl_secs,
-                ..
+                key, soft_ttl_secs, ..
             } => {
                 assert_eq!(key, "default/TOK");
-                assert_eq!(argv, vec!["op", "read", "op://v/i"]);
-                assert_eq!(soft_ttl_secs, Some(3600));
+                assert_eq!(*soft_ttl_secs, Some(3600));
             }
             _ => panic!("expected KvDefine"),
         }
+        assert_eq!(define_command_argv(&req), vec!["op", "read", "op://v/i"]);
     }
 
     #[test]
-    fn kv_define_source_op_expands_to_op_read() {
+    fn kv_define_source_op_carries_uri_verbatim() {
+        // `--source op://...` is now the `op` typed source carrying the uri
+        // verbatim (DR-0018 §1); the `op read` argv is produced by the daemon's
+        // lowering, not at parse time.
         let req = parse_kv_define(
             &[
                 "TOK".into(),
@@ -1114,9 +1218,28 @@ mod tests {
             "default",
         )
         .unwrap();
+        assert_eq!(define_op_uri(&req), "op://vault/item/field");
+    }
+
+    #[test]
+    fn op_source_lowers_to_op_read_argv() {
+        // The lowering (daemon side) of an op source is `op read <uri>`.
+        let req = parse_kv_define(
+            &["TOK".into(), "--source".into(), "op://v/i/f".into()],
+            "default",
+        )
+        .unwrap();
         match req {
-            Request::KvDefine { argv, .. } => {
-                assert_eq!(argv, vec!["op", "read", "op://vault/item/field"]);
+            Request::KvDefine { source, .. } => {
+                let lowered = source.lower();
+                assert_eq!(
+                    lowered.command_argv().unwrap(),
+                    &[
+                        "op".to_string(),
+                        "read".to_string(),
+                        "op://v/i/f".to_string()
+                    ]
+                );
             }
             _ => panic!("expected KvDefine"),
         }
@@ -1176,9 +1299,12 @@ mod tests {
         )
         .unwrap();
         match plan {
-            DefinePlan::Single(Request::KvDefine { key, argv, .. }) => {
-                assert_eq!(key, "default/TOK");
-                assert_eq!(argv, vec!["op", "read", "op://v/i/f"]);
+            DefinePlan::Single(req @ Request::KvDefine { .. }) => {
+                match &req {
+                    Request::KvDefine { key, .. } => assert_eq!(key, "default/TOK"),
+                    _ => unreachable!(),
+                }
+                assert_eq!(define_op_uri(&req), "op://v/i/f");
             }
             other => panic!("expected Single KvDefine, got {other:?}"),
         }
@@ -1498,16 +1624,14 @@ mod tests {
             "default",
         )
         .unwrap();
-        match req {
-            Request::KvDefine {
-                key, argv, meta, ..
-            } => {
+        match &req {
+            Request::KvDefine { key, meta, .. } => {
                 assert_eq!(key, "default/OTP");
-                assert_eq!(argv, s(&["op", "read", "op://vault/item/field"]));
                 assert_eq!(meta.type_label.as_deref(), Some("otp"));
             }
             _ => panic!("expected KvDefine"),
         }
+        assert_eq!(define_op_uri(&req), "op://vault/item/field");
     }
 
     #[test]
@@ -1545,10 +1669,13 @@ mod tests {
             "default",
         )
         .unwrap();
-        match req {
-            Request::KvDefine { argv, meta, .. } => {
+        match &req {
+            Request::KvDefine { meta, .. } => {
                 // The `--otp-digits 8` stayed in the command argv.
-                assert_eq!(argv, s(&["myprog", "--otp-digits", "8"]));
+                assert_eq!(
+                    define_command_argv(&req),
+                    s(&["myprog", "--otp-digits", "8"])
+                );
                 // The otp meta came only from the `--type otp` before --command;
                 // no digits param was set from the argv.
                 assert_eq!(meta.type_label.as_deref(), Some("otp"));
@@ -1556,6 +1683,75 @@ mod tests {
             }
             _ => panic!("expected KvDefine"),
         }
+    }
+
+    #[test]
+    fn kv_define_command_cwd_and_env_attach_to_command_source() {
+        // --command-cwd / --command-env precede --command and configure the
+        // `command` source's cwd / env (DR-0018 §1).
+        let req = parse_kv_define(
+            &s(&[
+                "K",
+                "--command-cwd",
+                "/work",
+                "--command-env",
+                "A=1",
+                "--command-env=B=2",
+                "--command",
+                "prog",
+                "arg",
+            ]),
+            "default",
+        )
+        .unwrap();
+        match &req {
+            Request::KvDefine {
+                source: SourceSpecWire::Command { command },
+                ..
+            } => {
+                assert_eq!(command.argv, s(&["prog", "arg"]));
+                assert_eq!(command.cwd.as_deref(), Some("/work"));
+                assert_eq!(command.env.get("A").map(String::as_str), Some("1"));
+                assert_eq!(command.env.get("B").map(String::as_str), Some("2"));
+            }
+            other => panic!("expected command source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_define_command_env_in_argv_is_not_consumed_as_flag() {
+        // A literal `--command-env` after `--command` stays in the argv (the
+        // prefix-grouping flag is extracted from the head only).
+        let req = parse_kv_define(
+            &s(&["K", "--command", "prog", "--command-env", "X=1"]),
+            "default",
+        )
+        .unwrap();
+        assert_eq!(
+            define_command_argv(&req),
+            s(&["prog", "--command-env", "X=1"])
+        );
+    }
+
+    #[test]
+    fn kv_define_command_cwd_env_with_source_is_rejected() {
+        // cwd/env only apply to --command, not --source.
+        let err = parse_kv_define(
+            &s(&["K", "--command-cwd", "/x", "--source", "op://v/i/f"]),
+            "default",
+        )
+        .unwrap_err();
+        assert!(err.contains("--command"), "msg: {err}");
+    }
+
+    #[test]
+    fn kv_define_command_env_without_equals_is_rejected() {
+        let err = parse_kv_define(
+            &s(&["K", "--command-env", "NOEQ", "--command", "prog"]),
+            "default",
+        )
+        .unwrap_err();
+        assert!(err.contains("NAME=VALUE"), "msg: {err}");
     }
 
     #[test]

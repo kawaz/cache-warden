@@ -24,10 +24,11 @@ SSH 鍵もまた「キャッシュされる秘密値の一種」であり、SSH 
 ### 扱う概念
 
 - **キャッシュエントリ**: 名前付き（KEY）の秘密値。value ソースと TTL、保護状態を持つ。
-- **value ソース**: 値の供給元。二種類:
+- **value ソース**: 値の供給元。ランタイムの二種類（加えて定義層では型付き kind、DR-0018）:
   - `static`: `set` 時に直接与えられた値（パイプ / 引数）。hard TTL 切れ後は再取得不可（再 set が必要）。
-  - `command`: 上流コマンド（例 `op read ...`）の実行結果。`define` で定義を登録し、初回 get で lazy に実行して生成する。
-    hard TTL 切れ後はコマンド再実行で再生成できる。
+  - `command`: 上流コマンドの実行結果。`define` で定義を登録し（`source = "command"` + `command.argv`、
+    または `source = "op"` + `op.uri` — 型付き原形は定義に保持され、`op` kind はランタイムにコマンド
+    呼び出しへ降ろされる）、初回 get で lazy に実行して生成する。hard TTL 切れ後はコマンド再実行で再生成できる。
 - **soft TTL / hard TTL**: 二段階のライフサイクル。soft と hard は **別々の基準点**から測る（DR-0011）。
   - **soft TTL 切れ**: 上流に取りに行かず、ユーザを再認証（TouchID 等）してキャッシュを延長する。
     基準は `extended_at`（最後の extend 時刻）。使うたびに延命される（idle extend）。
@@ -137,7 +138,7 @@ cache-warden daemon run（単一プロセス / tokio ランタイム）
 - **値のエンコーディング**: 秘密値はバイナリ安全のため base64（`value_b64` のように
   `_b64` サフィックスで明示）。エラーメッセージには秘密値を含めない。
 - **コマンド v1**: `ping` / `status`（デーモン情報 + エントリ一覧。**値は含めない**。「定義のみ（値未生成）」のキーも列挙し defined / has_value / state を区別。pin 中は残り秒を併記）/
-  `kv.define`（key + source `{command: argv} | {uri}` + soft/hard TTL 秒。valuesource 付きキーの定義を登録するのみで upstream は実行しない。完全一致 no-op / 不一致 `bad_request`。DR-0014）/
+  `kv.define`（key + 型付き source `{"source": "command", "command": {...}} | {"source": "op", "op": {...}}` + soft/hard TTL 秒。valuesource 付きキーの定義を登録するのみで upstream は実行しない。完全一致 no-op / 不一致 `bad_request`。DR-0014 / DR-0018）/
   `kv.set`（**static 専用** = `value_b64`、soft/hard TTL 秒）/
   `kv.get`（値不在 or HardExpired でも定義があれば lazy 生成。SoftExpired は再認証で延長、HardExpired + regenerable は再生成して値を返す。`dry_run: true` 指定時は通常の取得経路（lazy 生成・extend・regenerate・認証）を完走した上で応答に `value_b64` を**含めず**成功/失敗と状態のみ返す＝値はデーモンから出ない。DR-0015）/
   `kv.del`（値のみ破棄して定義は残す＝次の get で再生成。`with_define: true` で定義ごと削除）/ `kv.list`（定義のみのキーも列挙）/
@@ -148,21 +149,24 @@ cache-warden daemon run（単一プロセス / tokio ランタイム）
   取得し、`SystemInspector::ancestry` で祖先チェーンを得て Store の auth ゲートに
   requester として渡す。UDS 0600 + 同一 uid が第一防壁、ancestry は監査・将来ポリシーの
   材料（**ポリシー判定はまだしない**）。
-- **再認証**: config 由来（DR-0010）。`[auth].command` 設定時は `CommandAuthenticator`
-  （外部コマンドに委譲、exit 0 = 承認）、未設定時は `AllowAll`。ビルトイン TouchID は将来
-  iteration（同じ `Authenticator` trait の別実装として差し込む）。
+- **再認証**: config 由来（DR-0010 / DR-0018）。`[auth]` 省略時は `AllowAll`。書く場合は `type`
+  必須。`type = "command"` では `CommandAuthenticator`（外部コマンドに委譲、exit 0 = 承認）を使う。
+  将来の kind（`touchid`、`push` 等）は同じ `Authenticator` trait の別実装として既存の config 形式を
+  変えずに差し込める。
 
 CLI サブコマンド体系 v1: `daemon run` / `ping` / `status` /
 `kv define|set|get|del|list|pin|unpin` / `run` / `inject` / `config show|path|edit`（引数なしは help、ロングオプション）。
 `kv get` / `run` / `inject` の 3 動詞は `--dry-run` / `--reveal` を持つ（デフォルトは実値 reveal、`--dry-run` は
 マスク値で配線検証して値を出さない。極性は config / 環境変数で切替可、DR-0015。`run` / `inject` の詳細は
 「secret reference 注入（run / inject / dry-run）」節）。
-`kv define KEY (--command ARGV... | --source URI) [--soft-ttl D] [--hard-ttl D]` は valuesource 付きキーの
-定義登録（upstream は実行せず初回 get まで遅延、冪等＝完全一致 no-op / 不一致エラー）。`--source URI` は
-op:// URI を `["op","read","<URI>"]` へ展開する糖衣（op:// 以外はエラー）。`kv set KEY` は static 専用
-（command ソースは `kv define` で登録する）。`kv get KEY` は値不在 / HardExpired でも定義があれば lazy 生成する。
-`kv del KEY` は値のみ破棄（定義は残り次の get で再生成）、`kv del KEY --with-define` で定義ごと削除。
-`kv pin <KEY> <DURATION>` は TTL を無視して値を期限まで Active 保持（再認証必須）、`kv unpin <KEY>` は解除。
+`kv define KEY (--command ARGV... | --source URI) [--command-cwd PATH] [--command-env NAME=VALUE]... [--soft-ttl D] [--hard-ttl D]`
+は valuesource 付きキーの定義登録（upstream は実行せず初回 get まで遅延、冪等＝完全一致 no-op / 不一致エラー）。
+`--command ARGV...` は `source = "command"` + `command.argv` の糖衣。`--source op://URI` は `source = "op"` +
+`op.uri` の糖衣（型付き原形が定義に残り、status に op uri が見える。冪等比較も型付き形式で行う。op:// 以外はエラー）。
+`--command-cwd` / `--command-env`（反復可）は `command.cwd` / `command.env` を設定し、`--command` より前に置く。
+`kv set KEY` は static 専用（command ソースは `kv define` で登録する）。`kv get KEY` は値不在 / HardExpired でも
+定義があれば lazy 生成する。`kv del KEY` は値のみ破棄（定義は残り次の get で再生成）、`kv del KEY --with-define`
+で定義ごと削除。`kv pin <KEY> <DURATION>` は TTL を無視して値を期限まで Active 保持（再認証必須）、`kv unpin <KEY>` は解除。
 
 - **`daemon` グループ**: デーモンのライフサイクル操作を隔離する。`daemon run`（フォアグラウンド起動）
   のみ実装済み。`daemon register` / `daemon unregister`（launchd/systemd サービス登録）/
@@ -176,11 +180,12 @@ op:// URI を `["op","read","<URI>"]` へ展開する糖衣（op:// 以外はエ
   どちらも control socket クライアントとして実装済み（詳細は「secret reference 注入（run / inject / dry-run）」節、
   DR-0013 / DR-0015）。
 
-### 設定（TOML config・再認証コマンド、DR-0010）
+### 設定（TOML config・再認証コマンド、DR-0010 / DR-0018）
 
 デーモンの設定は TOML（`#[serde(deny_unknown_fields)]`）。config 無しでも全デフォルトで
 起動する。探索順（高優先順位が先）: `$CACHE_WARDEN_CONFIG` → `$XDG_CONFIG_HOME/cache-warden/config.toml`
 → `~/.config/cache-warden/config.toml`。詳細・代替案は [DR-0010](./decisions/DR-0010-config-and-reauth-command.md)。
+型付き source / auth スキーマは [DR-0018](./decisions/DR-0018-typed-sources-auth-and-prefetch.md) を参照。
 
 ```toml
 [daemon]
@@ -190,32 +195,42 @@ socket = "~/.local/state/cache-warden/control.sock"  # CLI --socket > [daemon].s
 default-mode = "reveal"               # "reveal"（既定・実値）| "dry-run"（マスク検証）。DR-0015
 
 [auth]
-command = ["/path/to/reauth-prompt"]  # 省略時は AllowAll（再認証なし）
+type = "command"                       # 省略時は AllowAll（再認証なし）。[auth] を書く場合は type 必須。DR-0018
+command = ["/path/to/reauth-prompt"]
 
-[kv.DB_PASSWORD]                       # 起動時は定義登録のみ（command ソースのみ）、実行は初回 get まで lazy
-command = ["op", "read", "op://vault/item/password"]
+[kv.DB_PASSWORD]                       # 起動時は定義登録のみ、実行は初回 get まで lazy
+source = "command"
+command.argv = ["op", "read", "op://vault/item/password"]
+soft-ttl = "1h"
+hard-ttl = "24h"
+
+[kv.MY_OP_SECRET]                      # op kind: 型付き原形を保持（uri が status に見える）、実行時に op-read へ降ろす
+source = "op"
+op.uri = "op://vault/item/field"
+op.account = "my.1password.com"        # optional
 soft-ttl = "1h"
 hard-ttl = "24h"
 
 [kv.SLOW_SECRET]                       # preload = true で起動時に eager 実行してキャッシュ投入
-command = ["op", "read", "op://vault/item/slow"]
+source = "command"
+command.argv = ["op", "read", "op://vault/item/slow"]
 soft-ttl = "1h"
 hard-ttl = "24h"
 preload = true
 ```
 
-- **再認証コマンド**: `CommandAuthenticator`（ライブラリ）が `[auth].command` の argv を実行し、
-  exit 0 = 承認 / 非ゼロ = 拒否 / spawn 失敗 = 利用不能。`AuthContext` の情報（key・operation・
-  requester チェーン）を環境変数で渡すが**秘密値は渡さない**。timeout なし（ユーザ入力待ちが正常系）。
+- **再認証コマンド（`type = "command"`）**: `CommandAuthenticator`（ライブラリ）が `[auth].command`
+  の argv を実行し、exit 0 = 承認 / 非ゼロ = 拒否 / spawn 失敗 = 利用不能。`AuthContext` の情報
+  （key・operation・requester チェーン）を環境変数で渡すが**秘密値は渡さない**。timeout なし（ユーザ入力待ちが正常系）。
 - **起動時は定義登録、preload は opt-in（DR-0014）**: `[kv.*]` は起動時に**定義登録のみ**行い、upstream の
   実行は初回 get まで遅延する（デフォルト lazy）。起動時に eager 実行してキャッシュ投入する挙動は
   `preload = true` で opt-in する。preload エントリの実行が失敗しても fatal でなく、stderr に 1 行警告（値なし）を出して
   定義は登録したまま起動継続する。**例外: `[authsock.sockets.*].keys` に参照されている鍵は preload フラグに
   関わらず自動で eager 実体化する**（socket 宣言が「起動時に公開鍵が要る」という意思表示なので、`preload = true`
   を二重に書く必要はない）。
-- **static を config に書けない**: `[kv.*]` は command ソースのみ。リテラル値（`value` 等）を
-  書くと設定エラー（平文秘密値が config に残る漏洩を構造的に防ぐ）。リテラル値は実行時に
-  pipe で投入する（`... | cache-warden kv set KEY`）。
+- **static を config に書けない**: `[kv.*]` は `source` フィールド（`"command"` または `"op"`）と
+  kind 別サブフィールドが必須。リテラル秘密値（`value` 等）を書くと設定エラー（平文秘密値が config
+  に残る漏洩を構造的に防ぐ）。リテラル値は実行時に pipe で投入する（`... | cache-warden kv set KEY`）。
 - **`[cli].default-mode`（DR-0015）**: `kv get` / `run` / `inject` のデフォルト極性を
   `"reveal"`（実値・既定）/ `"dry-run"`（マスク検証）から選ぶ。優先順位は
   `--reveal` / `--dry-run` フラグ > 環境変数 `CACHE_WARDEN_DRY_RUN`（`=1` で dry-run）>
@@ -230,8 +245,9 @@ cache-warden は config で宣言した SSH agent socket を自ら listen し、
 クライアント（`ssh` / `ssh-add` / git 等）から見ると、通常の SSH agent として振る舞う。
 
 ```toml
-[kv.GITHUB_KEY]                              # 秘密鍵 PEM の command 定義（preload 不要）
-command = ["op", "read", "op://vault/github/private_key"]
+[kv.GITHUB_KEY]                              # 秘密鍵 PEM の op source 定義（preload 不要）
+source = "op"
+op.uri = "op://vault/github/private_key"
 soft-ttl = "1h"
 hard-ttl = "24h"
 allowed_processes = ["ssh"]                  # 鍵単位のプロセス制限（key 層、config 専用、空=制限なし、省略可）
@@ -499,7 +515,7 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
 - **control socket / KV socket API**: 管理 CLI ↔ デーモンの通信と、他プロセスからプログラマティックに
   KV を操作する経路を 1 本の Unix domain socket プロトコルに統合する（DR-0008、設計は次ステップ）。
 - **自前 TouchID**: 上流（op）に頼らず cache-warden 自身が LocalAuthentication で再認証を発行する。
-  SSH 鍵署名のゲートにも転用できる。
+  SSH 鍵署名のゲートにも転用できる。`[auth]` 型付きスキーマの `type = "touchid"` が着地スロット（DR-0018）。
 - **アダプタの追加**: SSH / KV 以外の秘密値プロトコルを扱うアダプタ。
 - **KV definition モデル（`kv define` / 定義レイヤ / 定義永続化）**: 動詞の責務を
   define（定義登録のみ・lazy 実行）/ set（static 専用）/ get（読み専念）に分離し、
@@ -513,6 +529,16 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
   `--dry-run` / `--reveal`、`[cli].default-mode`、`CACHE_WARDEN_DRY_RUN`、`kv.get {dry_run}`、DR-0015）も
   実装済み（本文「secret reference 注入（run / inject / dry-run）」節）。
   **未着手**: 参照のインライン define（`cache-warden://KEY?argv=...`）。
+- **型付き source / auth スキーマ**（[DR-0018](./decisions/DR-0018-typed-sources-auth-and-prefetch.md)）:
+  `source = "<kind>"` 判別子 + kind 別サブテーブル（`command.*` / `op.*`）が bare な
+  `command = [...]` 配列形を置き換える。`[auth]` には `type` フィールドが必須化される。
+  `op` kind は定義に型付き原形を保持（uri が status に見える、冪等比較も型付き形式）。
+  コア `Definition` の第 2 の不透明スロットが `SourceMeta` を保持（`ValueMeta` と直交、
+  コアは解釈せず保存・比較のみ）。**実装済み**: `source = "command"` / `"op"` の config + defs +
+  CLI 糖衣（`--command ARGV...`、`--source op://URI`、`--command-cwd`、`--command-env`）/
+  `[auth] type = "command"`（`type` なしの `[auth] command = [...]` はエラー）/
+  型付き wire（`kv.define`）/ status は型付き原形を表示（op uri は見える、command の argv は status で隠し
+  config show で出す）。
 
 詳細は [ROADMAP.md](./ROADMAP.md) を参照。
 
@@ -525,5 +551,6 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
 - [DR-0008-single-daemon-hosting](./decisions/DR-0008-single-daemon-hosting.md) — 単一デーモンプロセス直担型のホスティング形態
 - [DR-0009-control-socket-protocol-v1](./decisions/DR-0009-control-socket-protocol-v1.md) — control socket プロトコル v1
 - [DR-0010-config-and-reauth-command](./decisions/DR-0010-config-and-reauth-command.md) — TOML config と再認証コマンド方式
+- [DR-0018-typed-sources-auth-and-prefetch](./decisions/DR-0018-typed-sources-auth-and-prefetch.md) — 型付き source / auth スキーマ
 - [STRUCTURE.md](./STRUCTURE.md) — 物理構造
 - [ROADMAP.md](./ROADMAP.md) — 将来検討

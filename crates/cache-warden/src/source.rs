@@ -13,7 +13,9 @@
 //! substitute a fake in tests and so the policy of *where* a process is spawned
 //! stays explicit. The production runner is [`CommandRunner`].
 
+use std::collections::BTreeMap;
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -36,14 +38,37 @@ pub enum ValueSource {
         /// The command line to run to (re)produce the value, as already-split
         /// argv. The first element is the program; the rest are arguments.
         argv: Vec<String>,
+        /// Working directory to spawn the command in, or `None` for the daemon's
+        /// own cwd. Part of the execution primitive (DR-0018 §1 `command.cwd`).
+        cwd: Option<PathBuf>,
+        /// Extra environment entries merged onto the daemon's environment for the
+        /// command (same-named keys override; DR-0018 §1 `command.env`). Kept
+        /// deterministic (`BTreeMap`) so equality and any serialization are stable.
+        env: BTreeMap<String, String>,
     },
 }
 
 impl ValueSource {
-    /// Construct a [`ValueSource::Command`] from an argv vector.
+    /// Construct a bare [`ValueSource::Command`] from an argv vector (no cwd,
+    /// no env overrides).
     pub fn command(argv: impl IntoIterator<Item = String>) -> Self {
         ValueSource::Command {
             argv: argv.into_iter().collect(),
+            cwd: None,
+            env: BTreeMap::new(),
+        }
+    }
+
+    /// Construct a [`ValueSource::Command`] with an explicit cwd / env overlay.
+    pub fn command_with(
+        argv: impl IntoIterator<Item = String>,
+        cwd: Option<PathBuf>,
+        env: BTreeMap<String, String>,
+    ) -> Self {
+        ValueSource::Command {
+            argv: argv.into_iter().collect(),
+            cwd,
+            env,
         }
     }
 
@@ -58,8 +83,30 @@ impl ValueSource {
     /// The argv to run for a [`ValueSource::Command`], or `None` for `Static`.
     pub fn command_argv(&self) -> Option<&[String]> {
         match self {
-            ValueSource::Command { argv } => Some(argv),
+            ValueSource::Command { argv, .. } => Some(argv),
             ValueSource::Static => None,
+        }
+    }
+
+    /// The working directory of a [`ValueSource::Command`], or `None`.
+    pub fn command_cwd(&self) -> Option<&std::path::Path> {
+        match self {
+            ValueSource::Command { cwd, .. } => cwd.as_deref(),
+            ValueSource::Static => None,
+        }
+    }
+
+    /// The environment overlay of a [`ValueSource::Command`] (empty for others).
+    pub fn command_env(&self) -> &BTreeMap<String, String> {
+        match self {
+            ValueSource::Command { env, .. } => env,
+            ValueSource::Static => {
+                // A small leaked-once empty map keeps the borrow signature simple
+                // without an extra field on `Static`.
+                static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> =
+                    std::sync::OnceLock::new();
+                EMPTY.get_or_init(BTreeMap::new)
+            }
         }
     }
 }
@@ -176,8 +223,18 @@ impl std::error::Error for RunError {}
 /// so tests can substitute a fake. The production implementation is
 /// [`CommandRunner`].
 pub trait SourceRunner {
-    /// Run `argv` and capture its stdout as a secret value.
-    fn run(&self, argv: &[String]) -> Result<SecretBytes, RunError>;
+    /// Run `argv` (optionally in `cwd`, with `env` merged onto the process
+    /// environment) and capture its stdout as a secret value.
+    ///
+    /// `cwd` of `None` means "the caller's working directory"; `env` entries are
+    /// added/overridden on top of the inherited environment. An empty `env` and a
+    /// `None` cwd reproduce the historical "argv only" behavior.
+    fn run(
+        &self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        env: &BTreeMap<String, String>,
+    ) -> Result<SecretBytes, RunError>;
 }
 
 /// Runs a source command with [`std::process::Command`] and captures stdout.
@@ -260,17 +317,27 @@ impl CommandRunner {
         &self,
         program: &str,
         args: &[String],
+        cwd: Option<&std::path::Path>,
+        env: &BTreeMap<String, String>,
     ) -> Result<(Vec<u8>, usize, std::process::ExitStatus), RunError> {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| RunError::SpawnFailed {
-                program: program.to_string(),
-                reason: e.to_string(),
-            })?;
+            .stderr(Stdio::piped());
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
+        // Merge the overlay onto the inherited environment (same-named keys
+        // override). Empty overlay = inherited environment unchanged.
+        for (k, v) in env {
+            command.env(k, v);
+        }
+        let mut child = command.spawn().map_err(|e| RunError::SpawnFailed {
+            program: program.to_string(),
+            reason: e.to_string(),
+        })?;
 
         // Drain both pipes on reader threads: a full pipe must never block us,
         // and the threads let the main path poll the child for the timeout.
@@ -372,10 +439,15 @@ impl Drains {
 }
 
 impl SourceRunner for CommandRunner {
-    fn run(&self, argv: &[String]) -> Result<SecretBytes, RunError> {
+    fn run(
+        &self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        env: &BTreeMap<String, String>,
+    ) -> Result<SecretBytes, RunError> {
         let (program, args) = argv.split_first().ok_or(RunError::NoProgram)?;
 
-        let (mut stdout, stderr_len, status) = self.collect(program, args)?;
+        let (mut stdout, stderr_len, status) = self.collect(program, args, cwd, env)?;
 
         if !status.success() {
             // stdout may hold partial secret material even on failure — wipe it.
@@ -402,6 +474,11 @@ impl SourceRunner for CommandRunner {
 mod tests {
     use super::*;
 
+    /// Run a runner with no cwd and an empty env overlay (the common test path).
+    fn run0(r: &CommandRunner, argv: &[String]) -> Result<SecretBytes, RunError> {
+        r.run(argv, None, &BTreeMap::new())
+    }
+
     #[test]
     fn static_is_not_regenerable() {
         let s = ValueSource::Static;
@@ -417,12 +494,32 @@ mod tests {
             s.command_argv(),
             Some(["op".to_string(), "read".to_string()].as_slice())
         );
+        assert_eq!(s.command_cwd(), None);
+        assert!(s.command_env().is_empty());
+    }
+
+    #[test]
+    fn command_with_carries_cwd_and_env() {
+        let mut env = BTreeMap::new();
+        env.insert("K".to_string(), "V".to_string());
+        let s = ValueSource::command_with(
+            ["prog".to_string()],
+            Some(PathBuf::from("/tmp")),
+            env.clone(),
+        );
+        assert_eq!(s.command_cwd(), Some(std::path::Path::new("/tmp")));
+        assert_eq!(s.command_env(), &env);
     }
 
     /// A fake runner so tests can exercise regeneration without spawning processes.
     struct FixedRunner(Vec<u8>);
     impl SourceRunner for FixedRunner {
-        fn run(&self, _argv: &[String]) -> Result<SecretBytes, RunError> {
+        fn run(
+            &self,
+            _argv: &[String],
+            _cwd: Option<&std::path::Path>,
+            _env: &BTreeMap<String, String>,
+        ) -> Result<SecretBytes, RunError> {
             Ok(SecretBytes::new(self.0.clone()))
         }
     }
@@ -430,7 +527,9 @@ mod tests {
     #[test]
     fn fake_runner_produces_secret() {
         let runner = FixedRunner(b"regenerated".to_vec());
-        let out = runner.run(&["op".to_string()]).unwrap();
+        let out = runner
+            .run(&["op".to_string()], None, &BTreeMap::new())
+            .unwrap();
         assert_eq!(out.expose_secret(), b"regenerated");
     }
 
@@ -498,14 +597,14 @@ mod tests {
     fn command_runner_captures_stdout_and_trims_newline() {
         // `echo` appends a trailing newline; default policy trims exactly one.
         let r = CommandRunner::new();
-        let out = r.run(&argv(&["echo", "hunter2"])).unwrap();
+        let out = run0(&r, &argv(&["echo", "hunter2"])).unwrap();
         assert_eq!(out.expose_secret(), b"hunter2");
     }
 
     #[test]
     fn command_runner_keep_policy_preserves_newline() {
         let r = CommandRunner::with_newline_policy(TrailingNewline::Keep);
-        let out = r.run(&argv(&["echo", "hunter2"])).unwrap();
+        let out = run0(&r, &argv(&["echo", "hunter2"])).unwrap();
         assert_eq!(out.expose_secret(), b"hunter2\n");
     }
 
@@ -513,14 +612,14 @@ mod tests {
     fn command_runner_captures_value_without_trailing_newline() {
         // `printf '%s'` emits no trailing newline; the value is captured verbatim.
         let r = CommandRunner::new();
-        let out = r.run(&argv(&["printf", "%s", "raw-token"])).unwrap();
+        let out = run0(&r, &argv(&["printf", "%s", "raw-token"])).unwrap();
         assert_eq!(out.expose_secret(), b"raw-token");
     }
 
     #[test]
     fn command_runner_nonzero_exit_is_classified() {
         let r = CommandRunner::new();
-        let err = r.run(&argv(&["false"])).unwrap_err();
+        let err = run0(&r, &argv(&["false"])).unwrap_err();
         assert!(matches!(
             err,
             RunError::NonZeroExit {
@@ -534,7 +633,7 @@ mod tests {
     fn command_runner_empty_stdout_is_empty_output() {
         // `true` succeeds with no output -> nothing to cache.
         let r = CommandRunner::new();
-        let err = r.run(&argv(&["true"])).unwrap_err();
+        let err = run0(&r, &argv(&["true"])).unwrap_err();
         assert_eq!(err, RunError::EmptyOutput);
     }
 
@@ -542,23 +641,21 @@ mod tests {
     fn command_runner_value_that_is_only_a_newline_is_empty_after_trim() {
         // A command that prints just "\n" trims to empty -> EmptyOutput.
         let r = CommandRunner::new();
-        let err = r.run(&argv(&["echo"])).unwrap_err();
+        let err = run0(&r, &argv(&["echo"])).unwrap_err();
         assert_eq!(err, RunError::EmptyOutput);
     }
 
     #[test]
     fn command_runner_spawn_failure_is_classified() {
         let r = CommandRunner::new();
-        let err = r
-            .run(&argv(&["this-binary-does-not-exist-cache-warden"]))
-            .unwrap_err();
+        let err = run0(&r, &argv(&["this-binary-does-not-exist-cache-warden"])).unwrap_err();
         assert!(matches!(err, RunError::SpawnFailed { .. }));
     }
 
     #[test]
     fn command_runner_empty_argv_is_no_program() {
         let r = CommandRunner::new();
-        let err = r.run(&[]).unwrap_err();
+        let err = run0(&r, &[]).unwrap_err();
         assert_eq!(err, RunError::NoProgram);
     }
 
@@ -566,13 +663,11 @@ mod tests {
     fn command_runner_stderr_is_not_in_error_contents() {
         // sh writes a secret-looking string to stderr and exits non-zero.
         let r = CommandRunner::new();
-        let err = r
-            .run(&argv(&[
-                "sh",
-                "-c",
-                "echo LEAKED_SECRET_abc123 >&2; exit 3",
-            ]))
-            .unwrap_err();
+        let err = run0(
+            &r,
+            &argv(&["sh", "-c", "echo LEAKED_SECRET_abc123 >&2; exit 3"]),
+        )
+        .unwrap_err();
         match &err {
             RunError::NonZeroExit { code, stderr_len } => {
                 assert_eq!(*code, Some(3));
@@ -588,7 +683,7 @@ mod tests {
     fn command_runner_captures_multiline_secret_via_sh() {
         // A value with internal newlines (PEM-like) keeps its interior, loses one trailing.
         let r = CommandRunner::new();
-        let out = r.run(&argv(&["printf", "line1\nline2\n"])).unwrap();
+        let out = run0(&r, &argv(&["printf", "line1\nline2\n"])).unwrap();
         assert_eq!(out.expose_secret(), b"line1\nline2");
     }
 
@@ -610,7 +705,7 @@ mod tests {
         // the runner kills it and reports Timeout well before then.
         let r = CommandRunner::new().with_timeout(Duration::from_millis(200));
         let start = Instant::now();
-        let err = r.run(&argv(&["sleep", "5"])).unwrap_err();
+        let err = run0(&r, &argv(&["sleep", "5"])).unwrap_err();
         let waited = start.elapsed();
         match err {
             RunError::Timeout { elapsed } => {
@@ -630,7 +725,7 @@ mod tests {
         // A command that finishes well within the timeout returns its value
         // normally — the timeout only fires on genuinely slow commands.
         let r = CommandRunner::new().with_timeout(Duration::from_secs(5));
-        let out = r.run(&argv(&["echo", "quick"])).unwrap();
+        let out = run0(&r, &argv(&["echo", "quick"])).unwrap();
         assert_eq!(out.expose_secret(), b"quick");
     }
 
@@ -638,7 +733,7 @@ mod tests {
     fn command_runner_no_timeout_still_works() {
         // The default (unlimited) runner is unchanged by the timeout plumbing.
         let r = CommandRunner::new();
-        let out = r.run(&argv(&["echo", "ok"])).unwrap();
+        let out = run0(&r, &argv(&["echo", "ok"])).unwrap();
         assert_eq!(out.expose_secret(), b"ok");
     }
 
@@ -649,13 +744,60 @@ mod tests {
         // thread drains it concurrently. `head -c` caps the stream at 256 KiB,
         // far larger than any pipe buffer (typically 64 KiB).
         let r = CommandRunner::new().with_timeout(Duration::from_secs(10));
-        let out = r
-            .run(&argv(&[
-                "sh",
-                "-c",
-                "head -c 262144 /dev/zero | tr '\\0' x",
-            ]))
-            .unwrap();
+        let out = run0(
+            &r,
+            &argv(&["sh", "-c", "head -c 262144 /dev/zero | tr '\\0' x"]),
+        )
+        .unwrap();
         assert_eq!(out.len(), 262144);
+    }
+
+    // ---- cwd / env overlay (DR-0018 §1) ----
+
+    #[test]
+    fn command_runner_runs_in_given_cwd() {
+        // `pwd` reflects the cwd we asked the runner to use.
+        let r = CommandRunner::new();
+        let out = r
+            .run(
+                &argv(&["pwd"]),
+                Some(std::path::Path::new("/tmp")),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        // macOS `/tmp` is a symlink to `/private/tmp`; `pwd` (a shell builtin run
+        // as a binary here) reports the logical path passed via current_dir.
+        let got = String::from_utf8_lossy(out.expose_secret()).into_owned();
+        assert!(got == "/tmp" || got == "/private/tmp", "pwd was {got:?}");
+    }
+
+    #[test]
+    fn command_runner_applies_env_overlay() {
+        let r = CommandRunner::new();
+        let mut env = BTreeMap::new();
+        env.insert("CACHE_WARDEN_TEST_VAR".to_string(), "overlaid".to_string());
+        let out = r
+            .run(
+                &argv(&["sh", "-c", "printf %s \"$CACHE_WARDEN_TEST_VAR\""]),
+                None,
+                &env,
+            )
+            .unwrap();
+        assert_eq!(out.expose_secret(), b"overlaid");
+    }
+
+    #[test]
+    fn command_runner_empty_overlay_inherits_environment() {
+        // An empty overlay leaves the inherited environment intact.
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("CACHE_WARDEN_INHERIT_VAR", "inherited") };
+        let r = CommandRunner::new();
+        let out = run0(
+            &r,
+            &argv(&["sh", "-c", "printf %s \"$CACHE_WARDEN_INHERIT_VAR\""]),
+        )
+        .unwrap();
+        assert_eq!(out.expose_secret(), b"inherited");
+        unsafe { std::env::remove_var("CACHE_WARDEN_INHERIT_VAR") };
     }
 }
