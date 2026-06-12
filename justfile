@@ -90,7 +90,16 @@ bump-version level="patch": ensure-clean
 # push to origin/main with gates
 push: ci check-outdated-translations check-version-bumped
     bump-semver vcs push --branch main --jj-bookmark-auto-advance
-    @echo "[hint] gh-monitor:watch-workflow --sha $(bump-semver vcs get commit-id --rev main) kawaz/cache-warden"
+    @echo "[hint] gh-monitor:watch-workflow --sha $(bump-semver vcs get commit-id --rev main) --on-success release.yml 'just on-success-release' kawaz/cache-warden"
+
+# release.yml workflow が success になった時に AI が実行する action
+# (watch-workflow の `--on-success release.yml 'just on-success-release'` 経由で
+# 通知 event に `[ACTION:release.yml] just on-success-release` が emit される)
+on-success-release:
+    # tap repo を直接 git pull (= `brew update` 全 tap 巡回より速い)
+    git -C "$(brew --repository)/Library/Taps/kawaz/homebrew-tap" pull --ff-only
+    brew upgrade --cask kawaz/tap/cache-warden
+    cache-warden --version
 
 # ---------- utility ----------
 
@@ -98,3 +107,4 @@ push: ci check-outdated-translations check-version-bumped
 version:
     echo "crate version: $(bump-semver get Cargo.toml)"
     if [ -x ./target/release/cache-warden ]; then echo "binary: $(./target/release/cache-warden --version)"; fi
+    if command -v cache-warden >/dev/null 2>&1; then echo "brew binary: $(cache-warden --version)"; fi
