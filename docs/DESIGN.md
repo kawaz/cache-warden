@@ -428,7 +428,7 @@ into `NS/KEY` and flows into the core's flat store (the core is unchanged). The 
   `--namespace` > `CACHE_WARDEN_NAMESPACE` > `[cli].namespace` > `"default"` (export it from a
   project's `.envrc` via direnv and the switch happens the moment you enter the directory).
 - **list / status**: by default only the current namespace is shown (key names with the `NS/` prefix
-  stripped); `--all-namespaces` lists every namespace in the composed `NS/KEY` form.
+  stripped); `--all` lists every namespace in the composed `NS/KEY` form.
 - **config / defs**: a `[kv.NAME]` entry takes an optional `namespace = "NS"` field (present =
   absolute; absent = the context default — `"default"` for the daemon config, the `--namespace` value
   for a `kv define --defs` invocation). TOML table keys are unique, so one file cannot define the same

@@ -355,12 +355,12 @@ fn resolve_cli_mode(
     ))
 }
 
-/// Dispatch `cache-warden status [--namespace NS] [--all-namespaces]`
+/// Dispatch `cache-warden status [--namespace NS] [--all]`
 /// (DR-0017 §2).
 ///
 /// Entries are namespace-filtered client-side exactly like `kv list`: by
 /// default only the current namespace is shown (names with the `NS/` prefix
-/// stripped); `--all-namespaces` shows every entry under its composed `NS/KEY`
+/// stripped); `--all` shows every entry under its composed `NS/KEY`
 /// name (internal daemon keys included, verbatim).
 fn dispatch_status(
     rest: &[String],
@@ -374,7 +374,7 @@ fn dispatch_status(
     let mut all = false;
     for a in &rest {
         match a.as_str() {
-            "--all-namespaces" => all = true,
+            "--all" => all = true,
             other => {
                 return Err(CliError::Message(format!(
                     "unknown argument for `status`: {other}"
@@ -496,11 +496,11 @@ fn dispatch_kv(
     Ok(run_client(socket, &req)?)
 }
 
-/// Dispatch `kv list [--all-namespaces]` (DR-0017 §2).
+/// Dispatch `kv list [--all]` (DR-0017 §2).
 ///
 /// The daemon returns every (composed) key; the namespace view is a client-side
 /// concern. By default only the current namespace's keys are shown, with the
-/// `NS/` prefix stripped. `--all-namespaces` lists every key in its composed
+/// `NS/` prefix stripped. `--all` lists every key in its composed
 /// `NS/KEY` form (internal daemon keys, which have no namespace, appear only
 /// here, verbatim).
 fn dispatch_kv_list(
@@ -511,7 +511,7 @@ fn dispatch_kv_list(
     let mut all = false;
     for a in kv_args {
         match a.as_str() {
-            "--all-namespaces" => all = true,
+            "--all" => all = true,
             other => {
                 return Err(CliError::Usage {
                     msg: format!("unknown argument for `kv list`: {other}"),

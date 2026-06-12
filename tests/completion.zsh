@@ -140,7 +140,7 @@ print "== kv get options =="
 _expect_contains "kv get opts" "cache-warden kv get KEY --" --dry-run --reveal --namespace
 
 print "== kv list options (DR-0017) =="
-_expect_contains "kv list opts" "cache-warden kv list --" --namespace --all-namespaces
+_expect_contains "kv list opts" "cache-warden kv list --" --namespace --all
 
 print "== kv del options =="
 _expect_contains "kv del opts" "cache-warden kv del KEY --" --with-define

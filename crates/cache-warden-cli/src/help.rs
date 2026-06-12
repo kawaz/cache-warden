@@ -762,10 +762,7 @@ pub fn kv_list() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " kv list"),
         summary: "List cached key names (current namespace).",
-        usage: concat!(
-            "cache-warden",
-            " kv list [--namespace NS] [--all-namespaces]"
-        ),
+        usage: concat!("cache-warden", " kv list [--namespace NS] [--all]"),
         subcommands: &[],
         options: &[
             Row {
@@ -774,13 +771,13 @@ pub fn kv_list() -> HelpSpec {
                        [cli].namespace > \"default\"; DR-0017)",
             },
             Row {
-                name: "--all-namespaces",
+                name: "--all",
                 desc: "List every namespace's keys in their composed NS/KEY form",
             },
         ],
         detail: "\
 By default only the current namespace's keys are listed (names shown without
-the NS/ prefix). --all-namespaces lists everything as NS/KEY (DR-0017).",
+the NS/ prefix). --all lists everything as NS/KEY (DR-0017).",
         show_global: true,
     }
 }
@@ -964,10 +961,10 @@ mod tests {
 
     #[test]
     fn kv_list_and_value_verbs_document_namespaces() {
-        // DR-0017: every kv leaf carries --namespace; list adds --all-namespaces.
+        // DR-0017: every kv leaf carries --namespace; list adds --all.
         let list = kv_list().render();
         assert!(list.contains("--namespace NS"));
-        assert!(list.contains("--all-namespaces"));
+        assert!(list.contains("--all"));
         assert!(list.contains("NS/KEY"));
         for spec in [kv_get(), kv_del(), kv_pin(), kv_unpin(), kv_define()] {
             let h = spec.render();

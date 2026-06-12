@@ -1523,7 +1523,7 @@ fn kv_set_positional_value_stdin_pipe_and_double_dash() {
 
 /// KV namespaces end-to-end (DR-0017): `--namespace` isolates same-named keys,
 /// `CACHE_WARDEN_NAMESPACE` supplies the default, `kv list` shows only the
-/// current namespace (with `--all-namespaces` for the composed view), and
+/// current namespace (with `--all` for the composed view), and
 /// references resolve unqualified-into-context / qualified-as-absolute.
 #[test]
 fn namespaces_isolate_keys_and_resolve_references() {
@@ -1579,25 +1579,22 @@ fn namespaces_isolate_keys_and_resolve_references() {
         "flag wins over env"
     );
 
-    // --- kv list: current NS only (stripped); --all-namespaces shows NS/KEY ---
+    // --- kv list: current NS only (stripped); --all shows NS/KEY ---
     let out = cli(&["kv", "list", "--namespace", "projA"], &[]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "DB\n");
-    let out = cli(
-        &["kv", "list", "--namespace", "projA", "--all-namespaces"],
-        &[],
-    );
+    let out = cli(&["kv", "list", "--namespace", "projA", "--all"], &[]);
     let all = String::from_utf8_lossy(&out.stdout);
     assert!(
         all.contains("projA/DB") && all.contains("projB/DB"),
         "{all}"
     );
 
-    // --- status: current NS only (stripped names); --all-namespaces composed ---
+    // --- status: current NS only (stripped names); --all composed ---
     let out = cli(&["status", "--namespace", "projA"], &[]);
     let st = String::from_utf8_lossy(&out.stdout);
     assert!(st.contains("  DB "), "stripped name in status: {st}");
     assert!(!st.contains("projB"), "other NS hidden: {st}");
-    let out = cli(&["status", "--all-namespaces"], &[]);
+    let out = cli(&["status", "--all"], &[]);
     let st = String::from_utf8_lossy(&out.stdout);
     assert!(st.contains("projA/DB") && st.contains("projB/DB"), "{st}");
 

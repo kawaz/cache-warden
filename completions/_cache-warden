@@ -205,7 +205,7 @@ _cache-warden() {
                     "$socket_opt" \
                     "$ns_opt" \
                     '--help[Show this help message]' \
-                    '--all-namespaces[List every namespace as NS/KEY]'
+                    '--all[List every namespace as NS/KEY]'
                   ;;
                 pin)
                   _arguments \
@@ -279,7 +279,7 @@ _cache-warden() {
             "$socket_opt" \
             "$ns_opt" \
             '--help[Show this help message]' \
-            '--all-namespaces[Show every namespace as NS/KEY]'
+            '--all[Show every namespace as NS/KEY]'
           ;;
       esac
       ;;

@@ -398,7 +398,7 @@ Store に流れる（コアは不変）。デフォルト NS は `"default"`。
   `--namespace` > `CACHE_WARDEN_NAMESPACE` > `[cli].namespace` > `"default"`
   （direnv で `.envrc` に export すればプロジェクトに入った瞬間に切り替わる）。
 - **list / status**: 既定は現在 NS のみ（`NS/` プレフィックスを外した素のキー名で表示）。
-  `--all-namespaces` で全 NS を `NS/KEY` 表記で列挙。
+  `--all` で全 NS を `NS/KEY` 表記で列挙。
 - **config / defs**: `[kv.NAME]` に省略可能な `namespace = "NS"` フィールド
   （あり = 絶対指定 / なし = 文脈デフォルト。daemon config の文脈は `"default"`、
   defs は `kv define --defs F --namespace NS` の指定値）。TOML テーブルキーは一意なので
