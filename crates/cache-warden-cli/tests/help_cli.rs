@@ -39,6 +39,9 @@ fn help_flag_goes_to_stdout_exit_zero_at_every_level() {
         &["--help"][..],
         &["daemon", "--help"][..],
         &["daemon", "run", "--help"][..],
+        &["daemon", "register", "--help"][..],
+        &["daemon", "unregister", "--help"][..],
+        &["daemon", "status", "--help"][..],
         &["kv", "--help"][..],
         &["kv", "define", "--help"][..],
         &["kv", "set", "--help"][..],
@@ -83,6 +86,23 @@ fn kv_define_help_carries_command_and_source() {
     assert!(out.contains("--command ARGV..."));
     assert!(out.contains("--source URI"));
     assert!(out.contains("lazily"));
+}
+
+#[test]
+fn daemon_group_help_lists_service_subcommands() {
+    // DR-0019: register / unregister / status are now real subcommands.
+    let out = stdout(&cw(&["daemon"]));
+    assert!(out.contains("register"));
+    assert!(out.contains("unregister"));
+    assert!(out.contains("status"));
+}
+
+#[test]
+fn daemon_register_help_carries_flags() {
+    let out = stdout(&cw(&["daemon", "register", "--help"]));
+    assert!(out.contains("--socket PATH"));
+    assert!(out.contains("--label NAME"));
+    assert!(out.contains("--print"));
 }
 
 #[test]

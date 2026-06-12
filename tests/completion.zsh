@@ -118,7 +118,11 @@ print "== config subcommands =="
 _expect_contains "config commands" "cache-warden config " show path edit
 
 print "== daemon subcommands =="
-_expect_contains "daemon commands" "cache-warden daemon " run
+_expect_contains "daemon commands" "cache-warden daemon " run register unregister status
+
+print "== daemon register options (DR-0019) =="
+_expect_contains "daemon register opts" "cache-warden daemon register --" \
+  --socket --label --print
 
 print "== kv define options =="
 _expect_contains "kv define opts" "cache-warden kv define KEY --" \

@@ -214,10 +214,20 @@ fn run() -> Result<(), CliError> {
     // Load the config (or defaults) up front: every command needs the resolved
     // socket, and `daemon run` / `config` need the rest of it (DR-0010).
     let loaded = config::load().map_err(|e| e.to_string())?;
+    // `daemon register` bakes the *explicitly requested* socket into the service
+    // definition (not the resolved default), so keep the pre-resolution CLI value
+    // for it before `resolve_socket` consumes it.
+    let cli_socket_for_daemon = cli_socket.clone();
     let socket = commands::resolve_socket(cli_socket, loaded.config.socket_path());
 
     match command.as_str() {
-        "daemon" => dispatch_daemon(&rest, socket, loaded.config),
+        "daemon" => dispatch_daemon(
+            &rest,
+            socket,
+            loaded.config,
+            loaded.path,
+            cli_socket_for_daemon,
+        ),
         "config" => dispatch_config(&rest, &loaded),
         "ping" => Ok(run_client(&socket, &protocol::wire::Request::Ping)?),
         "status" => dispatch_status(&rest, &socket, &loaded.config),
@@ -232,10 +242,20 @@ fn run() -> Result<(), CliError> {
 }
 
 /// Dispatch the `daemon` group.
+///
+/// `config_path` is the resolved config file the run-time loader found
+/// (`LoadedConfig.path`); `daemon register` bakes it into the service definition
+/// so the installed service uses the same config in effect at register time
+/// (DR-0019 §2). `cli_socket` is the *explicitly requested* `--socket` (already
+/// stripped from `rest` by the top-level parser, like every other command); only
+/// `register` consumes it, baking it into the service start command. A `None`
+/// means no `--socket` was given, so the service resolves the default at runtime.
 fn dispatch_daemon(
     rest: &[String],
     socket: PathBuf,
     config: config::Config,
+    config_path: Option<PathBuf>,
+    cli_socket: Option<PathBuf>,
 ) -> Result<(), CliError> {
     // Group help: no subcommand, or a `--help` anywhere => stdout, exit 0.
     if rest.is_empty() {
@@ -246,9 +266,9 @@ fn dispatch_daemon(
         println!("{}", help::daemon().render());
         return Ok(());
     }
+    let tail = &rest[1..];
     match rest[0].as_str() {
         "run" => {
-            let tail = &rest[1..];
             if help::wants_help(tail) {
                 println!("{}", help::daemon_run().render());
                 return Ok(());
@@ -257,6 +277,34 @@ fn dispatch_daemon(
                 commands::daemon_cmd::run_foreground(tail, socket, config),
                 help::daemon_run,
             )
+        }
+        "register" => {
+            if help::wants_help(tail) {
+                println!("{}", help::daemon_register().render());
+                return Ok(());
+            }
+            let sock = cli_socket.map(|p| p.to_string_lossy().into_owned());
+            or_usage(
+                commands::daemon_cmd::register(tail, config_path, sock.as_deref()),
+                help::daemon_register,
+            )
+        }
+        "unregister" => {
+            if help::wants_help(tail) {
+                println!("{}", help::daemon_unregister().render());
+                return Ok(());
+            }
+            or_usage(
+                commands::daemon_cmd::unregister(tail),
+                help::daemon_unregister,
+            )
+        }
+        "status" => {
+            if help::wants_help(tail) {
+                println!("{}", help::daemon_status().render());
+                return Ok(());
+            }
+            or_usage(commands::daemon_cmd::status(tail), help::daemon_status)
         }
         other => Err(CliError::Message(format!(
             "unknown daemon subcommand: {other} (try `{NAME} daemon --help`)"

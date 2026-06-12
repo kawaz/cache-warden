@@ -98,7 +98,12 @@ _cache-warden() {
       case "$words[1]" in
         daemon)
           local -a daemon_commands
-          daemon_commands=( 'run:Start the daemon in the foreground' )
+          daemon_commands=(
+            'run:Start the daemon in the foreground'
+            'register:Install the launchd/systemd user service (--print to preview)'
+            'unregister:Stop and remove the installed service'
+            'status:Show service registration / running state'
+          )
           _arguments -C \
             "$socket_opt" \
             '--help[Show this help message]' \
@@ -109,6 +114,25 @@ _cache-warden() {
             dargs)
               case "$words[1]" in
                 run) _arguments "$socket_opt" '--help[Show this help message]' ;;
+                register)
+                  # register は独自に --socket / --label / --print を取る
+                  # (--socket はサービス定義に焼く値で、トップ共通の --socket とは別意味)。
+                  _arguments \
+                    '--socket[Bake --socket PATH into the service start command]:socket:_files' \
+                    '--label[Service label (default: per-OS default)]:label' \
+                    '--print[Render the service definition to stdout; install nothing]' \
+                    '--help[Show this help message]'
+                  ;;
+                unregister)
+                  _arguments \
+                    '--label[Service label to remove (default: per-OS default)]:label' \
+                    '--help[Show this help message]'
+                  ;;
+                status)
+                  _arguments \
+                    '--label[Service label to query (default: per-OS default)]:label' \
+                    '--help[Show this help message]'
+                  ;;
               esac
               ;;
           esac

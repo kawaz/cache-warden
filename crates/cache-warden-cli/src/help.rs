@@ -191,6 +191,18 @@ pub fn top() -> HelpSpec {
                 desc: "Start the daemon in the foreground",
             },
             Row {
+                name: "daemon register",
+                desc: "Install the launchd/systemd user service (--print to preview)",
+            },
+            Row {
+                name: "daemon unregister",
+                desc: "Stop and remove the installed service",
+            },
+            Row {
+                name: "daemon status",
+                desc: "Show service registration / running state",
+            },
+            Row {
                 name: "ping",
                 desc: "Check that the daemon is alive",
             },
@@ -257,14 +269,33 @@ pub fn top() -> HelpSpec {
 pub fn daemon() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " daemon"),
-        summary: "Manage the cache-warden daemon process.",
+        summary: "Manage the cache-warden daemon process and service registration.",
         usage: concat!("cache-warden", " daemon <COMMAND> [OPTIONS]"),
-        subcommands: &[Row {
-            name: "run",
-            desc: "Start the daemon in the foreground",
-        }],
+        subcommands: &[
+            Row {
+                name: "run",
+                desc: "Start the daemon in the foreground",
+            },
+            Row {
+                name: "register",
+                desc: "Install the launchd/systemd user service (--print to preview)",
+            },
+            Row {
+                name: "unregister",
+                desc: "Stop and remove the installed service",
+            },
+            Row {
+                name: "status",
+                desc: "Show service registration / running state",
+            },
+        ],
         options: &[],
-        detail: "",
+        detail: "\
+register / unregister / status manage a per-user service (launchd LaunchAgent on
+macOS, `systemd --user` on Linux). register writes the service definition and
+starts it now + at login; it is idempotent (re-run to update the binary path or
+config). The register-time config path is baked into the definition so the
+service uses the same config that was in effect when you registered (DR-0019).",
         show_global: true,
     }
 }
@@ -278,6 +309,91 @@ pub fn daemon_run() -> HelpSpec {
         subcommands: &[],
         options: &[],
         detail: "",
+        show_global: true,
+    }
+}
+
+/// `daemon register` leaf page (DR-0019).
+pub fn daemon_register() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " daemon register"),
+        summary: "Install and start the per-user service (launchd / systemd --user).",
+        usage: concat!(
+            "cache-warden",
+            " daemon register [--socket PATH] [--label NAME] [--print]"
+        ),
+        subcommands: &[],
+        options: &[
+            Row {
+                name: "--socket PATH",
+                desc: "Bake `--socket PATH` into the service start command\n\
+                       (the service binds this control socket)",
+            },
+            Row {
+                name: "--label NAME",
+                desc: "Service label (default: com.github.kawaz.cache-warden on\n\
+                       macOS, cache-warden on Linux). Use to run multiple\n\
+                       instances side by side",
+            },
+            Row {
+                name: "--print",
+                desc: "Render the service definition to stdout and install\n\
+                       nothing (audit / dry-run)",
+            },
+        ],
+        detail: "\
+register writes the service definition (launchd plist or systemd unit) and loads
+it so the daemon starts now and at every login. It is idempotent: re-running
+updates the definition (binary path, socket, baked config) and restarts the
+service — this is the main way to point the service at a rebuilt binary.
+
+The binary path is the absolute path of the running executable; the config path
+is whatever the loader resolves at register time ($CACHE_WARDEN_CONFIG > XDG >
+~/.config), baked in as CACHE_WARDEN_CONFIG so the service does not silently pick
+up a different config. A minimal PATH is baked in so `op` is found.
+
+Linux: `systemd --user` services stop at logout unless lingering is enabled;
+register prints a hint to run `loginctl enable-linger` when it is off (it never
+enables it for you — that may require admin). Logs: macOS writes
+~/Library/Logs/cache-warden/daemon.log; Linux uses journald.",
+        show_global: true,
+    }
+}
+
+/// `daemon unregister` leaf page (DR-0019).
+pub fn daemon_unregister() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " daemon unregister"),
+        summary: "Stop, unload, and delete the installed service.",
+        usage: concat!("cache-warden", " daemon unregister [--label NAME]"),
+        subcommands: &[],
+        options: &[Row {
+            name: "--label NAME",
+            desc: "Service label to remove (default: the per-OS default label)",
+        }],
+        detail: "\
+Stops the service, unloads it from the service manager, and deletes its
+definition file. A label that is not registered is a no-op (idempotent).",
+        show_global: true,
+    }
+}
+
+/// `daemon status` leaf page (DR-0019).
+pub fn daemon_status() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " daemon status"),
+        summary: "Show the service registration / running state.",
+        usage: concat!("cache-warden", " daemon status [--label NAME]"),
+        subcommands: &[],
+        options: &[Row {
+            name: "--label NAME",
+            desc: "Service label to query (default: the per-OS default label)",
+        }],
+        detail: "\
+Reports whether the service definition is installed, whether the service manager
+reports it running, its pid, and the definition file path — a one-screen table,
+the same shape on macOS and Linux. This is distinct from the top-level
+`cache-warden status`, which lists cache entries (DR-0019).",
         show_global: true,
     }
 }
@@ -901,11 +1017,45 @@ mod tests {
     }
 
     #[test]
-    fn daemon_group_help_lists_run() {
+    fn daemon_group_help_lists_run_and_service_subcommands() {
         let h = daemon().render();
         assert!(h.contains("cache-warden daemon\n"));
         assert!(h.contains("Commands:"));
         assert!(h.contains("run"));
+        // DR-0019: register / unregister / status are now real subcommands.
+        assert!(h.contains("register"));
+        assert!(h.contains("unregister"));
+        assert!(h.contains("status"));
+    }
+
+    #[test]
+    fn daemon_register_help_carries_flags_and_notes() {
+        let h = daemon_register().render();
+        assert!(h.contains("--socket PATH"));
+        assert!(h.contains("--label NAME"));
+        assert!(h.contains("--print"));
+        // The idempotency + baked-config rationale is documented.
+        assert!(h.contains("idempotent"));
+        assert!(h.contains("CACHE_WARDEN_CONFIG"));
+        // The Linux linger hint is mentioned.
+        assert!(h.contains("enable-linger"));
+    }
+
+    #[test]
+    fn daemon_unregister_and_status_help_carry_label_flag() {
+        for h in [daemon_unregister().render(), daemon_status().render()] {
+            assert!(h.contains("--label NAME"), "missing --label in: {h}");
+        }
+        // status explains it differs from the top-level entry-listing status.
+        assert!(daemon_status().render().contains("distinct from"));
+    }
+
+    #[test]
+    fn top_help_lists_daemon_service_subcommands() {
+        let h = top().render();
+        assert!(h.contains("daemon register"));
+        assert!(h.contains("daemon unregister"));
+        assert!(h.contains("daemon status"));
     }
 
     #[test]
