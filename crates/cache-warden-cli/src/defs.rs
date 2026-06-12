@@ -1,24 +1,32 @@
 //! Definition files (`--defs FILE`) and the persisted-definition state file.
 //!
-//! Both speak the **same TOML grammar** as the daemon config's `[kv.*]` section
-//! (DR-0014 §4) — a subset: each `[kv.NAME]` table carries a `command` argv plus
-//! optional `soft-ttl` / `hard-ttl`. The static-value prohibition of the config
-//! schema is inherited (a `value` / `value-stdin` / `static` key is rejected),
-//! and `preload` — which only makes sense for the daemon's startup-eager config
-//! entries — is **rejected** here so a stray flag is surfaced rather than
-//! silently ignored (DR-0014 §4: "static values cannot be written" rule
-//! inherited; an unusable key is an error, matching `deny_unknown_fields`).
+//! Both carry the same per-entry fields as the daemon config's `[kv.*]` section
+//! (DR-0014 §4) — a subset: a `command` argv plus optional `soft-ttl` /
+//! `hard-ttl` (+ the value-type fields of DR-0016). The static-value
+//! prohibition of the config schema is inherited (a `value` / `value-stdin` /
+//! `static` key is rejected), and `preload` — which only makes sense for the
+//! daemon's startup-eager config entries — is **rejected** here so a stray flag
+//! is surfaced rather than silently ignored (DR-0014 §4: "static values cannot
+//! be written" rule inherited; an unusable key is an error, matching
+//! `deny_unknown_fields`).
 //!
-//! # Two callers, one grammar
+//! # Two callers, two table shapes (DR-0017 §5)
 //!
-//! - `kv define --defs FILE` parses a user-authored defs file into a list of
-//!   [`KvDefinition`]s, each of which the CLI registers via one `kv.define`
-//!   request ([`parse_defs_file`]).
+//! - `kv define --defs FILE` parses a **user-authored** defs file: flat
+//!   `[kv.NAME]` tables with an optional per-entry `namespace` field
+//!   ([`parse_defs_file`], the same grammar as the daemon config).
 //! - The daemon, when `[daemon].persist-definitions = true`, writes its online
 //!   definition registry to `$XDG_STATE_HOME/cache-warden/definitions.toml`
 //!   ([`serialize_definitions`] / [`save_definitions`]) and restores it at
-//!   startup ([`load_definitions`]). The persisted file holds **definitions
-//!   only** — KEY / argv / TTL — never a secret value (DR-0014 §4).
+//!   startup ([`load_definitions`]). The persisted format is the **uniform
+//!   two-level dotted nesting `[kv.NS.KEY]`** (kv → namespace → key →
+//!   definition): the file is machine-generated with every entry's namespace
+//!   normalized, so the depth is uniform, and the identifier charset
+//!   (`[A-Za-z0-9_]+`, no `.`) makes every segment a bare key — no quoting —
+//!   with an unambiguous path-depth-to-meaning mapping. The mixed-shape
+//!   ambiguity that rules dotted nesting out for the human config does not
+//!   exist here. The persisted file holds **definitions only** — KEY / argv /
+//!   TTL — never a secret value (DR-0014 §4).
 //!
 //! # No automatic discovery
 //!
@@ -250,16 +258,64 @@ pub fn parse_defs_file(path: &Path) -> Result<Vec<KvDefinition>, String> {
     parse_defs(&text).map_err(|e| format!("invalid defs file {}: {e}", path.display()))
 }
 
-/// Serialize a list of definitions into the defs-file TOML grammar.
+/// The persisted-definitions file: the uniform two-level dotted nesting
+/// `kv → NS → KEY → definition` (DR-0017 §5). A flat `[kv.KEY]` table (the
+/// user-defs shape) does not fit this type and is rejected by serde.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistFile {
+    /// Definitions keyed by namespace, then key name. `BTreeMap`s keep a
+    /// deterministic (sorted) order for predictable round-tripping.
+    #[serde(default)]
+    kv: BTreeMap<String, BTreeMap<String, DefEntry>>,
+}
+
+/// Parse persisted-definitions TOML text (`[kv.NS.KEY]` dotted nesting) into
+/// validated [`KvDefinition`]s, each pinned to its absolute namespace.
 ///
-/// The output is the same `[kv.NAME]` subset a human authors by hand, so the
-/// persisted file is readable and editable. Only definition metadata is written
-/// (KEY / argv / TTL); there is **no** field for a value, so a value can never
-/// be serialized by construction (DR-0014 §4).
+/// Both path segments are charset-validated (`[A-Za-z0-9_]+`, DR-0017 §1.5):
+/// TOML could express other segments via quoting, but such a file was not
+/// written by us. A per-entry `namespace` field is rejected — in this format
+/// the table path *is* the namespace.
+fn parse_persisted(text: &str) -> Result<Vec<KvDefinition>, ConfigError> {
+    let file: PersistFile =
+        toml::from_str(text).map_err(|e| ConfigError::new(format!("invalid TOML: {e}")))?;
+    let mut out = Vec::new();
+    for (ns, entries) in &file.kv {
+        crate::namespace::validate_identifier(ns, "namespace")
+            .map_err(|e| ConfigError::new(format!("[kv.{ns}]: {e}")))?;
+        for (key, entry) in entries {
+            crate::namespace::validate_identifier(key, "KEY")
+                .map_err(|e| ConfigError::new(format!("[kv.{ns}.{key}]: {e}")))?;
+            if entry.namespace.is_some() {
+                return Err(ConfigError::new(format!(
+                    "[kv.{ns}.{key}]: a `namespace` field is not allowed in the                      persisted format — the table path is the namespace"
+                )));
+            }
+            // `validate` sees the plain KEY (an identifier), so the entry's
+            // (absent) namespace field yields None; pin the path namespace.
+            let mut def = entry.validate(key)?;
+            def.namespace = Some(ns.clone());
+            out.push(def);
+        }
+    }
+    Ok(out)
+}
+
+/// Serialize a list of definitions into the persisted-definitions TOML format:
+/// the uniform two-level dotted nesting `[kv.NS.KEY]` (DR-0017 §5).
+///
+/// Two same-named keys in different namespaces are two distinct tables. Every
+/// path segment is an identifier (`[A-Za-z0-9_]+`, guaranteed by the protocol
+/// boundary for everything in the store), so segments are always TOML bare
+/// keys — the narrowed charset exists precisely so no quoting is ever needed.
+/// Only definition metadata is written (KEY / argv / TTL); there is **no**
+/// field for a value, so a value can never be serialized by construction
+/// (DR-0014 §4).
 pub fn serialize_definitions(defs: &[KvDefinition]) -> String {
-    // Build a deterministic (name-sorted) document by hand: `toml::to_string`
-    // on a map is fine, but emitting it directly keeps the output minimal and
-    // guarantees only the four allowed fields ever appear.
+    // Build a deterministic (namespace-then-key sorted) document by hand:
+    // emitting directly keeps the output minimal and guarantees only the
+    // allowed fields ever appear.
     let mut sorted: Vec<&KvDefinition> = defs.iter().collect();
     sorted.sort_by_key(|d| d.full_key(crate::namespace::DEFAULT_NAMESPACE));
 
@@ -268,12 +324,11 @@ pub fn serialize_definitions(defs: &[KvDefinition]) -> String {
         if i > 0 {
             out.push('\n');
         }
-        // Persist the composed `NS/KEY` as the (quoted) table name (DR-0017
-        // §5): two same-named keys in different namespaces would collide as
-        // plain `[kv.KEY]` tables, and this file is machine-written/read, so
-        // the quoted composed form is fine here.
-        let full = def.full_key(crate::namespace::DEFAULT_NAMESPACE);
-        out.push_str(&format!("[kv.{}]\n", toml_key(&full)));
+        let ns = def
+            .namespace
+            .as_deref()
+            .unwrap_or(crate::namespace::DEFAULT_NAMESPACE);
+        out.push_str(&format!("[kv.{ns}.{}]\n", def.name));
         out.push_str(&format!("command = {}\n", toml_string_array(&def.command)));
         if let Some(secs) = def.soft_ttl_secs {
             out.push_str(&format!("soft-ttl = \"{secs}s\"\n"));
@@ -299,20 +354,6 @@ pub fn serialize_definitions(defs: &[KvDefinition]) -> String {
         }
     }
     out
-}
-
-/// Quote a table key if it is not a bare key (TOML bare keys allow
-/// `A-Za-z0-9_-`). A name with other characters is rendered as a quoted key.
-fn toml_key(name: &str) -> String {
-    let bare = !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if bare {
-        name.to_string()
-    } else {
-        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
-    }
 }
 
 /// Render a string slice as a TOML array of basic (double-quoted) strings.
@@ -347,7 +388,7 @@ pub fn definitions_state_path() -> PathBuf {
 /// continue (the caller decides fatality — it is non-fatal at startup).
 pub fn load_definitions(path: &Path) -> Result<Vec<KvDefinition>, String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => parse_defs(&text)
+        Ok(text) => parse_persisted(&text)
             .map_err(|e| format!("invalid persisted definitions {}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!(
@@ -602,9 +643,9 @@ type = "magic"
         let text = serialize_definitions(std::slice::from_ref(&d));
         assert!(text.contains("type = \"otp\""), "text: {text}");
         assert!(text.contains("otp-digits = 8"), "text: {text}");
-        let back = parse_defs(&text).unwrap();
-        // Persisted entries come back with an absolute namespace (the composed
-        // table name); the composed key round-trips exactly.
+        let back = parse_persisted(&text).unwrap();
+        // Persisted entries come back with an absolute namespace (the dotted
+        // table path); the composed key round-trips exactly.
         assert_eq!(back[0].full_key("ignored"), d.full_key("default"));
         assert_eq!(back[0].meta, d.meta, "otp meta round-trips");
     }
@@ -618,7 +659,7 @@ type = "magic"
             def("B", &["printf", "x"], None, None),
         ];
         let text = serialize_definitions(&defs);
-        let back = parse_defs(&text).unwrap();
+        let back = parse_persisted(&text).unwrap();
         assert_eq!(back.len(), 2);
         // The persisted form pins the absolute namespace; the composed key,
         // argv, and TTLs round-trip exactly (DR-0017 §5).
@@ -637,33 +678,97 @@ type = "magic"
             def("ABLE", &["echo", "a"], Some(60), None),
         ];
         let text = serialize_definitions(&defs);
-        // Composed-key tables (quoted), name-sorted: ABLE before ZED.
-        let able = text.find("[kv.\"default/ABLE\"]").expect("ABLE table");
-        let zed = text.find("[kv.\"default/ZED\"]").expect("ZED table");
+        // Dotted nested tables (no quoting needed: the charset has no `.`),
+        // name-sorted: ABLE before ZED.
+        let able = text.find("[kv.default.ABLE]").expect("ABLE table");
+        let zed = text.find("[kv.default.ZED]").expect("ZED table");
         assert!(able < zed, "name-sorted: {text}");
         // No value field can ever appear.
         assert!(!text.contains("value"));
+        // And no quoted table names: the identifier charset (DR-0017 §1.5)
+        // makes every segment a TOML bare key.
+        assert!(!text.contains('"') || !text.contains("[kv.\""), "{text}");
     }
 
     #[test]
-    fn serialize_writes_composed_keys_quoted() {
-        // The persisted table name is the composed `NS/KEY`, which is never a
-        // TOML bare key (it contains `/`), so it is always quoted — and parses
-        // back to the same key + namespace (DR-0017 §5).
+    fn serialize_writes_dotted_nested_tables() {
+        // The persisted format is the uniform two-level dotted nesting
+        // `[kv.NS.KEY]` (DR-0017 §5): the identifier charset has no `.`, so
+        // every segment is a bare key (no quoting) and the path depth is
+        // unambiguous. It parses back to the same key + absolute namespace.
         let mut d = def("c", &["echo"], None, None);
         d.namespace = Some("projA".into());
         let text = serialize_definitions(std::slice::from_ref(&d));
-        assert!(text.contains("[kv.\"projA/c\"]"), "text: {text}");
-        let back = parse_defs(&text).unwrap();
+        assert!(text.contains("[kv.projA.c]"), "text: {text}");
+        let back = parse_persisted(&text).unwrap();
         assert_eq!(back[0].name, "c");
         assert_eq!(back[0].namespace.as_deref(), Some("projA"));
+    }
+
+    #[test]
+    fn serialize_same_key_in_two_namespaces_coexists() {
+        // The whole point of the nesting: the same KEY under two namespaces is
+        // two distinct tables (impossible as flat `[kv.KEY]`).
+        let mut a = def("DB", &["echo", "a"], None, None);
+        a.namespace = Some("projA".into());
+        let mut b = def("DB", &["echo", "b"], None, None);
+        b.namespace = Some("projB".into());
+        let text = serialize_definitions(&[a, b]);
+        assert!(text.contains("[kv.projA.DB]"), "{text}");
+        assert!(text.contains("[kv.projB.DB]"), "{text}");
+        let back = parse_persisted(&text).unwrap();
+        assert_eq!(back.len(), 2);
+        let keys: Vec<String> = back.iter().map(|d| d.full_key("ignored")).collect();
+        assert_eq!(keys, vec!["projA/DB", "projB/DB"]);
+    }
+
+    #[test]
+    fn persisted_parser_rejects_flat_entries() {
+        // The persisted grammar is uniformly two-level; a flat `[kv.KEY]`
+        // table (the user-defs shape) does not parse.
+        let err = parse_persisted("[kv.K]\ncommand = [\"echo\"]\n").unwrap_err();
+        assert!(err.message.contains("invalid TOML"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn persisted_parser_rejects_namespace_field() {
+        // In the persisted format the namespace IS the table path; a stray
+        // per-entry `namespace` field is ambiguous and refused.
+        let err = parse_persisted("[kv.projA.K]\nnamespace = \"projB\"\ncommand = [\"echo\"]\n")
+            .unwrap_err();
+        assert!(err.message.contains("namespace"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn persisted_parser_validates_segment_charset() {
+        // Quoted segments outside the identifier charset are rejected even
+        // though TOML can express them.
+        assert!(parse_persisted("[kv.\"a-b\".K]\ncommand = [\"echo\"]\n").is_err());
+        assert!(parse_persisted("[kv.NS.\"a.b\"]\ncommand = [\"echo\"]\n").is_err());
+    }
+
+    #[test]
+    fn user_defs_parser_rejects_quoted_composed_table_names() {
+        // The old persisted shape (`[kv."NS/KEY"]`) is gone: a user-defs table
+        // name is a plain identifier; the namespace travels in the per-entry
+        // field only.
+        let err = parse_defs("[kv.\"projA/c\"]\ncommand = [\"echo\"]\n").unwrap_err();
+        assert!(err.message.contains("A-Za-z0-9_"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn user_defs_parser_rejects_dotted_nesting() {
+        // The user-facing defs grammar stays flat `[kv.NAME]` (+ optional
+        // per-entry `namespace` field); the persisted nesting is not valid
+        // there (the shapes stay distinct on purpose).
+        assert!(parse_defs("[kv.NS.KEY]\ncommand = [\"echo\"]\n").is_err());
     }
 
     #[test]
     fn serialize_escapes_quotes_in_argv() {
         let defs = vec![def("K", &["echo", "a\"b"], None, None)];
         let text = serialize_definitions(&defs);
-        let back = parse_defs(&text).unwrap();
+        let back = parse_persisted(&text).unwrap();
         assert_eq!(back[0].command, vec!["echo", "a\"b"]);
     }
 
@@ -804,7 +909,7 @@ type = "magic"
             )
             .unwrap();
         let snap = snapshot_definitions(&store);
-        let back = parse_defs(&serialize_definitions(&snap)).unwrap();
+        let back = parse_persisted(&serialize_definitions(&snap)).unwrap();
         assert_eq!(back, snap);
     }
 

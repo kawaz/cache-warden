@@ -484,8 +484,7 @@ pub struct KvEntryConfig {
 /// shape (DR-0014 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvDefinition {
-    /// The entry's KEY segment (normalized: never contains `/`; a composed
-    /// `[kv."NS/KEY"]` table name is split into `name` + `namespace`).
+    /// The entry's KEY segment (an identifier; never contains `/`).
     pub name: String,
     /// The absolute namespace this entry is pinned to (DR-0017 §5), or `None`
     /// for "the context default" (the daemon config context is `"default"`, a
@@ -685,19 +684,15 @@ impl KvEntryConfig {
     }
 }
 
-/// Normalize a `[kv.NAME]` table name plus its optional `namespace` field into
+/// Validate a `[kv.NAME]` table name plus its optional `namespace` field into
 /// `(KEY, Option<NS>)` (DR-0017 §5).
 ///
-/// Two accepted shapes (config / defs are a machine-facing surface, so the
-/// composed form is allowed here unlike the CLI KEY argument):
-///
-/// - `NAME = KEY` (a plain identifier): the `namespace` field, if present, is
-///   the absolute NS; absent means "the context default" (`None`).
-/// - `NAME = "NS/KEY"` (a quoted composed key, as written by definition
-///   persistence): an absolute NS embedded in the table name. Combining it
-///   with a `namespace` field is ambiguous and rejected.
-///
-/// Both segments are charset-validated (`[A-Za-z0-9_]+`, DR-0017 §1.5).
+/// `NAME` is a plain identifier; the `namespace` field, if present, is the
+/// absolute NS, absent means "the context default" (`None`). Both are
+/// charset-validated (`[A-Za-z0-9_]+`, DR-0017 §1.5). This is the
+/// human-authored shape (daemon config / defs files); the machine-written
+/// persisted file uses the `[kv.NS.KEY]` dotted nesting instead (see
+/// `crate::defs`).
 pub fn split_kv_entry_name(
     name: &str,
     field_ns: &Option<String>,
@@ -705,21 +700,6 @@ pub fn split_kv_entry_name(
     if let Some(ns) = field_ns {
         crate::namespace::validate_identifier(ns, "namespace")
             .map_err(|e| ConfigError::new(format!("[kv.{name}]: {e}")))?;
-    }
-    if name.contains('/') {
-        let Some((ns, key)) = crate::namespace::split_composed(name) else {
-            return Err(ConfigError::new(format!(
-                "[kv.{name}]: invalid composed key name: must be \"NS/KEY\" with both \
-                 segments matching [A-Za-z0-9_]+ (DR-0017)"
-            )));
-        };
-        if field_ns.is_some() {
-            return Err(ConfigError::new(format!(
-                "[kv.{name}]: a composed \"NS/KEY\" table name cannot be combined with a \
-                 `namespace` field (pick one)"
-            )));
-        }
-        return Ok((key.to_string(), Some(ns.to_string())));
     }
     crate::namespace::validate_identifier(name, "KEY")
         .map_err(|e| ConfigError::new(format!("[kv.{name}]: {e}")))?;

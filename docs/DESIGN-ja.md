@@ -388,8 +388,10 @@ Store に流れる（コアは不変）。デフォルト NS は `"default"`。
   defs は `kv define --defs F --namespace NS` の指定値）。TOML テーブルキーは一意なので
   同一ファイル内に同じ NAME を別 NS で 2 回書けない（既知の制限）。authsock の
   `keys = [...]` は `"NS/KEY"` 修飾可（未修飾 = default NS）。
-- **定義永続化**: 合成キーを quoted テーブル名（`[kv."NS/KEY"]`）で保存して round-trip する
-  （機械生成・機械読みのファイルのため quoting は問題にならない）。
+- **定義永続化**: `[kv.NS.KEY]` の dotted ネスト（kv → NS → KEY の均一 2 階層マップ）で
+  保存して round-trip する。機械生成で全エントリの NS が正規化済み = 深度が均一であり、
+  文字種に `.` が無いので全セグメントが bare key（quoting 不要）かつパス深度 = 意味が一意。
+  同 KEY 別 NS の共存も自然に表現できる。
 
 ### OTP 値型（`kv define --type otp`、DR-0016）
 

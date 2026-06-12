@@ -418,8 +418,11 @@ into `NS/KEY` and flows into the core's flat store (the core is unchanged). The 
   for a `kv define --defs` invocation). TOML table keys are unique, so one file cannot define the same
   NAME twice in different namespaces (known limitation). An authsock `keys = [...]` entry may be
   qualified as `"NS/KEY"` (unqualified = default NS).
-- **Definition persistence**: composed keys are saved as quoted table names (`[kv."NS/KEY"]`) and
-  round-trip (the file is machine-written/read, so quoting is a non-issue).
+- **Definition persistence**: saved as the uniform two-level dotted nesting `[kv.NS.KEY]`
+  (kv → NS → KEY) and round-trips. The file is machine-generated with every entry's namespace
+  normalized (uniform depth), and the charset has no `.`, so every segment is a bare key — no
+  quoting — with an unambiguous path-depth-to-meaning mapping; the same KEY under two namespaces
+  coexists naturally.
 
 ### OTP Value Type (`kv define --type otp`, DR-0016)
 
