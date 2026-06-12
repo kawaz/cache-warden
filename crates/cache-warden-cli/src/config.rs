@@ -106,6 +106,11 @@ pub struct CliConfig {
     /// falls through to the built-in reveal default).
     #[serde(default, rename = "default-mode")]
     pub default_mode: Option<String>,
+    /// Default KV namespace for client verbs (DR-0017 §4). Absent means "not
+    /// set" (the resolver falls through to the built-in `"default"`). Sits
+    /// below the `--namespace` flag and `CACHE_WARDEN_NAMESPACE` in precedence.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 impl CliConfig {
@@ -431,6 +436,11 @@ pub struct KvEntryConfig {
     /// this flag (the agent registry needs the PEM resident at startup).
     #[serde(default)]
     pub preload: bool,
+    /// Pin this entry to an absolute namespace (DR-0017 §5). Absent = the
+    /// context default (`"default"` for the daemon config, the `--namespace`
+    /// value for a `kv define --defs` invocation).
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Value type for this definition (DR-0016). The only value today is `"otp"`;
     /// absent means an ordinary opaque value.
     #[serde(default, rename = "type")]
@@ -474,8 +484,13 @@ pub struct KvEntryConfig {
 /// shape (DR-0014 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvDefinition {
-    /// The entry name (the `[kv.NAME]` key).
+    /// The entry's KEY segment (normalized: never contains `/`; a composed
+    /// `[kv."NS/KEY"]` table name is split into `name` + `namespace`).
     pub name: String,
+    /// The absolute namespace this entry is pinned to (DR-0017 §5), or `None`
+    /// for "the context default" (the daemon config context is `"default"`, a
+    /// `kv define --defs` context is its `--namespace` value).
+    pub namespace: Option<String>,
     /// The command argv (program first) whose stdout is the value.
     pub command: Vec<String>,
     /// Parsed soft TTL in seconds, or `None`.
@@ -489,6 +504,14 @@ pub struct KvDefinition {
     /// empty for an ordinary (opaque) definition. Carried so the type round-trips
     /// through defs files and the persisted-definitions state file.
     pub meta: crate::protocol::wire::ValueMetaWire,
+}
+
+impl KvDefinition {
+    /// The composed store key for this entry under `ctx_ns` (DR-0017 §5): the
+    /// pinned `namespace` if set, else the context default.
+    pub fn full_key(&self, ctx_ns: &str) -> String {
+        crate::namespace::compose(self.namespace.as_deref().unwrap_or(ctx_ns), &self.name)
+    }
 }
 
 /// An error in the configuration file's *content* (distinct from I/O / TOML
@@ -648,9 +671,11 @@ impl KvEntryConfig {
             self.otp_period,
             &self.otp_algorithm,
         )?;
+        let (key_name, namespace) = split_kv_entry_name(name, &self.namespace)?;
 
         Ok(KvDefinition {
-            name: name.to_string(),
+            name: key_name,
+            namespace,
             command,
             soft_ttl_secs,
             hard_ttl_secs,
@@ -658,6 +683,47 @@ impl KvEntryConfig {
             meta,
         })
     }
+}
+
+/// Normalize a `[kv.NAME]` table name plus its optional `namespace` field into
+/// `(KEY, Option<NS>)` (DR-0017 §5).
+///
+/// Two accepted shapes (config / defs are a machine-facing surface, so the
+/// composed form is allowed here unlike the CLI KEY argument):
+///
+/// - `NAME = KEY` (a plain identifier): the `namespace` field, if present, is
+///   the absolute NS; absent means "the context default" (`None`).
+/// - `NAME = "NS/KEY"` (a quoted composed key, as written by definition
+///   persistence): an absolute NS embedded in the table name. Combining it
+///   with a `namespace` field is ambiguous and rejected.
+///
+/// Both segments are charset-validated (`[A-Za-z0-9_]+`, DR-0017 §1.5).
+pub fn split_kv_entry_name(
+    name: &str,
+    field_ns: &Option<String>,
+) -> Result<(String, Option<String>), ConfigError> {
+    if let Some(ns) = field_ns {
+        crate::namespace::validate_identifier(ns, "namespace")
+            .map_err(|e| ConfigError::new(format!("[kv.{name}]: {e}")))?;
+    }
+    if name.contains('/') {
+        let Some((ns, key)) = crate::namespace::split_composed(name) else {
+            return Err(ConfigError::new(format!(
+                "[kv.{name}]: invalid composed key name: must be \"NS/KEY\" with both \
+                 segments matching [A-Za-z0-9_]+ (DR-0017)"
+            )));
+        };
+        if field_ns.is_some() {
+            return Err(ConfigError::new(format!(
+                "[kv.{name}]: a composed \"NS/KEY\" table name cannot be combined with a \
+                 `namespace` field (pick one)"
+            )));
+        }
+        return Ok((key.to_string(), Some(ns.to_string())));
+    }
+    crate::namespace::validate_identifier(name, "KEY")
+        .map_err(|e| ConfigError::new(format!("[kv.{name}]: {e}")))?;
+    Ok((name.to_string(), field_ns.clone()))
 }
 
 impl AuthsockSocketConfig {
@@ -685,10 +751,32 @@ impl AuthsockSocketConfig {
         cache_warden_authsock::FilterEvaluator::parse(&self.filters).map_err(|e| {
             ConfigError::new(format!("[authsock.sockets.{name}]: invalid `filters`: {e}"))
         })?;
+        // Normalize the referenced KV keys to their composed `NS/KEY` form
+        // (DR-0017 §5): config is a machine-facing surface, so a qualified
+        // `"NS/KEY"` is allowed; an unqualified `KEY` means the default NS.
+        let mut keys = Vec::with_capacity(self.keys.len());
+        for k in &self.keys {
+            if k.contains('/') {
+                if crate::namespace::split_composed(k).is_none() {
+                    return Err(ConfigError::new(format!(
+                        "[authsock.sockets.{name}]: invalid key {k:?} in `keys`: must be \
+                         KEY or \"NS/KEY\" with segments matching [A-Za-z0-9_]+ (DR-0017)"
+                    )));
+                }
+                keys.push(k.clone());
+            } else {
+                crate::namespace::validate_identifier(k, "key")
+                    .map_err(|e| ConfigError::new(format!("[authsock.sockets.{name}]: {e}")))?;
+                keys.push(crate::namespace::compose(
+                    crate::namespace::DEFAULT_NAMESPACE,
+                    k,
+                ));
+            }
+        }
         Ok(AuthsockSocket {
             name: name.to_string(),
             path: expand_tilde(&self.path),
-            keys: self.keys.clone(),
+            keys,
             upstreams: self.upstreams.iter().map(|p| expand_tilde(p)).collect(),
             source: self.source.clone(),
             filters: self.filters.clone(),
@@ -790,6 +878,15 @@ impl Config {
                 "[cli]: `default-mode` must be \"reveal\" or \"dry-run\", got {m:?}"
             ))));
         }
+        // Validate `[cli].namespace` eagerly (DR-0017 §1.5): a junk namespace
+        // must fail at startup, not at first use.
+        if let Some(ns) = &cfg.cli.namespace
+            && let Err(e) = crate::namespace::validate_identifier(ns, "namespace")
+        {
+            return Err(ConfigParseError::Content(ConfigError::new(format!(
+                "[cli]: {e}"
+            ))));
+        }
         // An empty (or omitted) auth command is treated as "no command", not as
         // a configured-but-empty command; reject the misleading empty form.
         if let Some(argv) = &cfg.auth.command
@@ -834,7 +931,14 @@ impl Config {
         self.kv
             .iter()
             .filter(|(_, entry)| !entry.allowed_processes.is_empty())
-            .map(|(name, entry)| (name.clone(), entry.allowed_processes.clone()))
+            .filter_map(|(name, entry)| {
+                // Key the policy by the entry's *composed* store key (DR-0017
+                // §5: the policy follows the entry's resolved namespace; the
+                // daemon-config context is "default").
+                let def = entry.validate(name).ok()?;
+                let full = def.full_key(crate::namespace::DEFAULT_NAMESPACE);
+                Some((full, entry.allowed_processes.clone()))
+            })
             .collect()
     }
 
@@ -859,6 +963,12 @@ impl Config {
     /// `None` when `[cli].default-mode` is unset (DR-0015 §4).
     pub fn cli_default_mode(&self) -> Option<crate::mode::Mode> {
         self.cli.default_mode()
+    }
+
+    /// The configured default KV namespace, or `None` when `[cli].namespace`
+    /// is unset (DR-0017 §4). Validated by [`Config::parse`].
+    pub fn cli_namespace(&self) -> Option<String> {
+        self.cli.namespace.clone()
     }
 
     /// The validated authsock agent sockets, in deterministic (name-sorted)
@@ -1376,7 +1486,11 @@ keys = ["GITHUB_KEY", "OTHER_KEY"]
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].name, "default");
         assert_eq!(socks[0].path, PathBuf::from("/tmp/cache-warden.sock"));
-        assert_eq!(socks[0].keys, vec!["GITHUB_KEY", "OTHER_KEY"]);
+        // Unqualified keys are normalized to the composed default-NS form (DR-0017 §5).
+        assert_eq!(
+            socks[0].keys,
+            vec!["default/GITHUB_KEY", "default/OTHER_KEY"]
+        );
     }
 
     #[test]
@@ -1557,7 +1671,8 @@ allowed_processes = ["ssh", "git"]
         .unwrap();
         let policies = cfg.kv_process_policies();
         assert_eq!(
-            policies.get("TOK"),
+            // The policy is keyed by the composed store key (DR-0017 §5).
+            policies.get("default/TOK"),
             Some(&vec!["ssh".to_string(), "git".to_string()])
         );
     }

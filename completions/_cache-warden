@@ -53,6 +53,9 @@ _cache-warden() {
   # 共通 --socket オプション (コマンド名の後ならどこでも有効)。
   local socket_opt='--socket[Control socket path]:socket:_files'
 
+  # 共通 --namespace オプション (kv 全動詞 / run / inject; DR-0017)。
+  local ns_opt='--namespace[KV namespace (default: CACHE_WARDEN_NAMESPACE > config > default)]:namespace'
+
   # 共通 TTL オプション (kv define / kv set 共有)。
   local -a ttl_opts
   ttl_opts=(
@@ -136,6 +139,7 @@ _cache-warden() {
                   # define は新規キー登録なので位置 KEY は補完しない (自由入力)。
                   _arguments -C \
                     "$socket_opt" \
+                    "$ns_opt" \
                     '--help[Show this help message]' \
                     '--source[A source URI (op:// is built in)]:uri' \
                     '*--defs[Register every kv.NAME table in a TOML defs file]:file:_files' \
@@ -147,6 +151,7 @@ _cache-warden() {
                   # VALUE is positional (omitted = read from piped stdin).
                   _arguments \
                     "$socket_opt" \
+                    "$ns_opt" \
                     '--help[Show this help message]' \
                     "$ttl_opts[@]" \
                     '1:key:_cw_keys' \
@@ -155,6 +160,7 @@ _cache-warden() {
                 get)
                   _arguments \
                     "$socket_opt" \
+                    "$ns_opt" \
                     '--help[Show this help message]' \
                     '(--reveal)--dry-run[Verify retrieval WITHOUT emitting the value]' \
                     '(--dry-run)--reveal[Force real-value output]' \
@@ -163,16 +169,22 @@ _cache-warden() {
                 del)
                   _arguments \
                     "$socket_opt" \
+                    "$ns_opt" \
                     '--help[Show this help message]' \
                     '--with-define[Also drop the registered definition]' \
                     '1:key:_cw_keys'
                   ;;
                 list)
-                  _arguments "$socket_opt" '--help[Show this help message]'
+                  _arguments \
+                    "$socket_opt" \
+                    "$ns_opt" \
+                    '--help[Show this help message]' \
+                    '--all-namespaces[List every namespace as NS/KEY]'
                   ;;
                 pin)
                   _arguments \
                     "$socket_opt" \
+                    "$ns_opt" \
                     '--help[Show this help message]' \
                     '1:key:_cw_keys' \
                     '2:duration:(1h 30m 8h)'
@@ -180,6 +192,7 @@ _cache-warden() {
                 unpin)
                   _arguments \
                     "$socket_opt" \
+                    "$ns_opt" \
                     '--help[Show this help message]' \
                     '1:key:_cw_keys'
                   ;;
@@ -192,6 +205,7 @@ _cache-warden() {
           # `--` 以降は外部コマンドとして補完 (_normal)。
           _arguments \
             "$socket_opt" \
+            "$ns_opt" \
             '--help[Show this help message]' \
             '*--env[Add/override a child env var (NAME=VALUE)]:env:' \
             '*--defs[Register a TOML defs file before resolving]:file:_files' \
@@ -203,6 +217,7 @@ _cache-warden() {
         inject)
           _arguments \
             "$socket_opt" \
+            "$ns_opt" \
             '--help[Show this help message]' \
             '--in[Read the template from FILE (default: stdin)]:file:_files' \
             '--out[Write the result to FILE, created 0600 (default: stdout)]:file:_files' \
@@ -229,9 +244,16 @@ _cache-warden() {
           esac
           ;;
 
-        ping|status)
-          # サブコマンドなし。--socket / --help のみ。
+        ping)
           _arguments "$socket_opt" '--help[Show this help message]'
+          ;;
+
+        status)
+          _arguments \
+            "$socket_opt" \
+            "$ns_opt" \
+            '--help[Show this help message]' \
+            '--all-namespaces[Show every namespace as NS/KEY]'
           ;;
       esac
       ;;

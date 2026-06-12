@@ -77,22 +77,25 @@ pub fn parse_inject(args: &[String]) -> Result<InjectArgs, String> {
 
 /// Render a template's references into output bytes (pure, testable).
 ///
-/// `template` is the raw input; `resolver` resolves keys (deduped). Returns the
-/// rendered bytes on success. In reveal mode a failed reference returns an `Err`
-/// naming the failed keys (fail-closed). In dry-run mode it returns the masked
-/// bytes plus the failed keys, so the caller can still write the output and then
-/// exit non-zero.
+/// `template` is the raw input; `resolver` resolves keys (deduped). Unqualified
+/// references resolve into `ctx_ns`, qualified ones are absolute (DR-0017 §3);
+/// masks and failure lists show the resolved absolute key. Returns the rendered
+/// bytes on success. In reveal mode a failed reference returns an `Err` naming
+/// the failed keys (fail-closed). In dry-run mode it returns the masked bytes
+/// plus the failed keys, so the caller can still write the output and then exit
+/// non-zero.
 pub fn render<R: Resolver>(
     template: &[u8],
     mode: Mode,
+    ctx_ns: &str,
     resolver: &mut R,
 ) -> Result<refs::RenderedTemplate, String> {
     let keys: Vec<String> = refs::find_references_bytes(template)
         .into_iter()
         .map(|l| l.key)
         .collect();
-    let resolved = refs::resolve_all(&keys, resolver);
-    match refs::render_template(template, &resolved, mode) {
+    let resolved = refs::resolve_all(&keys, ctx_ns, resolver);
+    match refs::render_template(template, &resolved, mode, ctx_ns) {
         Ok(rendered) => Ok(rendered),
         Err(failures) => Err(format!(
             "{} reference(s) failed to resolve: {}",
@@ -165,22 +168,29 @@ mod tests {
 
     #[test]
     fn render_reveal_substitutes() {
+        // The resolver sees the qualified key (DR-0017 §3).
         let mut resolver = |k: &str| ok(format!("val-{k}").as_bytes());
-        let out = render(b"a=cache-warden://K", Mode::Reveal, &mut resolver).unwrap();
-        assert_eq!(out.bytes, b"a=val-K");
+        let out = render(
+            b"a=cache-warden://K",
+            Mode::Reveal,
+            "default",
+            &mut resolver,
+        )
+        .unwrap();
+        assert_eq!(out.bytes, b"a=val-default/K");
     }
 
     #[test]
     fn render_reveal_fails_closed() {
         let mut resolver = |_k: &str| -> ResolveResult { Err("nope".into()) };
-        let err = render(b"cache-warden://K", Mode::Reveal, &mut resolver).unwrap_err();
-        assert!(err.contains("K"), "err: {err}");
+        let err = render(b"cache-warden://K", Mode::Reveal, "default", &mut resolver).unwrap_err();
+        assert!(err.contains("default/K"), "err: {err}");
     }
 
     #[test]
     fn render_dry_run_masks_and_reports_failures() {
         let mut resolver = |k: &str| -> ResolveResult {
-            if k == "BAD" {
+            if k == "default/BAD" {
                 Err("nope".into())
             } else {
                 Ok(ResolvedValue::Verified)
@@ -189,14 +199,16 @@ mod tests {
         let out = render(
             b"cache-warden://OK cache-warden://BAD",
             Mode::DryRun,
+            "default",
             &mut resolver,
         )
         .unwrap();
+        // Masks display the resolved absolute key (DR-0017 §5).
         assert_eq!(
             out.bytes,
-            b"<cache-warden:OK:masked> <cache-warden:BAD:failed>"
+            b"<cache-warden:default/OK:masked> <cache-warden:default/BAD:failed>"
         );
-        assert_eq!(out.failures, vec!["BAD".to_string()]);
+        assert_eq!(out.failures, vec!["default/BAD".to_string()]);
     }
 
     #[test]

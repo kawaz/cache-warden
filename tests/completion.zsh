@@ -126,20 +126,23 @@ _expect_contains "kv define opts" "cache-warden kv define KEY --" \
 
 print "== kv set options =="
 _expect_contains "kv set opts" "cache-warden kv set KEY --" \
-  --soft-ttl --hard-ttl
+  --soft-ttl --hard-ttl --namespace
 # VALUE is positional now; the --value flags are gone, and value types (otp)
 # live on `kv define`, not `kv set` (DR-0016).
 _expect_not_contains "kv set has no removed/otp opts" "cache-warden kv set KEY --" \
   --value --value-stdin --type --otp-digits --otp-period --otp-algorithm
 
 print "== kv get options =="
-_expect_contains "kv get opts" "cache-warden kv get KEY --" --dry-run --reveal
+_expect_contains "kv get opts" "cache-warden kv get KEY --" --dry-run --reveal --namespace
+
+print "== kv list options (DR-0017) =="
+_expect_contains "kv list opts" "cache-warden kv list --" --namespace --all-namespaces
 
 print "== kv del options =="
 _expect_contains "kv del opts" "cache-warden kv del KEY --" --with-define
 
 print "== run options =="
-_expect_contains "run opts" "cache-warden run --" --env --defs --dry-run --reveal
+_expect_contains "run opts" "cache-warden run --" --env --defs --dry-run --reveal --namespace
 
 print "== inject options =="
 _expect_contains "inject opts" "cache-warden inject --" --in --out --defs --dry-run --reveal

@@ -69,8 +69,16 @@ pub fn snapshot_definitions(store: &Store) -> Vec<KvDefinition> {
             continue; // defensively skip a non-command definition
         };
         let ttl = def.ttl();
+        // Store keys are composed `NS/KEY` (DR-0017 §1); split so the
+        // persisted entry round-trips through the normalized KvDefinition
+        // shape. A key that does not split (an internal daemon key) is never
+        // a registered definition, but skip defensively if one appears.
+        let Some((ns, key_name)) = crate::namespace::split_composed(key) else {
+            continue;
+        };
         out.push(KvDefinition {
-            name: key.to_string(),
+            name: key_name.to_string(),
+            namespace: Some(ns.to_string()),
             command: argv.to_vec(),
             soft_ttl_secs: ttl.soft().map(|d| d.as_secs()),
             hard_ttl_secs: ttl.hard().map(|d| d.as_secs()),
@@ -80,7 +88,7 @@ pub fn snapshot_definitions(store: &Store) -> Vec<KvDefinition> {
             meta: meta_to_wire(def.meta()),
         });
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by_key(|d| d.full_key(crate::namespace::DEFAULT_NAMESPACE));
     out
 }
 
@@ -115,6 +123,11 @@ struct DefEntry {
     /// OTP hash algorithm (only with `type = "otp"`).
     #[serde(default, rename = "otp-algorithm")]
     otp_algorithm: Option<String>,
+    /// Pin this entry to an absolute namespace (DR-0017 §5). Absent = the
+    /// context default (the `--namespace` value of the `kv define --defs`
+    /// invocation, or `"default"` for the persisted-definitions file).
+    #[serde(default)]
+    namespace: Option<String>,
 
     // --- Forbidden-on-purpose keys (rejected with a clear error) ---
     /// `preload` is a config-only startup flag; meaningless in a defs file.
@@ -201,9 +214,11 @@ impl DefEntry {
             self.otp_period,
             &self.otp_algorithm,
         )?;
+        let (key_name, namespace) = crate::config::split_kv_entry_name(name, &self.namespace)?;
 
         Ok(KvDefinition {
-            name: name.to_string(),
+            name: key_name,
+            namespace,
             command,
             soft_ttl_secs: parse("soft-ttl", &self.soft_ttl)?,
             hard_ttl_secs: parse("hard-ttl", &self.hard_ttl)?,
@@ -246,14 +261,19 @@ pub fn serialize_definitions(defs: &[KvDefinition]) -> String {
     // on a map is fine, but emitting it directly keeps the output minimal and
     // guarantees only the four allowed fields ever appear.
     let mut sorted: Vec<&KvDefinition> = defs.iter().collect();
-    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    sorted.sort_by_key(|d| d.full_key(crate::namespace::DEFAULT_NAMESPACE));
 
     let mut out = String::new();
     for (i, def) in sorted.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&format!("[kv.{}]\n", toml_key(&def.name)));
+        // Persist the composed `NS/KEY` as the (quoted) table name (DR-0017
+        // §5): two same-named keys in different namespaces would collide as
+        // plain `[kv.KEY]` tables, and this file is machine-written/read, so
+        // the quoted composed form is fine here.
+        let full = def.full_key(crate::namespace::DEFAULT_NAMESPACE);
+        out.push_str(&format!("[kv.{}]\n", toml_key(&full)));
         out.push_str(&format!("command = {}\n", toml_string_array(&def.command)));
         if let Some(secs) = def.soft_ttl_secs {
             out.push_str(&format!("soft-ttl = \"{secs}s\"\n"));
@@ -379,6 +399,7 @@ mod tests {
     fn def(name: &str, argv: &[&str], soft: Option<u64>, hard: Option<u64>) -> KvDefinition {
         KvDefinition {
             name: name.to_string(),
+            namespace: None,
             command: argv.iter().map(|s| s.to_string()).collect(),
             soft_ttl_secs: soft,
             hard_ttl_secs: hard,
@@ -582,7 +603,10 @@ type = "magic"
         assert!(text.contains("type = \"otp\""), "text: {text}");
         assert!(text.contains("otp-digits = 8"), "text: {text}");
         let back = parse_defs(&text).unwrap();
-        assert_eq!(back[0], d, "otp meta round-trips");
+        // Persisted entries come back with an absolute namespace (the composed
+        // table name); the composed key round-trips exactly.
+        assert_eq!(back[0].full_key("ignored"), d.full_key("default"));
+        assert_eq!(back[0].meta, d.meta, "otp meta round-trips");
     }
 
     // ---- serialize / round-trip ----
@@ -596,8 +620,14 @@ type = "magic"
         let text = serialize_definitions(&defs);
         let back = parse_defs(&text).unwrap();
         assert_eq!(back.len(), 2);
-        assert_eq!(back[0], defs[0]);
-        assert_eq!(back[1], defs[1]);
+        // The persisted form pins the absolute namespace; the composed key,
+        // argv, and TTLs round-trip exactly (DR-0017 §5).
+        for (b, d) in back.iter().zip(defs.iter()) {
+            assert_eq!(b.full_key("ignored"), d.full_key("default"));
+            assert_eq!(b.command, d.command);
+            assert_eq!(b.soft_ttl_secs, d.soft_ttl_secs);
+            assert_eq!(b.hard_ttl_secs, d.hard_ttl_secs);
+        }
     }
 
     #[test]
@@ -607,20 +637,26 @@ type = "magic"
             def("ABLE", &["echo", "a"], Some(60), None),
         ];
         let text = serialize_definitions(&defs);
-        // Name-sorted: ABLE before ZED.
-        assert!(text.find("[kv.ABLE]").unwrap() < text.find("[kv.ZED]").unwrap());
+        // Composed-key tables (quoted), name-sorted: ABLE before ZED.
+        let able = text.find("[kv.\"default/ABLE\"]").expect("ABLE table");
+        let zed = text.find("[kv.\"default/ZED\"]").expect("ZED table");
+        assert!(able < zed, "name-sorted: {text}");
         // No value field can ever appear.
         assert!(!text.contains("value"));
     }
 
     #[test]
-    fn serialize_quotes_non_bare_keys() {
-        let defs = vec![def("a.b/c", &["echo"], None, None)];
-        let text = serialize_definitions(&defs);
-        assert!(text.contains("[kv.\"a.b/c\"]"), "text: {text}");
-        // And it round-trips back to the same name.
+    fn serialize_writes_composed_keys_quoted() {
+        // The persisted table name is the composed `NS/KEY`, which is never a
+        // TOML bare key (it contains `/`), so it is always quoted — and parses
+        // back to the same key + namespace (DR-0017 §5).
+        let mut d = def("c", &["echo"], None, None);
+        d.namespace = Some("projA".into());
+        let text = serialize_definitions(std::slice::from_ref(&d));
+        assert!(text.contains("[kv.\"projA/c\"]"), "text: {text}");
         let back = parse_defs(&text).unwrap();
-        assert_eq!(back[0].name, "a.b/c");
+        assert_eq!(back[0].name, "c");
+        assert_eq!(back[0].namespace.as_deref(), Some("projA"));
     }
 
     #[test]
@@ -650,7 +686,13 @@ type = "magic"
         ];
         save_definitions(&path, &defs).unwrap();
         let back = load_definitions(&path).unwrap();
-        assert_eq!(back, defs);
+        assert_eq!(back.len(), defs.len());
+        for (b, d) in back.iter().zip(defs.iter()) {
+            assert_eq!(b.full_key("ignored"), d.full_key("default"));
+            assert_eq!(b.command, d.command);
+            assert_eq!(b.soft_ttl_secs, d.soft_ttl_secs);
+            assert_eq!(b.hard_ttl_secs, d.hard_ttl_secs);
+        }
     }
 
     #[test]
@@ -714,14 +756,14 @@ type = "magic"
         .unwrap();
         store
             .define(
-                "ZED",
+                "default/ZED",
                 ValueSource::command(vec!["op".into(), "read".into(), "op://z".into()]),
                 ttl,
             )
             .unwrap();
         store
             .define(
-                "ABLE",
+                "default/ABLE",
                 ValueSource::command(vec!["printf".into(), "x".into()]),
                 Ttl::new(None, None).unwrap(),
             )
@@ -729,7 +771,7 @@ type = "magic"
         // A static value-only entry must NOT appear in the snapshot.
         let clock = FakeClock::new();
         store.set(
-            "STATIC",
+            "default/STATIC",
             ValueSource::Static,
             SecretBytes::new(b"v".to_vec()),
             Ttl::new(None, None).unwrap(),
@@ -739,6 +781,11 @@ type = "magic"
         let snap = snapshot_definitions(&store);
         let names: Vec<_> = snap.iter().map(|d| d.name.clone()).collect();
         assert_eq!(names, vec!["ABLE", "ZED"], "only definitions, name-sorted");
+        // The store's composed key splits into (namespace, name).
+        assert!(
+            snap.iter()
+                .all(|d| d.namespace.as_deref() == Some("default"))
+        );
         let zed = snap.iter().find(|d| d.name == "ZED").unwrap();
         assert_eq!(zed.command, vec!["op", "read", "op://z"]);
         assert_eq!(zed.soft_ttl_secs, Some(3600));
@@ -751,7 +798,7 @@ type = "magic"
         let mut store = Store::new();
         store
             .define(
-                "K",
+                "default/K",
                 ValueSource::command(vec!["echo".into(), "x".into()]),
                 Ttl::new(None, None).unwrap(),
             )

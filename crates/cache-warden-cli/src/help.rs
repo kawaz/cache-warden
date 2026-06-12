@@ -320,6 +320,11 @@ pub fn kv() -> HelpSpec {
         ],
         options: &[],
         detail: "\
+Every kv subcommand accepts `--namespace NS` to select the KV namespace
+(DR-0017). The default resolves as: --namespace > CACHE_WARDEN_NAMESPACE >
+[cli].namespace > \"default\". KEY and NS are identifiers ([A-Za-z0-9_]+); a
+`ns/key` form inside a KEY argument is rejected — the flag is the only path.
+
 Every kv subcommand accepts a `--` separator: everything after it is taken as
 positional arguments and never interpreted as an option, so option-looking key
 names stay safe (`kv get -- --weird-key`, `kv del -- \"$key\"`). One
@@ -355,6 +360,11 @@ pub fn kv_define() -> HelpSpec {
                 desc: "Register every [kv.NAME] in a TOML defs file at once\n\
                        (repeatable). Cannot be combined with KEY /\n\
                        --command / --source",
+            },
+            Row {
+                name: "--namespace NS",
+                desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\"; DR-0017)",
             },
             Row {
                 name: "--soft-ttl DUR",
@@ -399,7 +409,10 @@ computed 30s code, not the seed) — that combination is rejected.
 config [kv.*] section: command + soft-ttl / hard-ttl; no inline values, no
 preload). Each clashing key is reported on its own; one conflict does not stop
 the others. There is no automatic discovery — only the files you pass are read
-(a conventional name is .cache-warden.toml, but it is never loaded implicitly).",
+(a conventional name is .cache-warden.toml, but it is never loaded implicitly).
+An entry may pin itself with `namespace = \"NS\"` (absolute); without the field
+it follows this invocation's --namespace (DR-0017). Note: TOML table keys are
+unique, so one file cannot define the same NAME twice in different namespaces.",
         show_global: true,
     }
 }
@@ -412,6 +425,11 @@ pub fn kv_set() -> HelpSpec {
         usage: concat!("cache-warden", " kv set [OPTIONS] [--] KEY [VALUE]"),
         subcommands: &[],
         options: &[
+            Row {
+                name: "--namespace NS",
+                desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\"; DR-0017)",
+            },
             Row {
                 name: "--soft-ttl DUR",
                 desc: "Soft TTL (re-auth to extend). e.g. 1h, 30m, 45s, 86400",
@@ -448,13 +466,21 @@ pub fn kv_get() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " kv get"),
         summary: "Fetch a cached value (raw bytes to stdout).",
-        usage: concat!("cache-warden", " kv get <KEY> [--dry-run | --reveal]"),
+        usage: concat!(
+            "cache-warden",
+            " kv get [--namespace NS] <KEY> [--dry-run | --reveal]"
+        ),
         subcommands: &[],
         options: &[
             Row {
+                name: "--namespace NS",
+                desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\"; DR-0017)",
+            },
+            Row {
                 name: "--dry-run",
                 desc: "Verify retrieval WITHOUT emitting the value: print a mask\n\
-                       (<cache-warden:KEY:masked>), running the full chain\n\
+                       (<cache-warden:NS/KEY:masked>), running the full chain\n\
                        (lazy generate / extend / regenerate / re-auth)",
             },
             Row {
@@ -468,7 +494,8 @@ By default `kv get` REVEALS the real value (raw bytes to stdout). For a safe
 check, use --dry-run: it runs the full retrieval chain (and so has side
 effects — upstream execution, re-authentication / TouchID, cache warming) but
 returns only a mask, never the value. On failure --dry-run prints
-<cache-warden:KEY:failed> and exits non-zero.",
+<cache-warden:NS/KEY:failed> and exits non-zero (masks always show the
+resolved absolute NS/KEY).",
         show_global: true,
     }
 }
@@ -480,15 +507,20 @@ pub fn run_cmd() -> HelpSpec {
         summary: "Resolve cache-warden://KEY env references, then exec a command.",
         usage: concat!(
             "cache-warden",
-            " run [--env NAME=VALUE]... [--defs FILE]... [--dry-run | --reveal] -- CMD [ARGS...]"
+            " run [--namespace NS] [--env NAME=VALUE]... [--defs FILE]... [--dry-run | --reveal] -- CMD [ARGS...]"
         ),
         subcommands: &[],
         options: &[
             Row {
+                name: "--namespace NS",
+                desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\"; DR-0017)",
+            },
+            Row {
                 name: "--env NAME=VALUE",
                 desc: "Add/override a child env var (repeatable). A value that is\n\
-                       exactly cache-warden://KEY is resolved; --env wins over\n\
-                       the inherited environment",
+                       exactly cache-warden://[NS/]KEY is resolved; --env wins\n\
+                       over the inherited environment",
             },
             Row {
                 name: "--defs FILE",
@@ -512,9 +544,11 @@ re-authentication / TouchID, cache warming) — but injects only masks, never th
 value, and exits non-zero if any reference fails.
 
 Only env values that are ENTIRELY a reference are substituted (whole-value
-rule). argv is never an injection face: a reference-looking token after `--` is
-passed verbatim with a warning (use --env NAME=cache-warden://KEY). On success
-`run` execs the command (no parent lingers holding secrets).",
+rule). References are cache-warden://[NS/]KEY: an unqualified KEY resolves into
+this invocation's namespace, a qualified NS/KEY is absolute (DR-0017). argv is
+never an injection face: a reference-looking token after `--` is passed
+verbatim with a warning (use --env NAME=cache-warden://KEY). On success `run`
+execs the command (no parent lingers holding secrets).",
         show_global: true,
     }
 }
@@ -526,10 +560,15 @@ pub fn inject_cmd() -> HelpSpec {
         summary: "Substitute cache-warden://KEY references in a template stream.",
         usage: concat!(
             "cache-warden",
-            " inject [--in FILE] [--out FILE] [--defs FILE]... [--dry-run | --reveal]"
+            " inject [--namespace NS] [--in FILE] [--out FILE] [--defs FILE]... [--dry-run | --reveal]"
         ),
         subcommands: &[],
         options: &[
+            Row {
+                name: "--namespace NS",
+                desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\"; DR-0017)",
+            },
             Row {
                 name: "--in FILE",
                 desc: "Read the template from FILE (default: stdin)",
@@ -559,9 +598,11 @@ runs the full retrieval chain — with side effects (upstream execution,
 re-authentication / TouchID, cache warming) — but emits only masks, never the
 value, and exits non-zero if any reference fails.
 
-References are replaced as substrings (embedded composition is allowed, unlike
-`run`'s whole-value env rule). Processing is byte-oriented and binary safe. In
-reveal mode it is fail-closed: nothing is written if any reference fails.",
+References are cache-warden://[NS/]KEY, replaced as substrings (embedded
+composition is allowed, unlike `run`'s whole-value env rule): an unqualified
+KEY resolves into this invocation's namespace, a qualified NS/KEY is absolute
+(DR-0017). Processing is byte-oriented and binary safe. In reveal mode it is
+fail-closed: nothing is written if any reference fails.",
         show_global: true,
     }
 }
@@ -571,13 +612,23 @@ pub fn kv_del() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " kv del"),
         summary: "Delete a cached value (optionally its definition too).",
-        usage: concat!("cache-warden", " kv del <KEY> [--with-define]"),
+        usage: concat!(
+            "cache-warden",
+            " kv del [--namespace NS] <KEY> [--with-define]"
+        ),
         subcommands: &[],
-        options: &[Row {
-            name: "--with-define",
-            desc: "Also drop the registered definition so the key will not\n\
-                   regenerate on a later get (default: value only)",
-        }],
+        options: &[
+            Row {
+                name: "--namespace NS",
+                desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\"; DR-0017)",
+            },
+            Row {
+                name: "--with-define",
+                desc: "Also drop the registered definition so the key will not\n\
+                       regenerate on a later get (default: value only)",
+            },
+        ],
         detail: "",
         show_global: true,
     }
@@ -587,11 +638,26 @@ pub fn kv_del() -> HelpSpec {
 pub fn kv_list() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " kv list"),
-        summary: "List cached key names.",
-        usage: concat!("cache-warden", " kv list"),
+        summary: "List cached key names (current namespace).",
+        usage: concat!(
+            "cache-warden",
+            " kv list [--namespace NS] [--all-namespaces]"
+        ),
         subcommands: &[],
-        options: &[],
-        detail: "",
+        options: &[
+            Row {
+                name: "--namespace NS",
+                desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\"; DR-0017)",
+            },
+            Row {
+                name: "--all-namespaces",
+                desc: "List every namespace's keys in their composed NS/KEY form",
+            },
+        ],
+        detail: "\
+By default only the current namespace's keys are listed (names shown without
+the NS/ prefix). --all-namespaces lists everything as NS/KEY (DR-0017).",
         show_global: true,
     }
 }
@@ -601,9 +667,13 @@ pub fn kv_pin() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " kv pin"),
         summary: "Hold a value Active for DUR, ignoring its TTL (re-auth).",
-        usage: concat!("cache-warden", " kv pin <KEY> <DUR>"),
+        usage: concat!("cache-warden", " kv pin [--namespace NS] <KEY> <DUR>"),
         subcommands: &[],
-        options: &[],
+        options: &[Row {
+            name: "--namespace NS",
+            desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\"; DR-0017)",
+        }],
         detail: "\
 Hold the value Active for DUR (e.g. 8h), suppressing both soft and hard
 expiry until then. Useful before a long unattended run so an overnight hard
@@ -619,9 +689,13 @@ pub fn kv_unpin() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " kv unpin"),
         summary: "Drop a pin, returning the value to normal TTL evaluation.",
-        usage: concat!("cache-warden", " kv unpin <KEY>"),
+        usage: concat!("cache-warden", " kv unpin [--namespace NS] <KEY>"),
         subcommands: &[],
-        options: &[],
+        options: &[Row {
+            name: "--namespace NS",
+            desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\"; DR-0017)",
+        }],
         detail: "",
         show_global: true,
     }
@@ -761,6 +835,30 @@ mod tests {
         // but steers users there (DR-0016).
         assert!(!h.contains("--otp-digits"));
         assert!(h.contains("kv define KEY --type otp"));
+        // Namespace flag (DR-0017).
+        assert!(h.contains("--namespace NS"));
+    }
+
+    #[test]
+    fn kv_list_and_value_verbs_document_namespaces() {
+        // DR-0017: every kv leaf carries --namespace; list adds --all-namespaces.
+        let list = kv_list().render();
+        assert!(list.contains("--namespace NS"));
+        assert!(list.contains("--all-namespaces"));
+        assert!(list.contains("NS/KEY"));
+        for spec in [kv_get(), kv_del(), kv_pin(), kv_unpin(), kv_define()] {
+            let h = spec.render();
+            assert!(h.contains("--namespace NS"), "missing in: {h}");
+        }
+        // run / inject carry the flag and the [NS/]KEY reference grammar.
+        for spec in [run_cmd(), inject_cmd()] {
+            let h = spec.render();
+            assert!(h.contains("--namespace NS"), "missing in: {h}");
+            assert!(h.contains("[NS/]KEY"), "reference grammar in: {h}");
+        }
+        // The kv group page explains the precedence chain.
+        let group = kv().render();
+        assert!(group.contains("CACHE_WARDEN_NAMESPACE"));
     }
 
     #[test]

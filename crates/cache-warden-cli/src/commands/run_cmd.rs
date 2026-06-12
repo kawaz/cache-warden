@@ -110,15 +110,18 @@ pub struct ResolvedEnv {
 ///
 /// `inherited` is the parent env (typically `std::env::vars`), `overrides` are
 /// the `--env` assignments (later entries win, and `--env` wins over inherited).
-/// Only an env value that is **entirely** `cache-warden://KEY` is resolved;
-/// every other value is passed through literally. In reveal mode a value
-/// containing a NUL is rejected (env cannot carry NUL) and a failed reference
-/// fails the whole call (fail-closed). In dry-run mode references become masks
-/// and the call never fails-closed (failures are collected).
+/// Only an env value that is **entirely** `cache-warden://[NS/]KEY` is
+/// resolved; every other value is passed through literally. An unqualified
+/// reference resolves into `ctx_ns`, a qualified one is absolute (DR-0017 §3);
+/// masks and failure lists show the resolved absolute key. In reveal mode a
+/// value containing a NUL is rejected (env cannot carry NUL) and a failed
+/// reference fails the whole call (fail-closed). In dry-run mode references
+/// become masks and the call never fails-closed (failures are collected).
 pub fn resolve_env<R: Resolver>(
     inherited: &[(String, String)],
     overrides: &[(String, String)],
     mode: Mode,
+    ctx_ns: &str,
     resolver: &mut R,
 ) -> Result<ResolvedEnv, String> {
     // Merge inherited + overrides into a last-wins ordered list. `--env` after
@@ -136,47 +139,50 @@ pub fn resolve_env<R: Resolver>(
     }
 
     // Collect the distinct keys that are whole-value references and resolve them
-    // once each (dedup, DR-0013).
+    // once each (dedup, DR-0013). The map is keyed by the qualified form.
     let keys: Vec<String> = merged
         .iter()
         .filter_map(|(_, v)| refs::whole_value_key(v).map(|k| k.to_string()))
         .collect();
-    let resolved = refs::resolve_all(&keys, resolver);
+    let resolved = refs::resolve_all(&keys, ctx_ns, resolver);
 
     let mut vars: Vec<(String, String)> = Vec::with_capacity(merged.len());
     let mut failures: Vec<String> = Vec::new();
     for (name, value) in merged {
         match refs::whole_value_key(&value) {
             None => vars.push((name, value)), // literal, pass through
-            Some(key) => match resolved.get(key) {
-                Some(Ok(ResolvedValue::Value(bytes))) if !mode.is_dry_run() => {
-                    if bytes.contains(&0) {
-                        return Err(format!(
-                            "value for {name} (cache-warden://{key}) contains a NUL byte and cannot be placed in the environment"
-                        ));
+            Some(key) => {
+                let qkey = crate::namespace::qualify(key, ctx_ns);
+                match resolved.get(&qkey) {
+                    Some(Ok(ResolvedValue::Value(bytes))) if !mode.is_dry_run() => {
+                        if bytes.contains(&0) {
+                            return Err(format!(
+                                "value for {name} (cache-warden://{qkey}) contains a NUL byte and cannot be placed in the environment"
+                            ));
+                        }
+                        let s = String::from_utf8(bytes.clone()).map_err(|_| {
+                            format!(
+                                "value for {name} (cache-warden://{qkey}) is not valid UTF-8 and cannot be placed in the environment"
+                            )
+                        })?;
+                        vars.push((name, s));
                     }
-                    let s = String::from_utf8(bytes.clone()).map_err(|_| {
-                        format!(
-                            "value for {name} (cache-warden://{key}) is not valid UTF-8 and cannot be placed in the environment"
-                        )
-                    })?;
-                    vars.push((name, s));
-                }
-                Some(Ok(ResolvedValue::Value(_))) | Some(Ok(ResolvedValue::Verified)) => {
-                    // dry-run: mask regardless of whether a value leaked in.
-                    vars.push((name, refs::mask(key, true)));
-                }
-                Some(Err(_)) | None => {
-                    failures.push(key.to_string());
-                    if mode.is_dry_run() {
-                        vars.push((name, refs::mask(key, false)));
-                    } else {
-                        // reveal: keep the reference so the failing NAME is named
-                        // in the fail-closed error below.
-                        vars.push((name, value));
+                    Some(Ok(ResolvedValue::Value(_))) | Some(Ok(ResolvedValue::Verified)) => {
+                        // dry-run: mask regardless of whether a value leaked in.
+                        vars.push((name, refs::mask(&qkey, true)));
+                    }
+                    Some(Err(_)) | None => {
+                        failures.push(qkey.clone());
+                        if mode.is_dry_run() {
+                            vars.push((name, refs::mask(&qkey, false)));
+                        } else {
+                            // reveal: keep the reference so the failing NAME is
+                            // named in the fail-closed error below.
+                            vars.push((name, value));
+                        }
                     }
                 }
-            },
+            }
         }
     }
 
@@ -268,9 +274,10 @@ mod tests {
             ("LIT".to_string(), "literal".to_string()),
         ];
         let mut resolver = |k: &str| ok(format!("secret-{k}").as_bytes());
-        let r = resolve_env(&inherited, &[], Mode::Reveal, &mut resolver).unwrap();
+        let r = resolve_env(&inherited, &[], Mode::Reveal, "default", &mut resolver).unwrap();
         let map: std::collections::HashMap<_, _> = r.vars.into_iter().collect();
-        assert_eq!(map["DB"], "secret-DB_PW");
+        // The resolver sees the qualified key (DR-0017 §3).
+        assert_eq!(map["DB"], "secret-default/DB_PW");
         // Embedded reference is NOT substituted (whole-value rule).
         assert_eq!(map["MIX"], "x cache-warden://NO y");
         assert_eq!(map["LIT"], "literal");
@@ -281,7 +288,14 @@ mod tests {
         let inherited = vec![("TOK".to_string(), "inherited".to_string())];
         let overrides = vec![("TOK".to_string(), "cache-warden://TOK".to_string())];
         let mut resolver = |_k: &str| ok(b"from-ref");
-        let r = resolve_env(&inherited, &overrides, Mode::Reveal, &mut resolver).unwrap();
+        let r = resolve_env(
+            &inherited,
+            &overrides,
+            Mode::Reveal,
+            "default",
+            &mut resolver,
+        )
+        .unwrap();
         let map: std::collections::HashMap<_, _> = r.vars.into_iter().collect();
         assert_eq!(map["TOK"], "from-ref");
         // Only one TOK in the output.
@@ -299,7 +313,7 @@ mod tests {
             count += 1;
             ok(b"v")
         };
-        resolve_env(&inherited, &[], Mode::Reveal, &mut resolver).unwrap();
+        resolve_env(&inherited, &[], Mode::Reveal, "default", &mut resolver).unwrap();
         assert_eq!(count, 1, "K resolved once for both A and B");
     }
 
@@ -307,15 +321,16 @@ mod tests {
     fn resolve_env_reveal_fails_closed_on_failure() {
         let inherited = vec![("A".to_string(), "cache-warden://BAD".to_string())];
         let mut resolver = |_k: &str| -> ResolveResult { Err("no".into()) };
-        let err = resolve_env(&inherited, &[], Mode::Reveal, &mut resolver).unwrap_err();
-        assert!(err.contains("BAD"), "err: {err}");
+        let err = resolve_env(&inherited, &[], Mode::Reveal, "default", &mut resolver).unwrap_err();
+        // Failures are reported by the resolved absolute key (DR-0017 §5).
+        assert!(err.contains("default/BAD"), "err: {err}");
     }
 
     #[test]
     fn resolve_env_rejects_nul_in_value() {
         let inherited = vec![("A".to_string(), "cache-warden://K".to_string())];
         let mut resolver = |_k: &str| ok(b"a\0b");
-        let err = resolve_env(&inherited, &[], Mode::Reveal, &mut resolver).unwrap_err();
+        let err = resolve_env(&inherited, &[], Mode::Reveal, "default", &mut resolver).unwrap_err();
         assert!(err.contains("NUL"), "err: {err}");
     }
 
@@ -326,17 +341,18 @@ mod tests {
             ("BAD".to_string(), "cache-warden://BAD".to_string()),
         ];
         let mut resolver = |k: &str| -> ResolveResult {
-            if k == "BAD" {
+            if k == "projA/BAD" {
                 Err("no".into())
             } else {
                 Ok(ResolvedValue::Verified)
             }
         };
-        let r = resolve_env(&inherited, &[], Mode::DryRun, &mut resolver).unwrap();
+        let r = resolve_env(&inherited, &[], Mode::DryRun, "projA", &mut resolver).unwrap();
         let map: std::collections::HashMap<_, _> = r.vars.clone().into_iter().collect();
-        assert_eq!(map["OK"], "<cache-warden:OK:masked>");
-        assert_eq!(map["BAD"], "<cache-warden:BAD:failed>");
-        assert_eq!(r.failures, vec!["BAD".to_string()]);
+        // Masks display the resolved absolute key (DR-0017 §5).
+        assert_eq!(map["OK"], "<cache-warden:projA/OK:masked>");
+        assert_eq!(map["BAD"], "<cache-warden:projA/BAD:failed>");
+        assert_eq!(r.failures, vec!["projA/BAD".to_string()]);
     }
 
     // ---- argv_reference_tokens ----

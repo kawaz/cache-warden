@@ -243,8 +243,10 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
     // truth (dropping the entries that lost the merge from disk too).
     let persist = if config.persist_definitions() {
         let path = crate::defs::definitions_state_path();
-        let config_names: std::collections::HashSet<String> =
-            config_defs.iter().map(|d| d.name.clone()).collect();
+        let config_names: std::collections::HashSet<String> = config_defs
+            .iter()
+            .map(|d| d.full_key(crate::namespace::DEFAULT_NAMESPACE))
+            .collect();
         match crate::defs::load_definitions(&path) {
             Ok(persisted) => {
                 restore_persisted_definitions(&mut store, persisted, &config_names);
@@ -347,13 +349,17 @@ fn register_definitions<R, C>(
     C: cache_warden::Clock,
 {
     for entry in entries {
+        // The store key is the composed `NS/KEY` (DR-0017 §5: a pinned
+        // `namespace` field is absolute; absent means the daemon-config
+        // context, which is the default namespace).
+        let full_key = entry.full_key(crate::namespace::DEFAULT_NAMESPACE);
         let ttl = match Ttl::new(
             entry.soft_ttl_secs.map(std::time::Duration::from_secs),
             entry.hard_ttl_secs.map(std::time::Duration::from_secs),
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("cache-warden: definition `{}` skipped: {e}", entry.name);
+                eprintln!("cache-warden: definition `{full_key}` skipped: {e}");
                 continue;
             }
         };
@@ -364,21 +370,17 @@ fn register_definitions<R, C>(
         // opaque value-type metadata (DR-0016) rides along with the definition.
         let source = ValueSource::command(entry.command.clone());
         let meta = crate::daemon::handler::meta_from_wire(entry.meta.clone());
-        match store.define_with_meta(entry.name.clone(), source.clone(), ttl, meta.clone()) {
+        match store.define_with_meta(full_key.clone(), source.clone(), ttl, meta.clone()) {
             Ok(()) => {}
             Err(DefineError::Conflict) => {
                 eprintln!(
-                    "cache-warden: definition `{}` conflicts with an existing definition; skipped",
-                    entry.name
+                    "cache-warden: definition `{full_key}` conflicts with an existing definition; skipped"
                 );
                 continue;
             }
             Err(DefineError::StaticNotDefinable) => {
                 // Unreachable: a command source is never static.
-                eprintln!(
-                    "cache-warden: definition `{}` skipped: static source",
-                    entry.name
-                );
+                eprintln!("cache-warden: definition `{full_key}` skipped: static source");
                 continue;
             }
         }
@@ -386,14 +388,16 @@ fn register_definitions<R, C>(
         // Lazy by default; `preload = true` or an authsock-referenced key runs
         // the command eagerly. The produced value is opaque bytes; the key's
         // type (otp) stays on the definition registered just above (DR-0016).
-        if entry.preload || force_eager.contains(&entry.name) {
+        // `force_eager` holds composed keys (authsock `keys` are normalized at
+        // config validation), so the comparison is composed-to-composed.
+        if entry.preload || force_eager.contains(&full_key) {
             match runner.run(&entry.command) {
                 Ok(value) => {
-                    store.set(entry.name.clone(), source, value, ttl, clock);
+                    store.set(full_key.clone(), source, value, ttl, clock);
                 }
                 Err(e) => {
                     // The RunError Display is already secret-free (stderr redacted).
-                    eprintln!("cache-warden: preload `{}` failed: {e}", entry.name);
+                    eprintln!("cache-warden: preload `{full_key}` failed: {e}");
                 }
             }
         }
@@ -418,11 +422,11 @@ fn restore_persisted_definitions(
     config_names: &std::collections::HashSet<String>,
 ) {
     for def in persisted {
-        if config_names.contains(&def.name) {
+        let full_key = def.full_key(crate::namespace::DEFAULT_NAMESPACE);
+        if config_names.contains(&full_key) {
             eprintln!(
-                "cache-warden: persisted definition `{}` dropped (the config defines \
-                 it; config wins)",
-                def.name
+                "cache-warden: persisted definition `{full_key}` dropped (the config defines \
+                 it; config wins)"
             );
             continue;
         }
@@ -432,22 +436,16 @@ fn restore_persisted_definitions(
         ) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!(
-                    "cache-warden: persisted definition `{}` skipped: {e}",
-                    def.name
-                );
+                eprintln!("cache-warden: persisted definition `{full_key}` skipped: {e}");
                 continue;
             }
         };
         let source = ValueSource::command(def.command.clone());
         let meta = crate::daemon::handler::meta_from_wire(def.meta.clone());
-        match store.define_with_meta(def.name.clone(), source, ttl, meta) {
+        match store.define_with_meta(full_key.clone(), source, ttl, meta) {
             Ok(()) => {}
             Err(e) => {
-                eprintln!(
-                    "cache-warden: persisted definition `{}` skipped: {e}",
-                    def.name
-                );
+                eprintln!("cache-warden: persisted definition `{full_key}` skipped: {e}");
             }
         }
     }
@@ -462,7 +460,11 @@ fn restore_persisted_definitions(
 fn online_definitions(settings: &PersistSettings, store: &Store) -> Vec<KvDefinition> {
     crate::defs::snapshot_definitions(store)
         .into_iter()
-        .filter(|d| !settings.config_names.contains(&d.name))
+        .filter(|d| {
+            !settings
+                .config_names
+                .contains(&d.full_key(crate::namespace::DEFAULT_NAMESPACE))
+        })
         .collect()
 }
 
@@ -688,7 +690,7 @@ mod tests {
     fn run_request_set_then_get() {
         let s = shared();
         let set = Request::KvSet {
-            key: "K".into(),
+            key: "default/K".into(),
             source: SetSource::Static {
                 value_b64: encode_b64(b"v"),
             },
@@ -700,7 +702,7 @@ mod tests {
             &s,
             None,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -773,6 +775,7 @@ mod tests {
         let mut store = Store::new();
         let entries = vec![KvDefinition {
             name: "TOK".into(),
+            namespace: None,
             command: vec!["printf".into(), "tok-value".into()],
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
@@ -780,8 +783,11 @@ mod tests {
             meta: Default::default(),
         }];
         register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
-        assert!(store.is_defined("TOK"), "definition registered");
-        assert!(!store.has_value("TOK"), "value not produced eagerly (lazy)");
+        assert!(store.is_defined("default/TOK"), "definition registered");
+        assert!(
+            !store.has_value("default/TOK"),
+            "value not produced eagerly (lazy)"
+        );
     }
 
     #[test]
@@ -794,6 +800,7 @@ mod tests {
         let mut store = Store::new();
         let entries = vec![KvDefinition {
             name: "TOK".into(),
+            namespace: None,
             command: vec!["printf".into(), "tok-value".into()],
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
@@ -801,7 +808,7 @@ mod tests {
             meta: Default::default(),
         }];
         register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
-        let secret = store.get("TOK", &clock).expect("entry preloaded");
+        let secret = store.get("default/TOK", &clock).expect("entry preloaded");
         assert_eq!(secret.expose_secret(), b"tok-value");
     }
 
@@ -817,6 +824,7 @@ mod tests {
         let entries = vec![
             KvDefinition {
                 name: "AGENT_KEY".into(),
+                namespace: None,
                 command: vec!["printf".into(), "pem-bytes".into()],
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
@@ -825,6 +833,7 @@ mod tests {
             },
             KvDefinition {
                 name: "OTHER".into(),
+                namespace: None,
                 command: vec!["printf".into(), "other".into()],
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
@@ -833,17 +842,23 @@ mod tests {
             },
         ];
         let eager: std::collections::HashSet<String> =
-            ["AGENT_KEY".to_string()].into_iter().collect();
+            ["default/AGENT_KEY".to_string()].into_iter().collect();
         register_definitions(&mut store, &runner, &clock, &entries, &eager);
         // …but the authsock reference forces it resident.
         assert_eq!(
-            store.get("AGENT_KEY", &clock).unwrap().expose_secret(),
+            store
+                .get("default/AGENT_KEY", &clock)
+                .unwrap()
+                .expose_secret(),
             b"pem-bytes",
             "authsock-referenced key is eagerly materialized"
         );
         // The unreferenced key stays lazy.
-        assert!(store.is_defined("OTHER"));
-        assert!(!store.has_value("OTHER"), "unreferenced key stays lazy");
+        assert!(store.is_defined("default/OTHER"));
+        assert!(
+            !store.has_value("default/OTHER"),
+            "unreferenced key stays lazy"
+        );
     }
 
     #[test]
@@ -857,6 +872,7 @@ mod tests {
         let entries = vec![
             KvDefinition {
                 name: "BAD".into(),
+                namespace: None,
                 command: vec!["this-binary-does-not-exist-cw-preload".into()],
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
@@ -865,6 +881,7 @@ mod tests {
             },
             KvDefinition {
                 name: "GOOD".into(),
+                namespace: None,
                 command: vec!["printf".into(), "ok".into()],
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
@@ -875,15 +892,15 @@ mod tests {
         register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
         // BAD's eager run failed, but its definition survives for regeneration.
         assert!(
-            store.is_defined("BAD"),
+            store.is_defined("default/BAD"),
             "definition kept after failed preload"
         );
         assert!(
-            store.get("BAD", &clock).is_none(),
+            store.get("default/BAD", &clock).is_none(),
             "no value after failed preload"
         );
         assert_eq!(
-            store.get("GOOD", &clock).unwrap().expose_secret(),
+            store.get("default/GOOD", &clock).unwrap().expose_secret(),
             b"ok",
             "subsequent preload still runs"
         );
@@ -900,6 +917,7 @@ mod tests {
         let mut store = Store::new();
         let entries = vec![KvDefinition {
             name: "AGENT_KEY".into(),
+            namespace: None,
             command: vec!["this-binary-does-not-exist-cw-preload".into()],
             soft_ttl_secs: None,
             hard_ttl_secs: None,
@@ -907,10 +925,13 @@ mod tests {
             meta: Default::default(),
         }];
         let eager: std::collections::HashSet<String> =
-            ["AGENT_KEY".to_string()].into_iter().collect();
+            ["default/AGENT_KEY".to_string()].into_iter().collect();
         register_definitions(&mut store, &runner, &clock, &entries, &eager);
-        assert!(store.is_defined("AGENT_KEY"), "definition survives");
-        assert!(!store.has_value("AGENT_KEY"), "no value after failed run");
+        assert!(store.is_defined("default/AGENT_KEY"), "definition survives");
+        assert!(
+            !store.has_value("default/AGENT_KEY"),
+            "no value after failed run"
+        );
     }
 
     // ---- restore_persisted_definitions (config-priority merge; DR-0014 §4) ----
@@ -918,6 +939,7 @@ mod tests {
     fn pdef(name: &str, argv: &[&str], soft: Option<u64>, hard: Option<u64>) -> KvDefinition {
         KvDefinition {
             name: name.into(),
+            namespace: None,
             command: argv.iter().map(|s| s.to_string()).collect(),
             soft_ttl_secs: soft,
             hard_ttl_secs: hard,
@@ -935,8 +957,8 @@ mod tests {
             vec![pdef("TOK", &["printf", "v"], Some(3600), Some(86400))],
             &config_names,
         );
-        assert!(store.is_defined("TOK"), "persisted def restored");
-        let d = store.definition_of("TOK").unwrap();
+        assert!(store.is_defined("default/TOK"), "persisted def restored");
+        let d = store.definition_of("default/TOK").unwrap();
         assert_eq!(
             d.source().command_argv().unwrap(),
             &["printf".to_string(), "v".to_string()]
@@ -959,14 +981,14 @@ mod tests {
             &no_eager(),
         );
         let config_names: std::collections::HashSet<String> =
-            ["DB".to_string()].into_iter().collect();
+            ["default/DB".to_string()].into_iter().collect();
         // Persisted DB has a DIFFERENT argv; it must be dropped, not applied.
         restore_persisted_definitions(
             &mut store,
             vec![pdef("DB", &["persisted-cmd"], None, None)],
             &config_names,
         );
-        let d = store.definition_of("DB").unwrap();
+        let d = store.definition_of("default/DB").unwrap();
         assert_eq!(
             d.source().command_argv().unwrap(),
             &["config-cmd".to_string()],
@@ -988,8 +1010,14 @@ mod tests {
             ],
             &config_names,
         );
-        assert!(!store.is_defined("BAD"), "invalid TTL entry skipped");
-        assert!(store.is_defined("GOOD"), "subsequent entry still restored");
+        assert!(
+            !store.is_defined("default/BAD"),
+            "invalid TTL entry skipped"
+        );
+        assert!(
+            store.is_defined("default/GOOD"),
+            "subsequent entry still restored"
+        );
     }
 
     #[tokio::test]

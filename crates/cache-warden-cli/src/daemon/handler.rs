@@ -185,6 +185,25 @@ where
     )
 }
 
+/// Enforce the composed-key shape at the protocol boundary (DR-0017 §1.5):
+/// every key created via `kv.set` / `kv.define` must be `NS/KEY` with both
+/// segments in `[A-Za-z0-9_]+`. This keeps "a key that cannot be referenced or
+/// written into config" from ever existing. Internal daemon keys
+/// (`__authsock_op:*`) never pass through this path, so they are unaffected.
+fn validate_protocol_key(key: &str) -> Result<(), Response> {
+    if crate::namespace::split_composed(key).is_some() {
+        Ok(())
+    } else {
+        Err(Response::error(
+            ErrorKind::BadRequest,
+            format!(
+                "invalid key {key:?}: must be NS/KEY with both segments matching \
+                 [A-Za-z0-9_]+ (DR-0017)"
+            ),
+        ))
+    }
+}
+
 fn handle_set<A, R, C>(
     store: &mut Store,
     ctx: &HandlerCtx<'_, A, R, C>,
@@ -198,6 +217,9 @@ where
     R: SourceRunner,
     C: Clock,
 {
+    if let Err(resp) = validate_protocol_key(&key) {
+        return resp;
+    }
     let ttl = match Ttl::new(
         soft_ttl_secs.map(std::time::Duration::from_secs),
         hard_ttl_secs.map(std::time::Duration::from_secs),
@@ -239,6 +261,9 @@ fn handle_define(
     hard_ttl_secs: Option<u64>,
     meta: ValueMetaWire,
 ) -> Response {
+    if let Err(resp) = validate_protocol_key(&key) {
+        return resp;
+    }
     if argv.is_empty() {
         return Response::error(ErrorKind::BadRequest, "command argv must not be empty");
     }
@@ -589,7 +614,7 @@ mod tests {
 
     fn set_static(value: &[u8]) -> Request {
         Request::KvSet {
-            key: "K".into(),
+            key: "default/K".into(),
             source: SetSource::Static {
                 value_b64: encode_b64(value),
             },
@@ -647,7 +672,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -685,7 +710,7 @@ mod tests {
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
         assert!(handle_request(&mut store, &c, set_static(b"hunter2")).is_ok());
-        let resp = handle_request(&mut store, &c, dry_get("K"));
+        let resp = handle_request(&mut store, &c, dry_get("default/K"));
         assert_verified(&resp);
         let line = serde_json::to_string(&resp).unwrap();
         assert!(
@@ -702,9 +727,9 @@ mod tests {
         let mut store = Store::new();
         let runner = CountingRunner::new(b"from-cmd");
         let c = ctx(&AllowAll, &runner, &clock);
-        assert!(handle_request(&mut store, &c, define_cmd("K", &["echo", "x"])).is_ok());
+        assert!(handle_request(&mut store, &c, define_cmd("default/K", &["echo", "x"])).is_ok());
         assert_eq!(runner.runs(), 0);
-        let resp = handle_request(&mut store, &c, dry_get("K"));
+        let resp = handle_request(&mut store, &c, dry_get("default/K"));
         assert_verified(&resp);
         assert_eq!(
             runner.runs(),
@@ -719,7 +744,7 @@ mod tests {
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
-        let resp = handle_request(&mut store, &c, dry_get("ghost"));
+        let resp = handle_request(&mut store, &c, dry_get("default/ghost"));
         assert_eq!(err_kind(&resp), ErrorKind::NotFound);
     }
 
@@ -730,8 +755,8 @@ mod tests {
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
         let c = ctx(&DenyAll, &runner, &clock);
-        handle_request(&mut store, &c, define_cmd("K", &["echo", "x"]));
-        let resp = handle_request(&mut store, &c, dry_get("K"));
+        handle_request(&mut store, &c, define_cmd("default/K", &["echo", "x"]));
+        let resp = handle_request(&mut store, &c, dry_get("default/K"));
         assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
     }
 
@@ -745,7 +770,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "ghost".into(),
+                key: "default/ghost".into(),
                 dry_run: false,
             },
         );
@@ -760,13 +785,13 @@ mod tests {
         let mut store = Store::new();
         let runner = CountingRunner::new(b"from-cmd");
         let c = ctx(&AllowAll, &runner, &clock);
-        assert!(handle_request(&mut store, &c, define_cmd("K", &["echo", "x"])).is_ok());
+        assert!(handle_request(&mut store, &c, define_cmd("default/K", &["echo", "x"])).is_ok());
         assert_eq!(runner.runs(), 0, "define must not run the command");
         let resp = handle_request(
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -776,7 +801,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -790,11 +815,29 @@ mod tests {
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
-        assert!(handle_request(&mut store, &c, define_cmd("K", &["op", "read", "a"])).is_ok());
+        assert!(
+            handle_request(
+                &mut store,
+                &c,
+                define_cmd("default/K", &["op", "read", "a"])
+            )
+            .is_ok()
+        );
         // Identical definition: idempotent no-op.
-        assert!(handle_request(&mut store, &c, define_cmd("K", &["op", "read", "a"])).is_ok());
+        assert!(
+            handle_request(
+                &mut store,
+                &c,
+                define_cmd("default/K", &["op", "read", "a"])
+            )
+            .is_ok()
+        );
         // Different argv: conflict.
-        let resp = handle_request(&mut store, &c, define_cmd("K", &["op", "read", "b"]));
+        let resp = handle_request(
+            &mut store,
+            &c,
+            define_cmd("default/K", &["op", "read", "b"]),
+        );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
     }
 
@@ -805,7 +848,7 @@ mod tests {
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
         let req = Request::KvDefine {
-            key: "K".into(),
+            key: "default/K".into(),
             argv: vec![],
             soft_ttl_secs: None,
             hard_ttl_secs: None,
@@ -823,12 +866,12 @@ mod tests {
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
         let c = ctx(&DenyAll, &runner, &clock);
-        handle_request(&mut store, &c, define_cmd("K", &["echo", "x"]));
+        handle_request(&mut store, &c, define_cmd("default/K", &["echo", "x"]));
         let resp = handle_request(
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -842,7 +885,7 @@ mod tests {
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
         let req = Request::KvSet {
-            key: "K".into(),
+            key: "default/K".into(),
             source: SetSource::Static {
                 value_b64: encode_b64(b"v"),
             },
@@ -862,7 +905,7 @@ mod tests {
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
         let req = Request::KvSet {
-            key: "K".into(),
+            key: "default/K".into(),
             source: SetSource::Static {
                 value_b64: "not!base64!".into(),
             },
@@ -887,7 +930,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -906,7 +949,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -919,14 +962,14 @@ mod tests {
         let mut store = Store::new();
         let runner = CountingRunner::new(b"fresh");
         let c = ctx(&AllowAll, &runner, &clock);
-        handle_request(&mut store, &c, define_cmd("K", &["echo"]));
+        handle_request(&mut store, &c, define_cmd("default/K", &["echo"]));
         // First get lazily produces the value (run 1).
         assert_eq!(
             get_value(&handle_request(
                 &mut store,
                 &c,
                 Request::KvGet {
-                    key: "K".into(),
+                    key: "default/K".into(),
                     dry_run: false
                 }
             )),
@@ -937,7 +980,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -957,7 +1000,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -972,14 +1015,14 @@ mod tests {
         // swap to a failing runner so the post-hard-expiry regeneration fails.
         let ok_runner = CountingRunner::new(b"v");
         let c_ok = ctx(&AllowAll, &ok_runner, &clock);
-        handle_request(&mut store, &c_ok, define_cmd("K", &["echo"]));
+        handle_request(&mut store, &c_ok, define_cmd("default/K", &["echo"]));
         // First get lazily produces the value.
         assert_eq!(
             get_value(&handle_request(
                 &mut store,
                 &c_ok,
                 Request::KvGet {
-                    key: "K".into(),
+                    key: "default/K".into(),
                     dry_run: false
                 }
             )),
@@ -992,7 +1035,7 @@ mod tests {
             &mut store,
             &c_fail,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -1005,7 +1048,7 @@ mod tests {
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
-        for k in ["b", "a", "c"] {
+        for k in ["default/b", "default/a", "default/c"] {
             handle_request(
                 &mut store,
                 &c,
@@ -1022,7 +1065,9 @@ mod tests {
         let resp = handle_request(&mut store, &c, Request::KvList);
         match resp {
             Response::Ok(ok) => match ok.payload {
-                OkPayload::List { keys } => assert_eq!(keys, vec!["a", "b", "c"]),
+                OkPayload::List { keys } => {
+                    assert_eq!(keys, vec!["default/a", "default/b", "default/c"])
+                }
                 _ => panic!("not list"),
             },
             _ => panic!("expected ok"),
@@ -1040,7 +1085,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvDel {
-                key: "K".into(),
+                key: "default/K".into(),
                 with_define: false,
             },
         );
@@ -1056,7 +1101,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvDel {
-                key: "K".into(),
+                key: "default/K".into(),
                 with_define: false,
             },
         );
@@ -1088,7 +1133,7 @@ mod tests {
                 OkPayload::Status { pid, entries, .. } => {
                     assert_eq!(pid, 1234);
                     assert_eq!(entries.len(), 1);
-                    assert_eq!(entries[0].name, "K");
+                    assert_eq!(entries[0].name, "default/K");
                     assert_eq!(entries[0].state, "active");
                     assert_eq!(entries[0].pin_remaining_secs, None);
                 }
@@ -1115,14 +1160,14 @@ mod tests {
         let c = ctx(&AllowAll, &runner, &clock);
         handle_request(&mut store, &c, set_static(b"v"));
         // Pin for 1000s; then let the soft window (10s) lapse.
-        let resp = handle_request(&mut store, &c, pin("K", 1000));
+        let resp = handle_request(&mut store, &c, pin("default/K", 1000));
         assert!(resp.is_ok(), "pin ok: {resp:?}");
         clock.advance(Duration::from_secs(SOFT + 5));
         let resp = handle_request(
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -1136,7 +1181,7 @@ mod tests {
         let runner = CountingRunner::new(b"x");
         let c = ctx(&DenyAll, &runner, &clock);
         handle_request(&mut store, &c, set_static(b"v"));
-        let resp = handle_request(&mut store, &c, pin("K", 1000));
+        let resp = handle_request(&mut store, &c, pin("default/K", 1000));
         assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
     }
 
@@ -1147,7 +1192,7 @@ mod tests {
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
         assert_eq!(
-            err_kind(&handle_request(&mut store, &c, pin("ghost", 100))),
+            err_kind(&handle_request(&mut store, &c, pin("default/ghost", 100))),
             ErrorKind::NotFound
         );
     }
@@ -1161,7 +1206,7 @@ mod tests {
         handle_request(&mut store, &c, set_static(b"v"));
         clock.advance(Duration::from_secs(HARD)); // hard-expired
         assert_eq!(
-            err_kind(&handle_request(&mut store, &c, pin("K", 1000))),
+            err_kind(&handle_request(&mut store, &c, pin("default/K", 1000))),
             ErrorKind::HardExpired
         );
     }
@@ -1173,9 +1218,15 @@ mod tests {
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
         handle_request(&mut store, &c, set_static(b"v"));
-        handle_request(&mut store, &c, pin("K", 1000));
+        handle_request(&mut store, &c, pin("default/K", 1000));
         // Unpin then soft-expire: the value is gated again.
-        let resp = handle_request(&mut store, &c, Request::KvUnpin { key: "K".into() });
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvUnpin {
+                key: "default/K".into(),
+            },
+        );
         match resp {
             Response::Ok(ok) => match ok.payload {
                 OkPayload::Unpinned { unpinned } => assert!(unpinned),
@@ -1189,7 +1240,7 @@ mod tests {
                 &mut store,
                 &c,
                 Request::KvUnpin {
-                    key: "ghost".into()
+                    key: "default/ghost".into()
                 }
             )),
             ErrorKind::NotFound
@@ -1203,7 +1254,7 @@ mod tests {
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock);
         handle_request(&mut store, &c, set_static(b"v"));
-        handle_request(&mut store, &c, pin("K", 1000));
+        handle_request(&mut store, &c, pin("default/K", 1000));
         clock.advance(Duration::from_secs(100));
         let resp = handle_request(&mut store, &c, Request::Status);
         match resp {
@@ -1252,13 +1303,20 @@ mod tests {
         let mut store = Store::new();
         let runner = cache_warden::CommandRunner::new();
         let c = ctx(&AllowAll, &runner, &clock);
-        assert!(handle_request(&mut store, &c, define_otp_seed("OTP", OTP_SEED_B32, &[])).is_ok());
+        assert!(
+            handle_request(
+                &mut store,
+                &c,
+                define_otp_seed("default/OTP", OTP_SEED_B32, &[])
+            )
+            .is_ok()
+        );
 
         let resp = handle_request(
             &mut store,
             &c,
             Request::KvGet {
-                key: "OTP".into(),
+                key: "default/OTP".into(),
                 dry_run: false,
             },
         );
@@ -1284,13 +1342,13 @@ mod tests {
         handle_request(
             &mut store,
             &c,
-            define_otp_seed("OTP", OTP_SEED_B32, &[("digits", "8")]),
+            define_otp_seed("default/OTP", OTP_SEED_B32, &[("digits", "8")]),
         );
         let resp = handle_request(
             &mut store,
             &c,
             Request::KvGet {
-                key: "OTP".into(),
+                key: "default/OTP".into(),
                 dry_run: false,
             },
         );
@@ -1306,7 +1364,7 @@ mod tests {
         let runner = cache_warden::CommandRunner::new();
         let c = ctx(&AllowAll, &runner, &clock);
         let define = Request::KvDefine {
-            key: "OTP".into(),
+            key: "default/OTP".into(),
             argv: vec!["printf".into(), "%s".into(), OTP_SEED_B32.into()],
             soft_ttl_secs: Some(SOFT),
             hard_ttl_secs: Some(HARD),
@@ -1317,7 +1375,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "OTP".into(),
+                key: "default/OTP".into(),
                 dry_run: false,
             },
         );
@@ -1334,12 +1392,12 @@ mod tests {
         let runner = cache_warden::CommandRunner::new();
         let c = ctx(&AllowAll, &runner, &clock);
         let uri = format!("otpauth://totp/Label?secret={OTP_SEED_B32}&digits=8");
-        handle_request(&mut store, &c, define_otp_seed("OTP", &uri, &[]));
+        handle_request(&mut store, &c, define_otp_seed("default/OTP", &uri, &[]));
         let resp = handle_request(
             &mut store,
             &c,
             Request::KvGet {
-                key: "OTP".into(),
+                key: "default/OTP".into(),
                 dry_run: false,
             },
         );
@@ -1353,12 +1411,16 @@ mod tests {
         let mut store = Store::new();
         let runner = cache_warden::CommandRunner::new();
         let c = ctx(&AllowAll, &runner, &clock);
-        handle_request(&mut store, &c, define_otp_seed("OTP", OTP_SEED_B32, &[]));
+        handle_request(
+            &mut store,
+            &c,
+            define_otp_seed("default/OTP", OTP_SEED_B32, &[]),
+        );
         let resp = handle_request(
             &mut store,
             &c,
             Request::KvGet {
-                key: "OTP".into(),
+                key: "default/OTP".into(),
                 dry_run: true,
             },
         );
@@ -1380,12 +1442,12 @@ mod tests {
         let runner = cache_warden::CommandRunner::new();
         let c = ctx(&AllowAll, &runner, &clock);
         let bad = "this-is-not-a-valid-otp-seed";
-        assert!(handle_request(&mut store, &c, define_otp_seed("OTP", bad, &[])).is_ok());
+        assert!(handle_request(&mut store, &c, define_otp_seed("default/OTP", bad, &[])).is_ok());
         let resp = handle_request(
             &mut store,
             &c,
             Request::KvGet {
-                key: "OTP".into(),
+                key: "default/OTP".into(),
                 dry_run: false,
             },
         );
@@ -1401,12 +1463,16 @@ mod tests {
         let runner = cache_warden::CommandRunner::new();
         let c = ctx(&AllowAll, &runner, &clock);
         // Define + produce the value so a value entry also exists.
-        handle_request(&mut store, &c, define_otp_seed("OTP", OTP_SEED_B32, &[]));
+        handle_request(
+            &mut store,
+            &c,
+            define_otp_seed("default/OTP", OTP_SEED_B32, &[]),
+        );
         handle_request(
             &mut store,
             &c,
             Request::KvGet {
-                key: "OTP".into(),
+                key: "default/OTP".into(),
                 dry_run: false,
             },
         );
@@ -1440,7 +1506,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -1482,7 +1548,7 @@ mod tests {
         let clock = FakeClock::new();
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
-        let pol = policies(&[("K", &["ssh"])]);
+        let pol = policies(&[("default/K", &["ssh"])]);
         let chain = [proc(100, "ssh"), proc(50, "zsh")];
 
         // Seed the value with an unrestricted ctx (set is not gated by the key
@@ -1495,7 +1561,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -1507,7 +1573,7 @@ mod tests {
         let clock = FakeClock::new();
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
-        let pol = policies(&[("K", &["ssh"])]);
+        let pol = policies(&[("default/K", &["ssh"])]);
         let chain = [proc(100, "git"), proc(50, "zsh")];
 
         let c_set = ctx(&AllowAll, &runner, &clock);
@@ -1518,7 +1584,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -1532,7 +1598,7 @@ mod tests {
         let clock = FakeClock::new();
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
-        let pol = policies(&[("K", &["ssh"])]);
+        let pol = policies(&[("default/K", &["ssh"])]);
 
         let c_set = ctx(&AllowAll, &runner, &clock);
         handle_request(&mut store, &c_set, set_static(b"hunter2"));
@@ -1543,7 +1609,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -1564,7 +1630,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: false,
             },
         );
@@ -1576,7 +1642,7 @@ mod tests {
         let clock = FakeClock::new();
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
-        let pol = policies(&[("K", &["ssh"])]);
+        let pol = policies(&[("default/K", &["ssh"])]);
         let chain = [proc(100, "git")];
 
         let c_set = ctx(&AllowAll, &runner, &clock);
@@ -1589,7 +1655,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvGet {
-                key: "K".into(),
+                key: "default/K".into(),
                 dry_run: true,
             },
         );
@@ -1603,19 +1669,23 @@ mod tests {
         let clock = FakeClock::new();
         let mut store = Store::new();
         let runner = CountingRunner::new(b"generated");
-        let pol = policies(&[("LAZY", &["ssh"])]);
+        let pol = policies(&[("default/LAZY", &["ssh"])]);
         let chain = [proc(100, "git")];
 
         // Define LAZY (lazy: no value yet). A denied get must not run the command.
         let c_set = ctx(&AllowAll, &runner, &clock);
-        handle_request(&mut store, &c_set, define_cmd("LAZY", &["echo", "x"]));
+        handle_request(
+            &mut store,
+            &c_set,
+            define_cmd("default/LAZY", &["echo", "x"]),
+        );
 
         let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
         let resp = handle_request(
             &mut store,
             &c,
             Request::KvGet {
-                key: "LAZY".into(),
+                key: "default/LAZY".into(),
                 dry_run: false,
             },
         );
@@ -1636,7 +1706,7 @@ mod tests {
         let clock = FakeClock::new();
         let mut store = Store::new();
         let runner = CountingRunner::new(b"x");
-        let pol = policies(&[("K", &["ssh"])]);
+        let pol = policies(&[("default/K", &["ssh"])]);
         let chain = [proc(100, "git")]; // would be denied for a get
 
         let c_set = ctx(&AllowAll, &runner, &clock);
@@ -1648,7 +1718,7 @@ mod tests {
             &mut store,
             &c,
             Request::KvDel {
-                key: "K".into(),
+                key: "default/K".into(),
                 with_define: false,
             },
         );

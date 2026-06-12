@@ -357,8 +357,10 @@ Two verbs that make the CLI the primary path for handing multiple secret values 
 config file at once. Both are independent of the authsock adapter / auth core and are self-contained as
 control socket clients (`kv.get`).
 
-- **Reference syntax**: `cache-warden://KEY` (a single scheme, no aliases). A referenceable KEY matches
-  `[A-Za-z0-9_][A-Za-z0-9_.-]*` (every env-variable-style name fits). Resolution is single-pass — a
+- **Reference syntax**: `cache-warden://[NS/]KEY` (a single scheme, no aliases; DR-0017). KEY and NS
+  both match `[A-Za-z0-9_]+`. An **unqualified KEY resolves into the invocation's namespace; a
+  qualified NS/KEY is absolute**. Dry-run masks display the resolved absolute key
+  (`<cache-warden:NS/KEY:masked>`). Resolution is single-pass — a
   reference appearing inside an already-resolved value is **not expanded recursively** (structurally
   ruling out expansion blow-ups and secondary expansion). Repeated references to the same KEY are
   deduplicated to a single resolution (no repeated TouchID prompts). Production is **fail-closed** (if
@@ -393,6 +395,31 @@ control socket clients (`kv.get`).
 
 The whole implementation is confined to the `cache-warden-cli` crate (no core / authsock crate changes,
 DR-0002). Inline define on references (`cache-warden://KEY?argv=...`) is unimplemented in v1 (DR-0014).
+
+### KV Namespaces (`--namespace` / composed `NS/KEY`, DR-0017)
+
+The isolation mechanism that lets multiple projects use the same KEY name (`DB_PASSWORD` etc.) with
+different definitions. A namespace is a **CLI / protocol-layer concept**: the internal key is composed
+into `NS/KEY` and flows into the core's flat store (the core is unchanged). The default namespace is
+`"default"`.
+
+- **Charset**: KEY and NS are both `[A-Za-z0-9_]+` (single segment). Enforced at creation time at the
+  protocol boundary (`kv.set` / `kv.define`), so a key that cannot be referenced or written into config
+  never exists (the authsock-internal `__authsock_op:*` keys never cross the protocol, so they are
+  unaffected).
+- **CLI**: every kv verb plus `run` / `inject` / `status` takes `--namespace NS`. Embedding `ns/key`
+  in a KEY argument is rejected (the flag is the only selection path). The default resolves as
+  `--namespace` > `CACHE_WARDEN_NAMESPACE` > `[cli].namespace` > `"default"` (export it from a
+  project's `.envrc` via direnv and the switch happens the moment you enter the directory).
+- **list / status**: by default only the current namespace is shown (key names with the `NS/` prefix
+  stripped); `--all-namespaces` lists every namespace in the composed `NS/KEY` form.
+- **config / defs**: a `[kv.NAME]` entry takes an optional `namespace = "NS"` field (present =
+  absolute; absent = the context default — `"default"` for the daemon config, the `--namespace` value
+  for a `kv define --defs` invocation). TOML table keys are unique, so one file cannot define the same
+  NAME twice in different namespaces (known limitation). An authsock `keys = [...]` entry may be
+  qualified as `"NS/KEY"` (unqualified = default NS).
+- **Definition persistence**: composed keys are saved as quoted table names (`[kv."NS/KEY"]`) and
+  round-trip (the file is machine-written/read, so quoting is a non-issue).
 
 ### OTP Value Type (`kv define --type otp`, DR-0016)
 

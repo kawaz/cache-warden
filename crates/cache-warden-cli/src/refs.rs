@@ -1,11 +1,12 @@
 //! Secret reference syntax and resolution shared by `run` and `inject`
-//! (DR-0013 / DR-0015).
+//! (DR-0013 / DR-0015 / DR-0017).
 //!
-//! A reference is `cache-warden://KEY` where `KEY` matches
-//! `[A-Za-z0-9_][A-Za-z0-9_.-]*` (env-variable-ish names; the leading char is an
-//! alphanumeric or `_`). The scheme is the only one accepted — there are no
-//! short aliases (DR-0013). Resolution is a **single pass**: a resolved value is
-//! treated as opaque bytes and never re-scanned for further references (no
+//! A reference is `cache-warden://[NS/]KEY` where both `NS` and `KEY` match
+//! `[A-Za-z0-9_]+` (the identifier charset of DR-0017 §1.5). The scheme is the
+//! only one accepted — there are no short aliases (DR-0013). An **unqualified**
+//! `KEY` resolves into the caller's context namespace; a **qualified** `NS/KEY`
+//! is absolute (DR-0017 §3). Resolution is a **single pass**: a resolved value
+//! is treated as opaque bytes and never re-scanned for further references (no
 //! recursive expansion, DR-0013).
 //!
 //! This module is pure: it detects references, decides whole-value matches (the
@@ -17,37 +18,51 @@
 use std::collections::BTreeMap;
 
 use crate::mode::Mode;
+use crate::namespace::qualify;
 
 /// The reference scheme prefix.
 pub const SCHEME: &str = "cache-warden://";
 
-/// `true` if `c` may start a reference key (`[A-Za-z0-9_]`).
-fn is_key_start(c: char) -> bool {
+/// `true` if `c` is a reference identifier char (`[A-Za-z0-9_]`, DR-0017 §1.5).
+/// The same charset applies to every position of NS and KEY, so a reference
+/// always ends at the first char outside it (predictable termination for
+/// inject's substring scan).
+fn is_key_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// `true` if `c` may continue a reference key (`[A-Za-z0-9_.-]`).
-fn is_key_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'
+/// Consume a maximal `[NS/]KEY` run at the start of `t`, returning its byte
+/// length, or `None` if `t` does not start with an identifier char.
+///
+/// At most one `/` is consumed (single-segment NS, DR-0017 §1), and only when
+/// an identifier char follows it — `KEY/` at the end of a run leaves the `/`
+/// outside the reference. The charset is pure ASCII, so scanning bytes is
+/// exact even on binary input.
+fn match_reference_key(t: &[u8]) -> Option<usize> {
+    let seg = |t: &[u8]| t.iter().take_while(|b| is_key_char(**b as char)).count();
+    let first = seg(t);
+    if first == 0 {
+        return None;
+    }
+    let rest = &t[first..];
+    if rest.first() == Some(&b'/') {
+        let second = seg(&rest[1..]);
+        if second > 0 {
+            return Some(first + 1 + second);
+        }
+    }
+    Some(first)
 }
 
-/// If `s` is *exactly* one reference (`cache-warden://KEY` and nothing else),
-/// return the KEY. Used for the `run` env whole-value rule (DR-0013): only an
-/// env value that is entirely a reference is resolved.
+/// If `s` is *exactly* one reference (`cache-warden://[NS/]KEY` and nothing
+/// else), return the (possibly qualified) key. Used for the `run` env
+/// whole-value rule (DR-0013): only an env value that is entirely a reference
+/// is resolved.
 pub fn whole_value_key(s: &str) -> Option<&str> {
     let rest = s.strip_prefix(SCHEME)?;
-    if rest.is_empty() {
-        return None;
-    }
-    let mut chars = rest.chars();
-    let first = chars.next()?;
-    if !is_key_start(first) {
-        return None;
-    }
-    if chars.all(is_key_continue) {
-        Some(rest)
-    } else {
-        None
+    match match_reference_key(rest.as_bytes()) {
+        Some(len) if len == rest.len() => Some(rest),
+        _ => None,
     }
 }
 
@@ -58,11 +73,12 @@ pub fn contains_reference(s: &str) -> bool {
     find_references(s).into_iter().next().is_some()
 }
 
-/// One located reference within a byte template: its key and byte span
-/// `[start, end)` (the span covers the whole `cache-warden://KEY` text).
+/// One located reference within a byte template: its key (possibly `NS/KEY`
+/// qualified) and byte span `[start, end)` (the span covers the whole
+/// `cache-warden://[NS/]KEY` text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Located {
-    /// The reference key.
+    /// The reference key as written (unqualified `KEY` or qualified `NS/KEY`).
     pub key: String,
     /// Byte offset where `cache-warden://` begins.
     pub start: usize,
@@ -78,52 +94,14 @@ pub struct Located {
 /// key charset are ASCII, so byte offsets equal char-boundary offsets and the
 /// surrounding bytes (binary payload) are irrelevant to where a reference ends.
 pub fn find_references(s: &str) -> Vec<Located> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if s[i..].starts_with(SCHEME) {
-            let key_start = i + SCHEME.len();
-            // Consume a maximal valid key.
-            let tail = &s[key_start..];
-            let mut chars = tail.char_indices();
-            let mut end_rel = match chars.next() {
-                Some((_, c)) if is_key_start(c) => c.len_utf8(),
-                _ => {
-                    // `cache-warden://` not followed by a valid key char: not a
-                    // reference. Advance past the scheme to avoid rescanning it.
-                    i = key_start;
-                    continue;
-                }
-            };
-            for (idx, c) in chars {
-                if is_key_continue(c) {
-                    end_rel = idx + c.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            let end = key_start + end_rel;
-            out.push(Located {
-                key: s[key_start..end].to_string(),
-                start: i,
-                end,
-            });
-            i = end;
-        } else {
-            // Advance by one UTF-8 char.
-            let step = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-            i += step;
-        }
-    }
-    out
+    find_references_bytes(s.as_bytes())
 }
 
 /// Find every reference directly over a raw byte template, left to right,
-/// non-overlapping. Unlike [`find_references`] (which works on a `str`), this
-/// scans bytes so it is correct on **binary** input: a lossy UTF-8 conversion
-/// would shift offsets (a stray `0xff` becomes a 3-byte replacement char), so
-/// byte offsets from a lossy view do not map back to the original template.
+/// non-overlapping. This scans bytes so it is correct on **binary** input: a
+/// lossy UTF-8 conversion would shift offsets (a stray `0xff` becomes a 3-byte
+/// replacement char), so byte offsets from a lossy view do not map back to the
+/// original template.
 ///
 /// The scheme and key charset are ASCII, so a reference can only occur in ASCII
 /// regions; non-ASCII bytes simply never match and are skipped one at a time.
@@ -134,22 +112,20 @@ pub fn find_references_bytes(template: &[u8]) -> Vec<Located> {
     while i < template.len() {
         if template[i..].starts_with(scheme) {
             let key_start = i + scheme.len();
-            let mut j = key_start;
-            // First key char must be a start char.
-            if j < template.len() && is_key_start(template[j] as char) {
-                j += 1;
-                while j < template.len() && is_key_continue(template[j] as char) {
-                    j += 1;
+            match match_reference_key(&template[key_start..]) {
+                Some(len) => {
+                    let end = key_start + len;
+                    out.push(Located {
+                        key: String::from_utf8_lossy(&template[key_start..end]).into_owned(),
+                        start: i,
+                        end,
+                    });
+                    i = end;
                 }
-                out.push(Located {
-                    key: String::from_utf8_lossy(&template[key_start..j]).into_owned(),
-                    start: i,
-                    end: j,
-                });
-                i = j;
-            } else {
-                // Scheme not followed by a valid key char: skip past the scheme.
-                i = key_start;
+                None => {
+                    // Scheme not followed by a valid key char: skip past it.
+                    i = key_start;
+                }
             }
         } else {
             i += 1;
@@ -200,44 +176,54 @@ where
     }
 }
 
-/// Resolve a set of keys exactly once each (dedup), returning a key→result map.
+/// Resolve a set of reference keys exactly once each (dedup), returning a map
+/// keyed by the **qualified** (`NS/KEY`) form.
 ///
-/// Each distinct key is resolved a single time even if referenced many times
-/// (DR-0013: avoid repeated TouchID prompts). The order of resolution is the
-/// sorted key order (deterministic); the `BTreeMap` return is keyed by name.
+/// Each reference key is qualified against `ctx_ns` first (DR-0017 §3:
+/// unqualified keys resolve into the context namespace, qualified ones are
+/// absolute), so `bar` and `foo/bar` under ctx `foo` are the same entry and
+/// resolve a single time even if referenced many times (DR-0013: avoid
+/// repeated TouchID prompts). The order of resolution is the sorted key order
+/// (deterministic).
 pub fn resolve_all<R: Resolver>(
     keys: &[String],
+    ctx_ns: &str,
     resolver: &mut R,
 ) -> BTreeMap<String, ResolveResult> {
-    let mut unique: Vec<&String> = keys.iter().collect();
+    let mut unique: Vec<String> = keys.iter().map(|k| qualify(k, ctx_ns)).collect();
     unique.sort();
     unique.dedup();
     let mut map = BTreeMap::new();
     for key in unique {
-        let r = resolver.resolve(key);
-        map.insert(key.clone(), r);
+        let r = resolver.resolve(&key);
+        map.insert(key, r);
     }
     map
 }
 
-/// Render `template`'s references into bytes, given a resolution map and a mode
-/// (DR-0013 substring rule + DR-0015 dry-run masking).
+/// Render `template`'s references into bytes, given a resolution map (keyed by
+/// **qualified** `NS/KEY`, see [`resolve_all`]), the mode, and the context
+/// namespace (DR-0013 substring rule + DR-0015 dry-run masking + DR-0017 §3).
 ///
 /// - **Reveal**: each reference is replaced by its resolved bytes. If any key
 ///   failed, returns `Err` listing the failures (fail-closed: the caller emits
 ///   nothing — DR-0013).
 /// - **DryRun**: each reference is replaced by its mask
-///   (`<cache-warden:KEY:masked|failed>`). Never fails-closed: the whole
-///   template is rendered, but `failed` is `true` if any key failed so the
-///   caller can exit non-zero (DR-0015 §3).
+///   (`<cache-warden:NS/KEY:masked|failed>`). The mask always shows the
+///   **resolved absolute key** — an unqualified reference is displayed as what
+///   it resolved to, making the namespace resolution visible (DR-0017 §5).
+///   Never fails-closed: the whole template is rendered, but failures are
+///   collected so the caller can exit non-zero (DR-0015 §3).
 ///
-/// The return carries the rendered bytes and the list of failed keys (empty on
-/// full success). `template` is bytes for binary safety; references are located
-/// by scanning the raw bytes ([`find_references_bytes`]).
+/// The return carries the rendered bytes and the list of failed (qualified)
+/// keys (empty on full success). `template` is bytes for binary safety;
+/// references are located by scanning the raw bytes
+/// ([`find_references_bytes`]).
 pub fn render_template(
     template: &[u8],
     resolved: &BTreeMap<String, ResolveResult>,
     mode: Mode,
+    ctx_ns: &str,
 ) -> Result<RenderedTemplate, Vec<String>> {
     // Locate references directly over the raw bytes (a lossy text view would
     // shift offsets on binary input — see [`find_references_bytes`]).
@@ -250,23 +236,24 @@ pub fn render_template(
     for loc in &locs {
         // Copy the literal bytes before this reference.
         out.extend_from_slice(&template[cursor..loc.start]);
-        match resolved.get(&loc.key) {
+        let qkey = qualify(&loc.key, ctx_ns);
+        match resolved.get(&qkey) {
             Some(Ok(ResolvedValue::Value(bytes))) => {
                 if mode.is_dry_run() {
                     // Defensive: a dry-run map should not carry values, but mask
                     // anyway so a value can never leak into a dry-run output.
-                    out.extend_from_slice(mask(&loc.key, true).as_bytes());
+                    out.extend_from_slice(mask(&qkey, true).as_bytes());
                 } else {
                     out.extend_from_slice(bytes);
                 }
             }
             Some(Ok(ResolvedValue::Verified)) => {
-                out.extend_from_slice(mask(&loc.key, true).as_bytes());
+                out.extend_from_slice(mask(&qkey, true).as_bytes());
             }
             Some(Err(_)) | None => {
-                failures.push(loc.key.clone());
+                failures.push(qkey.clone());
                 if mode.is_dry_run() {
-                    out.extend_from_slice(mask(&loc.key, false).as_bytes());
+                    out.extend_from_slice(mask(&qkey, false).as_bytes());
                 } else {
                     // Reveal: copy the original reference text so the failed
                     // span is identifiable, but we will fail-closed below.
@@ -319,8 +306,9 @@ mod tests {
             whole_value_key("cache-warden://DB_PASSWORD"),
             Some("DB_PASSWORD")
         );
-        assert_eq!(whole_value_key("cache-warden://a.b-c_1"), Some("a.b-c_1"));
         assert_eq!(whole_value_key("cache-warden://_x"), Some("_x"));
+        // Qualified NS/KEY form (DR-0017 §3).
+        assert_eq!(whole_value_key("cache-warden://projA/DB"), Some("projA/DB"));
     }
 
     #[test]
@@ -329,9 +317,15 @@ mod tests {
         assert_eq!(whole_value_key("cache-warden://K suffix"), None);
         assert_eq!(whole_value_key("cache-warden://"), None);
         assert_eq!(whole_value_key("literal"), None);
-        // A leading `.` / `-` is not a valid key start.
+        // `.` / `-` are no longer key chars (DR-0017 §1.5).
         assert_eq!(whole_value_key("cache-warden://.bad"), None);
         assert_eq!(whole_value_key("cache-warden://-bad"), None);
+        assert_eq!(whole_value_key("cache-warden://a.b"), None);
+        assert_eq!(whole_value_key("cache-warden://a-b"), None);
+        // Hierarchy / dangling slash are not whole-value references.
+        assert_eq!(whole_value_key("cache-warden://a/b/c"), None);
+        assert_eq!(whole_value_key("cache-warden://a/"), None);
+        assert_eq!(whole_value_key("cache-warden:///k"), None);
     }
 
     // ---- find_references ----
@@ -348,11 +342,26 @@ mod tests {
     }
 
     #[test]
-    fn find_references_stops_key_at_first_invalid_char() {
-        // `/` after the key ends it (it's not in the key charset).
-        let locs = find_references("cache-warden://A/b");
+    fn find_references_consumes_single_ns_qualifier() {
+        // One NS segment is part of the reference (DR-0017 §3); a second `/`
+        // ends it (single-segment NS).
+        let locs = find_references("cache-warden://projA/DB/tail");
         assert_eq!(locs.len(), 1);
-        assert_eq!(locs[0].key, "A");
+        assert_eq!(locs[0].key, "projA/DB");
+
+        // A trailing `/` without an identifier after it stays outside.
+        let locs = find_references("cache-warden://KEY/ rest");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].key, "KEY");
+    }
+
+    #[test]
+    fn find_references_dash_terminates_key() {
+        // `-` left the charset (DR-0017 §1.5): `PW-suffix` reads as key `PW`
+        // followed by the literal `-suffix` (predictable termination).
+        let locs = find_references("cache-warden://PW-suffix");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].key, "PW");
     }
 
     #[test]
@@ -363,14 +372,11 @@ mod tests {
 
     #[test]
     fn find_references_no_recursive_rescan() {
-        // A key char run is consumed once; the result does not re-find a nested
-        // scheme inside an already-consumed key (there is none here, but assert
-        // single-pass behavior on adjacent refs).
+        // Single-pass: the first key run is consumed once. `Acache` ends at the
+        // `-` (no longer a key char), and no second scheme exists after it.
         let locs = find_references("cache-warden://Acache-warden://B");
-        // The first key greedily consumes letters; `:` ends it, but `cache-warden`
-        // chars are valid key chars, so the whole run up to `:` is one key.
         assert_eq!(locs.len(), 1);
-        assert_eq!(locs[0].key, "Acache-warden");
+        assert_eq!(locs[0].key, "Acache");
     }
 
     #[test]
@@ -398,7 +404,7 @@ mod tests {
         assert_eq!(mask("DB", false), "<cache-warden:DB:failed>");
     }
 
-    // ---- resolve_all (dedup) ----
+    // ---- resolve_all (dedup + qualification) ----
 
     #[test]
     fn resolve_all_resolves_each_key_once() {
@@ -408,11 +414,27 @@ mod tests {
             count += 1;
             v(format!("val-{k}").as_bytes())
         };
-        let map = resolve_all(&keys, &mut resolver);
+        let map = resolve_all(&keys, "default", &mut resolver);
         assert_eq!(count, 2, "B is resolved once despite two references");
         assert_eq!(map.len(), 2);
-        assert_eq!(map["A"], v(b"val-A"));
-        assert_eq!(map["B"], v(b"val-B"));
+        // The map is keyed by the qualified form; the resolver saw it too.
+        assert_eq!(map["default/A"], v(b"val-default/A"));
+        assert_eq!(map["default/B"], v(b"val-default/B"));
+    }
+
+    #[test]
+    fn resolve_all_unqualified_and_qualified_same_key_dedup() {
+        // `bar` under ctx `foo` and the explicit `foo/bar` are the same entry:
+        // one resolution (DR-0017 §3).
+        let keys = vec!["bar".to_string(), "foo/bar".to_string()];
+        let mut count = 0;
+        let mut resolver = |k: &str| {
+            count += 1;
+            v(format!("val-{k}").as_bytes())
+        };
+        let map = resolve_all(&keys, "foo", &mut resolver);
+        assert_eq!(count, 1, "qualified and unqualified collapse to one");
+        assert_eq!(map["foo/bar"], v(b"val-foo/bar"));
     }
 
     // ---- render_template: reveal ----
@@ -420,12 +442,13 @@ mod tests {
     #[test]
     fn render_reveal_substitutes_values() {
         let mut map = BTreeMap::new();
-        map.insert("USER".to_string(), v(b"alice"));
-        map.insert("PW".to_string(), v(b"s3cr3t"));
+        map.insert("default/USER".to_string(), v(b"alice"));
+        map.insert("default/PW".to_string(), v(b"s3cr3t"));
         let out = render_template(
             b"dsn=cache-warden://USER:cache-warden://PW@h",
             &map,
             Mode::Reveal,
+            "default",
         )
         .unwrap();
         assert_eq!(out.bytes, b"dsn=alice:s3cr3t@h");
@@ -433,42 +456,60 @@ mod tests {
     }
 
     #[test]
+    fn render_reveal_qualified_reference_is_absolute() {
+        // A `hoge/fuga` reference resolves to hoge/fuga even under ctx `foo`.
+        let mut map = BTreeMap::new();
+        map.insert("hoge/fuga".to_string(), v(b"abs"));
+        let out =
+            render_template(b"x=cache-warden://hoge/fuga", &map, Mode::Reveal, "foo").unwrap();
+        assert_eq!(out.bytes, b"x=abs");
+    }
+
+    #[test]
     fn render_reveal_is_binary_safe() {
         let mut map = BTreeMap::new();
-        map.insert("K".to_string(), v(&[0u8, 159, 146, 150]));
+        map.insert("default/K".to_string(), v(&[0u8, 159, 146, 150]));
         let template = b"\x00\xffcache-warden://K\x00".to_vec();
-        let out = render_template(&template, &map, Mode::Reveal).unwrap();
+        let out = render_template(&template, &map, Mode::Reveal, "default").unwrap();
         assert_eq!(out.bytes, vec![0u8, 0xff, 0, 159, 146, 150, 0]);
     }
 
     #[test]
     fn render_reveal_fails_closed_on_any_failure() {
         let mut map = BTreeMap::new();
-        map.insert("OK".to_string(), v(b"ok"));
-        map.insert("BAD".to_string(), Err("not found".to_string()));
-        let err = render_template(b"cache-warden://OK cache-warden://BAD", &map, Mode::Reveal)
-            .unwrap_err();
-        assert_eq!(err, vec!["BAD".to_string()]);
+        map.insert("default/OK".to_string(), v(b"ok"));
+        map.insert("default/BAD".to_string(), Err("not found".to_string()));
+        let err = render_template(
+            b"cache-warden://OK cache-warden://BAD",
+            &map,
+            Mode::Reveal,
+            "default",
+        )
+        .unwrap_err();
+        assert_eq!(err, vec!["default/BAD".to_string()]);
     }
 
     // ---- render_template: dry-run ----
 
     #[test]
-    fn render_dry_run_masks_all_and_never_fails_closed() {
+    fn render_dry_run_masks_show_resolved_absolute_key() {
+        // The mask displays the resolved absolute key, so an unqualified
+        // reference shows what it resolved to (DR-0017 §5).
         let mut map = BTreeMap::new();
-        map.insert("OK".to_string(), Ok(ResolvedValue::Verified));
-        map.insert("BAD".to_string(), Err("nope".to_string()));
+        map.insert("projA/OK".to_string(), Ok(ResolvedValue::Verified));
+        map.insert("projA/BAD".to_string(), Err("nope".to_string()));
         let out = render_template(
             b"a=cache-warden://OK b=cache-warden://BAD",
             &map,
             Mode::DryRun,
+            "projA",
         )
         .unwrap();
         assert_eq!(
             out.bytes,
-            b"a=<cache-warden:OK:masked> b=<cache-warden:BAD:failed>"
+            b"a=<cache-warden:projA/OK:masked> b=<cache-warden:projA/BAD:failed>"
         );
-        assert_eq!(out.failures, vec!["BAD".to_string()]);
+        assert_eq!(out.failures, vec!["projA/BAD".to_string()]);
     }
 
     #[test]
@@ -476,9 +517,9 @@ mod tests {
         // Defense in depth: if a Value somehow appears in a dry-run map, it must
         // still be masked, never emitted.
         let mut map = BTreeMap::new();
-        map.insert("K".to_string(), v(b"should-not-appear"));
-        let out = render_template(b"cache-warden://K", &map, Mode::DryRun).unwrap();
-        assert_eq!(out.bytes, b"<cache-warden:K:masked>");
+        map.insert("default/K".to_string(), v(b"should-not-appear"));
+        let out = render_template(b"cache-warden://K", &map, Mode::DryRun, "default").unwrap();
+        assert_eq!(out.bytes, b"<cache-warden:default/K:masked>");
         assert!(!String::from_utf8_lossy(&out.bytes).contains("should-not-appear"));
     }
 }

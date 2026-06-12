@@ -88,20 +88,20 @@ fn full_lifecycle_over_control_socket() {
 
     // --- kv.set (static) ---
     let set = format!(
-        r#"{{"cmd":"kv.set","key":"DB","source":{{"kind":"static","value_b64":"{}"}},"soft_ttl_secs":3600,"hard_ttl_secs":86400}}"#,
+        r#"{{"cmd":"kv.set","key":"default/DB","source":{{"kind":"static","value_b64":"{}"}},"soft_ttl_secs":3600,"hard_ttl_secs":86400}}"#,
         b64(b"hunter2")
     );
     let resp = request(&socket, &set);
     assert_eq!(resp["ok"], true, "set: {resp}");
 
     // --- kv.get returns the value (base64) ---
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"DB"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/DB"}"#);
     assert_eq!(resp["ok"], true, "get: {resp}");
     let got = resp["value_b64"].as_str().expect("value_b64");
     assert_eq!(B64.decode(got).unwrap(), b"hunter2");
 
     // --- kv.define a second key (command source; lazy, value produced on get) ---
-    let def = r#"{"cmd":"kv.define","key":"TOK","argv":["printf","tok-value"]}"#;
+    let def = r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","tok-value"]}"#;
     let resp = request(&socket, def);
     assert_eq!(resp["ok"], true, "define: {resp}");
     // Right after define, status shows TOK as defined with no value yet.
@@ -110,7 +110,7 @@ fn full_lifecycle_over_control_socket() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["name"] == "TOK")
+        .find(|e| e["name"] == "default/TOK")
         .expect("TOK in status");
     assert_eq!(tok["defined"], true, "TOK is defined: {tok}");
     assert_eq!(tok["has_value"], false, "TOK has no value yet: {tok}");
@@ -119,7 +119,7 @@ fn full_lifecycle_over_control_socket() {
         "TOK reports the defined state: {tok}"
     );
     // The first get lazily produces the value.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/TOK"}"#);
     let got = resp["value_b64"].as_str().expect("value_b64");
     assert_eq!(B64.decode(got).unwrap(), b"tok-value");
 
@@ -131,7 +131,8 @@ fn full_lifecycle_over_control_socket() {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    assert_eq!(keys, vec!["DB", "TOK"]);
+    // The wire view is the composed keyspace (DR-0017 §1).
+    assert_eq!(keys, vec!["default/DB", "default/TOK"]);
 
     // --- status: entries present, NO secret values leaked ---
     let resp = request(&socket, r#"{"cmd":"status"}"#);
@@ -148,18 +149,18 @@ fn full_lifecycle_over_control_socket() {
     assert!(
         entries
             .iter()
-            .any(|e| e["name"] == "DB" && e["state"] == "active")
+            .any(|e| e["name"] == "default/DB" && e["state"] == "active")
     );
 
     // --- kv.del removes a key ---
-    let resp = request(&socket, r#"{"cmd":"kv.del","key":"DB"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.del","key":"default/DB"}"#);
     assert_eq!(resp["deleted"], true, "del: {resp}");
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"DB"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/DB"}"#);
     assert_eq!(resp["ok"], false);
     assert_eq!(resp["error"]["kind"], "not_found");
 
     // --- delete a missing key reports deleted:false ---
-    let resp = request(&socket, r#"{"cmd":"kv.del","key":"DB"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.del","key":"default/DB"}"#);
     assert_eq!(resp["deleted"], false);
 
     // --- malformed request -> bad_request, daemon stays up ---
@@ -271,7 +272,7 @@ allowed_processes = ["no-such-process-name-xyz"]
     let (mut daemon, socket) = spawn_with_config(dir.path(), &cfg);
 
     // OPEN: unrestricted key gets normally.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"OPEN"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/OPEN"}"#);
     assert_eq!(resp["ok"], true, "open key get: {resp}");
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
@@ -280,7 +281,7 @@ allowed_processes = ["no-such-process-name-xyz"]
 
     // RESTRICT: our real ancestor name is allowed, so the get succeeds and
     // returns the value.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"RESTRICT"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/RESTRICT"}"#);
     assert_eq!(
         resp["ok"], true,
         "restricted key get from allowed ancestor: {resp}"
@@ -292,7 +293,7 @@ allowed_processes = ["no-such-process-name-xyz"]
 
     // DENIED: no process in our ancestry matches, so the get is refused with
     // auth_failed and no value is returned.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"DENIED"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/DENIED"}"#);
     assert_eq!(resp["ok"], false, "denied key get must fail: {resp}");
     assert_eq!(resp["error"]["kind"], "auth_failed");
     assert!(
@@ -310,7 +311,7 @@ allowed_processes = ["no-such-process-name-xyz"]
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
     assert!(
-        keys.contains(&"DENIED".to_string()),
+        keys.contains(&"default/DENIED".to_string()),
         "list shows DENIED: {keys:?}"
     );
 
@@ -343,19 +344,19 @@ preload = true
     let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
 
     // Preload populated TOK: a get is an immediate hit.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/TOK"}"#);
     assert_eq!(resp["ok"], true, "preloaded TOK get: {resp}");
     let got = resp["value_b64"].as_str().expect("value_b64");
     assert_eq!(B64.decode(got).unwrap(), b"preloaded-tok");
 
     // EXT is initially Active too.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"EXT"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/EXT"}"#);
     assert_eq!(resp["ok"], true);
 
     // Let EXT soft-expire (1s), then get: the daemon runs the re-auth command
     // (`true` => approved) and extends, returning the value.
     std::thread::sleep(Duration::from_millis(2500));
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"EXT"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/EXT"}"#);
     assert_eq!(
         resp["ok"], true,
         "extend should be approved by `true`: {resp}"
@@ -394,7 +395,7 @@ preload = true
     // After soft expiry, the get triggers the re-auth command (`false` =>
     // denied), so the daemon refuses with auth_failed.
     std::thread::sleep(Duration::from_millis(2500));
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"EXT"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/EXT"}"#);
     assert_eq!(
         resp["ok"], false,
         "extend must be denied by `false`: {resp}"
@@ -432,7 +433,7 @@ preload = true
     // pinning is a re-auth-gated operation even from Active.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.pin","key":"EXT","duration_secs":3600}"#,
+        r#"{"cmd":"kv.pin","key":"default/EXT","duration_secs":3600}"#,
     );
     assert_eq!(
         resp["ok"], false,
@@ -469,7 +470,7 @@ preload = true
     // Pin EXT for an hour while it is still Active (approved by `true`).
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.pin","key":"EXT","duration_secs":3600}"#,
+        r#"{"cmd":"kv.pin","key":"default/EXT","duration_secs":3600}"#,
     );
     assert_eq!(resp["ok"], true, "pin approved by `true`: {resp}");
     assert_eq!(resp["pinned"], true);
@@ -477,7 +478,7 @@ preload = true
     // Past the hard TTL (2s): without the pin the value would be zeroized, but
     // the pin holds it Active and gettable.
     std::thread::sleep(Duration::from_millis(2500));
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"EXT"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/EXT"}"#);
     assert_eq!(resp["ok"], true, "pinned value survives hard TTL: {resp}");
     let got = resp["value_b64"].as_str().expect("value_b64");
     assert_eq!(B64.decode(got).unwrap(), b"ext-value");
@@ -485,7 +486,7 @@ preload = true
     // status shows the pin's remaining seconds.
     let resp = request(&socket, r#"{"cmd":"status"}"#);
     let entries = resp["entries"].as_array().unwrap();
-    let ext = entries.iter().find(|e| e["name"] == "EXT").unwrap();
+    let ext = entries.iter().find(|e| e["name"] == "default/EXT").unwrap();
     assert_eq!(ext["state"], "active", "pinned entry reports Active");
     assert!(
         ext["pin_remaining_secs"].as_u64().unwrap() > 0,
@@ -496,13 +497,13 @@ preload = true
     // get must no longer return the old value via a pin (it will try to
     // regenerate the command source instead — approved by `true`, returning a
     // fresh value). The key point: status no longer shows a pin.
-    let resp = request(&socket, r#"{"cmd":"kv.unpin","key":"EXT"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.unpin","key":"default/EXT"}"#);
     assert_eq!(resp["ok"], true, "unpin ok: {resp}");
     assert_eq!(resp["unpinned"], true);
 
     let resp = request(&socket, r#"{"cmd":"status"}"#);
     let entries = resp["entries"].as_array().unwrap();
-    let ext = entries.iter().find(|e| e["name"] == "EXT").unwrap();
+    let ext = entries.iter().find(|e| e["name"] == "default/EXT").unwrap();
     assert!(
         ext.get("pin_remaining_secs").is_none() || ext["pin_remaining_secs"].is_null(),
         "after unpin there is no pin field: {ext}"
@@ -530,13 +531,13 @@ fn pin_missing_key_is_not_found() {
 
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.pin","key":"ghost","duration_secs":60}"#,
+        r#"{"cmd":"kv.pin","key":"default/ghost","duration_secs":60}"#,
     );
     assert_eq!(resp["ok"], false);
     assert_eq!(resp["error"]["kind"], "not_found");
 
     // unpin of a missing key is also not_found.
-    let resp = request(&socket, r#"{"cmd":"kv.unpin","key":"ghost"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.unpin","key":"default/ghost"}"#);
     assert_eq!(resp["ok"], false);
     assert_eq!(resp["error"]["kind"], "not_found");
 
@@ -571,7 +572,7 @@ fn define_get_lazy_del_value_only_then_get_regenerates() {
     // define (no upstream run yet) — status shows defined, no value.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","lazy-value"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","lazy-value"]}"#,
     );
     assert_eq!(resp["ok"], true, "define: {resp}");
     let resp = request(&socket, r#"{"cmd":"status"}"#);
@@ -579,13 +580,13 @@ fn define_get_lazy_del_value_only_then_get_regenerates() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["name"] == "TOK")
+        .find(|e| e["name"] == "default/TOK")
         .expect("TOK present");
     assert_eq!(tok["defined"], true);
     assert_eq!(tok["has_value"], false);
 
     // first get lazily produces the value.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/TOK"}"#);
     assert_eq!(resp["ok"], true, "lazy get: {resp}");
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
@@ -593,20 +594,20 @@ fn define_get_lazy_del_value_only_then_get_regenerates() {
     );
 
     // del (value only): the definition survives.
-    let resp = request(&socket, r#"{"cmd":"kv.del","key":"TOK"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.del","key":"default/TOK"}"#);
     assert_eq!(resp["deleted"], true, "del value: {resp}");
     let resp = request(&socket, r#"{"cmd":"status"}"#);
     let tok = resp["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["name"] == "TOK")
+        .find(|e| e["name"] == "default/TOK")
         .expect("TOK still defined after value del");
     assert_eq!(tok["defined"], true, "definition survives value-only del");
     assert_eq!(tok["has_value"], false);
 
     // get again: regenerated from the surviving definition.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/TOK"}"#);
     assert_eq!(resp["ok"], true, "regenerated get: {resp}");
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
@@ -629,22 +630,22 @@ fn del_with_define_drops_definition_so_get_is_not_found() {
 
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","v"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","v"]}"#,
     );
     assert_eq!(resp["ok"], true, "define: {resp}");
     // produce the value once.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/TOK"}"#);
     assert_eq!(resp["ok"], true);
 
     // del with_define: drops both value and definition.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.del","key":"TOK","with_define":true}"#,
+        r#"{"cmd":"kv.del","key":"default/TOK","with_define":true}"#,
     );
     assert_eq!(resp["deleted"], true, "del with_define: {resp}");
 
     // get: the key is gone entirely (no definition to regenerate from).
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/TOK"}"#);
     assert_eq!(resp["ok"], false, "get after with-define del: {resp}");
     assert_eq!(resp["error"]["kind"], "not_found");
 
@@ -655,7 +656,7 @@ fn del_with_define_drops_definition_so_get_is_not_found() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|e| e["name"] != "TOK"),
+            .all(|e| e["name"] != "default/TOK"),
         "TOK should be gone from status: {resp}"
     );
 
@@ -675,19 +676,19 @@ fn define_conflict_then_del_with_define_allows_redefine() {
 
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","a"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","a"]}"#,
     );
     assert_eq!(resp["ok"], true);
     // identical define is an idempotent no-op.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","a"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","a"]}"#,
     );
     assert_eq!(resp["ok"], true, "identical define is a no-op: {resp}");
     // conflicting define is rejected with a redefine hint.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","b"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","b"]}"#,
     );
     assert_eq!(resp["ok"], false, "conflict rejected: {resp}");
     assert_eq!(resp["error"]["kind"], "bad_request");
@@ -695,15 +696,15 @@ fn define_conflict_then_del_with_define_allows_redefine() {
     // del --with-define then redefine succeeds.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.del","key":"TOK","with_define":true}"#,
+        r#"{"cmd":"kv.del","key":"default/TOK","with_define":true}"#,
     );
     assert_eq!(resp["deleted"], true);
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"TOK","argv":["printf","b"]}"#,
+        r#"{"cmd":"kv.define","key":"default/TOK","argv":["printf","b"]}"#,
     );
     assert_eq!(resp["ok"], true, "redefine after del succeeds: {resp}");
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"TOK"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/TOK"}"#);
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
         b"b"
@@ -792,19 +793,19 @@ soft-ttl = "1h"
     // Both keys are defined (no value yet — lazy).
     let resp = request(&socket, r#"{"cmd":"status"}"#);
     let entries = resp["entries"].as_array().unwrap();
-    for name in ["ALPHA", "BETA"] {
+    for name in ["default/ALPHA", "default/BETA"] {
         let e = entries.iter().find(|e| e["name"] == name).expect("defined");
         assert_eq!(e["defined"], true, "{name} defined");
         assert_eq!(e["has_value"], false, "{name} lazy (no value)");
     }
 
     // First get lazily produces each value.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"ALPHA"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/ALPHA"}"#);
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
         b"alpha-value"
     );
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"BETA"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/BETA"}"#);
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
         b"beta-value"
@@ -831,7 +832,7 @@ fn define_defs_conflict_is_aggregated_not_fatal() {
     // Pre-register CLASH with one argv.
     let resp = request(
         &socket,
-        r#"{"cmd":"kv.define","key":"CLASH","argv":["printf","original"]}"#,
+        r#"{"cmd":"kv.define","key":"default/CLASH","argv":["printf","original"]}"#,
     );
     assert_eq!(resp["ok"], true);
 
@@ -860,13 +861,13 @@ command = ["printf", "fresh-value"]
     assert!(stderr.contains("CLASH"), "conflict names the key: {stderr}");
 
     // FRESH still got registered despite CLASH's failure.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"FRESH"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/FRESH"}"#);
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
         b"fresh-value"
     );
     // CLASH keeps its original definition.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"CLASH"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/CLASH"}"#);
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
         b"original"
@@ -917,7 +918,7 @@ fn persisted_definition_survives_daemon_restart() {
     let secret_file = dir.path().join("secret.txt");
     std::fs::write(&secret_file, b"top-secret-output").unwrap();
     let define = format!(
-        r#"{{"cmd":"kv.define","key":"PERSISTED","argv":["sh","-c","cat {}"]}}"#,
+        r#"{{"cmd":"kv.define","key":"default/PERSISTED","argv":["sh","-c","cat {}"]}}"#,
         secret_file.display()
     );
     let resp = request(&socket, &define);
@@ -925,7 +926,7 @@ fn persisted_definition_survives_daemon_restart() {
 
     // Produce the value once so a secret is resident in memory (and could, if
     // the invariant were broken, leak to disk).
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"PERSISTED"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/PERSISTED"}"#);
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
         b"top-secret-output"
@@ -986,12 +987,12 @@ fn persisted_definition_survives_daemon_restart() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["name"] == "PERSISTED")
+        .find(|e| e["name"] == "default/PERSISTED")
         .expect("PERSISTED restored after restart");
     assert_eq!(p["defined"], true, "restored as a definition: {p}");
 
     // get regenerates the value from the restored definition.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"PERSISTED"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/PERSISTED"}"#);
     assert_eq!(resp["ok"], true, "regenerate after restart: {resp}");
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
@@ -1041,7 +1042,7 @@ fn persistence_off_ignores_existing_state_file() {
     assert_eq!(resp["ok"], true);
 
     // GHOST must NOT be present (persistence is off, so the file was ignored).
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"GHOST"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/GHOST"}"#);
     assert_eq!(resp["ok"], false, "GHOST must not be restored: {resp}");
     assert_eq!(resp["error"]["kind"], "not_found");
 
@@ -1099,7 +1100,7 @@ fn persisted_config_priority_merge_drops_clashing_persisted_entry() {
     assert_eq!(resp["ok"], true);
 
     // DB resolves to the CONFIG definition, not the stale persisted one.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"DB"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/DB"}"#);
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
         b"from-config",
@@ -1129,12 +1130,15 @@ fn kv_get_dry_run_returns_verified_without_value_over_the_wire() {
     let (mut daemon, socket) = spawn_plain(dir.path());
 
     let set = format!(
-        r#"{{"cmd":"kv.set","key":"DB","source":{{"kind":"static","value_b64":"{}"}}}}"#,
+        r#"{{"cmd":"kv.set","key":"default/DB","source":{{"kind":"static","value_b64":"{}"}}}}"#,
         b64(b"top-secret")
     );
     assert_eq!(request(&socket, &set)["ok"], true);
 
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"DB","dry_run":true}"#);
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.get","key":"default/DB","dry_run":true}"#,
+    );
     assert_eq!(resp["ok"], true, "dry-run get: {resp}");
     assert_eq!(resp["verified"], true, "carries verified flag: {resp}");
     assert!(
@@ -1146,7 +1150,7 @@ fn kv_get_dry_run_returns_verified_without_value_over_the_wire() {
     assert!(!body.contains(&b64(b"top-secret")));
 
     // A normal get still returns the real value (default reveal).
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"DB"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/DB"}"#);
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
         b"top-secret"
@@ -1223,13 +1227,13 @@ fn otp_value_type_over_control_socket() {
 
     // --- kv.define an OTP key whose command emits the seed (6 digits default) ---
     let def = format!(
-        r#"{{"cmd":"kv.define","key":"OTP","argv":["printf","%s","{SEED_B32}"],"meta":{{"type":"otp"}}}}"#
+        r#"{{"cmd":"kv.define","key":"default/OTP","argv":["printf","%s","{SEED_B32}"],"meta":{{"type":"otp"}}}}"#
     );
     let resp = request(&socket, &def);
     assert_eq!(resp["ok"], true, "define otp: {resp}");
 
     // --- kv.get returns a 6-digit CODE, never the seed (write-only) ---
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"OTP"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/OTP"}"#);
     assert_eq!(resp["ok"], true, "get otp: {resp}");
     let got = resp["value_b64"].as_str().expect("value_b64");
     let code = B64.decode(got).unwrap();
@@ -1255,12 +1259,15 @@ fn otp_value_type_over_control_socket() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["name"] == "OTP")
+        .find(|e| e["name"] == "default/OTP")
         .expect("OTP in status");
     assert_eq!(otp["value_type"], "otp", "status shows type: {otp}");
 
     // --- dry-run get masks the code (no value carried) ---
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"OTP","dry_run":true}"#);
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.get","key":"default/OTP","dry_run":true}"#,
+    );
     assert_eq!(resp["ok"], true, "dry-run otp: {resp}");
     assert_eq!(resp["verified"], true, "dry-run verified: {resp}");
     let resp_str = resp.to_string();
@@ -1269,10 +1276,10 @@ fn otp_value_type_over_control_socket() {
 
     // --- an 8-digit otp definition via params ---
     let def = format!(
-        r#"{{"cmd":"kv.define","key":"OTP8","argv":["printf","%s","{SEED_B32}"],"meta":{{"type":"otp","params":{{"digits":"8"}}}}}}"#
+        r#"{{"cmd":"kv.define","key":"default/OTP8","argv":["printf","%s","{SEED_B32}"],"meta":{{"type":"otp","params":{{"digits":"8"}}}}}}"#
     );
     assert_eq!(request(&socket, &def)["ok"], true);
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"OTP8"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/OTP8"}"#);
     let code = B64.decode(resp["value_b64"].as_str().unwrap()).unwrap();
     assert_eq!(code.len(), 8, "8-digit otp code");
 
@@ -1330,7 +1337,7 @@ fn kv_set_positional_value_stdin_pipe_and_double_dash() {
         "piped kv set failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"PIPED"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/PIPED"}"#);
     assert_eq!(
         B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
         b"bin\0ary",
@@ -1351,7 +1358,7 @@ fn kv_set_positional_value_stdin_pipe_and_double_dash() {
         );
     }
 
-    // --- `--` separator: an option-looking key set / get / del ---
+    // --- `--` separator: positional protection + option-looking VALUE ---
     // `--socket` must come before the `--` (after it, everything is positional
     // — including a literal "--socket"), so build the argv explicitly instead
     // of using run_cli (which appends the socket at the end).
@@ -1361,28 +1368,237 @@ fn kv_set_positional_value_stdin_pipe_and_double_dash() {
         cmd.args(&verb_args[1..]);
         cmd.output().expect("run cli")
     };
-    let out = cli_dd(&["set", "--", "--weird-key", "weird-v"]);
+    // A `--`-protected VALUE may legitimately look like an option.
+    let out = cli_dd(&["set", "--", "DDK", "--value-stdin"]);
     assert!(
         out.status.success(),
-        "set -- --weird-key failed: {}",
+        "set -- DDK --value-stdin failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let out = cli_dd(&["get", "--", "--weird-key"]);
+    let out = cli_dd(&["get", "--", "DDK"]);
     assert!(
         out.status.success(),
-        "get -- --weird-key failed: {}",
+        "get -- DDK failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "weird-v");
-    let out = cli_dd(&["del", "--", "--weird-key"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "--value-stdin");
+    let out = cli_dd(&["del", "--", "DDK"]);
     assert!(
         out.status.success(),
-        "del -- --weird-key failed: {}",
+        "del -- DDK failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     // Gone after the delete.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"--weird-key"}"#);
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/DDK"}"#);
     assert_eq!(resp["ok"], false, "deleted key must not resolve: {resp}");
+
+    // An option-looking key after `--` is rejected by the KEY charset
+    // (DR-0017 §1.5) — not misparsed as a flag.
+    let out = cli_dd(&["get", "--", "--weird-key"]);
+    assert!(!out.status.success(), "charset-invalid key must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("A-Za-z0-9_"), "charset error: {err}");
+    assert!(
+        !err.contains("unknown option"),
+        "must not be flag-misparsed: {err}"
+    );
+
+    // Out-of-charset keys are also refused at the protocol boundary (the
+    // daemon rejects a non-composed key on kv.set; DR-0017 §1.5).
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.set","key":"default/has.dot","source":{"kind":"static","value_b64":"QQ=="}}"#,
+    );
+    assert_eq!(
+        resp["ok"], false,
+        "protocol must reject bad charset: {resp}"
+    );
+    let resp = request(
+        &socket,
+        r#"{"cmd":"kv.set","key":"flatkey","source":{"kind":"static","value_b64":"QQ=="}}"#,
+    );
+    assert_eq!(resp["ok"], false, "protocol must reject a flat key: {resp}");
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+/// KV namespaces end-to-end (DR-0017): `--namespace` isolates same-named keys,
+/// `CACHE_WARDEN_NAMESPACE` supplies the default, `kv list` shows only the
+/// current namespace (with `--all-namespaces` for the composed view), and
+/// references resolve unqualified-into-context / qualified-as-absolute.
+#[test]
+fn namespaces_isolate_keys_and_resolve_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+    assert_eq!(request(&socket, r#"{"cmd":"ping"}"#)["ok"], true);
+
+    let cli = |args: &[&str], envs: &[(&str, &str)]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cache-warden"));
+        // `--socket` must precede any `--` (for `run`, everything after it is
+        // the child argv), so insert it right after the command word.
+        cmd.arg(args[0]).arg("--socket").arg(&socket);
+        cmd.args(&args[1..]);
+        cmd.env_remove("CACHE_WARDEN_NAMESPACE");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.output().expect("run cli")
+    };
+
+    // --- same KEY in two namespaces holds two values ---
+    assert!(
+        cli(&["kv", "set", "DB", "a-value", "--namespace", "projA"], &[])
+            .status
+            .success()
+    );
+    assert!(
+        cli(&["kv", "set", "DB", "b-value", "--namespace", "projB"], &[])
+            .status
+            .success()
+    );
+    let out = cli(&["kv", "get", "DB", "--namespace", "projA"], &[]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a-value");
+    let out = cli(&["kv", "get", "DB", "--namespace", "projB"], &[]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "b-value");
+    // The default namespace does not see either.
+    let out = cli(&["kv", "get", "DB"], &[]);
+    assert!(
+        !out.status.success(),
+        "default NS must not resolve projA/DB"
+    );
+
+    // --- CACHE_WARDEN_NAMESPACE supplies the default; the flag overrides it ---
+    let out = cli(&["kv", "get", "DB"], &[("CACHE_WARDEN_NAMESPACE", "projA")]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a-value");
+    let out = cli(
+        &["kv", "get", "DB", "--namespace", "projB"],
+        &[("CACHE_WARDEN_NAMESPACE", "projA")],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "b-value",
+        "flag wins over env"
+    );
+
+    // --- kv list: current NS only (stripped); --all-namespaces shows NS/KEY ---
+    let out = cli(&["kv", "list", "--namespace", "projA"], &[]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "DB\n");
+    let out = cli(
+        &["kv", "list", "--namespace", "projA", "--all-namespaces"],
+        &[],
+    );
+    let all = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        all.contains("projA/DB") && all.contains("projB/DB"),
+        "{all}"
+    );
+
+    // --- status: current NS only (stripped names); --all-namespaces composed ---
+    let out = cli(&["status", "--namespace", "projA"], &[]);
+    let st = String::from_utf8_lossy(&out.stdout);
+    assert!(st.contains("  DB "), "stripped name in status: {st}");
+    assert!(!st.contains("projB"), "other NS hidden: {st}");
+    let out = cli(&["status", "--all-namespaces"], &[]);
+    let st = String::from_utf8_lossy(&out.stdout);
+    assert!(st.contains("projA/DB") && st.contains("projB/DB"), "{st}");
+
+    // --- references: unqualified resolves into the context namespace,
+    //     qualified is absolute (DR-0017 §3) ---
+    let out = cli(
+        &[
+            "run",
+            "--namespace",
+            "projA",
+            "--env",
+            "X=cache-warden://DB",
+            "--env",
+            "Y=cache-warden://projB/DB",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s:%s' \"$X\" \"$Y\"",
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a-value:b-value");
+
+    // --- dry-run masks display the resolved absolute key (DR-0017 §5) ---
+    let out = cli(
+        &["kv", "get", "DB", "--namespace", "projA", "--dry-run"],
+        &[],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "<cache-warden:projA/DB:masked>"
+    );
+
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+/// Per-entry `namespace` field in defs files (DR-0017 §5): a pinned entry is
+/// absolute, an unpinned one follows the `--defs` invocation's `--namespace`.
+#[test]
+fn defs_namespace_field_pins_entries_absolutely() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut daemon, socket) = spawn_plain(dir.path());
+    assert_eq!(request(&socket, r#"{"cmd":"ping"}"#)["ok"], true);
+
+    let defs_path = dir.path().join("ns.cache-warden.toml");
+    std::fs::write(
+        &defs_path,
+        r#"[kv.PINNED]
+namespace = "fixed"
+command = ["printf", "pinned-value"]
+
+[kv.FLOATING]
+command = ["printf", "floating-value"]
+"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
+        .args([
+            "kv",
+            "define",
+            "--namespace",
+            "ctx",
+            "--defs",
+            defs_path.to_str().unwrap(),
+            "--socket",
+        ])
+        .arg(&socket)
+        .output()
+        .expect("run cli");
+    assert!(
+        out.status.success(),
+        "define --defs failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // PINNED went to fixed/ regardless of the context; FLOATING followed it.
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"fixed/PINNED"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"pinned-value"
+    );
+    let resp = request(&socket, r#"{"cmd":"kv.get","key":"ctx/FLOATING"}"#);
+    assert_eq!(
+        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
+        b"floating-value"
+    );
 
     let pid = daemon.child.id();
     unsafe {

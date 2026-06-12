@@ -119,9 +119,11 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-/// Define a key whose value is the given literal (via `printf`).
+/// Define a key (in the default namespace) whose value is the given literal
+/// (via `printf`). The wire key is the composed `default/KEY` (DR-0017).
 fn define(socket: &Path, key: &str, value: &str) {
-    let json = format!(r#"{{"cmd":"kv.define","key":"{key}","argv":["printf","{value}"]}}"#);
+    let json =
+        format!(r#"{{"cmd":"kv.define","key":"default/{key}","argv":["printf","{value}"]}}"#);
     let resp = request(socket, &json);
     assert_eq!(resp["ok"], true, "define {key}: {resp}");
 }
@@ -233,7 +235,7 @@ fn run_dry_run_execs_with_masked_env() {
         "dry-run should exec: {}",
         stderr(&out)
     );
-    assert_eq!(stdout(&out), "<cache-warden:DB_PW:masked>");
+    assert_eq!(stdout(&out), "<cache-warden:default/DB_PW:masked>");
     assert!(
         !stdout(&out).contains("super-secret"),
         "real value must never appear in dry-run"
@@ -336,7 +338,7 @@ fn inject_dry_run_masks_and_reports_failures() {
     );
     assert_eq!(
         stdout(&out),
-        "a=<cache-warden:OK:masked> b=<cache-warden:BAD:failed>"
+        "a=<cache-warden:default/OK:masked> b=<cache-warden:default/BAD:failed>"
     );
     assert!(
         !stdout(&out).contains("real-value"),
@@ -399,7 +401,7 @@ fn env_var_flips_default_to_dry_run_and_flag_overrides_back() {
         "no failures, exit 0: {}",
         stderr(&out)
     );
-    assert_eq!(stdout(&out), "v=<cache-warden:K:masked>");
+    assert_eq!(stdout(&out), "v=<cache-warden:default/K:masked>");
 
     // An explicit --reveal overrides the env var back to real values.
     let out = run_cli_env(
@@ -429,13 +431,16 @@ fn kv_get_dry_run_prints_mask_and_real_get_prints_value() {
     // Dry-run: masked, value never emitted.
     let out = run_cli(&socket, &["kv", "get", "--dry-run", "TOK"]);
     assert!(out.status.success(), "dry-run get ok: {}", stderr(&out));
-    assert_eq!(stdout(&out).trim_end(), "<cache-warden:TOK:masked>");
+    assert_eq!(stdout(&out).trim_end(), "<cache-warden:default/TOK:masked>");
     assert!(!stdout(&out).contains("tok-value"));
 
     // Dry-run of a missing key: failed mask + non-zero exit.
     let out = run_cli(&socket, &["kv", "get", "--dry-run", "GHOST"]);
     assert!(!out.status.success(), "missing key dry-run exits non-zero");
-    assert_eq!(stdout(&out).trim_end(), "<cache-warden:GHOST:failed>");
+    assert_eq!(
+        stdout(&out).trim_end(),
+        "<cache-warden:default/GHOST:failed>"
+    );
 
     stop(daemon);
 }
@@ -522,7 +527,7 @@ fn otp_define_get_and_run_inject_the_code_not_the_seed() {
     // dry-run prints the mask, not the code.
     let out = run_cli(&socket, &["kv", "get", "OTP", "--dry-run"]);
     assert!(out.status.success(), "dry-run failed: {}", stderr(&out));
-    assert_eq!(stdout(&out).trim(), "<cache-warden:OTP:masked>");
+    assert_eq!(stdout(&out).trim(), "<cache-warden:default/OTP:masked>");
 
     // `run` injects the code into the child env (whole-value reference).
     let out = run_cli(

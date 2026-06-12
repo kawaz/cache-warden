@@ -14,6 +14,7 @@ mod daemon;
 mod defs;
 mod help;
 mod mode;
+mod namespace;
 mod otp_type;
 mod protocol;
 mod refs;
@@ -206,7 +207,7 @@ fn run() -> Result<(), CliError> {
         "daemon" => dispatch_daemon(&rest, socket, loaded.config),
         "config" => dispatch_config(&rest, &loaded),
         "ping" => Ok(run_client(&socket, &protocol::wire::Request::Ping)?),
-        "status" => Ok(run_client(&socket, &protocol::wire::Request::Status)?),
+        "status" => dispatch_status(&rest, &socket, &loaded.config),
         "kv" => dispatch_kv(&rest, &socket, &loaded.config),
         "run" => dispatch_run(&rest, &socket, &loaded.config),
         "inject" => dispatch_inject(&rest, &socket, &loaded.config),
@@ -293,6 +294,55 @@ fn resolve_cli_mode(
     ))
 }
 
+/// Dispatch `cache-warden status [--namespace NS] [--all-namespaces]`
+/// (DR-0017 §2).
+///
+/// Entries are namespace-filtered client-side exactly like `kv list`: by
+/// default only the current namespace is shown (names with the `NS/` prefix
+/// stripped); `--all-namespaces` shows every entry under its composed `NS/KEY`
+/// name (internal daemon keys included, verbatim).
+fn dispatch_status(
+    rest: &[String],
+    socket: &std::path::Path,
+    config: &config::Config,
+) -> Result<(), CliError> {
+    let (ns_flag, rest) = namespace::take_namespace_flag(rest).map_err(CliError::Message)?;
+    let ns =
+        namespace::resolve_namespace(ns_flag, namespace::env_namespace(), config.cli_namespace())
+            .map_err(CliError::Message)?;
+    let mut all = false;
+    for a in &rest {
+        match a.as_str() {
+            "--all-namespaces" => all = true,
+            other => {
+                return Err(CliError::Message(format!(
+                    "unknown argument for `status`: {other}"
+                )));
+            }
+        }
+    }
+
+    let resp = client::round_trip(socket, &protocol::wire::Request::Status)?;
+    let resp = match resp {
+        Response::Ok(mut ok) => {
+            if let OkPayload::Status { entries, .. } = &mut ok.payload {
+                let prefix = format!("{ns}/");
+                entries.retain(|e| all || e.name.starts_with(&prefix));
+                if !all {
+                    for e in entries.iter_mut() {
+                        if let Some(stripped) = e.name.strip_prefix(&prefix) {
+                            e.name = stripped.to_string();
+                        }
+                    }
+                }
+            }
+            Response::Ok(ok)
+        }
+        err => err,
+    };
+    Ok(render_response(resp)?)
+}
+
 /// Dispatch the `kv` group.
 fn dispatch_kv(
     rest: &[String],
@@ -329,13 +379,22 @@ fn dispatch_kv(
         return Ok(());
     }
 
+    // Resolve the namespace once for every kv verb (DR-0017 §4):
+    // --namespace flag > CACHE_WARDEN_NAMESPACE > [cli].namespace > "default".
+    let (ns_flag, kv_args) = or_usage(namespace::take_namespace_flag(kv_args), leaf_help)?;
+    let ns = or_usage(
+        namespace::resolve_namespace(ns_flag, namespace::env_namespace(), config.cli_namespace()),
+        leaf_help,
+    )?;
+    let kv_args = kv_args.as_slice();
+
     // `define` has two modes (single vs. `--defs` batch), so it is dispatched
     // specially before the single-request path below.
     if sub == "define" {
-        let plan = or_usage(commands::parse_kv_define_plan(kv_args), leaf_help)?;
+        let plan = or_usage(commands::parse_kv_define_plan(kv_args, &ns), leaf_help)?;
         return match plan {
             commands::DefinePlan::Single(req) => Ok(run_client(socket, &req)?),
-            commands::DefinePlan::Defs(files) => run_define_defs(socket, &files),
+            commands::DefinePlan::Defs(files) => run_define_defs(socket, &files, &ns),
         };
     }
 
@@ -343,13 +402,19 @@ fn dispatch_kv(
     // it strips the mode flags, resolves the mode, and renders a masked output
     // in dry-run (DR-0015).
     if sub == "get" {
-        return dispatch_kv_get(kv_args, socket, config);
+        return dispatch_kv_get(kv_args, socket, config, &ns);
+    }
+
+    // `list` filters / renders namespace-aware, so it is dispatched specially.
+    if sub == "list" {
+        return dispatch_kv_list(kv_args, socket, &ns);
     }
 
     let req = match sub {
         "set" => or_usage(
             commands::parse_kv_set(
                 kv_args,
+                &ns,
                 std::io::IsTerminal::is_terminal(&std::io::stdin()),
                 || {
                     let mut buf = Vec::new();
@@ -359,21 +424,69 @@ fn dispatch_kv(
             ),
             leaf_help,
         )?,
-        "del" => or_usage(commands::parse_kv_del(kv_args), leaf_help)?,
-        "unpin" => or_usage(commands::parse_kv_single_key("unpin", kv_args), leaf_help)?,
-        "pin" => or_usage(commands::parse_kv_pin(kv_args), leaf_help)?,
-        "list" => {
-            if !kv_args.is_empty() {
-                return Err(CliError::Usage {
-                    msg: format!("`kv list` takes no arguments: {kv_args:?}"),
-                    help: help::kv_list,
-                });
-            }
-            protocol::wire::Request::KvList
-        }
+        "del" => or_usage(commands::parse_kv_del(kv_args, &ns), leaf_help)?,
+        "unpin" => or_usage(
+            commands::parse_kv_single_key("unpin", kv_args, &ns),
+            leaf_help,
+        )?,
+        "pin" => or_usage(commands::parse_kv_pin(kv_args, &ns), leaf_help)?,
         _ => unreachable!("leaf_help match covers all known subcommands"),
     };
     Ok(run_client(socket, &req)?)
+}
+
+/// Dispatch `kv list [--all-namespaces]` (DR-0017 §2).
+///
+/// The daemon returns every (composed) key; the namespace view is a client-side
+/// concern. By default only the current namespace's keys are shown, with the
+/// `NS/` prefix stripped. `--all-namespaces` lists every key in its composed
+/// `NS/KEY` form (internal daemon keys, which have no namespace, appear only
+/// here, verbatim).
+fn dispatch_kv_list(
+    kv_args: &[String],
+    socket: &std::path::Path,
+    ns: &str,
+) -> Result<(), CliError> {
+    let mut all = false;
+    for a in kv_args {
+        match a.as_str() {
+            "--all-namespaces" => all = true,
+            other => {
+                return Err(CliError::Usage {
+                    msg: format!("unknown argument for `kv list`: {other}"),
+                    help: help::kv_list,
+                });
+            }
+        }
+    }
+    let resp = client::round_trip(socket, &protocol::wire::Request::KvList)?;
+    match resp {
+        Response::Ok(ok) => match ok.payload {
+            OkPayload::List { keys } => {
+                for k in filter_ns_keys(keys, ns, all) {
+                    println!("{k}");
+                }
+                Ok(())
+            }
+            other => Err(CliError::Message(format!(
+                "unexpected response payload for kv.list: {other:?}"
+            ))),
+        },
+        resp @ Response::Err(_) => Ok(render_response(resp)?),
+    }
+}
+
+/// Apply the namespace view to a list of composed keys (DR-0017 §2): with
+/// `all`, every key passes through verbatim (`NS/KEY` form); otherwise only
+/// keys in `ns` remain, with the prefix stripped.
+fn filter_ns_keys(keys: Vec<String>, ns: &str, all: bool) -> Vec<String> {
+    if all {
+        return keys;
+    }
+    let prefix = format!("{ns}/");
+    keys.into_iter()
+        .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
+        .collect()
 }
 
 /// Register every definition in one or more `--defs` files in bulk (DR-0014 §4).
@@ -384,7 +497,11 @@ fn dispatch_kv(
 /// fatal to the rest: all keys are attempted, and the failures are reported
 /// together at the end with a non-zero exit. This keeps one clashing key from
 /// taking the rest of a batch registration down with it.
-fn run_define_defs(socket: &std::path::Path, files: &[PathBuf]) -> Result<(), CliError> {
+fn run_define_defs(
+    socket: &std::path::Path,
+    files: &[PathBuf],
+    ctx_ns: &str,
+) -> Result<(), CliError> {
     let mut failures: Vec<String> = Vec::new();
     let mut ok_count = 0usize;
 
@@ -399,8 +516,11 @@ fn run_define_defs(socket: &std::path::Path, files: &[PathBuf]) -> Result<(), Cl
             }
         };
         for def in defs {
+            // The defs context namespace is the `--namespace` of this
+            // invocation; a per-entry `namespace` field is absolute (DR-0017 §5).
+            let full_key = def.full_key(ctx_ns);
             let req = protocol::wire::Request::KvDefine {
-                key: def.name.clone(),
+                key: full_key.clone(),
                 argv: def.command.clone(),
                 soft_ttl_secs: def.soft_ttl_secs,
                 hard_ttl_secs: def.hard_ttl_secs,
@@ -409,7 +529,7 @@ fn run_define_defs(socket: &std::path::Path, files: &[PathBuf]) -> Result<(), Cl
             match client::round_trip(socket, &req) {
                 Ok(Response::Ok(_)) => ok_count += 1,
                 Ok(Response::Err(e)) => {
-                    failures.push(format!("{}: {}", def.name, e.error.message));
+                    failures.push(format!("{}: {}", full_key, e.error.message));
                 }
                 Err(e) => {
                     // A transport error (daemon down) is not per-key; surface it
@@ -447,10 +567,14 @@ fn dispatch_kv_get(
     kv_args: &[String],
     socket: &std::path::Path,
     config: &config::Config,
+    ns: &str,
 ) -> Result<(), CliError> {
     let (mode_flag, rest) = or_usage(mode::take_mode_flag(kv_args), help::kv_get)?;
     let mode = or_usage(resolve_cli_mode(mode_flag, config), help::kv_get)?;
-    let req = or_usage(commands::parse_kv_single_key("get", &rest), help::kv_get)?;
+    let req = or_usage(
+        commands::parse_kv_single_key("get", &rest, ns),
+        help::kv_get,
+    )?;
     let key = match &req {
         protocol::wire::Request::KvGet { key, .. } => key.clone(),
         _ => unreachable!("parse_kv_single_key(\"get\") returns KvGet"),
@@ -501,13 +625,17 @@ fn dispatch_kv_get(
 /// `run` / `inject` (the `kv define --defs` batch path uses [`run_define_defs`],
 /// which reports per-file success counts; here a failure is simply fatal because
 /// `run` / `inject` must not proceed with a half-applied definition set).
-fn register_defs(socket: &std::path::Path, files: &[std::path::PathBuf]) -> Result<(), String> {
+fn register_defs(
+    socket: &std::path::Path,
+    files: &[std::path::PathBuf],
+    ctx_ns: &str,
+) -> Result<(), String> {
     use protocol::wire::{Request, Response};
     for file in files {
         let defs = defs::parse_defs_file(file)?;
         for def in defs {
             let req = Request::KvDefine {
-                key: def.name.clone(),
+                key: def.full_key(ctx_ns),
                 argv: def.command.clone(),
                 soft_ttl_secs: def.soft_ttl_secs,
                 hard_ttl_secs: def.hard_ttl_secs,
@@ -536,10 +664,16 @@ fn dispatch_run(
     }
     let (mode_flag, rest) = or_usage(mode::take_mode_flag(rest), help::run_cmd)?;
     let mode = or_usage(resolve_cli_mode(mode_flag, config), help::run_cmd)?;
+    let (ns_flag, rest) = or_usage(namespace::take_namespace_flag(&rest), help::run_cmd)?;
+    let ns = or_usage(
+        namespace::resolve_namespace(ns_flag, namespace::env_namespace(), config.cli_namespace()),
+        help::run_cmd,
+    )?;
     let parsed = or_usage(commands::run_cmd::parse_run(&rest), help::run_cmd)?;
 
     // Register any --defs before resolving (so a lazily-defined key exists).
-    register_defs(socket, &parsed.defs)?;
+    // The defs context namespace is this invocation's namespace (DR-0017 §5).
+    register_defs(socket, &parsed.defs, &ns)?;
 
     // Warn (once per token) that argv references are NOT injected (DR-0013).
     for tok in commands::run_cmd::argv_reference_tokens(&parsed.command) {
@@ -550,7 +684,8 @@ fn dispatch_run(
 
     let inherited: Vec<(String, String)> = std::env::vars().collect();
     let mut resolver = client::SocketResolver::new(socket, mode);
-    let resolved = commands::run_cmd::resolve_env(&inherited, &parsed.envs, mode, &mut resolver)?;
+    let resolved =
+        commands::run_cmd::resolve_env(&inherited, &parsed.envs, mode, &ns, &mut resolver)?;
 
     // dry-run fail-closed-but-evaluated: if a reference failed, do not exec; exit
     // non-zero after summarizing (DR-0015 §3). Reveal fail-closed already
@@ -599,9 +734,14 @@ fn dispatch_inject(
     }
     let (mode_flag, rest) = or_usage(mode::take_mode_flag(rest), help::inject_cmd)?;
     let mode = or_usage(resolve_cli_mode(mode_flag, config), help::inject_cmd)?;
+    let (ns_flag, rest) = or_usage(namespace::take_namespace_flag(&rest), help::inject_cmd)?;
+    let ns = or_usage(
+        namespace::resolve_namespace(ns_flag, namespace::env_namespace(), config.cli_namespace()),
+        help::inject_cmd,
+    )?;
     let parsed = or_usage(commands::inject_cmd::parse_inject(&rest), help::inject_cmd)?;
 
-    register_defs(socket, &parsed.defs)?;
+    register_defs(socket, &parsed.defs, &ns)?;
 
     // Read the template (stdin or --in FILE), binary safe.
     let template: Vec<u8> = match &parsed.in_file {
@@ -617,7 +757,7 @@ fn dispatch_inject(
     };
 
     let mut resolver = client::SocketResolver::new(socket, mode);
-    let rendered = commands::inject_cmd::render(&template, mode, &mut resolver)?;
+    let rendered = commands::inject_cmd::render(&template, mode, &ns, &mut resolver)?;
 
     // Write the (fully rendered) output: stdout or 0600 --out FILE.
     commands::inject_cmd::write_output(parsed.out_file.as_deref(), &rendered.bytes)
