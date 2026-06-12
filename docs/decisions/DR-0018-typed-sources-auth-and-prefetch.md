@@ -131,6 +131,10 @@ cache-warden kv prefetch [KEY...] [--namespace NS]... [--pin DURATION]
 
 - 位置引数 KEY = 現在 NS のキー、`--namespace NS` (反復可) = その NS の**全定義**を
   対象集合に追加。両方を混ぜられる。
+- **引数なし = 現在 NS の全定義** (`kv list` の既定スコープと同じ規則。default NS
+  だけで運用している場合は素の `kv prefetch --pin 12h` で全部仕込める)。
+  全 NS 横断の糖衣 (`--all` 等) は持たない — 複数 NS は `--namespace` の反復で
+  表現でき、まとめ方はユーザのスクリプト側の工夫に委ねる。
 - 対象のうち **lazy 未実体化と HardExpired (定義あり)** だけを取得する。Active /
   SoftExpired は取得 skip (SoftExpired は `--pin` 指定時に pin が拾う)。
 - 手動 prefetch の投入は **Active** (起動時 prefetch の SoftExpired 封印と異なる —
