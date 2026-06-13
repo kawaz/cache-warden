@@ -23,7 +23,7 @@
 //! escaping (with golden tests) is cheaper than a serializer dependency.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The OS-neutral description of the daemon service to register (DR-0019 §2).
 ///
@@ -46,6 +46,13 @@ pub struct ServiceDefinition {
     /// (`~/Library/Logs/cache-warden/daemon.log`). systemd uses journald and
     /// ignores this (DR-0019 §2).
     pub log_path: Option<String>,
+    /// launchd-only: the `AssociatedBundleIdentifiers` value (DR-0019 §2.5,
+    /// DR-0020 §1). `Some(label)` is set when the resolved binary lives inside a
+    /// `.app/Contents/MacOS/` bundle, so TCC's responsible-process anchors on the
+    /// Bundle ID and `op` access survives `brew upgrade` (the path changes, the
+    /// Bundle ID does not). `None` (bare binary / Linux) omits the key entirely
+    /// (current behaviour). systemd ignores this.
+    pub associated_bundle_identifiers: Option<String>,
 }
 
 /// The default per-user service label for the current OS (DR-0019 §1):
@@ -101,7 +108,44 @@ impl ServiceDefinition {
             program_args,
             env,
             log_path,
+            associated_bundle_identifiers: None,
         }
+    }
+}
+
+/// Detect the enclosing `.app` bundle path for `exe`, if `exe` lives at
+/// `<bundle>.app/Contents/MacOS/<binary>` (DR-0019 §2.5, DR-0020 §1).
+///
+/// Pure path inspection (no filesystem access) so it is unit-testable on any
+/// platform with fixed inputs. The caller is expected to pass a canonicalized
+/// path so the `Contents/MacOS` segment match is reliable.
+///
+/// Returns `Some(<...>.app)` when the path's parent chain is
+/// `…/Foo.app/Contents/MacOS/<binary>`; `None` for a bare binary (the common
+/// Linux / non-bundle case → no `AssociatedBundleIdentifiers`).
+pub fn app_bundle_path(exe: &Path) -> Option<PathBuf> {
+    // exe = <bundle>.app/Contents/MacOS/<binary>
+    //   parent           = <bundle>.app/Contents/MacOS
+    //   parent.parent    = <bundle>.app/Contents
+    //   parent.parent.parent = <bundle>.app
+    let macos_dir = exe.parent()?;
+    if macos_dir.file_name()?.to_str()? != "MacOS" {
+        return None;
+    }
+    let contents_dir = macos_dir.parent()?;
+    if contents_dir.file_name()?.to_str()? != "Contents" {
+        return None;
+    }
+    let app_dir = contents_dir.parent()?;
+    if app_dir
+        .file_name()?
+        .to_str()?
+        .to_ascii_lowercase()
+        .ends_with(".app")
+    {
+        Some(app_dir.to_path_buf())
+    } else {
+        None
     }
 }
 
@@ -159,6 +203,15 @@ pub fn render_launchd_plist(def: &ServiceDefinition) -> String {
             out.push_str(&format!("\t\t<string>{}</string>\n", xml_escape(v)));
         }
         out.push_str("\t</dict>\n");
+    }
+
+    // AssociatedBundleIdentifiers (DR-0019 §2.5, DR-0020 §1): anchor TCC's
+    // responsible-process on the Bundle ID so `op` access survives `brew upgrade`
+    // (the .app path changes; the Bundle ID does not). Set only when the resolved
+    // binary lives in a `.app` bundle; omitted for bare binaries.
+    if let Some(bundle_id) = &def.associated_bundle_identifiers {
+        out.push_str("\t<key>AssociatedBundleIdentifiers</key>\n");
+        out.push_str(&format!("\t<string>{}</string>\n", xml_escape(bundle_id)));
     }
 
     if let Some(log) = &def.log_path {
@@ -769,6 +822,7 @@ mod tests {
             program_args: vec!["/bin/cw".into(), "daemon".into(), "run".into()],
             env: BTreeMap::new(),
             log_path: None,
+            associated_bundle_identifiers: None,
         };
         let s = render_launchd_plist(&d);
         assert!(!s.contains("EnvironmentVariables"));
@@ -819,6 +873,7 @@ WantedBy=default.target
             ],
             env: BTreeMap::new(),
             log_path: None,
+            associated_bundle_identifiers: None,
         };
         let s = render_systemd_unit(&d);
         assert!(
@@ -900,5 +955,112 @@ WantedBy=default.target
         assert_eq!(parse_linger("Linger=yes\n"), Some(true));
         assert_eq!(parse_linger("Linger=no\n"), Some(false));
         assert_eq!(parse_linger("Other=1\n"), None);
+    }
+
+    // ---- .app bundle path detection (DR-0019 §2.5) ----
+
+    #[test]
+    fn app_bundle_path_detects_canonical_macos_layout() {
+        let exe = Path::new("/Applications/CacheWarden.app/Contents/MacOS/cache-warden");
+        assert_eq!(
+            app_bundle_path(exe),
+            Some(PathBuf::from("/Applications/CacheWarden.app"))
+        );
+    }
+
+    #[test]
+    fn app_bundle_path_is_case_insensitive_on_app_suffix() {
+        // The `.app` directory name matching tolerates case (HFS+ is case-
+        // insensitive by default), so `.App` / `.APP` still resolve.
+        let exe = Path::new("/Applications/Foo.App/Contents/MacOS/foo");
+        assert_eq!(
+            app_bundle_path(exe),
+            Some(PathBuf::from("/Applications/Foo.App"))
+        );
+    }
+
+    #[test]
+    fn app_bundle_path_rejects_bare_binary() {
+        // A plain PATH symlink target (no .app/Contents/MacOS chain) → None.
+        assert_eq!(
+            app_bundle_path(Path::new("/opt/homebrew/bin/cache-warden")),
+            None
+        );
+        assert_eq!(
+            app_bundle_path(Path::new("/usr/local/bin/cache-warden")),
+            None
+        );
+        // Right leaf, wrong intermediates.
+        assert_eq!(
+            app_bundle_path(Path::new("/x/Foo.app/Resources/MacOS/foo")),
+            None
+        );
+        assert_eq!(
+            app_bundle_path(Path::new("/x/Foo/Contents/MacOS/foo")),
+            None
+        );
+        // The dev build output path must never be mistaken for a bundle.
+        assert_eq!(
+            app_bundle_path(Path::new("/repo/target/release/cache-warden")),
+            None
+        );
+    }
+
+    // ---- launchd plist with AssociatedBundleIdentifiers (DR-0019 §2.5) ----
+
+    #[test]
+    fn launchd_plist_with_bundle_id_golden() {
+        let d = ServiceDefinition {
+            label: "com.github.kawaz.cache-warden".into(),
+            program_args: vec![
+                "/Applications/CacheWarden.app/Contents/MacOS/cache-warden".into(),
+                "daemon".into(),
+                "run".into(),
+            ],
+            env: BTreeMap::new(),
+            log_path: None,
+            associated_bundle_identifiers: Some("com.github.kawaz.cache-warden".into()),
+        };
+        let got = render_launchd_plist(&d);
+        let expected = "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+\t<key>Label</key>
+\t<string>com.github.kawaz.cache-warden</string>
+\t<key>ProgramArguments</key>
+\t<array>
+\t\t<string>/Applications/CacheWarden.app/Contents/MacOS/cache-warden</string>
+\t\t<string>daemon</string>
+\t\t<string>run</string>
+\t</array>
+\t<key>RunAtLoad</key>
+\t<true/>
+\t<key>KeepAlive</key>
+\t<true/>
+\t<key>AssociatedBundleIdentifiers</key>
+\t<string>com.github.kawaz.cache-warden</string>
+</dict>
+</plist>
+";
+        assert_eq!(
+            got, expected,
+            "launchd plist (with bundle id) golden mismatch"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_without_bundle_id_omits_key() {
+        // The default (bare binary / Linux) path: no AssociatedBundleIdentifiers.
+        let d = ServiceDefinition::for_daemon(
+            "/opt/homebrew/bin/cache-warden",
+            "com.github.kawaz.cache-warden",
+            None,
+            None,
+            None,
+        );
+        let s = render_launchd_plist(&d);
+        assert!(!s.contains("AssociatedBundleIdentifiers"), "{s}");
     }
 }

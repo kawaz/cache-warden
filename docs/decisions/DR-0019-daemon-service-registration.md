@@ -47,13 +47,50 @@ cache-warden daemon status
 | 環境 | `EnvironmentVariables` (CACHE_WARDEN_CONFIG が env 指定なら引き継ぐ) | `Environment=` 同 |
 | ログ | `StandardOutPath/StandardErrorPath` → `~/Library/Logs/cache-warden/daemon.log` | journald (デフォルト、指定不要) |
 
-- バイナリパスは `current_exe()` の絶対パス (authsock の内部サブコマンド解決と同じ流儀)。
+- **バイナリパスは安定パスへ解決する (DR-0019 §2.5)**。`current_exe()` 直使いは
+  dev/ephemeral パス (`target/release/...`) や version-managed パス
+  (Cellar/mise 等) をそのまま焼き込み、`cargo clean` / `brew upgrade` で
+  サービスが壊れる。下記 §2.5 の解決を通す。
 - config は**パスを焼き込む**: register 時点の探索結果 (`$CACHE_WARDEN_CONFIG` > XDG >
   `~/.config`) を `CACHE_WARDEN_CONFIG` としてサービス定義に明示する。サービスの env は
   シェルと違うため、暗黙の探索に任せると「register したときと違う config で動く」事故が
   起きる。config 未存在なら焼き込まない (全デフォルト起動)。
 - PATH はサービス定義に最小限を明示 (`/opt/homebrew/bin` 等、op CLI が見つかる範囲)。
   ユーザシェルの PATH 全体は持ち込まない (warden plist の轍 = セッション固有パスの混入)。
+
+### 2.5. バイナリパスの安定解決 (`stable-which` ライブラリ + .app レイヤ)
+
+`daemon register` の plist/unit に焼き込むバイナリパスは、`current_exe()` をそのまま
+使わず**安定パスへ解決**する。実装は kawaz 製の **`stable-which` ライブラリ**を使う
+(git 依存、tag `v0.3.3` ピン。runtime 依存ゼロで DR-0002 と整合。CLI crate は
+crates.io 非公開なので publish 競合なし)。
+
+- `stable_which::resolve_stable_path(current_exe, ScoringPolicy::SameBinary)` で
+  「同一バイナリを指す最も安定したパス」を得る。dev の `target/release` や Cellar
+  versioned パスは `BuildOutput` / `ManagedBy` / `Ephemeral` とタグ付けされ、安定な
+  PATH symlink (`/opt/homebrew/bin/cache-warden` 等) があればそちらが選ばれる。
+- 安定候補が無い (= dev バイナリしか無い) 場合は、その旨を warn した上で dev パスで
+  続行する (開発時の利便。`--force` 相当の明示なしでも止めはしないが、不安定である
+  ことは伝える)。`--executable PATH` で明示上書きも可能。
+- **採用理由 (warden inline との対比)**: authsock-warden は同等ロジックを
+  `resolve_service_executable` + `version_manager.rs` として約 280 行 inline で持つが、
+  `stable-which` はそれを**抽出・汎用化・テスト済みにした専用ライブラリ**であり、
+  README が `SameBinary` policy の use case を "Service registration" と名指ししている。
+  inline コピーより共有ライブラリ利用 (dogfooding) を選ぶ。
+
+#### macOS の .app レイヤ (TCC、DR-0020 連携)
+
+`stable-which` は PATH 安定性が責務で TCC の .app 解決はしない。macOS 固有の処理を
+上に薄く足す (warden の `find_app_bundle` 相当):
+
+- 解決後のパスを canonicalize し、`.app/Contents/MacOS/` 配下なら**その .app バイナリの
+  パスを ProgramArguments に使い**、plist に `AssociatedBundleIdentifiers` を設定する。
+  TCC の responsible-process が Bundle ID ベースになり、`brew upgrade` でパスが変わっても
+  op アクセス許可が永続する (DR-0020)。
+- brew cask の構造上 `/opt/homebrew/bin/cache-warden` → `/Applications/CacheWarden.app/
+  Contents/MacOS/cache-warden` (= PATH 安定 symlink と .app バイナリが 1 本で繋がる) なので、
+  `/Applications/CacheWarden.app` (これも brew upgrade を跨いで安定) を直接指す。
+- .app 配下でない (bare binary / Linux) なら AssociatedBundleIdentifiers なし。
 
 ### 3. Linux 固有の注意 (register 時に hint)
 

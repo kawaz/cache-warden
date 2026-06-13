@@ -320,7 +320,7 @@ pub fn daemon_register() -> HelpSpec {
         summary: "Install and start the per-user service (launchd / systemd --user).",
         usage: concat!(
             "cache-warden",
-            " daemon register [--socket PATH] [--label NAME] [--print]"
+            " daemon register [--socket PATH] [--label NAME] [--executable PATH] [--print]"
         ),
         subcommands: &[],
         options: &[
@@ -336,6 +336,12 @@ pub fn daemon_register() -> HelpSpec {
                        instances side by side",
             },
             Row {
+                name: "--executable PATH",
+                desc: "Override the binary path baked into the service. Default:\n\
+                       resolve the running binary to a stable install path\n\
+                       (used as-is when given)",
+            },
+            Row {
                 name: "--print",
                 desc: "Render the service definition to stdout and install\n\
                        nothing (audit / dry-run)",
@@ -347,8 +353,13 @@ it so the daemon starts now and at every login. It is idempotent: re-running
 updates the definition (binary path, socket, baked config) and restarts the
 service — this is the main way to point the service at a rebuilt binary.
 
-The binary path is the absolute path of the running executable; the config path
-is whatever the loader resolves at register time ($CACHE_WARDEN_CONFIG > XDG >
+The binary path is resolved to a stable install path (e.g. /opt/homebrew/bin/
+cache-warden) instead of the volatile path of the running executable, so the
+service survives `cargo clean` / `brew upgrade`. On macOS, a binary inside a
+`.app` bundle sets AssociatedBundleIdentifiers so TCC (op access) anchors on the
+Bundle ID. If only a dev/build path is found, register warns and bakes it anyway;
+pass `--executable PATH` to choose the path explicitly. The config path is
+whatever the loader resolves at register time ($CACHE_WARDEN_CONFIG > XDG >
 ~/.config), baked in as CACHE_WARDEN_CONFIG so the service does not silently pick
 up a different config. A minimal PATH is baked in so `op` is found.
 
@@ -1030,10 +1041,13 @@ mod tests {
         let h = daemon_register().render();
         assert!(h.contains("--socket PATH"));
         assert!(h.contains("--label NAME"));
+        assert!(h.contains("--executable PATH"));
         assert!(h.contains("--print"));
         // The idempotency + baked-config rationale is documented.
         assert!(h.contains("idempotent"));
         assert!(h.contains("CACHE_WARDEN_CONFIG"));
+        // DR-0019 §2.5: stable-path resolution + .app TCC layer are documented.
+        assert!(h.contains("AssociatedBundleIdentifiers"));
         // The Linux linger hint is mentioned.
         assert!(h.contains("enable-linger"));
     }

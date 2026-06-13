@@ -18,7 +18,9 @@
 //! Subcommand routing and `--help` / no-arg handling live in the dispatcher
 //! (`main.rs`); these functions are the leaf actions.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use stable_which::{Candidate, PathTag, ScoringPolicy, resolve_stable_path};
 
 use crate::commands::service;
 use crate::config::Config;
@@ -55,6 +57,12 @@ pub struct RegisterArgs {
     /// `--print`: render the definition to stdout instead of installing
     /// (dry-run / audit).
     pub print: bool,
+    /// `--executable PATH`: an explicit override for the binary path baked into
+    /// the service definition (DR-0019 §2.5; warden-compatible). `None` = resolve
+    /// the running binary via `stable-which`. When set, the path is used as-is
+    /// (only existence-validated) — the operator takes responsibility for its
+    /// stability.
+    pub executable: Option<String>,
 }
 
 /// Parse `daemon register` flags (DR-0019 §1):
@@ -86,6 +94,15 @@ pub fn parse_register_args(args: &[String]) -> Result<RegisterArgs, String> {
             i += 1;
         } else if a == "--print" {
             out.print = true;
+            i += 1;
+        } else if a == "--executable" {
+            let v = args
+                .get(i + 1)
+                .ok_or("--executable requires a PATH argument")?;
+            out.executable = Some(v.clone());
+            i += 2;
+        } else if let Some(v) = a.strip_prefix("--executable=") {
+            out.executable = Some(v.to_string());
             i += 1;
         } else {
             return Err(format!("unknown option for `daemon register`: {a}"));
@@ -121,6 +138,98 @@ pub fn parse_unregister_args(args: &[String]) -> Result<UnregisterArgs, String> 
     Ok(out)
 }
 
+/// Whether a `stable-which` resolution settled on a *non-stable* path (DR-0019
+/// §2.5): the best candidate is still a dev build output (`target/release`) or an
+/// ephemeral/temp location, i.e. no stable PATH symlink points at this binary.
+///
+/// Pure (operates on the candidate's tags) so the warn branch is unit-testable
+/// without a filesystem. A `true` result means `register` should warn but still
+/// proceed with the dev path (DR-0019 §2.5: do not block development).
+fn is_unstable_resolution(tags: &[PathTag]) -> bool {
+    tags.iter()
+        .any(|t| matches!(t, PathTag::BuildOutput | PathTag::Ephemeral))
+}
+
+/// The outcome of resolving the binary path to bake into the service definition
+/// (DR-0019 §2.5): the program path plus the enclosing `.app` bundle (macOS TCC
+/// layer) if any, and a human-facing warning when the path is unstable.
+#[derive(Debug)]
+struct ResolvedExe {
+    /// The path to bake as `ProgramArguments[0]` / `ExecStart`.
+    program: String,
+    /// The enclosing `.app` bundle, when the resolved binary lives in one
+    /// (`<bundle>.app/Contents/MacOS/<binary>`). Drives `AssociatedBundleIdentifiers`.
+    app_bundle: Option<PathBuf>,
+    /// A stderr warning to emit (dev/ephemeral path with no stable candidate).
+    warning: Option<String>,
+}
+
+/// Resolve the binary path to bake into the service definition (DR-0019 §2.5).
+///
+/// - `explicit`: an `--executable PATH` override. Used as-is (existence-checked
+///   only); the operator owns its stability (warden-compatible).
+/// - otherwise: `stable_which::resolve_stable_path(current_exe, SameBinary)`
+///   picks the most stable PATH symlink that points at the same binary. A
+///   dev/ephemeral-only result is kept but flagged with a warning.
+///
+/// The resolved path is canonicalized to detect a `.app/Contents/MacOS/` bundle
+/// (the macOS TCC layer); when found, the `.app` bundle path is returned so the
+/// caller can set `AssociatedBundleIdentifiers`. On macOS the canonical in-bundle
+/// path is used as the program path (stable across `brew upgrade`).
+fn resolve_program_exe(
+    current_exe: PathBuf,
+    explicit: Option<&str>,
+) -> Result<ResolvedExe, String> {
+    if let Some(p) = explicit {
+        let path = PathBuf::from(p);
+        if !path.exists() {
+            return Err(format!("--executable path does not exist: {p}"));
+        }
+        let (program, app_bundle) = with_app_layer(&path, p.to_string());
+        return Ok(ResolvedExe {
+            program,
+            app_bundle,
+            warning: None,
+        });
+    }
+
+    let candidate: Candidate = resolve_stable_path(&current_exe, ScoringPolicy::SameBinary)
+        .map_err(|e| format!("cannot resolve a stable binary path: {e}"))?;
+    let warning = if is_unstable_resolution(&candidate.tags) {
+        Some(format!(
+            "cache-warden: warning: no stable install path found for the daemon binary; \
+             baking the development path {} into the service (it will break on `cargo clean` \
+             / rebuild). Install via Homebrew or pass `--executable PATH` for a stable path \
+             (DR-0019).",
+            candidate.path.display()
+        ))
+    } else {
+        None
+    };
+    let (program, app_bundle) = with_app_layer(
+        &candidate.path,
+        candidate.path.to_string_lossy().into_owned(),
+    );
+    Ok(ResolvedExe {
+        program,
+        app_bundle,
+        warning,
+    })
+}
+
+/// Apply the macOS `.app` layer to a resolved path (DR-0019 §2.5): canonicalize
+/// it and, if it sits at `<bundle>.app/Contents/MacOS/<binary>`, return the
+/// canonical in-bundle program path plus the `.app` bundle directory. Otherwise
+/// return `fallback` unchanged with no bundle (bare binary / Linux).
+fn with_app_layer(path: &Path, fallback: String) -> (String, Option<PathBuf>) {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(app) = service::app_bundle_path(&canonical) {
+        (canonical.to_string_lossy().into_owned(), Some(app))
+    } else {
+        (fallback, None)
+    }
+}
+
 /// Build the [`service::ServiceDefinition`] for a `daemon register` invocation
 /// (DR-0019 §2). Split out from [`register`] so the construction (label / argv /
 /// baked config) is unit-testable without a backend.
@@ -130,23 +239,34 @@ pub fn parse_unregister_args(args: &[String]) -> Result<UnregisterArgs, String> 
 /// - `config_path`: the register-time resolved config file (`LoadedConfig.path`),
 ///   baked in as `CACHE_WARDEN_CONFIG` when present.
 /// - `log_path`: the launchd log target (ignored by systemd).
+///
+/// - `app_bundle`: the enclosing `.app` bundle of the resolved binary, when any.
+///   `Some(_)` sets `AssociatedBundleIdentifiers = label` so TCC anchors on the
+///   Bundle ID (DR-0019 §2.5, DR-0020 §1); `None` (bare binary / Linux) omits it.
 fn build_definition(
     exe: &str,
     args: &RegisterArgs,
     config_path: Option<&str>,
     log_path: Option<String>,
+    app_bundle: Option<&Path>,
 ) -> service::ServiceDefinition {
     let label = args
         .label
         .clone()
         .unwrap_or_else(|| service::default_label().to_string());
-    service::ServiceDefinition::for_daemon(
+    let mut def = service::ServiceDefinition::for_daemon(
         exe,
         &label,
         args.socket.as_deref(),
         config_path,
         log_path,
-    )
+    );
+    if app_bundle.is_some() {
+        // The Bundle ID baked into AssociatedBundleIdentifiers is the service
+        // label (the reverse-DNS id that also names the plist). DR-0020 §1.
+        def.associated_bundle_identifiers = Some(label);
+    }
+    def
 }
 
 /// Execute `daemon register` (DR-0019 §1/§2/§3).
@@ -169,14 +289,22 @@ pub fn register(
     if parsed.socket.is_none() {
         parsed.socket = cli_socket.map(str::to_string);
     }
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("cannot resolve own binary path: {e}"))?
-        .to_string_lossy()
-        .into_owned();
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("cannot resolve own binary path: {e}"))?;
+    let resolved = resolve_program_exe(current_exe, parsed.executable.as_deref())?;
+    if let Some(w) = &resolved.warning {
+        eprintln!("{w}");
+    }
     let cfg = config_path
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
-    let def = build_definition(&exe, &parsed, cfg.as_deref(), service::default_log_path());
+    let def = build_definition(
+        &resolved.program,
+        &parsed,
+        cfg.as_deref(),
+        service::default_log_path(),
+        resolved.app_bundle.as_deref(),
+    );
 
     let backend = service::backend()?;
 
@@ -313,11 +441,13 @@ mod tests {
             socket: Some("/tmp/x.sock".into()),
             label: None,
             print: false,
+            executable: None,
         };
         let def = build_definition(
             "/bin/cache-warden",
             &args,
             Some("/home/k/.config/cache-warden/config.toml"),
+            None,
             None,
         );
         assert_eq!(def.label, service::default_label());
@@ -343,10 +473,116 @@ mod tests {
             socket: None,
             label: Some("com.example.alt".into()),
             print: false,
+            executable: None,
         };
-        let def = build_definition("/bin/cw", &args, None, None);
+        let def = build_definition("/bin/cw", &args, None, None, None);
         assert_eq!(def.label, "com.example.alt");
         assert_eq!(def.program_args, vec!["/bin/cw", "daemon", "run"]);
         assert!(!def.env.contains_key("CACHE_WARDEN_CONFIG"));
+        // No .app bundle → no AssociatedBundleIdentifiers.
+        assert!(def.associated_bundle_identifiers.is_none());
+    }
+
+    // ---- --executable flag parsing (DR-0019 §2.5) ----
+
+    #[test]
+    fn register_args_parse_executable_both_forms() {
+        let a =
+            parse_register_args(&s(&["--executable", "/opt/homebrew/bin/cache-warden"])).unwrap();
+        assert_eq!(
+            a.executable.as_deref(),
+            Some("/opt/homebrew/bin/cache-warden")
+        );
+        let b = parse_register_args(&s(&[
+            "--executable=/Applications/CacheWarden.app/Contents/MacOS/cache-warden",
+        ]))
+        .unwrap();
+        assert_eq!(
+            b.executable.as_deref(),
+            Some("/Applications/CacheWarden.app/Contents/MacOS/cache-warden")
+        );
+    }
+
+    #[test]
+    fn register_args_executable_requires_value() {
+        assert!(parse_register_args(&s(&["--executable"])).is_err());
+    }
+
+    // ---- unstable-resolution warning branch (DR-0019 §2.5) ----
+
+    #[test]
+    fn unstable_resolution_flags_build_output_and_ephemeral() {
+        // A dev build output / ephemeral path → unstable → warn.
+        assert!(is_unstable_resolution(&[
+            PathTag::Input,
+            PathTag::BuildOutput
+        ]));
+        assert!(is_unstable_resolution(&[PathTag::Ephemeral]));
+    }
+
+    #[test]
+    fn unstable_resolution_clears_for_stable_path() {
+        // A stable PATH symlink that is the same binary → no warning.
+        assert!(!is_unstable_resolution(&[
+            PathTag::InPathEnv(0),
+            PathTag::SameCanonical
+        ]));
+        // ManagedBy / Shim are "warning-ish" for stability but still a real
+        // install path, not a dev artifact → no warn branch here.
+        assert!(!is_unstable_resolution(&[PathTag::ManagedBy(
+            "mise".into()
+        )]));
+        assert!(!is_unstable_resolution(&[PathTag::Shim]));
+    }
+
+    // ---- --executable: bundle id wiring via build_definition (DR-0019 §2.5) ----
+
+    #[test]
+    fn build_definition_sets_bundle_id_when_app_bundle_present() {
+        let args = RegisterArgs {
+            socket: None,
+            label: None,
+            print: false,
+            executable: None,
+        };
+        let bundle = PathBuf::from("/Applications/CacheWarden.app");
+        let def = build_definition(
+            "/Applications/CacheWarden.app/Contents/MacOS/cache-warden",
+            &args,
+            None,
+            None,
+            Some(bundle.as_path()),
+        );
+        // AssociatedBundleIdentifiers is the label (reverse-DNS id).
+        assert_eq!(
+            def.associated_bundle_identifiers.as_deref(),
+            Some(service::default_label())
+        );
+    }
+
+    // ---- resolve_program_exe with explicit --executable (DR-0019 §2.5) ----
+
+    #[test]
+    fn resolve_program_exe_explicit_existing_path_used_as_is() {
+        // An explicit, existing, non-.app path is baked verbatim with no bundle.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let p = tmp.path().to_string_lossy().into_owned();
+        let r = resolve_program_exe(PathBuf::from("/unused"), Some(&p)).unwrap();
+        // A bare temp file is not a .app → no bundle, no warning.
+        assert!(r.app_bundle.is_none());
+        assert!(r.warning.is_none());
+        // The program path is the explicit path (possibly canonicalized if it
+        // happened to be a symlink; here it is a plain file so it stays as-is).
+        assert_eq!(r.program, p);
+    }
+
+    #[test]
+    fn resolve_program_exe_explicit_missing_path_errors() {
+        let err = resolve_program_exe(
+            PathBuf::from("/unused"),
+            Some("/no/such/cache-warden-binary-xyz"),
+        )
+        .unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
     }
 }
