@@ -100,6 +100,13 @@ on-success-release:
     git -C "$(brew --repository)/Library/Taps/kawaz/homebrew-tap" pull --ff-only
     brew upgrade --cask kawaz/tap/cache-warden
     cache-warden --version
+    # daemon は in-memory に secret を保持するため自動再起動しない (再起動 = cache
+    # クリア = 全鍵 re-auth)。有効化はユーザの明示判断に委ね、案内だけ出す:
+    @echo ""
+    @echo "[note] バイナリを upgrade しました。常駐 daemon が居る場合は旧版のまま稼働中です。"
+    @echo "[note] daemon は in-memory に secret を保持するため自動再起動しません (再起動すると cache が消え再認証が必要)。"
+    @echo "[note] 新バージョンを有効化するなら手動で再起動してください: cache-warden daemon register (idempotent / bootout+bootstrap で再起動)。"
+    @echo "[note] 稼働状態の確認: cache-warden daemon status"
 
 # ---------- utility ----------
 
