@@ -33,7 +33,7 @@ sha2 = "0.10"
 # Stable binary-path resolution for `daemon register` (DR-0019 §2.5): resolve
 # the running binary to a stable PATH symlink (not a dev/Cellar/ephemeral path)
 # baked into the service definition. Runtime-dependency-free (DR-0002).
-stable-which = { git = "https://github.com/kawaz/stable-which", tag = "v0.3.3" }
+stable-which = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

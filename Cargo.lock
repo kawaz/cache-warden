@@ -992,7 +992,8 @@ dependencies = [
 [[package]]
 name = "stable-which"
 version = "0.3.3"
-source = "git+https://github.com/kawaz/stable-which?tag=v0.3.3#3a9cf82b0eb41295e100916d98be9a75780428e9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a21e7a8f52fa6787ee51c4d1409f4076971ddc6053d58cb23e13ebc237eb234b"
 
 [[package]]
 name = "subtle"
