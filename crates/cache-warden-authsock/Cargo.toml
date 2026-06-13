@@ -26,7 +26,7 @@ bytes = "1"
 # SSH key handling: public-key blob parsing/encoding (codec + registry) and
 # private-key PEM parsing (OpenSSH + PKCS#8) for the signer. `ssh_encoding::Encode`
 # (re-exported by ssh-key) builds the wire public-key blob in the registry.
-ssh-key = { version = "0.6", features = ["std", "ed25519", "rsa"] }
+ssh-key = { version = "0.6", features = ["std", "ed25519", "rsa", "p256", "p384", "p521"] }
 ssh-encoding = "0.2"
 # Local error enum for this crate. The core library stays std-only; the adapter
 # may take an ergonomic error dependency.
@@ -52,6 +52,19 @@ regex = "1"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 # RSA signing (ssh-rsa / rsa-sha2-256 / rsa-sha2-512) with CRT precomputation.
 rsa = { version = "0.9", features = ["std"] }
+# ECDSA signing (ecdsa-sha2-nistp256/384/521). Each curve's `ecdsa` feature
+# binds the SSH-mandated hash (P-256->SHA-256, P-384->SHA-384, P-521->SHA-512)
+# as the `Signer` default digest; `pem` pulls in PKCS#8 + SEC1 PEM decoding for
+# the `BEGIN PRIVATE KEY` / `BEGIN EC PRIVATE KEY` parse paths. ssh-key only
+# parses the OpenSSH ECDSA wire form, so these crates own the PKCS#8/SEC1 decode
+# and all signing, mirroring how `rsa` / `ed25519-dalek` are used here.
+p256 = { version = "0.13", features = ["ecdsa", "pem", "std"] }
+p384 = { version = "0.13", features = ["ecdsa", "pem", "std"] }
+# P-521's `Signer` impl draws its nonce from `OsRng`, so it needs `getrandom`
+# (P-256/384 get a deterministic RFC 6979 nonce and do not). `pem` on all three
+# pulls in the PKCS#8 + SEC1 (`BEGIN EC PRIVATE KEY`) PEM decoders used by the
+# `SecretKey::from_*_pem` parse paths.
+p521 = { version = "0.13", features = ["ecdsa", "pem", "std", "getrandom"] }
 # PKCS#8 PEM/DER decoding + OID dispatch for strict private-key parsing.
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
 # SHA-1 hash for legacy ssh-rsa signatures (deprecated remote servers).
@@ -80,3 +93,6 @@ bytes = "1"
 # Temp authorized_keys files for the keyfile filter tests, and a private cache
 # dir for the op disk-cache tests.
 tempfile = "3"
+# Generate ephemeral ECDSA keys in the signer round-trip tests (per-curve, so we
+# never hardcode P-384 / P-521 secrets). `OsRng` feeds `EcdsaKeypair::random`.
+rand_core = { version = "0.6", features = ["getrandom"] }

@@ -109,6 +109,9 @@ enum PemKind {
     OpenSsh,
     Pkcs8,
     EncryptedPkcs8,
+    /// SEC1 `BEGIN EC PRIVATE KEY` (RFC 5915). Emitted by `openssl ec` and older
+    /// tooling for ECDSA keys; carries a `namedCurve` OID inside the DER.
+    Sec1Ec,
     Unknown,
 }
 
@@ -122,6 +125,7 @@ fn pem_kind(pem: &str) -> PemKind {
             "-----BEGIN OPENSSH PRIVATE KEY-----" => PemKind::OpenSsh,
             "-----BEGIN PRIVATE KEY-----" => PemKind::Pkcs8,
             "-----BEGIN ENCRYPTED PRIVATE KEY-----" => PemKind::EncryptedPkcs8,
+            "-----BEGIN EC PRIVATE KEY-----" => PemKind::Sec1Ec,
             _ => PemKind::Unknown,
         };
     }
@@ -139,6 +143,23 @@ fn pem_kind(pem: &str) -> PemKind {
 enum KeyMaterial {
     Ed25519(Box<Ed25519SigningKey>),
     Rsa(Box<rsa::RsaPrivateKey>),
+    /// ECDSA over a NIST prime curve. Each variant holds the curve-specific
+    /// RustCrypto `SigningKey`, whose `Signer` impl already binds the
+    /// SSH-mandated hash (P-256→SHA-256, P-384→SHA-384, P-521→SHA-512). Boxed
+    /// for the same single-pointer-wide reason as the other variants.
+    Ecdsa(Box<EcdsaKey>),
+}
+
+/// Curve-tagged ECDSA signing key.
+///
+/// We keep the native per-curve `SigningKey` end-to-end (no intermediate
+/// representation at sign time), matching the Ed25519 / RSA design rationale.
+/// The SSH algorithm name and the (r,s) field width follow directly from the
+/// variant.
+enum EcdsaKey {
+    NistP256(p256::ecdsa::SigningKey),
+    NistP384(p384::ecdsa::SigningKey),
+    NistP521(p521::ecdsa::SigningKey),
 }
 
 impl KeyMaterial {
@@ -150,17 +171,28 @@ impl KeyMaterial {
     fn from_pem(pem: &str) -> Result<Self> {
         match pem_kind(pem) {
             PemKind::OpenSsh => {
-                let key = PrivateKey::from_openssh(pem)
-                    .map_err(|_| Error::KeyStore("Invalid OpenSSH private key".to_string()))?;
-                Self::from_openssh_private_key(&key)
+                match PrivateKey::from_openssh(pem) {
+                    Ok(key) => Self::from_openssh_private_key(&key),
+                    // ssh-key 0.6 fails (`Encoding(Length)`) on OpenSSH ECDSA
+                    // keys whose private scalar mpint is shorter than the curve's
+                    // fixed field width — notably P-521 keys whose top byte is
+                    // zero (~1/256 chance), where OpenSSH emits a 65-byte mpint
+                    // but ssh-key demands 66. Fall back to a hand-rolled OpenSSH
+                    // ECDSA decode that reads the scalar as a real mpint. This is
+                    // ECDSA-specific; non-ECDSA failures are real errors.
+                    Err(_) => parse_openssh_ecdsa_fallback(pem)
+                        .map(|ec| KeyMaterial::Ecdsa(Box::new(ec)))
+                        .ok_or_else(|| Error::KeyStore("Invalid OpenSSH private key".to_string())),
+                }
             }
             PemKind::Pkcs8 => Self::from_pkcs8(pem),
+            PemKind::Sec1Ec => Self::from_sec1_ec(pem),
             PemKind::EncryptedPkcs8 => Err(Error::KeyStore(
                 "Encrypted PKCS#8 private keys are not supported".to_string(),
             )),
             PemKind::Unknown => Err(Error::KeyStore(
-                "Unsupported PEM format. Expected \"BEGIN OPENSSH PRIVATE KEY\" \
-                 or \"BEGIN PRIVATE KEY\""
+                "Unsupported PEM format. Expected \"BEGIN OPENSSH PRIVATE KEY\", \
+                 \"BEGIN PRIVATE KEY\" or \"BEGIN EC PRIVATE KEY\""
                     .to_string(),
             )),
         }
@@ -178,8 +210,11 @@ impl KeyMaterial {
             KeypairData::Rsa(kp) => Ok(KeyMaterial::Rsa(Box::new(rsa_keypair_to_rsa_private_key(
                 kp,
             )?))),
+            KeypairData::Ecdsa(kp) => Ok(KeyMaterial::Ecdsa(Box::new(
+                ecdsa_keypair_to_signing_key(kp)?,
+            ))),
             other => Err(Error::KeyStore(format!(
-                "Unsupported key algorithm: {:?}. Only Ed25519 and RSA are supported.",
+                "Unsupported key algorithm: {:?}. Only Ed25519, RSA and ECDSA are supported.",
                 other.algorithm()
             ))),
         }
@@ -207,11 +242,21 @@ impl KeyMaterial {
         parse_pkcs8_rsa(pem)
     }
 
+    /// Parse a SEC1 `BEGIN EC PRIVATE KEY` PEM. ECDSA-only by definition (the
+    /// SEC1 format exists solely for EC keys), so it dispatches straight to the
+    /// curve probe.
+    fn from_sec1_ec(pem: &str) -> Result<Self> {
+        Ok(KeyMaterial::Ecdsa(Box::new(ecdsa_from_sec1_pem(pem)?)))
+    }
+
     /// Sign and return an SSH signature blob (`string(algo) + string(sig)`).
     fn sign(&self, data: &[u8], flags: u32) -> Result<Vec<u8>> {
         match self {
             KeyMaterial::Ed25519(key) => Ok(sign_ed25519(key, data)),
             KeyMaterial::Rsa(key) => sign_rsa(key, data, flags),
+            // ECDSA ignores the RSA SHA-2 flags entirely: the hash is fixed per
+            // curve by the SSH spec (RFC 5656) and bound into each SigningKey.
+            KeyMaterial::Ecdsa(key) => Ok(sign_ecdsa(key, data)),
         }
     }
 
@@ -233,6 +278,7 @@ impl KeyMaterial {
                     .map_err(|_| Error::KeyStore("failed to derive RSA public key".to_string()))?;
                 Ok(KeyData::Rsa(ssh_pub))
             }
+            KeyMaterial::Ecdsa(key) => Ok(KeyData::Ecdsa(ecdsa_public_key_data(key)?)),
         }
     }
 }
@@ -276,6 +322,259 @@ fn sign_rsa(key: &rsa::RsaPrivateKey, data: &[u8], flags: u32) -> Result<Vec<u8>
     };
 
     Ok(encode_signature_blob(algorithm_name, &sig_bytes))
+}
+
+/// Sign `data` with an ECDSA key and emit the SSH wire signature blob.
+///
+/// Wire format (RFC 5656 §3.1.2): `string(algorithm) || string(ecdsa_sig_blob)`
+/// where `ecdsa_sig_blob = mpint(r) || mpint(s)`. The hash is fixed by the curve
+/// (P-256→SHA-256 etc.) and already bound into each crate's `Signer` impl, so we
+/// just sign and re-encode the (r, s) field-byte pair as SSH mpints.
+fn sign_ecdsa(key: &EcdsaKey, data: &[u8]) -> Vec<u8> {
+    let (algorithm_name, r, s) = match key {
+        EcdsaKey::NistP256(sk) => {
+            let sig: p256::ecdsa::Signature = signature::Signer::sign(sk, data);
+            let (r, s) = sig.split_bytes();
+            ("ecdsa-sha2-nistp256", r.to_vec(), s.to_vec())
+        }
+        EcdsaKey::NistP384(sk) => {
+            let sig: p384::ecdsa::Signature = signature::Signer::sign(sk, data);
+            let (r, s) = sig.split_bytes();
+            ("ecdsa-sha2-nistp384", r.to_vec(), s.to_vec())
+        }
+        EcdsaKey::NistP521(sk) => {
+            let sig: p521::ecdsa::Signature = signature::Signer::sign(sk, data);
+            let (r, s) = sig.split_bytes();
+            ("ecdsa-sha2-nistp521", r.to_vec(), s.to_vec())
+        }
+    };
+    let mut sig_blob = Vec::new();
+    encode_mpint(&r, &mut sig_blob);
+    encode_mpint(&s, &mut sig_blob);
+    encode_signature_blob(algorithm_name, &sig_blob)
+}
+
+/// Encode a big-endian unsigned integer as an SSH `mpint` (RFC 4251 §5):
+/// `string(<minimal twos-complement big-endian bytes>)`. Leading zero bytes are
+/// stripped, and a single `0x00` is prepended when the high bit of the first
+/// significant byte is set (so the value stays non-negative). Zero encodes as an
+/// empty string.
+fn encode_mpint(be_bytes: &[u8], out: &mut Vec<u8>) {
+    let start = be_bytes
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(be_bytes.len());
+    let trimmed = &be_bytes[start..];
+    let need_pad = trimmed.first().map(|&b| b & 0x80 != 0).unwrap_or(false);
+    let len = trimmed.len() + usize::from(need_pad);
+    out.extend_from_slice(&(len as u32).to_be_bytes());
+    if need_pad {
+        out.push(0x00);
+    }
+    out.extend_from_slice(trimmed);
+}
+
+/// Build an [`EcdsaKey`] from ssh-key's parsed OpenSSH `EcdsaKeypair`.
+///
+/// ssh-key exposes the raw big-endian private scalar (`EcdsaPrivateKey::as_slice`)
+/// per curve variant; we feed it to the matching RustCrypto `SecretKey` so the
+/// curve is fixed by the variant (no curve confusion) and the scalar is range-
+/// checked. `from_slice` rejects a zero / out-of-range scalar, so a malformed key
+/// fails loudly here.
+fn ecdsa_keypair_to_signing_key(kp: &ssh_key::private::EcdsaKeypair) -> Result<EcdsaKey> {
+    use ssh_key::private::EcdsaKeypair;
+    match kp {
+        EcdsaKeypair::NistP256 { private, .. } => {
+            let sk = p256::SecretKey::from_slice(private.as_slice())
+                .map_err(|_| Error::KeyStore("Invalid ECDSA P-256 private key".to_string()))?;
+            Ok(EcdsaKey::NistP256(sk.into()))
+        }
+        EcdsaKeypair::NistP384 { private, .. } => {
+            let sk = p384::SecretKey::from_slice(private.as_slice())
+                .map_err(|_| Error::KeyStore("Invalid ECDSA P-384 private key".to_string()))?;
+            Ok(EcdsaKey::NistP384(sk.into()))
+        }
+        EcdsaKeypair::NistP521 { private, .. } => {
+            let sk = p521::SecretKey::from_slice(private.as_slice())
+                .map_err(|_| Error::KeyStore("Invalid ECDSA P-521 private key".to_string()))?;
+            Ok(EcdsaKey::NistP521(p521_signing_key(&sk)?))
+        }
+    }
+}
+
+/// Build an [`EcdsaKey`] from a PKCS#8 DER blob (id-ecPublicKey).
+///
+/// The curve is carried in the AlgorithmIdentifier's namedCurve parameter, which
+/// each `SecretKey::from_pkcs8_der` validates. We try the curves in turn; only
+/// the matching one decodes, so there is no risk of curve confusion (a P-384 key
+/// will not parse as P-256).
+fn ecdsa_from_pkcs8_der(der: &[u8]) -> Result<EcdsaKey> {
+    use pkcs8::DecodePrivateKey;
+    if let Ok(sk) = p256::SecretKey::from_pkcs8_der(der) {
+        return Ok(EcdsaKey::NistP256(sk.into()));
+    }
+    if let Ok(sk) = p384::SecretKey::from_pkcs8_der(der) {
+        return Ok(EcdsaKey::NistP384(sk.into()));
+    }
+    if let Ok(sk) = p521::SecretKey::from_pkcs8_der(der) {
+        return Ok(EcdsaKey::NistP521(p521_signing_key(&sk)?));
+    }
+    Err(Error::KeyStore(
+        "Invalid or unsupported-curve PKCS#8 ECDSA private key".to_string(),
+    ))
+}
+
+/// Parse a SEC1 `BEGIN EC PRIVATE KEY` PEM (RFC 5915) into an [`EcdsaKey`].
+///
+/// SEC1 carries the namedCurve OID inline, so each `SecretKey::from_sec1_pem`
+/// only accepts its own curve; trying them in turn is curve-confusion-safe.
+fn ecdsa_from_sec1_pem(pem: &str) -> Result<EcdsaKey> {
+    if let Ok(sk) = p256::SecretKey::from_sec1_pem(pem) {
+        return Ok(EcdsaKey::NistP256(sk.into()));
+    }
+    if let Ok(sk) = p384::SecretKey::from_sec1_pem(pem) {
+        return Ok(EcdsaKey::NistP384(sk.into()));
+    }
+    if let Ok(sk) = p521::SecretKey::from_sec1_pem(pem) {
+        return Ok(EcdsaKey::NistP521(p521_signing_key(&sk)?));
+    }
+    Err(Error::KeyStore(
+        "Invalid or unsupported-curve SEC1 EC private key".to_string(),
+    ))
+}
+
+/// Hand-rolled OpenSSH ECDSA private-key decode, used only when ssh-key 0.6
+/// rejects the key (see the `from_pem` call site for why P-521 triggers this).
+///
+/// Parses the unencrypted `openssh-key-v1` container far enough to reach the
+/// first private key's `string(curve) || string(Q) || mpint(d)` fields, reads
+/// the scalar `d` as a *real* mpint (the bug is that ssh-key wants a fixed-width
+/// field), and builds the matching curve's `SecretKey`. Returns `None` for
+/// anything that is not a single unencrypted OpenSSH ECDSA key, so the caller
+/// surfaces the original "invalid key" error.
+fn parse_openssh_ecdsa_fallback(pem: &str) -> Option<EcdsaKey> {
+    use base64::Engine;
+    use ssh_encoding::Decode;
+
+    let b64: Zeroizing<String> = Zeroizing::new(
+        pem.lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<String>(),
+    );
+    let data: Zeroizing<Vec<u8>> = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .ok()?,
+    );
+
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+    let body = data.strip_prefix(MAGIC)?;
+    let mut reader: &[u8] = body;
+
+    // ciphername, kdfname, kdfoptions. Only unencrypted keys are in scope (the
+    // PKCS#8/encrypted paths are handled elsewhere); bail on anything else.
+    let ciphername = Vec::<u8>::decode(&mut reader).ok()?;
+    if ciphername != b"none" {
+        return None;
+    }
+    let _kdfname = Vec::<u8>::decode(&mut reader).ok()?;
+    let _kdfopts = Vec::<u8>::decode(&mut reader).ok()?;
+
+    let nkeys = u32::decode(&mut reader).ok()?;
+    if nkeys != 1 {
+        return None;
+    }
+    let _public = Vec::<u8>::decode(&mut reader).ok()?;
+    let private = Zeroizing::new(Vec::<u8>::decode(&mut reader).ok()?);
+
+    // Private section: uint32 check1, uint32 check2, then the key fields.
+    let mut p: &[u8] = &private;
+    let check1 = u32::decode(&mut p).ok()?;
+    let check2 = u32::decode(&mut p).ok()?;
+    if check1 != check2 {
+        return None;
+    }
+    let keytype = Vec::<u8>::decode(&mut p).ok()?;
+    let curve = Vec::<u8>::decode(&mut p).ok()?;
+    let _q = Vec::<u8>::decode(&mut p).ok()?;
+    // The scalar is an SSH mpint (variable length): it may carry a leading
+    // sign-padding zero (value's top bit set) or be *shorter* than the field
+    // width (value's top bytes zero). Normalize to the curve's fixed field width
+    // by stripping a sign-pad zero and then left-padding with zeros, which is
+    // what `SecretKey::from_slice` expects.
+    let scalar_mpint = Zeroizing::new(Vec::<u8>::decode(&mut p).ok()?);
+    let magnitude: &[u8] = match scalar_mpint.split_first() {
+        Some((0, rest)) => rest,
+        _ => &scalar_mpint,
+    };
+
+    let field_width = match keytype.as_slice() {
+        b"ecdsa-sha2-nistp256" => 32,
+        b"ecdsa-sha2-nistp384" => 48,
+        b"ecdsa-sha2-nistp521" => 66,
+        _ => return None,
+    };
+    if magnitude.len() > field_width {
+        return None;
+    }
+    let mut scalar = Zeroizing::new(vec![0u8; field_width]);
+    scalar[field_width - magnitude.len()..].copy_from_slice(magnitude);
+
+    match (keytype.as_slice(), curve.as_slice()) {
+        (b"ecdsa-sha2-nistp256", b"nistp256") => {
+            let sk = p256::SecretKey::from_slice(&scalar).ok()?;
+            Some(EcdsaKey::NistP256(sk.into()))
+        }
+        (b"ecdsa-sha2-nistp384", b"nistp384") => {
+            let sk = p384::SecretKey::from_slice(&scalar).ok()?;
+            Some(EcdsaKey::NistP384(sk.into()))
+        }
+        (b"ecdsa-sha2-nistp521", b"nistp521") => {
+            let sk = p521::SecretKey::from_slice(&scalar).ok()?;
+            Some(EcdsaKey::NistP521(p521_signing_key(&sk).ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// Derive the ssh-key public [`EcdsaPublicKey`] from an [`EcdsaKey`].
+///
+/// Built from the SEC1 uncompressed point of the curve's `VerifyingKey`, so it
+/// works for every parse path (OpenSSH / PKCS#8 / SEC1). Encoding the resulting
+/// `KeyData::Ecdsa` yields the SSH wire public-key blob used for enumeration.
+fn ecdsa_public_key_data(key: &EcdsaKey) -> Result<ssh_key::public::EcdsaPublicKey> {
+    use ssh_key::public::EcdsaPublicKey;
+    let sec1: Vec<u8> = match key {
+        EcdsaKey::NistP256(sk) => sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec(),
+        EcdsaKey::NistP384(sk) => sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec(),
+        // p521's `SigningKey` wrapper lacks `verifying_key()` (no `verifying`
+        // feature flag exists on the crate); derive the public key via the
+        // `VerifyingKey: From<&SigningKey>` impl instead.
+        EcdsaKey::NistP521(sk) => p521::ecdsa::VerifyingKey::from(sk)
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec(),
+    };
+    EcdsaPublicKey::from_sec1_bytes(&sec1)
+        .map_err(|_| Error::KeyStore("failed to derive ECDSA public key".to_string()))
+}
+
+/// Build a p521 ECDSA `SigningKey` from a parsed `SecretKey`.
+///
+/// p521's wrapper `SigningKey` (unlike p256/p384) implements neither
+/// `From<&SecretKey>` nor the PKCS#8/SEC1 decode traits, so we route through the
+/// raw scalar bytes. `from_slice` re-validates the scalar (non-zero, in range).
+fn p521_signing_key(sk: &p521::SecretKey) -> Result<p521::ecdsa::SigningKey> {
+    p521::ecdsa::SigningKey::from_slice(&sk.to_bytes())
+        .map_err(|_| Error::KeyStore("Invalid ECDSA P-521 private key".to_string()))
 }
 
 /// Convert ssh-key's RsaKeypair into rsa::RsaPrivateKey by reconstructing from
@@ -336,6 +635,10 @@ fn parse_pkcs8_strict(pem: &str) -> Result<Option<KeyMaterial>> {
 
     const ED25519_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
     const RSA_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+    // id-ecPublicKey: the AlgorithmIdentifier OID shared by every NIST ECDSA
+    // curve. The specific curve is carried in the AlgorithmIdentifier parameters
+    // (a namedCurve OID), which the per-curve `SecretKey::from_pkcs8_der` reads.
+    const EC_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 
     let Ok((_label, doc)) = SecretDocument::from_pem(pem) else {
         return Ok(None);
@@ -354,9 +657,13 @@ fn parse_pkcs8_strict(pem: &str) -> Result<Option<KeyMaterial>> {
         key.precompute()
             .map_err(|_| Error::KeyStore("RSA key initialization failed".to_string()))?;
         Ok(Some(KeyMaterial::Rsa(Box::new(key))))
+    } else if info.algorithm.oid == EC_OID {
+        Ok(Some(KeyMaterial::Ecdsa(Box::new(ecdsa_from_pkcs8_der(
+            doc.as_bytes(),
+        )?))))
     } else {
         Err(Error::KeyStore(
-            "Unsupported PKCS#8 algorithm. Only Ed25519 and RSA are supported.".to_string(),
+            "Unsupported PKCS#8 algorithm. Only Ed25519, RSA and ECDSA are supported.".to_string(),
         ))
     }
 }
@@ -713,6 +1020,217 @@ IGmiN6jIaYLa8S4Be472ERHj
         let pub_key = ssh_key::PublicKey::from_openssh(RSA_PUBLIC_KEY).unwrap();
         let data = b"openssh format rsa";
         let blob = sign(&openssh_pem, data, SSH_AGENT_RSA_SHA2_512).unwrap();
+        verify(&pub_key, data, &parse_ssh_signature(&blob));
+    }
+
+    // ───── ECDSA TEST FIXTURES ─────
+    // The ECDSA P-256 private keys below are FOR UNIT TESTS ONLY. Generated
+    // locally via `ssh-keygen -t ecdsa -b 256`; intentionally checked in and
+    // protecting nothing. Do NOT install them anywhere. The P-384 / P-521 round
+    // trips are exercised with freshly generated keys instead of hardcoded ones.
+
+    /// P-256 OpenSSH-format private key. FOR TESTS ONLY.
+    const ECDSA_P256_OPENSSH: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
+1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQSyKrNRasgsv+4qOOXbTrBD2h8fS0do
+S4KFrX0KysZ+nRL8SODhemBItMzL7RRBGwfkdhjyv3Ka1KuVPcjEUuIUAAAAsM7tau/O7W
+rvAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLIqs1FqyCy/7io4
+5dtOsEPaHx9LR2hLgoWtfQrKxn6dEvxI4OF6YEi0zMvtFEEbB+R2GPK/cprUq5U9yMRS4h
+QAAAAgVWlVkNdBySxzgcbhA75tqXuJaEPvvBKPOK1JyIiV5aAAAAARZWNkc2EyNTYgdGVz
+dCBrZXkBAgMEBQYH
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    /// P-256 PKCS#8-format private key (same key as `ECDSA_P256_OPENSSH`).
+    /// FOR TESTS ONLY.
+    const ECDSA_P256_PKCS8: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgVWlVkNdBySxzgcbh
+A75tqXuJaEPvvBKPOK1JyIiV5aChRANCAASyKrNRasgsv+4qOOXbTrBD2h8fS0do
+S4KFrX0KysZ+nRL8SODhemBItMzL7RRBGwfkdhjyv3Ka1KuVPcjEUuIU
+-----END PRIVATE KEY-----
+";
+
+    /// P-256 SEC1-format private key (`BEGIN EC PRIVATE KEY`, same key).
+    /// FOR TESTS ONLY.
+    const ECDSA_P256_SEC1: &str = "-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIFVpVZDXQcksc4HG4QO+bal7iWhD77wSjzitSciIleWgoAoGCCqGSM49
+AwEHoUQDQgAEsiqzUWrILL/uKjjl206wQ9ofH0tHaEuCha19CsrGfp0S/Ejg4Xpg
+SLTMy+0UQRsH5HYY8r9ymtSrlT3IxFLiFA==
+-----END EC PRIVATE KEY-----
+";
+
+    /// OpenSSH public counterpart of the P-256 fixtures. FOR TESTS ONLY.
+    const ECDSA_P256_PUBLIC: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLIqs1FqyCy/7io45dtOsEPaHx9LR2hLgoWtfQrKxn6dEvxI4OF6YEi0zMvtFEEbB+R2GPK/cprUq5U9yMRS4hQ= ecdsa256 test key";
+
+    #[test]
+    fn from_pem_parses_ecdsa_openssh() {
+        let material = KeyMaterial::from_pem(ECDSA_P256_OPENSSH).unwrap();
+        assert!(matches!(material, KeyMaterial::Ecdsa(_)));
+    }
+
+    #[test]
+    fn from_pem_parses_ecdsa_pkcs8() {
+        let material = KeyMaterial::from_pem(ECDSA_P256_PKCS8).unwrap();
+        assert!(matches!(material, KeyMaterial::Ecdsa(_)));
+    }
+
+    #[test]
+    fn from_pem_parses_ecdsa_sec1() {
+        let material = KeyMaterial::from_pem(ECDSA_P256_SEC1).unwrap();
+        assert!(matches!(material, KeyMaterial::Ecdsa(_)));
+    }
+
+    #[test]
+    fn ecdsa_p256_all_formats_yield_same_public_key() {
+        // OpenSSH / PKCS#8 / SEC1 are three encodings of the *same* private key;
+        // the derived public-key blob must be identical across all three.
+        let blob = |pem: &str| {
+            let m = KeyMaterial::from_pem(pem).unwrap();
+            let kd = m.public_key_data().unwrap();
+            let mut b = Vec::new();
+            Encode::encode(&kd, &mut b).unwrap();
+            b
+        };
+        let openssh = blob(ECDSA_P256_OPENSSH);
+        assert_eq!(openssh, blob(ECDSA_P256_PKCS8));
+        assert_eq!(openssh, blob(ECDSA_P256_SEC1));
+
+        // ...and it must match the standalone OpenSSH public key.
+        let expected = ssh_key::PublicKey::from_openssh(ECDSA_P256_PUBLIC).unwrap();
+        let mut expected_blob = Vec::new();
+        expected.key_data().encode(&mut expected_blob).unwrap();
+        assert_eq!(openssh, expected_blob);
+    }
+
+    #[test]
+    fn sign_ecdsa_p256_openssh_produces_verifiable_signature() {
+        let pub_key = ssh_key::PublicKey::from_openssh(ECDSA_P256_PUBLIC).unwrap();
+        let data = b"ecdsa p256 challenge";
+        let blob = sign(ECDSA_P256_OPENSSH, data, 0).unwrap();
+        let (algo, _) = parse_blob(&blob);
+        assert_eq!(algo, "ecdsa-sha2-nistp256");
+        verify(&pub_key, data, &parse_ssh_signature(&blob));
+    }
+
+    #[test]
+    fn sign_ecdsa_p256_pkcs8_produces_verifiable_signature() {
+        let pub_key = ssh_key::PublicKey::from_openssh(ECDSA_P256_PUBLIC).unwrap();
+        let data = b"ecdsa p256 pkcs8 challenge";
+        let blob = sign(ECDSA_P256_PKCS8, data, 0).unwrap();
+        verify(&pub_key, data, &parse_ssh_signature(&blob));
+    }
+
+    #[test]
+    fn sign_ecdsa_p256_sec1_produces_verifiable_signature() {
+        let pub_key = ssh_key::PublicKey::from_openssh(ECDSA_P256_PUBLIC).unwrap();
+        let data = b"ecdsa p256 sec1 challenge";
+        let blob = sign(ECDSA_P256_SEC1, data, 0).unwrap();
+        verify(&pub_key, data, &parse_ssh_signature(&blob));
+    }
+
+    /// Round-trip (generate -> OpenSSH PEM -> parse -> sign -> verify) for every
+    /// supported curve, using freshly generated keys so we never hardcode P-384 /
+    /// P-521 secrets. ECDSA nonces are random, so we only assert verifiability.
+    #[test]
+    fn sign_ecdsa_round_trip_all_curves_openssh() {
+        use ssh_key::private::EcdsaKeypair;
+        use ssh_key::{EcdsaCurve, LineEnding};
+        for curve in [
+            EcdsaCurve::NistP256,
+            EcdsaCurve::NistP384,
+            EcdsaCurve::NistP521,
+        ] {
+            let kp = EcdsaKeypair::random(&mut rand_core::OsRng, curve).unwrap();
+            let pk = ssh_key::PrivateKey::from(kp);
+            let openssh_pem = pk.to_openssh(LineEnding::LF).unwrap().to_string();
+            let pub_key = pk.public_key();
+
+            let data = b"per-curve openssh round trip";
+            let blob = sign(&openssh_pem, data, 0).unwrap();
+            let (algo, _) = parse_blob(&blob);
+            let expected_algo = match curve {
+                EcdsaCurve::NistP256 => "ecdsa-sha2-nistp256",
+                EcdsaCurve::NistP384 => "ecdsa-sha2-nistp384",
+                EcdsaCurve::NistP521 => "ecdsa-sha2-nistp521",
+            };
+            assert_eq!(algo, expected_algo, "curve {curve:?}");
+            verify(pub_key, data, &parse_ssh_signature(&blob));
+        }
+    }
+
+    /// The derived ECDSA public-key blob must round-trip back through
+    /// `PublicKey::from_bytes` for every curve (enumeration path soundness).
+    #[test]
+    fn ecdsa_public_blob_round_trips_all_curves() {
+        use ssh_key::private::EcdsaKeypair;
+        use ssh_key::{EcdsaCurve, LineEnding};
+        for curve in [
+            EcdsaCurve::NistP256,
+            EcdsaCurve::NistP384,
+            EcdsaCurve::NistP521,
+        ] {
+            let kp = EcdsaKeypair::random(&mut rand_core::OsRng, curve).unwrap();
+            let pk = ssh_key::PrivateKey::from(kp);
+            let openssh_pem = pk.to_openssh(LineEnding::LF).unwrap().to_string();
+
+            let (blob, _comment) = public_key_blob_from_pem(&openssh_pem).unwrap();
+            use ssh_encoding::Decode;
+            let parsed = ssh_key::public::KeyData::decode(&mut blob.as_slice()).unwrap();
+            assert_eq!(&parsed, pk.public_key().key_data(), "curve {curve:?}");
+        }
+    }
+
+    // A real ssh-keygen P-521 OpenSSH key whose private scalar mpint is 65 bytes
+    // (top byte of the value is zero, ~1/256 chance). ssh-key 0.6 rejects it with
+    // `Encoding(Length)`; our hand-rolled OpenSSH ECDSA fallback must recover it.
+    // FOR TESTS ONLY — generated locally, protects nothing.
+    const ECDSA_P521_SHORT_SCALAR_OPENSSH: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAArAAAABNlY2RzYS
+1zaGEyLW5pc3RwNTIxAAAACG5pc3RwNTIxAAAAhQQAln3NyrH79taU0ZWywPKAJaXL+h/n
+oQ6kurgRVH3DWM0JgDygA2yUicTQJ4BPUcSnivAUtDGDGiiWLIqPoU7GuTMB5Y8/abgLOr
+NMQrZ4KutXYc04E1+4RzswETJgQ3YL/lwqAkI8S/oyssbAN8Ig3nKspAP59vnO6AlP4VAQ
+ImsxFGYAAAEABozsCwaM7AsAAAATZWNkc2Etc2hhMi1uaXN0cDUyMQAAAAhuaXN0cDUyMQ
+AAAIUEAJZ9zcqx+/bWlNGVssDygCWly/of56EOpLq4EVR9w1jNCYA8oANslInE0CeAT1HE
+p4rwFLQxgxooliyKj6FOxrkzAeWPP2m4CzqzTEK2eCrrV2HNOBNfuEc7MBEyYEN2C/5cKg
+JCPEv6MrLGwDfCIN5yrKQD+fb5zugJT+FQECJrMRRmAAAAQSaNNRsCYO2UBlpjhNSuEx6Q
+0Lljg/yS7D/uH+2z8QGtPyVeGCs91uu0Tp6RY2wAerTYQfnFz70bRjXYsYeTysVrAAAAAn
+AzAQ==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    const ECDSA_P521_SHORT_SCALAR_PUBLIC: &str = "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBACWfc3Ksfv21pTRlbLA8oAlpcv6H+ehDqS6uBFUfcNYzQmAPKADbJSJxNAngE9RxKeK8BS0MYMaKJYsio+hTsa5MwHljz9puAs6s0xCtngq61dhzTgTX7hHOzARMmBDdgv+XCoCQjxL+jKyxsA3wiDecqykA/n2+c7oCU/hUBAiazEUZg== p3";
+
+    #[test]
+    fn ssh_key_rejects_short_scalar_p521_but_we_recover_it() {
+        // Document the upstream limitation: ssh-key itself cannot parse this key.
+        assert!(
+            ssh_key::PrivateKey::from_openssh(ECDSA_P521_SHORT_SCALAR_OPENSSH).is_err(),
+            "fixture must be one ssh-key 0.6 rejects (else the fallback is untested)"
+        );
+        // ...but our fallback parses it as ECDSA.
+        let material = KeyMaterial::from_pem(ECDSA_P521_SHORT_SCALAR_OPENSSH).unwrap();
+        assert!(matches!(material, KeyMaterial::Ecdsa(_)));
+    }
+
+    #[test]
+    fn short_scalar_p521_derives_correct_public_key() {
+        // The fallback must reconstruct the exact key: its derived public blob
+        // has to equal ssh-keygen's published public key (a wrong scalar would
+        // yield a different point).
+        let (blob, _c) = public_key_blob_from_pem(ECDSA_P521_SHORT_SCALAR_OPENSSH).unwrap();
+        let expected = ssh_key::PublicKey::from_openssh(ECDSA_P521_SHORT_SCALAR_PUBLIC).unwrap();
+        let mut eb = Vec::new();
+        expected.key_data().encode(&mut eb).unwrap();
+        assert_eq!(blob, eb);
+    }
+
+    #[test]
+    fn short_scalar_p521_signs_and_verifies() {
+        let pub_key = ssh_key::PublicKey::from_openssh(ECDSA_P521_SHORT_SCALAR_PUBLIC).unwrap();
+        let data = b"short scalar p521 challenge";
+        let blob = sign(ECDSA_P521_SHORT_SCALAR_OPENSSH, data, 0).unwrap();
+        let (algo, _) = parse_blob(&blob);
+        assert_eq!(algo, "ecdsa-sha2-nistp521");
         verify(&pub_key, data, &parse_ssh_signature(&blob));
     }
 }

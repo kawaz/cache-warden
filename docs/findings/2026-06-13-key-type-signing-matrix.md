@@ -6,6 +6,13 @@ cache-warden の authsock アダプタ (`crates/cache-warden-authsock/src/signer
 
 検証環境: macOS, OpenSSH_10.3p1 / OpenSSL 3.6.2, cache-warden 0.19.1 (release build)。
 
+> **更新 (2026-06-13)**: 本監査で判明した ECDSA 非対応は修正済み。`signer.rs` に
+> `KeyMaterial::Ecdsa` を追加し、nistp256/384/521 の OpenSSH / PKCS#8 / SEC1 parse、
+> 署名 (`mpint(r) || mpint(s)` wire 形式)、公開鍵導出を実装。実 sshd handshake で
+> 3 曲線とも `Authenticated ... using "publickey"` を確認。ssh-key 0.6 が P-521 OpenSSH
+> 鍵の短縮スカラー (65 byte mpint) を `Encoding(Length)` で弾く upstream bug は、
+> 自前 OpenSSH ECDSA フォールバック parse で救済済み。以下マトリクスは更新後の状態。
+
 ## 判明した事実
 
 ### 対応マトリクス (鍵タイプ × {parse, 列挙, 署名, 署名検証})
@@ -17,12 +24,13 @@ cache-warden の authsock アダプタ (`crates/cache-warden-authsock/src/signer
 | RSA-2048 (OpenSSH形式) | OK | OK | OK | OK (実 sshd handshake) | 対応 |
 | RSA-2048 (PKCS#8) | OK | OK | OK | OK | 対応 |
 | RSA-4096 (OpenSSH形式) | OK | OK | OK | OK (実 sshd handshake) | 対応 |
-| ecdsa-sha2-nistp256 (OpenSSH形式) | **NG** | NG | NG | - | **非対応** |
-| ecdsa-sha2-nistp256 (PKCS#8) | **NG** | NG | NG | - | **非対応** |
-| ecdsa-sha2-nistp384 (OpenSSH/PKCS#8) | **NG** | NG | NG | - | **非対応** |
-| ecdsa-sha2-nistp521 (OpenSSH/PKCS#8) | **NG** | NG | NG | - | **非対応** |
-| RSA PKCS#1 (`BEGIN RSA PRIVATE KEY`) | **NG** | NG | NG | - | **非対応 (形式)** |
-| EC SEC1 (`BEGIN EC PRIVATE KEY`) | **NG** | NG | NG | - | **非対応 (形式)** |
+| ecdsa-sha2-nistp256 (OpenSSH形式) | OK | OK | OK | OK (実 sshd handshake) | **対応** |
+| ecdsa-sha2-nistp256 (PKCS#8) | OK | OK | OK | OK | **対応** |
+| ecdsa-sha2-nistp256 (SEC1) | OK | OK | OK | OK | **対応** |
+| ecdsa-sha2-nistp384 (OpenSSH/PKCS#8/SEC1) | OK | OK | OK | OK (実 sshd handshake) | **対応** |
+| ecdsa-sha2-nistp521 (OpenSSH/PKCS#8/SEC1) | OK | OK | OK | OK (実 sshd handshake) | **対応** |
+| EC SEC1 (`BEGIN EC PRIVATE KEY`) | OK | OK | OK | OK | **対応** (ECDSA 全曲線) |
+| RSA PKCS#1 (`BEGIN RSA PRIVATE KEY`) | **NG** | NG | NG | - | **非対応 (形式、scope外)** |
 | ssh-dss (DSA) | - | - | - | - | scope外 (OpenSSH 10 が生成不可 = 既に削除) |
 | ed25519-sk / ecdsa-sk (FIDO) | **NG (コード非対応)** | NG | NG | - | **非対応** (実機はデバイス無しで未検証、コードに分岐なし) |
 | *-cert-v01 (証明書) | NG (コード非対応) | NG | NG | - | **非対応** (private key として来ないが、cert 提示機構なし) |
@@ -48,21 +56,22 @@ legacy サーバ (ssh-rsa のみ) の両対応が実証された。PKCS#1 由来
 `ssh -Q PubkeyAcceptedAlgorithms` が列挙する 20 種に対し、cache-warden が署名可能なのは
 **実質 ed25519 / rsa (sha1,sha2-256,sha2-512) のみ**。以下が gap (= 非対応):
 
-- **ECDSA 全曲線非対応** (`ecdsa-sha2-nistp256/384/521`): 最重要。OpenSSH 既定で
-  生成・利用される主要鍵タイプの一つ。`signer.rs:181` の match で `KeypairData::Rsa`
-  / `Ed25519` 以外は `other =>` のエラー枝に落ちる。PKCS#8 経路も
-  `parse_pkcs8_strict()` が ED25519_OID / RSA_OID 以外を `Unsupported PKCS#8 algorithm`
-  で弾く (`signer.rs:357-360`)。
+- ~~**ECDSA 全曲線非対応** (`ecdsa-sha2-nistp256/384/521`)~~ → **対応済み (2026-06-13)**。
+  `KeyMaterial::Ecdsa` バリアント + `from_openssh_private_key` の `KeypairData::Ecdsa`
+  分岐 + `parse_pkcs8_strict` の EC OID (1.2.840.10045.2.1) 分岐 + SEC1 (`BEGIN EC
+  PRIVATE KEY`) 経路 + `sign_ecdsa` (曲線別 SHA-256/384/512、`mpint(r)||mpint(s)`)
+  を実装。p256/p384/p521 crate で署名、ssh-key + p521 crate で parse。
 - **FIDO/SK 鍵非対応** (`sk-ssh-ed25519@` / `sk-ecdsa-sha2-nistp256@` /
   `webauthn-sk-*`): コードに分岐なし。ただし SK 鍵は秘密鍵 PEM を agent が保持して
   ローカル署名する設計と相性が悪い (ハードウェア常駐が前提) ため、scope 外とする
   妥当性はある。
 - **証明書 (`*-cert-v01@openssh.com`) 非対応**: registry / IDENTITIES に証明書 blob を
   載せる機構なし。
-- **鍵保存形式の gap**: `pem_kind()` (`signer.rs:115-129`) は `BEGIN OPENSSH PRIVATE KEY`
-  / `BEGIN PRIVATE KEY` (PKCS#8) / `BEGIN ENCRYPTED PRIVATE KEY` のみ認識。
-  **PKCS#1 (`BEGIN RSA PRIVATE KEY`) と SEC1 (`BEGIN EC PRIVATE KEY`) は `Unknown`**
-  扱いで parse 不可。openssl / 旧来ツールが出すこれらの素の PEM は読めない。
+- **鍵保存形式の gap**: `pem_kind()` は `BEGIN OPENSSH PRIVATE KEY` / `BEGIN PRIVATE
+  KEY` (PKCS#8) / `BEGIN ENCRYPTED PRIVATE KEY` / **`BEGIN EC PRIVATE KEY` (SEC1、
+  2026-06-13 追加)** を認識。SEC1 は ECDSA 全曲線で parse 可。
+  **PKCS#1 (`BEGIN RSA PRIVATE KEY`) のみ未対応** (= openssl 等の素の RSA PEM。op 経路
+  では PKCS#8 なので発生せず、優先度低・scope 外)。
 
 ## 実用的な示唆 / ベストプラクティス
 
@@ -82,19 +91,19 @@ legacy サーバ (ssh-rsa のみ) の両対応が実証された。PKCS#1 由来
 
 ### 対処方針 (推奨度順)
 
-1. **ECDSA 対応を追加する** (最優先)。`KeyMaterial` に `Ecdsa` バリアントを足し、
-   `from_openssh_private_key` の `KeypairData::Ecdsa` 分岐、`parse_pkcs8_strict` の
-   EC OID (1.2.840.10045.2.1) 分岐、`sign()` の P-256/384/521 別 ECDSA 署名
-   (`p256`/`p384`/`p521` crate)、`public_key_data()` の EC 公開鍵導出を実装。
-   署名 blob は `string("ecdsa-sha2-nistpXXX") + string(mpint r || mpint s)` 形式。
-2. **当面の運用ガード**: ECDSA を非対応と明記し、起動時に ECDSA 鍵を検出したら
-   warning だけでなくより目立つ案内 (「ECDSA は未対応、ed25519/rsa に切り替えを」)
-   を出す。op 経路では列挙時点で ECDSA を弾いて「列挙されたのに署名不可」の非対称を
-   解消する (= fail-fast)。
-3. PKCS#1/SEC1 形式対応は優先度低 (op 経路では発生しない)。必要なら `pem_kind` に
-   `BEGIN RSA PRIVATE KEY` / `BEGIN EC PRIVATE KEY` を追加し `rsa`/`sec1` crate で parse。
-4. SK 鍵・証明書は scope 外とする判断が妥当。ただし README/DESIGN に「対応鍵タイプ:
-   ed25519 / RSA のみ」を明記し、ユーザの期待値を合わせる。
+1. ~~**ECDSA 対応を追加する** (最優先)~~ → **実装済み (2026-06-13)**。`KeyMaterial::Ecdsa`
+   + `from_openssh_private_key` の `KeypairData::Ecdsa` 分岐 + `parse_pkcs8_strict` の
+   EC OID 分岐 + `sign_ecdsa()` の P-256/384/521 別署名 (`p256`/`p384`/`p521` crate) +
+   `public_key_data()` の EC 公開鍵導出。署名 blob は
+   `string("ecdsa-sha2-nistpXXX") + string(mpint r || mpint s)`。SEC1 形式も同時対応。
+   P-521 OpenSSH 短縮スカラーの ssh-key bug は自前フォールバック parse で救済。
+2. ~~**当面の運用ガード**~~ → 不要になった (ECDSA 対応済みで「列挙されたのに署名不可」の
+   非対称が解消)。local/op 双方の経路で ECDSA が parse → 署名 → 検証まで通る。
+3. PKCS#1 (`BEGIN RSA PRIVATE KEY`) 形式は依然未対応 (op 経路では発生しない、優先度低)。
+   必要なら `pem_kind` に `BEGIN RSA PRIVATE KEY` を追加し `rsa` crate の PKCS#1 decode で parse。
+   SEC1 (`BEGIN EC PRIVATE KEY`) は 2026-06-13 に対応済み。
+4. SK 鍵・証明書は scope 外とする判断が妥当。README/DESIGN の対応鍵タイプは
+   「ed25519 / RSA / **ECDSA (nistp256/384/521)**」に更新する (本 finding 反映後)。
 
 ## 検証の詳細
 
