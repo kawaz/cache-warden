@@ -37,8 +37,31 @@ pub fn run_foreground(args: &[String], socket: PathBuf, config: Config) -> Resul
             "`daemon run` takes no positional arguments: {args:?}"
         ));
     }
+    // Block the shutdown signals (SIGINT / SIGTERM) on this thread *before* the
+    // runtime spawns its worker threads, so every worker — and the dedicated
+    // `sigwait` thread — inherits the block. The daemon then consumes those
+    // signals synchronously via `sigwait` (see `server::wait_for_shutdown`)
+    // rather than through tokio's async signal driver, which is unreliable on
+    // macOS once `ptrace(PT_DENY_ATTACH)` has run (`server::block_shutdown_signals`).
+    #[cfg(unix)]
+    if !crate::daemon::server::block_shutdown_signals() {
+        eprintln!(
+            "cache-warden: warning: could not block shutdown signals; \
+             SIGINT/SIGTERM handling may be degraded"
+        );
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // Belt-and-suspenders: re-block on every worker thread explicitly, so a
+        // worker can never take a shutdown signal via the default disposition
+        // (which would kill the process before the socket-cleanup path runs)
+        // even if mask inheritance ever changes.
+        .on_thread_start(|| {
+            #[cfg(unix)]
+            {
+                let _ = crate::daemon::server::block_shutdown_signals();
+            }
+        })
         .build()
         .map_err(|e| format!("failed to start runtime: {e}"))?;
     rt.block_on(crate::daemon::server::run(socket, config))

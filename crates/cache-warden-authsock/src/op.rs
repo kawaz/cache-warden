@@ -147,6 +147,9 @@ impl RealOpClient {
         if let Some(account) = &self.account {
             cmd.args(["--account", account]);
         }
+        // The daemon blocks SIGINT/SIGTERM process-wide for its `sigwait`-based
+        // shutdown; give the child a clean signal mask so it stays killable.
+        cache_warden::spawn_with_clean_signal_mask(&mut cmd);
         cmd
     }
 

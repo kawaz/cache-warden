@@ -334,6 +334,9 @@ impl CommandRunner {
         for (k, v) in env {
             command.env(k, v);
         }
+        // The daemon blocks SIGINT/SIGTERM process-wide for its `sigwait`-based
+        // shutdown; give the child a clean signal mask so it stays killable.
+        crate::spawn_with_clean_signal_mask(&mut command);
         let mut child = command.spawn().map_err(|e| RunError::SpawnFailed {
             program: program.to_string(),
             reason: e.to_string(),

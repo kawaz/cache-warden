@@ -8,13 +8,26 @@
 
 use std::process::{Command, Output};
 
-/// Invoke the built `cache-warden` binary with `args`, with a nonexistent
-/// config so nothing real is baked in (the `--print` output stays deterministic
-/// across machines).
+/// Invoke the built `cache-warden` binary with `args` in an isolated config
+/// environment so nothing real is baked in and the `--print` output stays
+/// deterministic across machines.
+///
+/// Config resolution checks `$CACHE_WARDEN_CONFIG`, then `$XDG_CONFIG_HOME`,
+/// then `$HOME/.config` (`config::config_search_paths`). Overriding only
+/// `CACHE_WARDEN_CONFIG` is not enough: a dogfooding host has a real
+/// `~/.config/cache-warden/config.toml`, which the `$HOME` fallback would find
+/// and bake into the rendered service definition. Point all three at a fresh
+/// empty temp dir so every candidate resolves to a nonexistent file.
 fn cw(args: &[&str]) -> Output {
+    let isolated = tempfile::tempdir().expect("tempdir for isolated config env");
     Command::new(env!("CARGO_BIN_EXE_cache-warden"))
         .args(args)
-        .env("CACHE_WARDEN_CONFIG", "/nonexistent/cw-service-test.toml")
+        .env(
+            "CACHE_WARDEN_CONFIG",
+            isolated.path().join("nonexistent.toml"),
+        )
+        .env("XDG_CONFIG_HOME", isolated.path().join("xdg"))
+        .env("HOME", isolated.path())
         .output()
         .expect("spawn cache-warden")
 }

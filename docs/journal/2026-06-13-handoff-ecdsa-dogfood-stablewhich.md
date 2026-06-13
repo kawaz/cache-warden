@@ -42,19 +42,17 @@
   切断しても fetch を完遂して値をキャッシュすべき (一度 fetch すれば以降ヒット = loop
   が self-limiting)。handler/authsock の sign→fetch→cache 順序を確認。
 
-### B. macOS-local CI 失敗 (ECDSA push をブロック)
-`cargo test -p cache-warden-cli --test e2e full_lifecycle_over_control_socket` が
-**この macOS で決定的に失敗** (e2e.rs:191 "socket should be removed on shutdown")。
-- **CI は ubuntu-latest (Linux) で green** = リリース経路は正常、macOS ローカルのみ。
-- 今朝 (v0.19.x の `just push`) はローカルでも通っていた。コード不変・ECDSA でも
-  parent でも失敗・残骸プロセス無し・リソース正常。
-- 手動再現: SIGTERM → プロセス即死だが socket 残存 / SIGINT → graceful shutdown が hang。
-  `wait_for_shutdown` は SIGTERM を正しく select している実装。診断 eprintln が
-  なぜか出力されない (ping は通る) = **マシン状態起因の疑い** (2 日連続稼働 + 当日の
-  大量 daemon churn)。**reboot で解消する可能性**。
-- 漏れた socket は DR-0009 stale 検知で次回起動時に除去 = 実害軽微。
-- 次セッション: reboot 後に `just ci` を試す or daemon shutdown 応答性 (serve が
-  shutdown watch に即応しているか) を実調査。ただし「今朝は通った」ので実バグ断定は慎重に。
+### B. macOS-local CI 失敗 → 【解決済み 2026-06-13、DR-0021】
+`full_lifecycle_over_control_socket` e2e (e2e.rs:191 "socket should be removed on shutdown")
+が macOS ローカルで失敗していた件。「マシン状態 / reboot で解消」説は**誤り**だった。
+- **真の原因**: macOS の `ptrace(PT_DENY_ATTACH)` (DR-0007 hardening) が tokio の非同期
+  シグナル driver を壊す。`[daemon].allow-debug-attach` トグルだけで挙動が反転する制御
+  実験で因果確定。Linux は `prctl(PR_SET_DUMPABLE)` で無影響 (CI 緑・macOS のみ失敗に一致)。
+- **修正**: シグナル処理を tokio::signal → プロセス全ブロック + 専用スレッド `sigwait` +
+  watchdog + 子プロセス mask reset に置換 (詳細は **DR-0021**)。Codex レビューで子 mask
+  継承と fallback の穴を是正。実機検証: 通常 shutdown ~24ms、e2e/`just ci` 安定 green。
+- 副次で `service_e2e` の `register --print` テストが dogfood の `~/.config/cache-warden/
+  config.toml` を拾って失敗していたのも修正 (HOME/XDG も隔離)。
 
 ### C. 鍵形式の残ギャップ (key-type 監査 `docs/findings/2026-06-13-key-type-signing-matrix.md`)
 ECDSA は修正済み。**未対応**: RSA PKCS#1 (`BEGIN RSA PRIVATE KEY`) / FIDO sk-* / 証明書。

@@ -355,6 +355,9 @@ impl Authenticator for CommandAuthenticator {
             }
         }
 
+        // The daemon blocks SIGINT/SIGTERM process-wide for its `sigwait`-based
+        // shutdown; give the child a clean signal mask so it stays killable.
+        crate::spawn_with_clean_signal_mask(&mut command);
         let status = command.status().map_err(|e| {
             AuthError::unavailable(format!("failed to run re-auth command `{program}`: {e}"))
         })?;

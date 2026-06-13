@@ -180,6 +180,16 @@ impl Shared {
 /// `socket_path` is already resolved by the caller (CLI `--socket` > env >
 /// `[daemon].socket` > built-in default); the daemon does not re-derive it.
 pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
+    // Install the shutdown-signal notifier *first*, before the (potentially slow)
+    // startup work below. The shutdown signals are already blocked process-wide
+    // (`block_shutdown_signals`, called before the runtime started); a dedicated
+    // `sigwait` thread consumes them. Spawning it up front means a SIGINT/SIGTERM
+    // that arrives *during* startup is dequeued immediately and its notification
+    // latched (tokio's `Notify` stores one permit), so the daemon still shuts
+    // down promptly even if it is signalled before it finishes binding/preloading.
+    #[cfg(unix)]
+    let shutdown_notify = spawn_shutdown_notifier(socket_path.clone());
+
     // Suppress core dumps before any secret enters the Store: a crash must not
     // write in-memory secrets (incl. mlocked pages, DR-0007) to disk. Fail-open
     // and consistent with the mlock policy — a failure warns but does not abort
@@ -312,6 +322,9 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
         shutdown_rx,
     );
 
+    #[cfg(unix)]
+    wait_for_shutdown(shutdown_notify).await;
+    #[cfg(not(unix))]
     wait_for_shutdown().await;
     let _ = shutdown_tx.send(true);
     let _ = server.await;
@@ -656,28 +669,205 @@ fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Respons
     response
 }
 
-/// Wait for SIGINT or SIGTERM (Unix); Ctrl+C only elsewhere.
-async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        let ctrl_c = tokio::signal::ctrl_c();
-        let mut sigterm =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => {
-                    let _ = ctrl_c.await;
-                    return;
+/// The set of signals that request a graceful daemon shutdown.
+#[cfg(unix)]
+const SHUTDOWN_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
+
+/// How long the shutdown watchdog ([`spawn_shutdown_notifier`]) waits for the
+/// graceful shutdown to complete before forcing `_exit`. Generous relative to
+/// the sub-millisecond graceful path (so an only-moderately-loaded host still
+/// shuts down cleanly), but short enough that a stop request is always honoured
+/// promptly and well within a service manager's own SIGTERM→SIGKILL window.
+#[cfg(unix)]
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Build a `sigset_t` containing the [`SHUTDOWN_SIGNALS`].
+#[cfg(unix)]
+fn shutdown_sigset() -> libc::sigset_t {
+    // SAFETY: `sigemptyset` / `sigaddset` initialise and populate a `sigset_t` we
+    // own exclusively for the duration of these calls; no other memory is touched.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in SHUTDOWN_SIGNALS {
+            libc::sigaddset(&mut set, sig);
+        }
+        set
+    }
+}
+
+/// Block the shutdown signals (SIGINT / SIGTERM) in the calling thread so they
+/// can be delivered *synchronously* via [`wait_for_shutdown`]'s `sigwait` thread
+/// instead of through an asynchronous handler.
+///
+/// **Call this before the tokio runtime is built** (see `daemon_cmd`): a thread
+/// that spawns children passes its signal mask on to them, so blocking on the
+/// main thread first means every runtime worker — and the dedicated `sigwait`
+/// thread — inherits the block. Any thread that does *not* block these signals
+/// could take one via the kernel's default disposition and kill the process
+/// before the cleanup path runs.
+///
+/// Design rationale: we deliberately avoid `tokio::signal` here. On macOS,
+/// `ptrace(PT_DENY_ATTACH)` (the [`hardening::deny_debugger_attach`] layer,
+/// DR-0007) makes tokio's asynchronous signal driver miss SIGTERM — the daemon
+/// is then killed by the default disposition without removing its control socket
+/// (regression covered by the `full_lifecycle_over_control_socket` e2e test). A
+/// `sigwait`-on-a-dedicated-thread design is a synchronous kernel call that does
+/// not depend on the async driver at all, so it is immune to the interaction —
+/// and it has no startup race (blocking happens before the socket is even bound).
+///
+/// [`hardening::deny_debugger_attach`]: super::hardening::deny_debugger_attach
+///
+/// Returns `true` if the mask was updated, `false` if the libc call refused
+/// (near-impossible for a valid signal set; the caller decides whether to warn).
+#[cfg(unix)]
+pub fn block_shutdown_signals() -> bool {
+    let set = shutdown_sigset();
+    // SAFETY: `pthread_sigmask` reads the `sigset_t` we own and updates only the
+    // calling thread's signal mask; no memory we own is mutated.
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
+    rc == 0
+}
+
+/// Unblock the shutdown signals (SIGINT / SIGTERM) in the calling thread,
+/// restoring the kernel's default "terminate" disposition.
+///
+/// Used only on the degraded fallback path in [`wait_for_shutdown`]: if the
+/// dedicated `sigwait` thread could not be spawned, the process would otherwise
+/// be left with the signals blocked and *no* consumer — i.e. unkillable by
+/// SIGINT/SIGTERM. Unblocking hands shutdown back to the OS default disposition
+/// (an abrupt, cleanup-less termination, but reliably killable) rather than
+/// relying on tokio's async signal driver, which is the very thing that is
+/// broken on macOS under `ptrace(PT_DENY_ATTACH)` (see [`block_shutdown_signals`]).
+#[cfg(unix)]
+fn unblock_shutdown_signals() {
+    let set = shutdown_sigset();
+    // SAFETY: as in `block_shutdown_signals`, but unblocking.
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Spawn the dedicated thread that waits (synchronously, via `sigwait`) for a
+/// shutdown signal and latches a [`tokio::sync::Notify`] when one arrives.
+///
+/// Call this *early* in [`run`], before the startup work, so a signal that
+/// arrives during startup is consumed immediately (the signals are blocked
+/// process-wide by [`block_shutdown_signals`], so until something `sigwait`s
+/// them they only accumulate as pending — they are never lost, but nothing acts
+/// on them). The returned `Notify` stores one permit, so an early signal is
+/// observed the moment [`run`] reaches its `notified().await`.
+///
+/// We use a dedicated std thread + `sigwait` rather than `tokio::signal` because
+/// tokio's asynchronous signal driver is unreliable on macOS once
+/// `ptrace(PT_DENY_ATTACH)` has run (see [`block_shutdown_signals`]); `sigwait`
+/// is a synchronous kernel call that does not depend on that driver.
+///
+/// Returns `None` if the thread could not be spawned (extremely unlikely), in
+/// which case [`wait_for_shutdown`] falls back to tokio's async `ctrl_c`.
+///
+/// After delivering the notification the thread also arms a **shutdown
+/// watchdog**: if the process has not exited within [`SHUTDOWN_GRACE`] it unlinks
+/// the control socket and forces termination with `_exit`. The async graceful
+/// path (flip `shutdown_tx`, drain the accept loop, unlink the sockets) normally
+/// completes in well under a millisecond, so the watchdog never fires in
+/// practice. It exists to bound the shutdown latency unconditionally: because
+/// the shutdown signals are blocked process-wide, the kernel's default
+/// "terminate" disposition no longer acts as a backstop, so a daemon wedged
+/// mid-shutdown (or starved before it can drive the async shutdown to
+/// completion) would otherwise never exit. The watchdog restores the guarantee
+/// that a SIGINT/SIGTERM always stops the daemon promptly — and unlinks the
+/// control socket first so the forced path still leaves a clean filesystem (any
+/// `[authsock.sockets.*]` files rely on the next start's stale-socket recovery,
+/// DR-0009).
+///
+/// `control_socket` is the path to remove on the forced path.
+#[cfg(unix)]
+fn spawn_shutdown_notifier(control_socket: PathBuf) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let signalled = std::sync::Arc::clone(&notify);
+    let spawned = std::thread::Builder::new()
+        .name("cw-signal".to_owned())
+        .spawn(move || {
+            // Re-assert the block locally: `sigwait`'s contract requires the
+            // waited-for signals to be blocked in the calling thread (they are
+            // already, via inheritance, but being explicit is robust to how this
+            // thread happens to be spawned).
+            let _ = block_shutdown_signals();
+            let set = shutdown_sigset();
+            let mut sig: libc::c_int = 0;
+            // Loop until `sigwait` reports a real delivery. It returns 0 on
+            // success; on a spurious non-zero return we must NOT fall through and
+            // notify (that would trigger shutdown without a signal). With our
+            // fixed, valid signal set a non-zero return is not expected, so this
+            // simply re-arms rather than acting on a phantom signal.
+            loop {
+                // SAFETY: `sigwait` reads the `sigset_t` we own and writes the
+                // delivered signal number into `sig`, which we own. It blocks
+                // until one of the (process-wide blocked) shutdown signals fires.
+                let rc = unsafe { libc::sigwait(&set, &mut sig) };
+                if rc == 0 {
+                    break;
                 }
-            };
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = sigterm.recv() => {}
+            }
+            signalled.notify_one();
+            // Watchdog: bound the shutdown latency. If the graceful path has not
+            // finished (i.e. the whole process has not exited) within the grace
+            // window, clean up the control socket and force termination. If
+            // graceful shutdown completes first the process exits and this thread
+            // is torn down before the sleep returns, so the lines below are only
+            // ever reached on a wedged/starved shutdown.
+            std::thread::sleep(SHUTDOWN_GRACE);
+            eprintln!(
+                "cache-warden: graceful shutdown did not finish within {}s of the \
+                 stop signal; forcing exit",
+                SHUTDOWN_GRACE.as_secs()
+            );
+            let _ = std::fs::remove_file(&control_socket);
+            // SAFETY: `_exit` takes no pointers and simply terminates the process.
+            // Exit 0: a SIGINT/SIGTERM-initiated stop is an intentional shutdown,
+            // so we report success (the warning above is the observability hook).
+            unsafe { libc::_exit(0) };
+        });
+    match spawned {
+        Ok(_) => Some(notify),
+        Err(e) => {
+            eprintln!(
+                "cache-warden: warning: could not start signal thread ({e}); falling back to async Ctrl+C handling"
+            );
+            None
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Wait for a shutdown signal: await the notifier installed by
+/// [`spawn_shutdown_notifier`].
+///
+/// `None` means the `sigwait` thread could not be spawned. The signals are still
+/// blocked process-wide (from before the runtime started), so there is no async
+/// consumer left — we must *unblock* them to hand shutdown back to the kernel's
+/// default disposition, then park. We do **not** await `tokio::signal::ctrl_c`
+/// here: installing a tokio SIGINT handler would re-disarm the default
+/// disposition and route through the async driver that is unreliable under
+/// `ptrace(PT_DENY_ATTACH)` — the exact failure this whole design avoids. After
+/// unblocking, an abrupt OS terminate is the (degraded but reliable) outcome.
+#[cfg(unix)]
+async fn wait_for_shutdown(notify: Option<std::sync::Arc<tokio::sync::Notify>>) {
+    match notify {
+        Some(notify) => notify.notified().await,
+        None => {
+            unblock_shutdown_signals();
+            // Park forever; the unblocked SIGINT/SIGTERM now terminate the
+            // process via the kernel default disposition.
+            std::future::pending::<()>().await;
+        }
     }
+}
+
+/// Wait for Ctrl+C on non-Unix platforms.
+#[cfg(not(unix))]
+async fn wait_for_shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

@@ -62,6 +62,7 @@
 //! are implemented (see [`SecretBytes`] and [`CommandRunner::with_timeout`]).
 
 mod auth;
+mod child_process;
 mod clock;
 mod definition;
 mod entry;
@@ -75,6 +76,7 @@ pub use auth::{
     AllowAll, AuthContext, AuthError, AuthOperation, Authenticator, CommandAuthenticator, DenyAll,
     RecordingAuthenticator,
 };
+pub use child_process::spawn_with_clean_signal_mask;
 pub use clock::{Clock, FakeClock, Monotonic, SystemClock};
 pub use definition::{DefineError, Definition};
 pub use entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl, TtlError};
