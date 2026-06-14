@@ -281,6 +281,18 @@ impl Store {
         self.entries.get_mut(key).map(|e| e.evaluate(clock))
     }
 
+    /// The current lifecycle state of `key` without triggering zeroize (DR-0025).
+    ///
+    /// Uses [`CacheEntry::state`] (pure read), the same method [`ItemRef::state`]
+    /// calls in filter callbacks. Hard-expired entries are reported as
+    /// [`EntryState::HardExpired`] but their value is **not** zeroized.
+    ///
+    /// Use this for observation-only paths (e.g. `status` display) where
+    /// zeroize timing is handled by the normal `get` / `state_of` path.
+    pub fn entry_state_pure(&self, key: &str, clock: &impl Clock) -> Option<EntryState> {
+        self.entries.get(key).map(|e| e.state(clock))
+    }
+
     /// Re-authenticate and refresh `key` back to Active.
     ///
     /// Returns `Err(ExtendOutcome::NotFound)` if the key is absent, or
@@ -540,6 +552,10 @@ impl Store {
     ///
     /// Listing does not evaluate TTL or mutate entries; keys of hard-expired-
     /// but-not-yet-deleted entries are still listed until removed.
+    ///
+    /// # Deprecated
+    /// Use `list_filtered(|r| r.entry().is_some())` instead (DR-0025).
+    #[deprecated(note = "use list_filtered(|r| r.entry().is_some()) instead")]
     pub fn list(&self) -> Vec<&str> {
         self.entries.keys().map(String::as_str).collect()
     }
@@ -656,6 +672,10 @@ impl Store {
     /// definition-only keys (defined but not yet produced, or whose value was
     /// deleted) so `status` / `list` can report them. Listing evaluates no TTL
     /// and exposes no secret.
+    ///
+    /// # Deprecated
+    /// Use `list_filtered(|_| true)` instead (DR-0025).
+    #[deprecated(note = "use list_filtered(|_| true) instead")]
     pub fn keys(&self) -> Vec<&str> {
         let mut keys: Vec<&str> = self
             .entries
@@ -667,6 +687,107 @@ impl Store {
         keys.dedup();
         keys
     }
+
+    /// Filter the union of value entries and definitions by an [`ItemRef`] predicate (DR-0025).
+    ///
+    /// The callback receives an [`ItemRef<'_>`] for each key in the union of
+    /// `entries` and `definitions`, and returns `true` to include that key.
+    ///
+    /// - `list_filtered(|_| true)` is equivalent to the deprecated `keys()`.
+    /// - `list_filtered(|r| r.entry().is_some())` is equivalent to the deprecated `list()`.
+    ///
+    /// The callback holds an immutable borrow (`&Store`), so side effects such as
+    /// hard-expiry zeroize are impossible inside a filter. Use `store.get` or
+    /// `store.state_of` to trigger zeroize on specific keys.
+    pub fn list_filtered<F>(&self, filter: F) -> Vec<&str>
+    where
+        F: Fn(&ItemRef<'_>) -> bool,
+    {
+        let mut keys: Vec<&str> = self
+            .entries
+            .keys()
+            .chain(self.definitions.keys())
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+
+        keys.into_iter()
+            .filter(|key| {
+                let item = ItemRef { key, store: self };
+                filter(&item)
+            })
+            .collect()
+    }
+}
+
+// ---- ItemRef: lazy accessor handle (DR-0025) ----
+
+/// Lazy accessor handle to a single key in a [`Store`] (DR-0025).
+///
+/// `ItemRef` bundles an immutable borrow of the store with a key name,
+/// providing lazy per-accessor lookup across the three internal maps
+/// (`entries` / `definitions` / `failure_backoffs`). An accessor is only
+/// called if the filter needs it; accessors that are not called incur no
+/// lookup cost.
+///
+/// The borrow is immutable (`&Store`), so a filter callback that holds an
+/// `ItemRef` cannot trigger side effects such as hard-expiry zeroize. Pure
+/// observation only.
+pub struct ItemRef<'a> {
+    key: &'a str,
+    store: &'a Store,
+}
+
+impl<'a> ItemRef<'a> {
+    /// The key this handle refers to.
+    pub fn key(&self) -> &str {
+        self.key
+    }
+
+    /// The current lifecycle state of the entry, computed with
+    /// [`CacheEntry::state`] (pure read). Returns `None` if the key has no
+    /// value entry.
+    ///
+    /// Does **not** trigger zeroize (`&self` borrow). Use `Store::state_of`
+    /// (`&mut`) or `Store::get` to trigger hard-expiry zeroize.
+    pub fn state(&self, clock: &impl Clock) -> Option<EntryState> {
+        self.store.entries.get(self.key).map(|e| e.state(clock))
+    }
+
+    /// Borrow the [`CacheEntry`] for this key, or `None` if absent.
+    pub fn entry(&self) -> Option<&CacheEntry> {
+        self.store.entries.get(self.key)
+    }
+
+    /// Borrow the [`Definition`] for this key, or `None` if undefined.
+    pub fn definition(&self) -> Option<&Definition> {
+        self.store.definitions.get(self.key)
+    }
+
+    /// Borrow the [`FailureRecord`] for this key, or `None` if absent.
+    pub fn failure(&self) -> Option<&FailureRecord> {
+        self.store.failure_backoffs.get(self.key)
+    }
+
+    /// Remaining backoff duration for this key, or `None` if no active backoff.
+    pub fn failure_remaining(&self, clock: &impl Clock) -> Option<std::time::Duration> {
+        self.store.failure_backoff_remaining(self.key, clock)
+    }
+
+    /// Borrow the [`ValueMeta`] from this key's definition, or `None` if undefined.
+    pub fn value_meta(&self) -> Option<&ValueMeta> {
+        self.store.definitions.get(self.key).map(|d| d.meta())
+    }
+
+    /// Borrow the [`SourceMeta`] from this key's definition, or `None` if undefined.
+    pub fn source_meta(&self) -> Option<&SourceMeta> {
+        self.store.definitions.get(self.key).map(|d| d.source_meta())
+    }
+}
+
+// Reopen `impl Store` for the rest of the public API.
+impl Store {
 
     /// Produce (or reproduce) `key`'s value from its registered definition.
     ///
@@ -1104,7 +1225,9 @@ mod tests {
         let (s, _cap) = crate::test_helpers::store_with_cap();
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
-        assert!(s.list().is_empty());
+        #[allow(deprecated)]
+        let list = s.list();
+        assert!(list.is_empty());
     }
 
     #[test]
@@ -1227,7 +1350,9 @@ mod tests {
         s.set("b", ValueSource::Static, SecretBytes::from("1"), ttl(), &cap, &clock).unwrap();
         s.set("a", ValueSource::Static, SecretBytes::from("2"), ttl(), &cap, &clock).unwrap();
         s.set("c", ValueSource::Static, SecretBytes::from("3"), ttl(), &cap, &clock).unwrap();
-        assert_eq!(s.list(), vec!["a", "b", "c"]);
+        #[allow(deprecated)]
+        let result = s.list();
+        assert_eq!(result, vec!["a", "b", "c"]);
         assert_eq!(s.len(), 3);
     }
 
@@ -1990,8 +2115,12 @@ mod tests {
         s.get_or_regenerate("both", &CountingRunner::new(b"v"), &AllowAll, None, &cap, &clock)
             .unwrap();
 
-        assert_eq!(s.list(), vec!["both", "val"]);
-        assert_eq!(s.keys(), vec!["both", "def", "val"]);
+        #[allow(deprecated)]
+        let list_result = s.list();
+        #[allow(deprecated)]
+        let keys_result = s.keys();
+        assert_eq!(list_result, vec!["both", "val"]);
+        assert_eq!(keys_result, vec!["both", "def", "val"]);
     }
 
     #[test]
@@ -2313,5 +2442,181 @@ mod tests {
             .regenerate("K", &CountingRunner::new(b"x"), &AllowAll, None, &wrong_cap, &clock)
             .unwrap_err();
         assert_eq!(err, RegenerateOutcome::CapMismatch, "cap check must run before backoff check");
+    }
+
+    // ---- list_filtered / ItemRef (DR-0025) ----
+
+    #[test]
+    fn list_filtered_true_matches_keys() {
+        // list_filtered(|_| true) must return the same set as the deprecated keys().
+        let clock = FakeClock::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        // value only
+        s.set("value_only", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        // definition only (command source required)
+        s.define(
+            "def_only",
+            ValueSource::command(["echo".into()]),
+            ttl(),
+        ).unwrap();
+        // both: a key can appear in both entries and definitions simultaneously.
+        // set() inserts into entries, define() inserts into definitions — separate maps.
+        s.define(
+            "both_key",
+            ValueSource::command(["echo".into()]),
+            ttl(),
+        ).unwrap();
+        s.set("both_key", ValueSource::command(["echo".into()]), SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+
+        #[allow(deprecated)]
+        let expected = s.keys();
+        let actual = s.list_filtered(|_| true);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn list_filtered_entry_matches_list() {
+        // list_filtered(|r| r.entry().is_some()) must match the deprecated list().
+        let clock = FakeClock::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("a", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set("b", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.define("def_only", ValueSource::command(["echo".into()]), ttl()).unwrap();
+
+        #[allow(deprecated)]
+        let expected = s.list();
+        let actual = s.list_filtered(|r| r.entry().is_some());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn list_filtered_empty_store_returns_empty() {
+        let (s, _cap) = crate::test_helpers::store_with_cap();
+        let result = s.list_filtered(|_| true);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn list_filtered_false_returns_empty() {
+        let clock = FakeClock::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("a", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        let result = s.list_filtered(|_| false);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn list_filtered_definition_only_filter() {
+        let clock = FakeClock::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("value_only", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.define("def_only", ValueSource::command(["echo".into()]), ttl()).unwrap();
+
+        let result = s.list_filtered(|r| r.definition().is_some());
+        assert_eq!(result, vec!["def_only"]);
+    }
+
+    #[test]
+    fn list_filtered_failure_filter() {
+        let clock = FakeClock::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(Duration::from_secs(60));
+        // Insert a value then expire it so regenerate can run.
+        s.set("K", ValueSource::command(["echo".into()]), SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        clock.advance(HARD);
+        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
+        // Now K has a failure record.
+        let result = s.list_filtered(|r| r.failure().is_some());
+        assert_eq!(result, vec!["K"]);
+        // A key without failure should not appear.
+        s.set("clean", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        let result2 = s.list_filtered(|r| r.failure().is_some());
+        assert_eq!(result2, vec!["K"]);
+    }
+
+    #[test]
+    fn item_ref_state_is_pure_read_no_zeroize() {
+        // DR-0025: ItemRef::state uses CacheEntry::state (pure read), not evaluate.
+        // After hard expiry, the entry's value is still in entries map (not zeroized)
+        // because ItemRef::state does not call evaluate/zeroize.
+        let clock = FakeClock::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("K", ValueSource::Static, SecretBytes::from("secret"), ttl(), &cap, &clock).unwrap();
+        clock.advance(HARD);
+
+        // Access via list_filtered with state — pure read, no zeroize.
+        let states: Vec<_> = s.list_filtered(|r| {
+            // Inside the callback the value entry must still be present
+            // (not zeroized), since ItemRef::state is pure read.
+            assert!(r.entry().is_some(), "entry must be present before zeroize");
+            r.state(&clock).map(|st| st == EntryState::HardExpired).unwrap_or(false)
+        });
+        assert_eq!(states, vec!["K"]);
+
+        // The entry must still be there (not zeroized by the filter above).
+        assert!(s.entries.contains_key("K"), "entry still present after pure-read filter");
+    }
+
+    #[test]
+    fn item_ref_value_meta_from_definition() {
+        let clock = FakeClock::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        let meta = ValueMeta::with_type("otp".to_string(), Vec::<(String, String)>::new());
+        s.define_with_meta(
+            "typed_key",
+            ValueSource::command(["echo".into()]),
+            ttl(),
+            meta.clone(),
+            crate::meta::SourceMeta::new(),
+        ).unwrap();
+        // Undefined key: value_meta returns None.
+        s.set("plain", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+
+        let found_typed = s.list_filtered(|r| {
+            r.value_meta().and_then(|m| m.type_label()).map(|t| t == "otp").unwrap_or(false)
+        });
+        assert_eq!(found_typed, vec!["typed_key"]);
+
+        let found_plain = s.list_filtered(|r| r.value_meta().is_none());
+        assert_eq!(found_plain, vec!["plain"]);
+    }
+
+    #[test]
+    fn item_ref_failure_remaining_with_clock() {
+        let clock = FakeClock::new();
+        let backoff = Duration::from_secs(60);
+        let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(backoff);
+        s.set("K", ValueSource::command(["echo".into()]), SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        clock.advance(HARD);
+        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
+
+        // failure_remaining via ItemRef should match failure_backoff_remaining.
+        let expected_remaining = s.failure_backoff_remaining("K", &clock);
+        let item_remaining = s.list_filtered(|r| r.failure_remaining(&clock).is_some());
+        assert_eq!(item_remaining, vec!["K"]);
+        // Check the actual remaining value matches.
+        let via_filter: Vec<_> = s.list_filtered(|r| {
+            r.failure_remaining(&clock) == expected_remaining
+        });
+        assert_eq!(via_filter, vec!["K"]);
+    }
+
+    #[test]
+    fn list_filtered_sorted_and_deduped() {
+        // Keys that appear in both entries and definitions should not be duplicated.
+        let clock = FakeClock::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        // "shared" appears in both maps.
+        s.define("shared", ValueSource::command(["echo".into()]), ttl()).unwrap();
+        // Produce a value (would need get_or_regenerate, but just set for simplicity):
+        // Actually, we can't set a value AND keep the definition since define requires command.
+        // We can set a command-sourced value directly using set().
+        s.set("shared", ValueSource::command(["echo".into()]), SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set("z", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.define("a", ValueSource::command(["echo".into()]), ttl()).unwrap();
+
+        let result = s.list_filtered(|_| true);
+        // "shared" appears in both entries and definitions, must be deduped.
+        // Order: sorted alphabetically.
+        assert_eq!(result, vec!["a", "shared", "z"]);
     }
 }

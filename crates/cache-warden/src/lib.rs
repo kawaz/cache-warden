@@ -89,6 +89,6 @@ pub use process::{FakeInspector, InspectError, ProcessInfo, ProcessInspector, Sy
 pub use secret::SecretBytes;
 pub use source::{CommandRunner, RunError, SourceRunner, TrailingNewline, ValueSource};
 pub use store::{
-    ExtendAuthOutcome, ExtendOutcome, FailureRecord, PinAuthOutcome, RegenerateDefOutcome,
+    ExtendAuthOutcome, ExtendOutcome, FailureRecord, ItemRef, PinAuthOutcome, RegenerateDefOutcome,
     RegenerateOutcome, Store, StoreBuilder, StoreBundle,
 };

@@ -85,9 +85,12 @@ where
     match req {
         Request::Ping => Response::pong(),
         Request::Status => handle_status(store, ctx),
-        // `kv.list` surfaces definition-only keys too (DR-0014 §6): use the union
-        // `keys()` rather than `list()` (value entries only).
-        Request::KvList => Response::list(store.keys().iter().map(|s| s.to_string()).collect()),
+        // `kv.list` surfaces definition-only keys too (DR-0014 §6): use the full
+        // union via list_filtered (DR-0025), replacing the deprecated `keys()`.
+        Request::KvList => {
+            let keys = store.list_filtered(|_| true);
+            Response::list(keys.iter().map(|s| s.to_string()).collect())
+        }
         Request::KvDel { key, with_define } => {
             let removed = if with_define {
                 store.delete_with_definition(&key, ctx.store_cap).unwrap_or(false)
@@ -134,23 +137,44 @@ where
     A: ?Sized,
     C: Clock,
 {
-    // Collect names first to avoid holding an immutable borrow across the
-    // mutable `state_of` calls. `keys()` is the union of value entries and
-    // definitions, so definition-only keys are surfaced too (DR-0014 §6).
-    let names: Vec<String> = store.keys().iter().map(|s| s.to_string()).collect();
+    // Collect the union of all known keys via list_filtered (DR-0025).
+    // Clone to String so the immutable borrow from list_filtered is released
+    // before any accessor needs the store again.
+    let names: Vec<String> = store
+        .list_filtered(|_| true)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
     let now = ctx.clock.now();
     let mut entries = Vec::with_capacity(names.len());
     for name in names {
+        // Use ItemRef accessors (immutable, pure read) for all metadata fields.
+        // DR-0025 §Implementation Notes: status display uses ItemRef::state
+        // (pure read, no zeroize). Zeroize occurs naturally via store.get /
+        // store.state_of on the next active retrieval path.
         let has_value = store.has_value(&name);
         let defined = store.is_defined(&name);
         // A definition-only key (no value entry yet) has no lifecycle state; it
         // reports the synthetic `"defined"` state. Otherwise use the value's
-        // real state.
-        let state = match store.state_of(&name, ctx.clock) {
+        // real state via ItemRef::state (pure read — no zeroize side effect).
+        let item_state = {
+            // Construct a temporary ItemRef via list_filtered by filtering for
+            // the specific key. Since list_filtered releases its borrow before
+            // this block, we can call store.list_filtered again for a single key.
+            // However, it is more efficient to use the Store's public accessor
+            // methods directly for individual key lookup.
+            //
+            // ItemRef::state is only accessible via list_filtered's callback.
+            // For single-key lookup, we use entry().state() directly, which is
+            // the same CacheEntry::state (pure read) that ItemRef::state calls.
+            store
+                .entry_state_pure(&name, ctx.clock)
+        };
+        let state = match item_state {
             Some(s) => state_str(s).to_string(),
             None if defined => "defined".to_string(),
             // Neither a value nor a definition: nothing to report (shouldn't
-            // happen for a name `keys()` returned, but skip defensively).
+            // happen for a name list_filtered returned, but skip defensively).
             None => continue,
         };
         // A defined key is always command-backed (regenerable); for a value-only

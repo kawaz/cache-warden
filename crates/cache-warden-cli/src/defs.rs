@@ -70,9 +70,11 @@ fn meta_to_wire(meta: &ValueMeta) -> ValueMetaWire {
 pub fn snapshot_definitions(store: &Store) -> Vec<KvDefinition> {
     use crate::protocol::wire::SourceSpecWire;
     let mut out = Vec::new();
-    for key in store.keys() {
+    // list_filtered with definition().is_some() yields only keys with a
+    // registered definition, avoiding the `keys()` + skip pattern (DR-0025).
+    for key in store.list_filtered(|r| r.definition().is_some()) {
         let Some(def) = store.definition_of(key) else {
-            continue; // value-only key: nothing to persist
+            continue; // defensive: list_filtered already ensured definition exists
         };
         // Persist the **typed source origin** (DR-0018 §2), not the lowered argv:
         // the persisted file round-trips the typed form. A definition without a
