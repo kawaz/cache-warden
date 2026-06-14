@@ -169,6 +169,15 @@ impl PublicKeyRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_blob.is_empty()
     }
+
+    /// All registered keys, in deterministic (blob-sorted) order.
+    ///
+    /// Used by callers that need the full [`RegisteredKey`] — for example to
+    /// register definitions for op-sourced keys in the core [`Store`] after
+    /// [`Self::register_op_key`] has been called.
+    pub fn all_keys(&self) -> impl Iterator<Item = &RegisteredKey> {
+        self.by_blob.values()
+    }
 }
 
 #[cfg(test)]

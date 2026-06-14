@@ -53,8 +53,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cache_warden::{
-    AuthContext, Authenticator, Clock, EntryState, ProcessInfo, ProcessInspector,
-    RegenerateOutcome, SourceRunner, Store, SystemInspector, Ttl, ValueSource,
+    Authenticator, Clock, DefineError, EntryState, ProcessInfo, ProcessInspector,
+    RegenerateDefOutcome, RegenerateOutcome, SourceRunner, Store, SystemInspector, Ttl,
+    ValueSource,
 };
 use cache_warden_authsock::{
     AgentCodec, AgentMessage, DiscoveredKey, FilterEvaluator, GithubFetcher, GithubMatcher,
@@ -292,6 +293,57 @@ pub fn spawn_listeners(
             )
         {
             op_key_count = register_op_keys(&socket.name, exe, source, keys, &mut registry);
+        }
+
+        // Register definitions for all op-sourced keys in the core Store so that
+        // get_or_regenerate (DR-0014 lazy path) can produce their values. This
+        // replaces the former lazy_load_op_key independent fetch/set path (A-3a).
+        //
+        // Conflict is treated as a no-op (idempotent re-start or two sockets
+        // sharing the same op source are fine). Any other DefineError (which is
+        // currently only StaticNotDefinable, i.e. unreachable here since we always
+        // pass a command source) is logged and the key is skipped — the socket
+        // still serves the keys that did register.
+        if let Ok(mut store) = shared.store.lock() {
+            for reg in registry.all_keys() {
+                if let KeySource::Op {
+                    argv,
+                    soft_ttl_secs,
+                    hard_ttl_secs,
+                } = &reg.source
+                {
+                    let ttl = match Ttl::new(
+                        soft_ttl_secs.map(std::time::Duration::from_secs),
+                        hard_ttl_secs.map(std::time::Duration::from_secs),
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!(
+                                "cache-warden: authsock `{}`: op key `{}` has invalid TTL \
+                                 configuration ({e}); skipping definition registration",
+                                socket.name, reg.kv_key
+                            );
+                            continue;
+                        }
+                    };
+                    match store.define(&reg.kv_key, ValueSource::command(argv.clone()), ttl) {
+                        Ok(()) | Err(DefineError::Conflict) => {} // ok or idempotent
+                        Err(e) => {
+                            eprintln!(
+                                "cache-warden: authsock `{}`: failed to register definition for \
+                                 op key `{}` ({e}); lazy loading via get_or_regenerate unavailable",
+                                socket.name, reg.kv_key
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            eprintln!(
+                "cache-warden: authsock `{}`: store lock poisoned; skipping op key \
+                 definition registration",
+                socket.name
+            );
         }
 
         let listener = match bind_control_socket(&socket.path) {
@@ -885,11 +937,11 @@ where
 ///   failure (its PEM was never loaded); otherwise the Iteration 1 gate applies
 ///   (Active passes, SoftExpired extends, HardExpired regenerates if regenerable).
 /// - [`KeySource::Op`]: the entry is created **lazily**. If the core has no entry
-///   yet (the NotLoaded case), the source command (`op item get`) is run to fetch
-///   the PEM, the user re-authenticates, and the value is `set` as a command
-///   source with the source's TTLs — then it is Active. Once it exists, the same
-///   Iteration 1 gate applies (idle extend within soft, regenerate via the same
-///   command after hard).
+///   yet (the NotLoaded case), [`Store::get_or_regenerate`] is called: it uses
+///   the definition registered at spawn time (DR-0014 lazy path) to run the fetch
+///   command, re-authenticate, and install the value — then it is Active. Once it
+///   exists, the same Iteration 1 gate applies (idle extend within soft, regenerate
+///   via the same command after hard).
 ///
 /// Returns `true` if the value is now Active, `false` on any failure (denied,
 /// hard-expired static, fetch error) — the caller maps that to SSH_AGENT_FAILURE.
@@ -909,24 +961,15 @@ where
     C: Clock,
 {
     match store.state_of(key, clock) {
-        // Absent. For an op key this is the lazy NotLoaded path: fetch + auth +
-        // set. A local key has no value to load, so it stays a failure.
+        // Absent. For an op key this is the lazy NotLoaded path: the definition
+        // was registered at spawn time, so get_or_regenerate can fetch + auth +
+        // set the value via the core DR-0014 path. A local key has no value to
+        // load, so it stays a failure.
         None => match source {
             KeySource::Local => false,
-            KeySource::Op {
-                argv,
-                soft_ttl_secs,
-                hard_ttl_secs,
-            } => lazy_load_op_key(
-                store,
-                key,
-                argv,
-                *soft_ttl_secs,
-                *hard_ttl_secs,
-                auth,
-                runner,
-                requester,
-                clock,
+            KeySource::Op { .. } => matches!(
+                store.get_or_regenerate(key, runner, auth, requester, clock),
+                Ok(()) | Err(RegenerateDefOutcome::ValueResident)
             ),
         },
         Some(EntryState::Active) => true,
@@ -950,60 +993,6 @@ where
             }
         }
     }
-}
-
-/// First-sign load of an op key: run the fetch command, re-authenticate, and
-/// `set` the value into the core as a command source (port plan §1.3 / §1.4).
-///
-/// The command (`op item get ... --reveal`) runs **before** the auth prompt so an
-/// upstream failure (op not signed in) surfaces without wasting a TouchID — the
-/// same order the core's `regenerate` uses. The fetched `SecretBytes` is dropped
-/// (zeroized) if auth is denied, leaving no entry behind. On success the value is
-/// `set` with the source's TTLs and is immediately Active.
-#[allow(clippy::too_many_arguments)]
-fn lazy_load_op_key<A, R, C>(
-    store: &mut Store,
-    key: &str,
-    argv: &[String],
-    soft_ttl_secs: Option<u64>,
-    hard_ttl_secs: Option<u64>,
-    auth: &A,
-    runner: &R,
-    requester: Option<&[ProcessInfo]>,
-    clock: &C,
-) -> bool
-where
-    A: Authenticator + ?Sized,
-    R: SourceRunner,
-    C: Clock,
-{
-    let ttl = match Ttl::new(
-        soft_ttl_secs.map(std::time::Duration::from_secs),
-        hard_ttl_secs.map(std::time::Duration::from_secs),
-    ) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    // Fetch the PEM first (before bothering the user for biometrics). This op
-    // fetch needs no cwd / env overlay (DR-0018: the authsock op path is internal).
-    let value = match runner.run(argv, None, &std::collections::BTreeMap::new()) {
-        Ok(v) => v,
-        // The RunError Display is secret-free; we drop it silently (FAILURE).
-        Err(_) => return false,
-    };
-    // Re-authenticate. `value` is dropped (zeroized) on denial. The op
-    // first-load is the regenerate-equivalent of an absent value, so it uses the
-    // Regenerate auth operation (the same context the later hard-expiry
-    // regenerate of this key uses).
-    let ctx = match requester {
-        Some(chain) => AuthContext::regenerate(key).with_requester(chain.to_vec()),
-        None => AuthContext::regenerate(key),
-    };
-    if auth.authenticate(&ctx).is_err() {
-        return false;
-    }
-    store.set(key, ValueSource::command(argv.to_vec()), value, ttl, clock);
-    true
 }
 
 #[cfg(test)]
@@ -1493,25 +1482,37 @@ mod tests {
         }
     }
 
-    /// A registry holding one op-sourced key (no core entry yet — lazy) plus an
-    /// empty store. The op key's KV name is namespaced like the production path.
+    /// A registry holding one op-sourced key (no core entry yet — lazy) plus a
+    /// store that has the op key's definition registered (as spawn_listeners does
+    /// after A-3a). The op key's KV name is namespaced like the production path.
     fn op_fixture(soft: u64, hard: u64) -> (Mutex<Store>, PublicKeyRegistry) {
-        let mut registry = PublicKeyRegistry::new();
         let argv = private_key_argv("/path/cache-warden", "itemABC", Some("kawaz.1password.com"));
+        let kv_key = op_kv_key("itemABC");
+        let mut registry = PublicKeyRegistry::new();
         registry
             .register_op_key(
-                op_kv_key("itemABC"),
+                kv_key.clone(),
                 ED25519_PUB,
                 "kawaz op key",
                 KeySource::Op {
-                    argv,
+                    argv: argv.clone(),
                     soft_ttl_secs: Some(soft),
                     hard_ttl_secs: Some(hard),
                 },
             )
             .unwrap();
-        // The core starts empty: the op key's value is loaded lazily on first sign.
-        (Mutex::new(Store::new()), registry)
+        // Register the definition so get_or_regenerate can lazily produce the value
+        // (mirrors what spawn_listeners now does after A-3a).
+        let mut store = Store::new();
+        let ttl = Ttl::new(
+            Some(Duration::from_secs(soft)),
+            Some(Duration::from_secs(hard)),
+        )
+        .unwrap();
+        store
+            .define(kv_key, ValueSource::command(argv), ttl)
+            .expect("define must succeed for a fresh store");
+        (Mutex::new(store), registry)
     }
 
     #[test]
@@ -1788,6 +1789,95 @@ mod tests {
         let mut registry = PublicKeyRegistry::new();
         let n = register_op_keys("sock", "/path/cache-warden", &source, &keys, &mut registry);
         assert_eq!(n, 1, "the unparseable key is skipped");
+    }
+
+    // ---- A-3a: op key definition registration + get_or_regenerate unification ----
+    //
+    // These tests capture the post-refactor contract: after spawn_listeners-level
+    // setup (registry registration + store.define), the core's get_or_regenerate
+    // path handles lazy loading rather than the now-deleted lazy_load_op_key.
+    //
+    // Step 2 (TDD red): written before the implementation exists; all three fail
+    // until step 3 (spawn_listeners define registration + ensure_loaded rewrite).
+
+    /// After spawn_listeners-equivalent setup (op_fixture now calls store.define),
+    /// the op key's kv_key is registered in the definition registry.
+    #[test]
+    fn op_key_registers_definition_in_store_at_spawn() {
+        let clock = FakeClock::new();
+        let (store, _registry) = op_fixture(SOFT, HARD);
+        let kv_key = op_kv_key("itemABC");
+        assert!(
+            store.lock().unwrap().is_defined(&kv_key),
+            "op key must be registered in the definition registry after spawn"
+        );
+        let _ = clock; // suppress unused warning
+    }
+
+    /// When a definition is registered, ensure_loaded for an absent op key goes
+    /// through store.get_or_regenerate rather than the former lazy_load_op_key.
+    #[test]
+    fn op_key_lazy_load_goes_through_get_or_regenerate() {
+        let clock = FakeClock::new();
+        let (store, registry) = op_fixture(SOFT, HARD);
+        let runner = PemRunner::new();
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &runner,
+            &clock,
+            None,
+            &req,
+        );
+        // The runner must have been called exactly once (lazy load via get_or_regenerate).
+        assert_eq!(
+            runner.runs(),
+            1,
+            "get_or_regenerate must invoke the runner once for a missing op key"
+        );
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+    }
+
+    /// After a fetch failure, the definition persists (is_defined true) but no
+    /// value entry is created (has_value false), allowing the next call to retry.
+    #[test]
+    fn op_key_fetch_failure_does_not_remove_definition() {
+        let clock = FakeClock::new();
+        let (store, registry) = op_fixture(SOFT, HARD);
+        let kv_key = op_kv_key("itemABC");
+
+        // NoRunner always fails the fetch.
+        let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
+        let resp = handle_local_sign(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None,
+            &req,
+        );
+        assert_eq!(
+            resp.msg_type,
+            MessageType::Failure,
+            "fetch failure yields SSH_AGENT_FAILURE"
+        );
+
+        let guard = store.lock().unwrap();
+        // Definition persists through failure so the next attempt can retry.
+        assert!(
+            guard.is_defined(&kv_key),
+            "definition must survive a fetch failure (retry is possible)"
+        );
+        // No value was installed.
+        assert!(
+            !guard.has_value(&kv_key),
+            "no value entry must exist after a fetch failure"
+        );
     }
 
     // ---- Iteration 2: upstream merge / routing (async, against a fake agent) ----

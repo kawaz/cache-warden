@@ -233,12 +233,29 @@ fetch-failure-backoff = "5s"  # default 5s; "0s" で機能無効化
 
 ## Open Questions (follow-up)
 
-- **Q1 (= A-3c)**: 案 C (失敗種別区別) → op の exit code / stderr 区別可能性を調査、結果次第で別 DR
+- **Q1 (= A-3c、2026-06-14 解決)**: 案 C (失敗種別区別) の op 区別可能性調査完了。`docs/findings/2026-06-14-op-cli-failure-categorization.md` 参照。結論:
+  - **exit code は区別不可** (op は全失敗で exit:1)
+  - **stderr regex で部分的に区別可** (vault 不在 / item 不在 / not signed in / account not found / spawn 失敗 = 確認済)
+  - **TouchID dismiss / timeout / ネット一時失敗の stderr パターンは未確認** (= 在席要、最も区別したいカテゴリだが未調査)
+  - core `RunError` は **意図的に stderr を捨てる**設計 (secret redaction)、per-category を core まで伝播するには設計変更が必要
+  - → **DR-0022 は一律 5s で確定** (本 DR で完結)
+  - TouchID 系 stderr が在席調査で判明したら DR-0024 (per-category backoff) として再評価
+  - op の stderr message は非公式 API、version 上がるとパターン変化リスクあり (= per-category 実装の懸念)
 - **Q2**: `failure_backoffs` の永続化 (process restart 跨ぎ) は不要か → 不要 (= 再起動は新規セッション、過去失敗を持ち越さない)
 - **Q3**: per-source / per-key の backoff 期間設定 (`[kv.NAME].failure-backoff = "10s"`) → ssh 体感のトレードオフ検証次第、follow-up
 - **Q4**: 副次問題 (TouchID 中 Mutex 保持で blocking pool ストール、`docs/issue/2026-06-14-touchid-blocks-blocking-pool.md`) は本 DR の範囲外、別 issue で扱う
 - **Q5** (v2 で W4 反映): backoff 中の SIGN_REQUEST に `agent refused` 以外の signal を返すべきか → SSH agent protocol に "retry later" 機構なし、`agent refused` 一択 (= 設計判断クローズ)。**ssh client 側の retry は外部頼み**: OpenSSH の `ConnectionAttempts` (= sshd 接続リトライ、agent には効かない) / `ssh-retry` ラッパー / mosh 等のセッション維持ツール / VS Code Remote SSH 等の auto-reconnect。control socket 経由 `kv.get` 経路は `RegenerateOutcome::Backoff` を `kv.get` レスポンスに乗せて backoff 残時間を提示する余地あり → follow-up issue で別検討
 - **Q6** (v2 新): `failure_backoffs` の永続化 (Store の serialize / restore in handoff)。`graceful restart` (`docs/issue/2026-06-14-graceful-restart-state-handoff.md`) で kv + endpoint fd を新プロセスへ引き継ぐ際、`failure_backoffs` も引き継ぐべきか。直感は yes (= 直前の失敗履歴を新プロセスでも保持しないと restart で reset される) → graceful restart 設計の一部として詰める
+- **Q7** (v2 追記、ペルソナ QA): `[auth].command` (CommandAuthenticator) の auth 失敗を runner.run 失敗と同じ扱いで `failure_backoffs.insert` するか、別扱いするか
+  - 同じ扱い = fail-safe (= auth 設定間違い時に全 SIGN が事実上 stop、暴走 prevention)
+  - 別扱い = auth エラーは backoff 対象外、毎 SIGN で auth コマンドを叩く (= 設定間違いに即気付く、reliability hole が少ない)
+  - 暫定設計: **同じ扱い** (= 「source 実行の retry policy / circuit breaker」分類のため、auth ゲートも source 実行と同列に扱う)、ただし stderr / status で `(auth failed)` vs `(fetch failed)` を区別表示して原因切り分け可能にする
+  - dogfood で評価、必要なら別 DR で改訂
+- **Q8** (v2 追記、ペルソナ「野生のデバッガー」): backoff 中の key に対する `kv prefetch` (DR-0018、未実装) はどう振る舞うか
+  - 案 X1: backoff を bypass (= ユーザの明示 warm up 命令を尊重)
+  - 案 X2: backoff を honor (= 5s は短い、急がば回れ)
+  - 暫定設計: **案 X1 (bypass)** = kawaz の明示意図を尊重、prefetch は手動コマンドで意図的に叩く想定 (= DR-0018 設計趣旨)
+  - DR-0018 prefetch の実装時に確定 (= 本 DR の Open Question で予約)
 
 ## Related
 

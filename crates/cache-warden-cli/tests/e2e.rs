@@ -1032,10 +1032,10 @@ fn persisted_definition_survives_daemon_restart() {
     let persisted_text = {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(t) = std::fs::read_to_string(&state_file) {
-                if t.contains("PERSISTED") {
-                    break t;
-                }
+            if let Ok(t) = std::fs::read_to_string(&state_file)
+                && t.contains("PERSISTED")
+            {
+                break t;
             }
             assert!(Instant::now() < deadline, "state file never appeared");
             std::thread::sleep(Duration::from_millis(20));
