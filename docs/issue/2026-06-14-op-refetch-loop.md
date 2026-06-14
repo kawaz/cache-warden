@@ -1,9 +1,32 @@
 # SIGN 起因の op fetch が client 切断で完遂せず再 fetch ループになる
 
-- status: open
+- status: **wip — code complete, pending live verification** (2026-06-14)
 - 発見: 2026-06-13 (Phase 3 dogfood 切替直後、離席中に観測)
 - 元記録: `docs/journal/2026-06-13-handoff-ecdsa-dogfood-stablewhich.md` §A (本 issue で独立昇格)
 - 関連: DR-0018 (型付き source、prefetch で起動時 warm 化することで二次的に緩和し得る) / [2026-06-13-op-discovery-blocks-startup.md](./2026-06-13-op-discovery-blocks-startup.md) (起動時 op 同期ブロック、同じ op fetch 経路)
+
+## 解決方法 (= code complete、実機検証待ち、2026-06-14)
+
+仮説確定 (= op fetch 失敗時の `store.set` スキップ + backoff 無し → 同 key への次 SIGN_REQUEST で再 fetch ループ) に対し、core `Store` に `failure_backoffs` 機構を追加し、同 key への直近失敗から `[daemon].fetch-failure-backoff` (default 5s) 内の再 fetch を抑止する設計を確立 + 実装した。
+
+- 設計判断: [DR-0022-fetch-failure-backoff.md](../decisions/DR-0022-fetch-failure-backoff.md) (v1 → Codex review → v2 改訂)
+- 実装の前提 refactor: [docs/design/lazy-load-op-key-unification-plan.md](../design/lazy-load-op-key-unification-plan.md) (A-3a)
+- 失敗種別調査: [docs/findings/2026-06-14-op-cli-failure-categorization.md](../findings/2026-06-14-op-cli-failure-categorization.md) (A-3c)
+- 副次問題: [2026-06-14-touchid-blocks-blocking-pool.md](./2026-06-14-touchid-blocks-blocking-pool.md) (= Mutex 保持中の blocking pool ストール、別 issue)
+- live 検証手順: [docs/runbooks/op-refetch-loop-live-diagnosis.md](../runbooks/op-refetch-loop-live-diagnosis.md)
+
+実装コミット (= ローカル、未 push):
+
+- `71da8806` refactor(authsock): A-3a — unify op key lazy loading through Store::get_or_regenerate
+- `44ea8e57` feat(core): A-3b — fetch failure backoff (DR-0022)
+
+残作業:
+
+- live 検証 (= runbook の §5/§6 を kawaz 在席で実機実行): backoff が効くこと + 接続元 rate driver の特定
+- CLI 出力 (`status` / `kv list`) に `backoff_until_secs` を表示する追加実装 (= A-3d、wire 側は実装済)
+- TouchID dismiss / timeout の stderr 観測 (= A-3c で在席要として残った確認、DR-0024 候補)
+
+実機検証 OK で push 後、本 issue を `pending-sublimation` → delete (DR + runbook + findings に sublimation 済)。
 
 ## 現象
 

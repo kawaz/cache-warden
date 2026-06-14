@@ -14,6 +14,30 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Errors that can terminate the daemon's `run` loop.
+#[derive(Debug)]
+pub enum ServerError {
+    /// A shutdown signal arrived while the daemon was still starting up.
+    ShutdownDuringStartup,
+    /// An I/O error (bind failure, etc.).
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShutdownDuringStartup => write!(f, "shutdown signal received during startup"),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for ServerError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
 use cache_warden::{
     AllowAll, Authenticator, CommandAuthenticator, CommandRunner, DefineError, ProcessInfo,
     ProcessInspector, SourceRunner, Store, SystemClock, SystemInspector, Ttl,
@@ -121,13 +145,15 @@ pub(crate) struct Shared {
     /// "now", so per-request clocks would make every entry look freshly
     /// activated and defeat TTL evaluation entirely.
     pub(crate) clock: SystemClock,
-    /// Persistence settings for online definitions, or `None` when
-    /// `[daemon].persist-definitions` is off (DR-0014 §4). When `Some`, every
-    /// `kv.define` / `kv.del --with-define` that changes the definition registry
-    /// rewrites the state file atomically (0600), persisting **online**
-    /// definitions only (config `[kv.*]` definitions are excluded — the config
-    /// is their source of truth, not the state file).
-    persist: Option<PersistSettings>,
+    /// Persistence settings for online definitions (DR-0014 §4). Empty (not
+    /// set) when `[daemon].persist-definitions` is off; set once after startup
+    /// completes. When set, every `kv.define` / `kv.del --with-define` that
+    /// changes the definition registry rewrites the state file atomically
+    /// (0600), persisting **online** definitions only (config `[kv.*]`
+    /// definitions are excluded — the config is their source of truth, not the
+    /// state file). Uses `OnceLock` so the slot can be filled after the `Arc`
+    /// is handed to the serve loop (DR-0023 Phase 1: startup is non-blocking).
+    persist: std::sync::OnceLock<PersistSettings>,
     socket_path: String,
     pid: u32,
     /// Key-level process-access policies (DR-0012 key layer): key name → its
@@ -162,7 +188,7 @@ impl Shared {
             runner: CommandRunner::new(),
             auth,
             clock,
-            persist: None,
+            persist: std::sync::OnceLock::new(),
             socket_path: String::new(),
             pid: std::process::id(),
             kv_process_policies: std::collections::BTreeMap::new(),
@@ -179,7 +205,7 @@ impl Shared {
 ///
 /// `socket_path` is already resolved by the caller (CLI `--socket` > env >
 /// `[daemon].socket` > built-in default); the daemon does not re-derive it.
-pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
+pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError> {
     // Install the shutdown-signal notifier *first*, before the (potentially slow)
     // startup work below. The shutdown signals are already blocked process-wide
     // (`block_shutdown_signals`, called before the runtime started); a dedicated
@@ -218,77 +244,28 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
         );
     }
 
+    // Bind the control socket early so clients can connect (and answer `ping`)
+    // while `preload = true` entries are running (DR-0023 Phase 1).
     let listener = bind_control_socket(&socket_path)?;
 
     let runner = CommandRunner::new();
     let clock = SystemClock::new();
-    let mut store = Store::new();
-    // Inject the backoff duration from config (DR-0022). Library consumers use
-    // the zero default (backoff disabled); the daemon reads the user's setting
-    // and activates the feature here. `fetch_failure_backoff()` is infallible at
-    // this point because `Config::parse` validated the duration string eagerly.
-    store.set_failure_backoff(config.fetch_failure_backoff());
 
-    // Register `[kv.*]` command definitions before serving (DR-0014 §4). Each is
-    // registered as a definition (lazy by default); a `preload = true` entry is
-    // also run eagerly so its first `get` is a cache hit. A failed eager preload
-    // is a warning, not fatal: the definition stays registered and the value
-    // regenerates on the next `get`.
-    //
-    // Keys referenced by any `[authsock.sockets.*].keys` are force-eager
-    // regardless of `preload`: the agent registry derives their public halves at
-    // startup (REQUEST_IDENTITIES needs the PEM resident), and the socket
-    // declaration itself is the intent — requiring a second `preload = true` on
-    // the same key would be a silent-footgun (a forgotten flag would drop the
-    // key from the agent; DR-0004's "never interrupt key use" invariant).
-    let authsock_keys: std::collections::HashSet<String> = config
-        .authsock_sockets()
-        .iter()
-        .flat_map(|s| s.keys.iter().cloned())
-        .collect();
-    let config_defs = config.kv_definitions();
-    register_definitions(&mut store, &runner, &clock, &config_defs, &authsock_keys);
-
-    // Restore persisted online definitions when `[daemon].persist-definitions`
-    // is on (DR-0014 §4). The restore is a **config-priority merge**: a key the
-    // config already defines wins, and a clashing persisted entry is dropped
-    // with a warning. Keys the config does not define are restored as-is. When
-    // persistence is off, the state file is neither read nor written (even if it
-    // exists). After restoring we rewrite the file so it becomes the current
-    // truth (dropping the entries that lost the merge from disk too).
-    let persist = if config.persist_definitions() {
-        let path = crate::defs::definitions_state_path();
-        let config_names: std::collections::HashSet<String> = config_defs
-            .iter()
-            .map(|d| d.full_key(crate::namespace::DEFAULT_NAMESPACE))
-            .collect();
-        match crate::defs::load_definitions(&path) {
-            Ok(persisted) => {
-                restore_persisted_definitions(&mut store, persisted, &config_names);
-            }
-            Err(e) => {
-                // A corrupt state file is non-fatal: warn and start without it
-                // (the file is rewritten from the in-memory registry below).
-                eprintln!("cache-warden: {e}; ignoring persisted definitions");
-            }
-        }
-        let settings = PersistSettings { path, config_names };
-        // Rewrite the file from the merged registry (online definitions only) so
-        // disk == current truth: entries that lost the config-priority merge are
-        // removed from disk, and any config keys that leaked into an older file
-        // are dropped (config keys are never persisted).
-        write_online_definitions(&settings, &store);
-        Some(settings)
-    } else {
-        None
-    };
-
+    // Build `Shared` with an empty Store and an empty `persist` OnceLock.
+    // The persist slot is filled from within the blocking startup task after
+    // definitions are registered (DR-0023 Phase 1): OnceLock allows a single
+    // interior write after the Arc has been handed to the serve loop, without
+    // needing a Mutex or rebuilding the whole Shared struct.
     let shared = Arc::new(Shared {
-        store: Mutex::new(store),
+        store: Mutex::new({
+            let mut s = Store::new();
+            s.set_failure_backoff(config.fetch_failure_backoff());
+            s
+        }),
         runner,
         auth: build_authenticator(&config),
         clock,
-        persist,
+        persist: std::sync::OnceLock::new(), // filled after startup by the blocking task
         socket_path: socket_path.display().to_string(),
         pid: std::process::id(),
         kv_process_policies: config.kv_process_policies(),
@@ -296,11 +273,147 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // Start the accept loop immediately so clients can connect while preloading.
     let server = tokio::spawn(serve(listener, Arc::clone(&shared), shutdown_rx.clone()));
 
     println!(
         "cache-warden daemon listening on {} (pid {}). Press Ctrl+C to stop.",
         shared.socket_path, shared.pid
+    );
+
+    // Register `[kv.*]` command definitions on the blocking pool (DR-0023 Phase 1).
+    //
+    // Each entry is registered as a definition (lazy by default); a `preload = true`
+    // entry is also run eagerly so its first `get` is a cache hit. A failed eager
+    // preload is a warning, not fatal: the definition stays registered and the value
+    // regenerates on the next `get`.
+    //
+    // Keys referenced by any `[authsock.sockets.*].keys` are force-eager regardless
+    // of `preload`: the agent registry derives their public halves at startup
+    // (REQUEST_IDENTITIES needs the PEM resident), and the socket declaration itself
+    // is the intent — requiring a second `preload = true` on the same key would be a
+    // silent-footgun (a forgotten flag would drop the key from the agent;
+    // DR-0004's "never interrupt key use" invariant).
+    //
+    // `register_definitions` may call `runner.run()` for eager entries, which can
+    // block for seconds (a secret source may prompt the user). Running it on the
+    // blocking pool prevents stalling the tokio runtime. A concurrent `select!` on
+    // the shutdown notify lets a SIGTERM received during startup abort the preload
+    // immediately (DR-0023 Phase 1).
+    let authsock_keys: std::collections::HashSet<String> = config
+        .authsock_sockets()
+        .iter()
+        .flat_map(|s| s.keys.iter().cloned())
+        .collect();
+    let config_defs = config.kv_definitions();
+
+    // Clone the Arc so the blocking closure can write into the shared Store and
+    // fill the OnceLock persist slot.
+    let shared_for_startup = Arc::clone(&shared);
+    eprintln!("cache-warden: registering config definitions ...");
+    let t0 = std::time::Instant::now();
+
+    // Capture everything the blocking closure needs by value so the closure is
+    // `'static`. `runner` is Copy. `config_defs` and `authsock_keys` are moved.
+    let runner_for_task = runner; // Copy
+    let config_defs_for_task = config_defs.clone();
+    let authsock_keys_for_task = authsock_keys.clone();
+    // Persist-related data also goes into the blocking task to keep all I/O
+    // (file reads for restore, file writes for rewrite) off the async runtime.
+    let persist_enabled = config.persist_definitions();
+    let config_names_for_persist: std::collections::HashSet<String> = config_defs
+        .iter()
+        .map(|d| d.full_key(crate::namespace::DEFAULT_NAMESPACE))
+        .collect();
+    let failure_backoff = config.fetch_failure_backoff();
+
+    let blocking = tokio::task::spawn_blocking(move || {
+        // Write config definitions directly into the shared Store while holding
+        // its lock. The serve loop is already running but no client request can
+        // observe a partial state: each request takes the same lock, so they
+        // queue behind this startup write (DR-0008 invariant).
+        let mut store = shared_for_startup
+            .store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        store.set_failure_backoff(failure_backoff);
+        register_definitions(
+            &mut store,
+            &runner_for_task,
+            &shared_for_startup.clock,
+            &config_defs_for_task,
+            &authsock_keys_for_task,
+        );
+
+        // Restore persisted online definitions (DR-0014 §4) inside the same
+        // blocking task to keep all startup I/O off the async runtime.
+        if persist_enabled {
+            let path = crate::defs::definitions_state_path();
+            match crate::defs::load_definitions(&path) {
+                Ok(persisted) => {
+                    restore_persisted_definitions(&mut store, persisted, &config_names_for_persist);
+                }
+                Err(e) => {
+                    eprintln!("cache-warden: {e}; ignoring persisted definitions");
+                }
+            }
+            let settings = PersistSettings {
+                path,
+                config_names: config_names_for_persist,
+            };
+            write_online_definitions(&settings, &store);
+            // Install into the OnceLock while still holding the store lock so
+            // the serve loop never observes a window where the file is written
+            // but `persist` is not yet set. The store lock is the gate: any
+            // `kv.define` / `kv.del --with-define` request arriving now queues
+            // behind this lock and will see `persist` set when it runs.
+            let _ = shared_for_startup.persist.set(settings);
+        }
+        // store lock released here (MutexGuard dropped)
+    });
+
+    // Race the blocking startup work against a shutdown signal (DR-0023 Phase 1):
+    // if SIGTERM arrives while preload is running, abort and exit cleanly.
+    #[cfg(unix)]
+    {
+        match &shutdown_notify {
+            Some(notify) => {
+                tokio::select! {
+                    res = blocking => {
+                        res.map_err(|e| ServerError::Io(
+                            io::Error::other(format!("startup task panicked: {e}"))
+                        ))?;
+                    }
+                    _ = notify.notified() => {
+                        // Shutdown signal arrived during startup. The blocking task
+                        // is still running in the thread pool but we are not
+                        // awaiting it — it will complete eventually (or be
+                        // terminated when the process exits). The watchdog timer in
+                        // spawn_shutdown_notifier bounds the total latency.
+                        eprintln!("cache-warden: shutdown signal received during startup");
+                        let _ = shutdown_tx.send(true);
+                        let _ = server.await;
+                        let _ = std::fs::remove_file(&socket_path);
+                        return Err(ServerError::ShutdownDuringStartup);
+                    }
+                }
+            }
+            None => {
+                // No shutdown notifier (extremely unlikely): run to completion.
+                blocking.await.map_err(|e| {
+                    ServerError::Io(io::Error::other(format!("startup task panicked: {e}")))
+                })?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    blocking
+        .await
+        .map_err(|e| ServerError::Io(io::Error::other(format!("startup task panicked: {e}"))))?;
+
+    eprintln!(
+        "cache-warden: startup complete in {:.2}s",
+        t0.elapsed().as_secs_f64()
     );
 
     // Start one SSH agent listener per `[authsock.sockets.*]` (port Iteration 1).
@@ -319,9 +432,73 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
             .timeout_duration()
             .unwrap_or_else(|_| std::time::Duration::from_secs(10)),
     };
+
+    // Run op discovery on the blocking pool (DR-0023 Phase 1): `op item list` and
+    // `op item get` are synchronous CLI calls (`std::process::Command::output()`)
+    // that must not block an async worker. A concurrent `select!` on the shutdown
+    // notify lets a SIGTERM received during discovery abort immediately.
+    //
+    // `spawn_listeners` spawns async tasks (`tokio::spawn`) and therefore must run
+    // on the async runtime — only `discover_all_sources` (the blocking part) moves
+    // to the thread pool. The discovered map is passed into `spawn_listeners` as an
+    // argument, keeping the two concerns cleanly separated.
+    let authsock_sources = config.authsock_sources();
+    let authsock_sockets = config.authsock_sockets();
+    let discovered = if authsock_sources.is_empty() {
+        // No op sources configured: skip blocking discovery entirely.
+        std::collections::BTreeMap::new()
+    } else {
+        let sources_for_discover = authsock_sources.clone();
+        eprintln!("cache-warden: discovering op-backed keys ...");
+        let t_discover = std::time::Instant::now();
+
+        let discover_task = tokio::task::spawn_blocking(move || {
+            super::authsock::discover_all_sources(&sources_for_discover)
+        });
+
+        #[cfg(unix)]
+        let result = {
+            match &shutdown_notify {
+                Some(notify) => {
+                    tokio::select! {
+                        res = discover_task => {
+                            res.map_err(|e| ServerError::Io(
+                                io::Error::other(format!("op discovery task panicked: {e}"))
+                            ))?
+                        }
+                        _ = notify.notified() => {
+                            eprintln!("cache-warden: shutdown signal received during op discovery");
+                            let _ = shutdown_tx.send(true);
+                            let _ = server.await;
+                            let _ = std::fs::remove_file(&socket_path);
+                            return Err(ServerError::ShutdownDuringStartup);
+                        }
+                    }
+                }
+                None => discover_task.await.map_err(|e| {
+                    ServerError::Io(io::Error::other(format!("op discovery task panicked: {e}")))
+                })?,
+            }
+        };
+        #[cfg(not(unix))]
+        let result = discover_task.await.map_err(|e| {
+            ServerError::Io(io::Error::other(format!("op discovery task panicked: {e}")))
+        })?;
+
+        let total_keys: usize = result.values().map(|v| v.len()).sum();
+        eprintln!(
+            "cache-warden: discovery completed in {:.2}s ({} sources, {} keys)",
+            t_discover.elapsed().as_secs_f64(),
+            result.len(),
+            total_keys,
+        );
+        result
+    };
+
     let authsock_handles = super::authsock::spawn_listeners(
-        &config.authsock_sockets(),
-        &config.authsock_sources(),
+        &authsock_sockets,
+        &authsock_sources,
+        discovered,
         github_settings,
         Arc::clone(&shared),
         shutdown_rx,
@@ -518,9 +695,10 @@ fn write_online_definitions(settings: &PersistSettings, store: &Store) {
 /// Called from the request path after a definition-changing command
 /// (`kv.define` / `kv.del --with-define`) succeeds. A write failure is returned
 /// so the caller can surface it (an in-memory/disk divergence is the dangerous
-/// case — DR-0014 §4); when persistence is off this is a no-op `Ok(())`.
+/// case — DR-0014 §4); when persistence is off (or startup has not yet completed)
+/// this is a no-op `Ok(())`.
 fn persist_if_enabled(shared: &Shared, store: &Store) -> std::io::Result<()> {
-    match &shared.persist {
+    match shared.persist.get() {
         Some(settings) => {
             crate::defs::save_definitions(&settings.path, &online_definitions(settings, store))
         }
@@ -616,6 +794,13 @@ fn dispatch(shared: &Arc<Shared>, peer: Option<u32>, line: &str) -> Response {
 ///
 /// Factored out so it can be exercised directly in tests without socket I/O.
 fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Response {
+    // `ping` needs neither the store lock nor the requester ancestry (it just
+    // returns a pong). Short-circuit before taking the lock so pings succeed
+    // even while the startup blocking task holds the store lock (DR-0023 Phase 1).
+    if matches!(req, Request::Ping) {
+        return Response::pong();
+    }
+
     // Resolve requester ancestry from the peer pid (best effort).
     let requester: Option<Vec<ProcessInfo>> = peer.and_then(|pid| {
         let inspector = SystemInspector::new();
@@ -888,7 +1073,7 @@ mod tests {
             runner: CommandRunner::new(),
             auth: Box::new(AllowAll),
             clock: SystemClock::new(),
-            persist: None,
+            persist: std::sync::OnceLock::new(),
             socket_path: "/tmp/test.sock".into(),
             pid: std::process::id(),
             kv_process_policies: std::collections::BTreeMap::new(),

@@ -1640,6 +1640,133 @@ fn namespaces_isolate_keys_and_resolve_references() {
     let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
 }
 
+/// DR-0023 Phase 1: `preload = true` の kv コマンドが長時間かかっても、
+/// daemon が socket を bind して ping に応答できるようになること (startup の
+/// blocking を spawn_blocking に移すことで、socket は preload 完了前に開く)。
+///
+/// kv エントリのコマンドを `sleep 30; printf done` にして startup blocking を
+/// シミュレートする (30 秒間 blocking してから出力するので empty-output で
+/// 早期終了しない)。
+///
+/// Phase 1 実装前: daemon が `sh -c 'sleep 30; printf done'` の完了を待つため、
+/// ping が 3 秒以内に返らず fail する。
+/// Phase 1 実装後: preload は spawn_blocking に移り、socket は先に開くので
+/// ping は即座に成功する。
+#[test]
+fn test_socket_available_before_preload_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    // SIGPIPE / timeout 対策で setsid を使って signal をシールドしたい所だが、
+    // portable に書くために `sh -c 'trap "" TERM; sleep 30; printf done'` で
+    // SIGTERM を無視し、本当に 30 秒かかる preload をシミュレートする。
+    // (SIGTERMが子プロセスグループに伝わっても sleep が止まらない)
+    let cfg = r#"
+[kv.SLOW]
+source = "command"
+command.argv = ["sh", "-c", "trap '' TERM; sleep 30; printf done"]
+preload = true
+"#;
+    let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
+
+    // 3 秒以内に ping に応答することを確認。
+    // Phase 1 実装前: `sleep 30` が同期実行されるため 3 秒以内に ping が返らない。
+    // Phase 1 実装後: preload は spawn_blocking に移るため socket は即座に開く。
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let ping_succeeded = loop {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket) {
+            // socket が開いているなら ping を試みる (タイムアウト付き)
+            use std::io::{BufRead, BufReader, Write};
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+            let mut writer = stream.try_clone().unwrap();
+            if writer.write_all(b"{\"cmd\":\"ping\"}\n").is_ok() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_ok() && line.contains("\"ok\":true") {
+                    break true;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // shutdown してからアサート (daemon を残さない; slow preload の子プロセスも kill)
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+        // sleep が TERM を無視しているので KILL も送る
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    let _ = wait_for_exit(&mut daemon, Duration::from_secs(5));
+
+    assert!(
+        ping_succeeded,
+        "daemon socket should respond to ping within 3s even when preload takes 30s (DR-0023 Phase 1)"
+    );
+}
+
+/// DR-0023 Phase 1: startup 中に shutdown signal を受けたとき、spawn_blocking 内の
+/// 長時間ブロッキング処理があっても SHUTDOWN_GRACE (5s) + 余裕の合計 10 秒以内に
+/// daemon が exit することを確認する。
+///
+/// kv エントリのコマンドを `sleep 30` (SIGTERM を無視) にして startup blocking を
+/// シミュレートする。socket が開いてから (daemon が preload 中) 1 秒後に SIGTERM を
+/// 送信し、10 秒以内に exit することを確認。
+///
+/// Phase 1 実装前: spawn_blocking が完了するまで (30 秒後まで) run() が戻らないため、
+/// SIGTERM を受けても shutdownパスに到達せず、watchdog (SHUTDOWN_GRACE=5s) が
+/// 発火するまでに合計 30+5=35 秒かかる。
+/// Phase 1 実装後: startup select! が SIGTERM を受けて即座に ShutdownDuringStartup を
+/// 返し、watchdog が発火する前に graceful shutdown が完了する。
+#[test]
+fn test_shutdown_during_startup_exits_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    // SIGTERM を無視してバックグラウンドで 30 秒スリープする preload をシミュレート。
+    // daemon に SIGTERM を送っても子プロセス (sh -c) の sleep は終わらないが、
+    // daemon 自身は select! で ShutdownDuringStartup を検出して exit すべき。
+    let cfg = r#"
+[kv.SLOW]
+source = "command"
+command.argv = ["sh", "-c", "trap '' TERM; sleep 30; printf done"]
+preload = true
+"#;
+    let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
+
+    // daemon が socket を開くまで待つ (preload 中のはず)。
+    let socket_open_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= socket_open_deadline {
+            panic!("daemon did not open socket within 5s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // socket が開いてから 1 秒待つ (preload がブロック中であることを確認してから)。
+    std::thread::sleep(Duration::from_secs(1));
+
+    // SIGTERM を送る (startup blocking 中のはず)。
+    let pid = daemon.child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+
+    // 10 秒以内に exit することを確認 (SHUTDOWN_GRACE=5s + 余裕)。
+    // Phase 1 実装後: startup select! が即座に ShutdownDuringStartup を返し、
+    // graceful shutdown が完了するため watchdog が発火する前に exit する。
+    let status = wait_for_exit(&mut daemon, Duration::from_secs(10));
+    assert!(
+        status.success() || status.code().is_none(),
+        "daemon should exit cleanly (exit 0 or signal kill) on SIGTERM during startup, \
+         got: {status:?} (DR-0023 Phase 1)"
+    );
+}
+
 /// Per-entry `namespace` field in defs files (DR-0017 §5): a pinned entry is
 /// absolute, an unpinned one follows the `--defs` invocation's `--namespace`.
 #[test]

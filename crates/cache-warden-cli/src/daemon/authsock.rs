@@ -142,7 +142,11 @@ struct SocketState {
 /// Returns a `source name → discovered keys` map. Sharing one discovery across
 /// every socket that references the same source mirrors authsock-warden's shared
 /// op state (one TouchID-bearing `op item list`, not one per socket).
-fn discover_all_sources(sources: &[AuthsockSource]) -> BTreeMap<String, Vec<DiscoveredKey>> {
+///
+/// `pub` so `server::run` can invoke it on the blocking pool (DR-0023 Phase 1):
+/// `op item list` / `op item get` are synchronous CLI calls that must not block
+/// the async runtime workers.
+pub fn discover_all_sources(sources: &[AuthsockSource]) -> BTreeMap<String, Vec<DiscoveredKey>> {
     let mut out = BTreeMap::new();
     for source in sources {
         let client = match &source.op_account {
@@ -227,18 +231,22 @@ fn op_kv_key(item_id: &str) -> String {
 /// empty (no key resolved) is still bound — it simply answers REQUEST_IDENTITIES
 /// with an empty list until a key is set.
 ///
-/// `sources` are the validated `[authsock.sources.*]`; their keys are discovered
-/// once up front (see [`discover_all_sources`]) and registered into the registry
-/// of every socket that references them via `source`.
+/// `sources` are the validated `[authsock.sources.*]`.
+///
+/// `discovered` is the pre-computed `source name → discovered keys` map produced
+/// by [`discover_all_sources`] **before** this call. The caller is responsible for
+/// running discovery (on the blocking pool, DR-0023 Phase 1) and passing the
+/// result here so `spawn_listeners` can stay free of synchronous blocking work
+/// (it spawns async `tokio::spawn` tasks and must not call `tokio::spawn` from
+/// inside a `spawn_blocking` closure).
 pub fn spawn_listeners(
     sockets: &[AuthsockSocket],
     sources: &[AuthsockSource],
+    discovered: BTreeMap<String, Vec<DiscoveredKey>>,
     github: GithubSettings,
     shared: Arc<Shared>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Vec<(PathBuf, JoinHandle<()>)> {
-    // Discover every op source once (shared across sockets referencing it).
-    let discovered = discover_all_sources(sources);
     let source_by_name: BTreeMap<&str, &AuthsockSource> =
         sources.iter().map(|s| (s.name.as_str(), s)).collect();
 

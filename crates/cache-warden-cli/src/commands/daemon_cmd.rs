@@ -64,8 +64,28 @@ pub fn run_foreground(args: &[String], socket: PathBuf, config: Config) -> Resul
         })
         .build()
         .map_err(|e| format!("failed to start runtime: {e}"))?;
-    rt.block_on(crate::daemon::server::run(socket, config))
-        .map_err(|e| format!("daemon error: {e}"))
+    match rt.block_on(crate::daemon::server::run(socket, config)) {
+        Ok(()) => Ok(()),
+        Err(crate::daemon::server::ServerError::ShutdownDuringStartup) => {
+            // A shutdown signal arrived while the daemon was still starting up.
+            // This is an intentional, clean exit — force immediate process
+            // termination via _exit so the tokio runtime does not wait for the
+            // still-running startup blocking task (which may block for many
+            // seconds — e.g. a preload command with a long timeout). The
+            // watchdog in spawn_shutdown_notifier would eventually do the same,
+            // but exiting here first is cleaner and faster (DR-0023 Phase 1).
+            // SAFETY: `_exit` immediately terminates the process. All required
+            // cleanup (control socket removal, shutdown_tx send) already ran
+            // inside `server::run` before returning this variant.
+            #[cfg(unix)]
+            unsafe {
+                libc::_exit(0);
+            }
+            #[cfg(not(unix))]
+            Ok(())
+        }
+        Err(e) => Err(format!("daemon error: {e}")),
+    }
 }
 
 /// Parsed flags for `daemon register` (DR-0019 §1).
