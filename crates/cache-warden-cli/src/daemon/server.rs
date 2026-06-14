@@ -223,6 +223,11 @@ pub async fn run(socket_path: PathBuf, config: Config) -> io::Result<()> {
     let runner = CommandRunner::new();
     let clock = SystemClock::new();
     let mut store = Store::new();
+    // Inject the backoff duration from config (DR-0022). Library consumers use
+    // the zero default (backoff disabled); the daemon reads the user's setting
+    // and activates the feature here. `fetch_failure_backoff()` is infallible at
+    // this point because `Config::parse` validated the duration string eagerly.
+    store.set_failure_backoff(config.fetch_failure_backoff());
 
     // Register `[kv.*]` command definitions before serving (DR-0014 §4). Each is
     // registered as a definition (lazy by default); a `preload = true` entry is

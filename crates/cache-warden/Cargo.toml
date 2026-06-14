@@ -16,6 +16,11 @@ zeroize = "1"
 # See docs/decisions/DR-0006-process-inspection-dependencies.md for the rationale and the
 # sysinfo / raw-syscall / zero-dependency alternatives that were rejected.
 libc = "0.2"
+# Structured diagnostic logging for failure backoff events (DR-0022). Consumer
+# installs a subscriber (e.g. tracing-subscriber in the daemon); the core only
+# emits the events. DR-0002 allows this as a well-established zero-boilerplate
+# observability primitive that does not pull in runtime or network dependencies.
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

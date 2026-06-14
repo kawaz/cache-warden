@@ -540,6 +540,12 @@ pub struct EntryInfo {
     /// exposes the secret — for `op` it is the reference, never the fetched value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Seconds until the fetch-failure backoff window lapses, or `None` when no
+    /// backoff is active (DR-0022). When present and positive, re-fetch is
+    /// suppressed for this many more seconds. Reported as `0` if the window has
+    /// already elapsed but the record has not yet been evicted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_until_secs: Option<u64>,
 }
 
 /// A structured error returned in a failed [`Response`].
@@ -976,6 +982,7 @@ mod tests {
                     pin_remaining_secs: None,
                     value_type: None,
                     source: None,
+                    backoff_until_secs: None,
                 },
                 EntryInfo {
                     name: "P".into(),
@@ -986,6 +993,7 @@ mod tests {
                     pin_remaining_secs: Some(3600),
                     value_type: Some("otp".into()),
                     source: None,
+                    backoff_until_secs: None,
                 },
             ],
         );
@@ -1004,6 +1012,7 @@ mod tests {
             pin_remaining_secs: None,
             value_type: None,
             source: None,
+            backoff_until_secs: None,
         };
         let line = serde_json::to_string(&info).unwrap();
         assert!(!line.contains("pin_remaining_secs"), "{line}");

@@ -37,12 +37,32 @@ fn auth_context(key: &str, op: AuthOperation, requester: Option<&[ProcessInfo]>)
     }
 }
 
+/// A record of a fetch failure for a given key (DR-0022).
+///
+/// Stored in [`Store::failure_backoffs`]; consulted at the start of every
+/// `regenerate` / `get_or_regenerate` call to suppress redundant upstream
+/// fetch attempts while a short-term backoff window is active.
+#[derive(Debug, Clone, Copy)]
+pub struct FailureRecord {
+    /// Monotonic time at which the failure occurred.
+    pub failed_at: crate::clock::Monotonic,
+    /// How long to suppress re-fetch after this failure. A zero value means
+    /// the record is inert (backoff disabled — see [`Store::failure_backoff_duration`]).
+    pub retry_after: std::time::Duration,
+}
+
 /// In-memory secure key/value cache.
 ///
-/// Two maps, deliberately separate (DR-0014): `entries` holds live secret
-/// **values** (TTL-gated, zeroized on hard expiry), while `definitions` holds
-/// the value-free **definitions** (how to regenerate a value: command + TTL).
-/// A key may appear in either, neither, or both:
+/// Three maps, deliberately separate (DR-0014, DR-0022):
+///
+/// - `entries` holds live secret **values** (TTL-gated, zeroized on hard expiry).
+/// - `definitions` holds the value-free **definitions** (how to regenerate).
+/// - `failure_backoffs` holds per-key failure records (DR-0022): when a fetch
+///   fails, the record blocks re-fetch until `retry_after` elapses. Lifetime
+///   mirrors `definitions`: cleared by [`Store::delete_with_definition`]; survives
+///   value-only [`Store::delete`] and hard-TTL expiry.
+///
+/// A key may appear in any combination of `entries` / `definitions`:
 ///
 /// - value only → a `set` entry with no definition (e.g. a static value).
 /// - definition only → defined but never yet produced (lazy), or its value was
@@ -52,12 +72,66 @@ fn auth_context(key: &str, op: AuthOperation, requester: Option<&[ProcessInfo]>)
 pub struct Store {
     entries: BTreeMap<String, CacheEntry>,
     definitions: BTreeMap<String, Definition>,
+    /// Per-key short-term failure backoff records (DR-0022).
+    ///
+    /// An entry is inserted when `runner.run` fails in `regenerate` /
+    /// `get_or_regenerate`, and removed when the same path succeeds. The
+    /// lifetime of a record follows `definitions`: it is dropped by
+    /// `delete_with_definition` but survives `delete` (value-only) and
+    /// hard-TTL expiry — because the definition is still present and the
+    /// next lazy load would retry the same failing source.
+    ///
+    /// [`Store::set`] never touches this map (DR-0022 §C1): a static value
+    /// injection is not the same event as a lazy-fetch success.
+    failure_backoffs: BTreeMap<String, FailureRecord>,
+    /// How long to suppress re-fetch after a `runner.run` failure (DR-0022).
+    ///
+    /// Set via [`Store::set_failure_backoff`]. The default is [`Duration::ZERO`],
+    /// which disables the feature (no records are written, no backoff is applied).
+    /// The daemon reads this from `[daemon].fetch-failure-backoff` in config and
+    /// injects it at startup; library consumers stay at the zero default.
+    failure_backoff_duration: std::time::Duration,
 }
 
 impl Store {
     /// Create an empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configure the per-failure backoff duration (DR-0022).
+    ///
+    /// After a `runner.run` failure in `regenerate` / `get_or_regenerate`, the
+    /// store suppresses re-fetch attempts for this long. A [`Duration::ZERO`]
+    /// (the default) disables the feature: no records are inserted and no
+    /// backoff is ever returned. The daemon reads this from
+    /// `[daemon].fetch-failure-backoff` and calls this at startup.
+    pub fn set_failure_backoff(&mut self, d: std::time::Duration) {
+        self.failure_backoff_duration = d;
+    }
+
+    /// Remaining backoff duration for `key`, or `None` if no active backoff.
+    ///
+    /// Returns `Some(remaining)` iff a failure record exists *and* the backoff
+    /// window has not yet elapsed. Returns `None` if the key has no failure
+    /// record or the window has already passed. This is value-free metadata
+    /// for `status` / `kv list` and test introspection.
+    pub fn failure_backoff_remaining(
+        &self,
+        key: &str,
+        clock: &impl Clock,
+    ) -> Option<std::time::Duration> {
+        let record = self.failure_backoffs.get(key)?;
+        if record.retry_after == std::time::Duration::ZERO {
+            return None;
+        }
+        let now = clock.now();
+        let elapsed = now.saturating_duration_since(record.failed_at);
+        if elapsed < record.retry_after {
+            Some(record.retry_after - elapsed)
+        } else {
+            None
+        }
     }
 
     /// Insert or replace the entry under `key`, becoming Active now.
@@ -190,6 +264,19 @@ impl Store {
         requester: Option<&[ProcessInfo]>,
         clock: &impl Clock,
     ) -> Result<(), RegenerateOutcome> {
+        // DR-0022: check backoff before touching the entry.
+        // A backoff window from a previous RunFailed suppresses re-fetch.
+        if let Some(remaining) = self.failure_backoff_remaining(key, clock) {
+            tracing::warn!(
+                key,
+                retry_after_secs = remaining.as_secs_f64(),
+                "regenerate: backoff active, suppressing re-fetch"
+            );
+            return Err(RegenerateOutcome::Backoff {
+                retry_after: remaining,
+            });
+        }
+
         let entry = self
             .entries
             .get_mut(key)
@@ -208,16 +295,33 @@ impl Store {
         let ttl = entry.ttl();
         let source = entry.source().clone();
 
-        // 2. Re-run upstream. On failure nothing is mutated.
-        let value = runner
-            .run(&argv, cwd.as_deref(), &env)
-            .map_err(RegenerateOutcome::RunFailed)?;
+        // 2. Re-run upstream. On failure record backoff if duration > 0.
+        let value = runner.run(&argv, cwd.as_deref(), &env).map_err(|e| {
+            if self.failure_backoff_duration > std::time::Duration::ZERO {
+                tracing::warn!(
+                    key,
+                    backoff_secs = self.failure_backoff_duration.as_secs_f64(),
+                    "regenerate: runner failed, inserting failure backoff"
+                );
+                self.failure_backoffs.insert(
+                    key.to_string(),
+                    FailureRecord {
+                        failed_at: clock.now(),
+                        retry_after: self.failure_backoff_duration,
+                    },
+                );
+            }
+            RegenerateOutcome::RunFailed(e)
+        })?;
 
         // 3. Re-authenticate. `value` is dropped (zeroized) on the error path.
+        // TODO(Q7): auth failures are not currently backoff-tracked; see DR-0022 Open Question Q7.
         auth.authenticate(&auth_context(key, AuthOperation::Regenerate, requester))
             .map_err(RegenerateOutcome::AuthFailed)?;
 
         // 4. Replace with a fresh Active entry (overwrite zeroizes the old one).
+        // On success, clear any existing backoff record (DR-0022).
+        self.failure_backoffs.remove(key);
         self.entries
             .insert(key.to_string(), CacheEntry::new(source, value, ttl, clock));
         Ok(())
@@ -477,6 +581,18 @@ impl Store {
             return Err(RegenerateDefOutcome::ValueResident);
         }
 
+        // DR-0022: check backoff before making an upstream call.
+        if let Some(remaining) = self.failure_backoff_remaining(key, clock) {
+            tracing::warn!(
+                key,
+                retry_after_secs = remaining.as_secs_f64(),
+                "get_or_regenerate: backoff active, suppressing re-fetch"
+            );
+            return Err(RegenerateDefOutcome::Backoff {
+                retry_after: remaining,
+            });
+        }
+
         let (argv, cwd, env) = match definition.source() {
             ValueSource::Command { argv, cwd, env } => (argv.clone(), cwd.clone(), env.clone()),
             // Definitions are command-only by construction (`define` rejects
@@ -486,16 +602,33 @@ impl Store {
         let source = definition.source().clone();
         let ttl = definition.ttl();
 
-        // 1. Re-run upstream. On failure nothing is mutated.
-        let value = runner
-            .run(&argv, cwd.as_deref(), &env)
-            .map_err(RegenerateDefOutcome::RunFailed)?;
+        // 1. Re-run upstream. On failure record backoff if duration > 0.
+        let value = runner.run(&argv, cwd.as_deref(), &env).map_err(|e| {
+            if self.failure_backoff_duration > std::time::Duration::ZERO {
+                tracing::warn!(
+                    key,
+                    backoff_secs = self.failure_backoff_duration.as_secs_f64(),
+                    "get_or_regenerate: runner failed, inserting failure backoff"
+                );
+                self.failure_backoffs.insert(
+                    key.to_string(),
+                    FailureRecord {
+                        failed_at: clock.now(),
+                        retry_after: self.failure_backoff_duration,
+                    },
+                );
+            }
+            RegenerateDefOutcome::RunFailed(e)
+        })?;
 
         // 2. Re-authenticate. `value` is dropped (zeroized) on the error path.
+        // TODO(Q7): auth failures are not currently backoff-tracked; see DR-0022 Open Question Q7.
         auth.authenticate(&auth_context(key, AuthOperation::Regenerate, requester))
             .map_err(RegenerateDefOutcome::AuthFailed)?;
 
         // 3. Install a fresh Active entry (overwriting any destroyed husk).
+        // On success, clear any existing backoff record (DR-0022).
+        self.failure_backoffs.remove(key);
         self.entries
             .insert(key.to_string(), CacheEntry::new(source, value, ttl, clock));
         Ok(())
@@ -508,9 +641,15 @@ impl Store {
     /// drops only the value (the definition survives so the next get
     /// regenerates), whereas this forgets the key entirely so it will *not*
     /// regenerate. The removed value entry is dropped (zeroizing its secret).
+    ///
+    /// Also removes the failure-backoff record for `key` (DR-0022): the
+    /// backoff lifetime mirrors the definition lifetime — if there is no
+    /// definition, there is no lazy-fetch path, so the backoff is meaningless.
     pub fn delete_with_definition(&mut self, key: &str) -> bool {
         let had_value = self.entries.remove(key).is_some();
         let had_def = self.definitions.remove(key).is_some();
+        // DR-0022: failure backoff lifetime = definition lifetime.
+        self.failure_backoffs.remove(key);
         had_value || had_def
     }
 }
@@ -582,6 +721,13 @@ pub enum RegenerateOutcome {
     /// Re-authentication was denied or unavailable; the fetched value was
     /// discarded (zeroized) and the stored entry is unchanged.
     AuthFailed(AuthError),
+    /// A previous fetch failure is within its backoff window; no upstream call
+    /// was made. Callers should wait at least `retry_after` before retrying
+    /// (DR-0022). The caller is told the *remaining* window, not the original.
+    Backoff {
+        /// Remaining duration of the backoff window.
+        retry_after: std::time::Duration,
+    },
 }
 
 impl std::fmt::Display for RegenerateOutcome {
@@ -596,6 +742,11 @@ impl std::fmt::Display for RegenerateOutcome {
             }
             RegenerateOutcome::RunFailed(e) => write!(f, "regeneration command failed: {e}"),
             RegenerateOutcome::AuthFailed(e) => write!(f, "regeneration blocked: {e}"),
+            RegenerateOutcome::Backoff { retry_after } => write!(
+                f,
+                "backoff active; retry after {:.1}s",
+                retry_after.as_secs_f64()
+            ),
         }
     }
 }
@@ -607,6 +758,13 @@ impl std::error::Error for RegenerateOutcome {
             RegenerateOutcome::AuthFailed(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+impl RegenerateOutcome {
+    /// Whether this outcome represents a backoff (no upstream call was made).
+    pub fn is_backoff(&self) -> bool {
+        matches!(self, RegenerateOutcome::Backoff { .. })
     }
 }
 
@@ -659,6 +817,13 @@ pub enum RegenerateDefOutcome {
     /// Re-authentication was denied or unavailable; the fetched value was
     /// discarded (zeroized) and the store is unchanged.
     AuthFailed(AuthError),
+    /// A previous fetch failure is within its backoff window; no upstream call
+    /// was made. The caller should wait at least `retry_after` before retrying
+    /// (DR-0022). Mirrors [`RegenerateOutcome::Backoff`].
+    Backoff {
+        /// Remaining duration of the backoff window.
+        retry_after: std::time::Duration,
+    },
 }
 
 impl std::fmt::Display for RegenerateDefOutcome {
@@ -675,6 +840,11 @@ impl std::fmt::Display for RegenerateDefOutcome {
                 write!(f, "definition command failed: {e}")
             }
             RegenerateDefOutcome::AuthFailed(e) => write!(f, "regeneration blocked: {e}"),
+            RegenerateDefOutcome::Backoff { retry_after } => write!(
+                f,
+                "backoff active; retry after {:.1}s",
+                retry_after.as_secs_f64()
+            ),
         }
     }
 }
@@ -686,6 +856,13 @@ impl std::error::Error for RegenerateDefOutcome {
             RegenerateDefOutcome::AuthFailed(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+impl RegenerateDefOutcome {
+    /// Whether this outcome represents a backoff (no upstream call was made).
+    pub fn is_backoff(&self) -> bool {
+        matches!(self, RegenerateDefOutcome::Backoff { .. })
     }
 }
 
@@ -1821,5 +1998,285 @@ mod tests {
             .unwrap();
         assert_eq!(runner.runs(), 1);
         assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"regenerated");
+    }
+
+    // ---- fetch failure backoff (DR-0022 A-3b) ----
+
+    const BACKOFF: Duration = Duration::from_secs(5);
+
+    /// Helper: build a Store with backoff enabled (duration = BACKOFF).
+    fn store_with_backoff() -> Store {
+        let mut s = Store::new();
+        s.set_failure_backoff(BACKOFF);
+        s
+    }
+
+    /// 1. 回帰: failure_backoff_duration = 0 のとき従来通り RunFailed が返る (backoff 機能なし)
+    #[test]
+    fn backoff_zero_duration_gives_run_failed_regression() {
+        let clock = FakeClock::new();
+        let mut s = Store::new(); // default failure_backoff_duration = Duration::ZERO
+        cmd_entry(&mut s, "K", &clock);
+        clock.advance(HARD);
+        let auth = RecordingAuthenticator::allowing();
+        let err = s
+            .regenerate("K", &FailingRunner, &auth, None, &clock)
+            .unwrap_err();
+        // With duration = 0, we get RunFailed (no backoff record written because retry_after = 0).
+        assert_eq!(err, RegenerateOutcome::RunFailed(RunError::EmptyOutput));
+        assert_eq!(auth.call_count(), 0);
+    }
+
+    /// 2. 新仕様: fake op exit 1 直後 (clock 進めず) の regenerate は Backoff を返し、
+    ///    fake op は再実行されない
+    #[test]
+    fn backoff_active_after_first_failure_blocks_rerun() {
+        let clock = FakeClock::new();
+        let mut s = store_with_backoff();
+        cmd_entry(&mut s, "K", &clock);
+        clock.advance(HARD);
+
+        // 1st call: FailingRunner records the failure → backoff inserted
+        let err = s
+            .regenerate("K", &FailingRunner, &AllowAll, None, &clock)
+            .unwrap_err();
+        assert_eq!(err, RegenerateOutcome::RunFailed(RunError::EmptyOutput));
+
+        // 2nd call (clock unchanged): should return Backoff without re-running the runner
+        let counting = CountingRunner::new(b"v");
+        let err2 = s
+            .regenerate("K", &counting, &AllowAll, None, &clock)
+            .unwrap_err();
+        match err2 {
+            RegenerateOutcome::Backoff { retry_after } => {
+                assert!(
+                    retry_after > Duration::ZERO,
+                    "retry_after should be positive"
+                );
+                assert!(
+                    retry_after <= BACKOFF,
+                    "retry_after should not exceed backoff period"
+                );
+            }
+            other => panic!("expected Backoff, got {other:?}"),
+        }
+        assert_eq!(
+            counting.runs(),
+            0,
+            "runner must NOT be called during backoff"
+        );
+    }
+
+    /// 3. backoff 期間経過後に再呼び出すと fake op が再実行される
+    #[test]
+    fn backoff_expires_after_duration_allows_rerun() {
+        let clock = FakeClock::new();
+        let mut s = store_with_backoff();
+        cmd_entry(&mut s, "K", &clock);
+        clock.advance(HARD);
+
+        // Trigger failure → backoff
+        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+
+        // Advance past the backoff window
+        clock.advance(BACKOFF + Duration::from_millis(1));
+
+        // Now the runner should be called again
+        let counting = CountingRunner::new(b"fresh");
+        s.regenerate("K", &counting, &AllowAll, None, &clock)
+            .unwrap();
+        assert_eq!(
+            counting.runs(),
+            1,
+            "runner must be called after backoff expires"
+        );
+        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"fresh");
+    }
+
+    /// 4. backoff 中に store.set を直接呼び出しても failure_backoffs は残る
+    ///    (set は failure_backoffs を触らない)
+    #[test]
+    fn store_set_does_not_clear_failure_backoffs() {
+        let clock = FakeClock::new();
+        let mut s = store_with_backoff();
+        cmd_entry(&mut s, "K", &clock);
+        clock.advance(HARD);
+
+        // Trigger failure → backoff
+        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+
+        // Direct store.set (static value injection via adapter) — backoff should remain
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("injected"),
+            ttl(),
+            &clock,
+        );
+        // The value is there now, but if we tried to regenerate (hypothetically), the
+        // backoff record should still be present.
+        // We verify by checking failure_backoff_remaining returns Some.
+        let remaining = s.failure_backoff_remaining("K", &clock);
+        assert!(
+            remaining.is_some(),
+            "failure_backoffs must survive a store.set (set is not a regenerate success)"
+        );
+    }
+
+    /// 5. failure_backoff_duration = 0s で従来動作 (= backoff 機能なし)
+    ///    (テスト 1 と同等だが、明示的に set_failure_backoff(0) を確認)
+    #[test]
+    fn set_failure_backoff_zero_disables_feature() {
+        let clock = FakeClock::new();
+        let mut s = Store::new();
+        s.set_failure_backoff(Duration::ZERO); // explicit 0
+        cmd_entry(&mut s, "K", &clock);
+        clock.advance(HARD);
+
+        // 1st failure: should return RunFailed, not record any backoff
+        let err = s
+            .regenerate("K", &FailingRunner, &AllowAll, None, &clock)
+            .unwrap_err();
+        assert_eq!(err, RegenerateOutcome::RunFailed(RunError::EmptyOutput));
+
+        // 2nd call immediately after (clock unchanged): still RunFailed, never Backoff
+        let err2 = s
+            .regenerate("K", &FailingRunner, &AllowAll, None, &clock)
+            .unwrap_err();
+        match err2 {
+            RegenerateOutcome::Backoff { .. } => {
+                panic!("Backoff must not be returned when failure_backoff_duration = 0")
+            }
+            RegenerateOutcome::RunFailed(_) => {} // correct: no backoff guard, runner is called
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    /// 6. 並行レース: 同一 key に対する 2 回の連続 regenerate で
+    ///    1 個目が失敗した後、2 個目は backoff を返す
+    #[test]
+    fn sequential_regenerate_second_sees_backoff_after_first_fails() {
+        let clock = FakeClock::new();
+        let mut s = store_with_backoff();
+        cmd_entry(&mut s, "K", &clock);
+        clock.advance(HARD);
+
+        // 1st: failure
+        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+
+        // 2nd (same Mutex guard context in real use; here sequential): backoff
+        let counting = CountingRunner::new(b"v");
+        let err2 = s
+            .regenerate("K", &counting, &AllowAll, None, &clock)
+            .unwrap_err();
+        assert!(
+            matches!(err2, RegenerateOutcome::Backoff { .. }),
+            "second call must see backoff, got {err2:?}"
+        );
+        assert_eq!(counting.runs(), 0);
+    }
+
+    /// 7. get_or_regenerate (lazy 経路) でも Backoff が返る
+    #[test]
+    fn get_or_regenerate_returns_backoff_after_failure() {
+        let clock = FakeClock::new();
+        let mut s = store_with_backoff();
+        s.define("K", cmd_source(), ttl()).unwrap();
+
+        // 1st call: fetch fails → backoff inserted
+        let err = s
+            .get_or_regenerate("K", &FailingRunner, &AllowAll, None, &clock)
+            .unwrap_err();
+        assert_eq!(err, RegenerateDefOutcome::RunFailed(RunError::EmptyOutput));
+
+        // 2nd call (clock unchanged): Backoff
+        let counting = CountingRunner::new(b"v");
+        let err2 = s
+            .get_or_regenerate("K", &counting, &AllowAll, None, &clock)
+            .unwrap_err();
+        assert!(
+            matches!(err2, RegenerateDefOutcome::Backoff { .. }),
+            "lazy path must also return Backoff, got {err2:?}"
+        );
+        assert_eq!(counting.runs(), 0);
+    }
+
+    /// 8a. kv.del --with-define (delete_with_definition) で failure_backoffs も消える
+    #[test]
+    fn delete_with_definition_clears_failure_backoffs() {
+        let clock = FakeClock::new();
+        let mut s = store_with_backoff();
+        s.define("K", cmd_source(), ttl()).unwrap();
+
+        // Trigger failure → backoff
+        let _ = s.get_or_regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+
+        // Delete with definition
+        assert!(s.delete_with_definition("K"));
+        assert!(!s.is_defined("K"));
+
+        // failure_backoffs should be cleared
+        let remaining = s.failure_backoff_remaining("K", &clock);
+        assert!(
+            remaining.is_none(),
+            "failure_backoffs must be cleared by delete_with_definition"
+        );
+    }
+
+    /// 8b. kv.del (値のみ削除) では failure_backoffs は残る
+    #[test]
+    fn value_only_delete_keeps_failure_backoffs() {
+        let clock = FakeClock::new();
+        let mut s = store_with_backoff();
+        s.define("K", cmd_source(), ttl()).unwrap();
+
+        // Trigger failure → backoff
+        let _ = s.get_or_regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+
+        // Value-only delete (definition survives)
+        s.delete("K");
+        assert!(!s.has_value("K"), "value removed");
+        assert!(s.is_defined("K"), "definition survives");
+
+        // failure_backoffs should remain (next lazy load must still see backoff)
+        let remaining = s.failure_backoff_remaining("K", &clock);
+        assert!(
+            remaining.is_some(),
+            "failure_backoffs must survive a value-only delete"
+        );
+    }
+
+    /// 8c. hard-ttl 切れで entry drop しても failure_backoffs は残る
+    #[test]
+    fn hard_expiry_drop_keeps_failure_backoffs() {
+        let clock = FakeClock::new();
+        let mut s = store_with_backoff();
+        s.define("K", cmd_source(), ttl()).unwrap();
+
+        // First produce a value so we have something to expire
+        let counting = CountingRunner::new(b"v");
+        s.get_or_regenerate("K", &counting, &AllowAll, None, &clock)
+            .unwrap();
+
+        // Trigger a failure while in HardExpired state to record backoff
+        clock.advance(HARD);
+        assert_eq!(s.state_of("K", &clock), Some(EntryState::HardExpired));
+        let _ = s.get_or_regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+
+        // Verify backoff is present
+        assert!(s.failure_backoff_remaining("K", &clock).is_some());
+
+        // Now the hard-expired entry is "dropped" conceptually (it stays in map as HardExpired
+        // but the key is still defined). The key point: failure_backoffs must remain.
+        // We verify by trying to regenerate with a good runner and expecting Backoff:
+        let counting2 = CountingRunner::new(b"v2");
+        let err = s
+            .get_or_regenerate("K", &counting2, &AllowAll, None, &clock)
+            .unwrap_err();
+        assert!(
+            matches!(err, RegenerateDefOutcome::Backoff { .. }),
+            "backoff must survive hard-expiry drop, got {err:?}"
+        );
+        assert_eq!(counting2.runs(), 0);
     }
 }

@@ -174,6 +174,11 @@ where
         let source = store
             .definition_of(&name)
             .and_then(|d| crate::protocol::wire::source_meta_display(d.source_meta()));
+        // Remaining backoff seconds (DR-0022): how long until re-fetch is allowed.
+        // Reported as seconds (ceiling), or None when no active backoff.
+        let backoff_until_secs = store
+            .failure_backoff_remaining(&name, ctx.clock)
+            .map(|d| d.as_secs());
         entries.push(EntryInfo {
             name,
             state,
@@ -183,6 +188,7 @@ where
             pin_remaining_secs,
             value_type,
             source,
+            backoff_until_secs,
         });
     }
     Response::status(
@@ -413,6 +419,18 @@ where
                 Err(RegenerateOutcome::AuthFailed(e)) => {
                     Response::error(ErrorKind::AuthFailed, e.to_string())
                 }
+                Err(RegenerateOutcome::Backoff { retry_after }) => {
+                    // A previous fetch failure is within its backoff window (DR-0022).
+                    // Report UpstreamFailed so the client knows the upstream is unhealthy;
+                    // the retry_after hint is included in the message.
+                    Response::error(
+                        ErrorKind::UpstreamFailed,
+                        format!(
+                            "backoff active after previous fetch failure; retry after {:.1}s",
+                            retry_after.as_secs_f64()
+                        ),
+                    )
+                }
             }
         }
     }
@@ -516,6 +534,16 @@ where
         }
         Err(RegenerateDefOutcome::AuthFailed(e)) => {
             Response::error(ErrorKind::AuthFailed, e.to_string())
+        }
+        Err(RegenerateDefOutcome::Backoff { retry_after }) => {
+            // A previous fetch failure is within its backoff window (DR-0022).
+            Response::error(
+                ErrorKind::UpstreamFailed,
+                format!(
+                    "backoff active after previous fetch failure; retry after {:.1}s",
+                    retry_after.as_secs_f64()
+                ),
+            )
         }
     }
 }

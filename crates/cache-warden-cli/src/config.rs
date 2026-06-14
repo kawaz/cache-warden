@@ -378,7 +378,7 @@ pub struct AuthsockSocket {
 }
 
 /// `[daemon]` section.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Control socket path. Tilde and `$VAR` are **not** expanded except a
@@ -409,6 +409,36 @@ pub struct DaemonConfig {
     /// warning at startup so the weakened state is never silent.
     #[serde(default, rename = "allow-debug-attach")]
     pub allow_debug_attach: bool,
+    /// Short-term backoff duration after a `runner.run` failure (DR-0022).
+    ///
+    /// After any upstream fetch fails, the daemon suppresses re-fetch attempts
+    /// for this long. This prevents op from being hammered with TouchID prompts
+    /// when the SSH client (or another caller) mechanically retries. Default
+    /// `"5s"` (≈ TouchID reaction time; see DR-0022 §backoff period). Set to
+    /// `"0s"` to disable the feature entirely.
+    ///
+    /// Parsed via [`parse_duration`] at daemon startup; validated eagerly in
+    /// [`Config::parse`].
+    #[serde(
+        default = "default_fetch_failure_backoff",
+        rename = "fetch-failure-backoff"
+    )]
+    pub fetch_failure_backoff: String,
+}
+
+fn default_fetch_failure_backoff() -> String {
+    "5s".to_string()
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            socket: None,
+            persist_definitions: false,
+            allow_debug_attach: false,
+            fetch_failure_backoff: default_fetch_failure_backoff(),
+        }
+    }
 }
 
 /// `[auth]` section (typed since DR-0018 §3).
@@ -1055,7 +1085,21 @@ impl Config {
                 }
             }
         }
+        // Validate `[daemon].fetch-failure-backoff` eagerly (DR-0022).
+        parse_duration(&cfg.daemon.fetch_failure_backoff).map_err(|e| {
+            ConfigParseError::Content(ConfigError::new(format!(
+                "[daemon]: fetch-failure-backoff: {e}"
+            )))
+        })?;
         Ok(cfg)
+    }
+
+    /// The parsed `[daemon].fetch-failure-backoff` duration (DR-0022).
+    ///
+    /// Pre-validated by [`Config::parse`], so this cannot fail after parsing.
+    pub fn fetch_failure_backoff(&self) -> std::time::Duration {
+        parse_duration(&self.daemon.fetch_failure_backoff)
+            .unwrap_or(std::time::Duration::from_secs(5))
     }
 
     /// The resolved re-authentication command argv, if any (DR-0018 §3:

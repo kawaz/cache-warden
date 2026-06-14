@@ -983,12 +983,16 @@ where
             match store.regenerate(key, runner, auth, requester, clock) {
                 Ok(()) => true,
                 // A static hard-expired key cannot regenerate; not signable.
+                // DR-0022: Backoff means a previous fetch failed recently; treat as
+                // non-signable (agent refused). The ssh client side retries via
+                // ConnectionAttempts / ssh-retry wrappers after the backoff elapses.
                 Err(
                     RegenerateOutcome::NotFound
                     | RegenerateOutcome::NotRegenerable
                     | RegenerateOutcome::NotHardExpired
                     | RegenerateOutcome::RunFailed(_)
-                    | RegenerateOutcome::AuthFailed(_),
+                    | RegenerateOutcome::AuthFailed(_)
+                    | RegenerateOutcome::Backoff { .. },
                 ) => false,
             }
         }
