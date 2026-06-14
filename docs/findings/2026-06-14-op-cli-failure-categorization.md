@@ -5,6 +5,11 @@ DR-0022 案 C の前提調査 (A-3c)。op の exit code / stderr で失敗種別
 
 調査環境: macOS 25.5.0, op 2.34.1 (Homebrew), cache-warden main ブランチ (2026-06-14)。
 
+> **重要訂正 (2026-06-14)**: 本調査の §検証の詳細 で「在席不要」と分類した op コマンド (`op item get nonexistent_xyz` 等の失敗するはずのコマンド) は、**実機では item 不在判定の前に biometric session 確立用の TouchID が要求されていた**。Sonnet 調査中、kawaz が在席で reflective に全許可していたため Sonnet 側からは「成功 (= EXIT:1 で stderr 取れた)」に見え、TouchID 連発が調査結果に反映されなかった。
+> - 教訓: `op --version` / `op --help` 以外の op コマンドは **session 確立で TouchID 出る可能性あり**、「在席不要」と短絡判断しない
+> - 観測自体は valid (= exit code と stderr のマトリクスは正しい)、ただし「在席不要範囲」の表記は誤り
+> - 詳細: memory `feedback-op-cli-touchid-requirement.md`
+
 ---
 
 ## 判明した事実
