@@ -62,6 +62,7 @@
 //! are implemented (see [`SecretBytes`] and [`CommandRunner::with_timeout`]).
 
 mod auth;
+mod capability;
 mod child_process;
 mod clock;
 mod definition;
@@ -71,11 +72,14 @@ mod process;
 mod secret;
 mod source;
 mod store;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_helpers;
 
 pub use auth::{
     AllowAll, AuthContext, AuthError, AuthOperation, Authenticator, CommandAuthenticator, DenyAll,
     RecordingAuthenticator,
 };
+pub use capability::{CapError, Capability};
 pub use child_process::spawn_with_clean_signal_mask;
 pub use clock::{Clock, FakeClock, Monotonic, SystemClock};
 pub use definition::{DefineError, Definition};
@@ -86,5 +90,5 @@ pub use secret::SecretBytes;
 pub use source::{CommandRunner, RunError, SourceRunner, TrailingNewline, ValueSource};
 pub use store::{
     ExtendAuthOutcome, ExtendOutcome, FailureRecord, PinAuthOutcome, RegenerateDefOutcome,
-    RegenerateOutcome, Store,
+    RegenerateOutcome, Store, StoreBuilder, StoreBundle,
 };

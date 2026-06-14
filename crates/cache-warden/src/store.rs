@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 
 use crate::auth::{AuthContext, AuthError, AuthOperation, Authenticator};
+use crate::capability::{CapError, Capability};
 use crate::clock::{Clock, Monotonic};
 use crate::definition::{DefineError, Definition};
 use crate::entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl};
@@ -68,7 +69,12 @@ pub struct FailureRecord {
 /// - definition only → defined but never yet produced (lazy), or its value was
 ///   `delete`d (the definition survives so the next get can regenerate it).
 /// - both → a defined key whose value has been produced and is resident.
-#[derive(Debug, Default)]
+///
+/// Capability gate (DR-0024): all secret-handling methods require a [`Capability`]
+/// token obtained from the [`StoreBuilder`] that created this store. Callers
+/// holding a different token (or no token) receive [`CapError::KeyMismatch`].
+/// Use [`Store::builder`] to construct a store and obtain matching capabilities.
+#[derive(Debug)]
 pub struct Store {
     entries: BTreeMap<String, CacheEntry>,
     definitions: BTreeMap<String, Definition>,
@@ -86,28 +92,118 @@ pub struct Store {
     failure_backoffs: BTreeMap<String, FailureRecord>,
     /// How long to suppress re-fetch after a `runner.run` failure (DR-0022).
     ///
-    /// Set via [`Store::set_failure_backoff`]. The default is [`Duration::ZERO`],
-    /// which disables the feature (no records are written, no backoff is applied).
-    /// The daemon reads this from `[daemon].fetch-failure-backoff` in config and
-    /// injects it at startup; library consumers stay at the zero default.
+    /// Configured via [`StoreBuilder::failure_backoff`]. The default is
+    /// [`Duration::ZERO`], which disables the feature (no records are written,
+    /// no backoff is applied). The daemon reads this from
+    /// `[daemon].fetch-failure-backoff` and passes it through the builder.
+    failure_backoff_duration: std::time::Duration,
+    /// Process-local capability token for this store (DR-0024).
+    ///
+    /// Every secret-handling method checks the caller's [`Capability`] token
+    /// against this value. A mismatch returns [`CapError::KeyMismatch`]
+    /// immediately, before any backoff, lifecycle, runner, or auth logic runs.
+    access_token: u128,
+}
+
+/// Outcome of constructing a [`Store`] via [`StoreBuilder::build`].
+///
+/// Bundles the store with three separate [`Capability`] tokens — one per
+/// adapter role (control, authsock, otp). All three tokens are identical in
+/// this implementation (they share the same per-process random token); separate
+/// fields anticipate future role-based differentiation without breaking callers.
+pub struct StoreBundle {
+    /// The constructed store.
+    pub store: Store,
+    /// Capability for the control adapter (kv set/get/delete, list, define…).
+    pub control_cap: Capability,
+    /// Capability for the authsock adapter (get, extend, regenerate).
+    pub authsock_cap: Capability,
+    /// Capability for the OTP adapter (get, set).
+    pub otp_cap: Capability,
+}
+
+/// Builder for [`Store`], producing a [`StoreBundle`] that includes the
+/// matching [`Capability`] tokens (DR-0024).
+///
+/// Prefer [`Store::builder`] as the entry point.
+pub struct StoreBuilder {
     failure_backoff_duration: std::time::Duration,
 }
 
-impl Store {
-    /// Create an empty store.
+impl StoreBuilder {
+    /// Create a builder with default settings (backoff disabled).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            failure_backoff_duration: std::time::Duration::ZERO,
+        }
     }
 
-    /// Configure the per-failure backoff duration (DR-0022).
+    /// Set the per-failure backoff duration (DR-0022).
     ///
     /// After a `runner.run` failure in `regenerate` / `get_or_regenerate`, the
     /// store suppresses re-fetch attempts for this long. A [`Duration::ZERO`]
-    /// (the default) disables the feature: no records are inserted and no
-    /// backoff is ever returned. The daemon reads this from
-    /// `[daemon].fetch-failure-backoff` and calls this at startup.
-    pub fn set_failure_backoff(&mut self, d: std::time::Duration) {
+    /// (the default) disables the feature. The daemon reads this from
+    /// `[daemon].fetch-failure-backoff` in config.
+    pub fn failure_backoff(mut self, d: std::time::Duration) -> Self {
         self.failure_backoff_duration = d;
+        self
+    }
+
+    /// Build the store and generate a fresh per-process capability token.
+    ///
+    /// Returns a [`StoreBundle`] containing the store and three [`Capability`]
+    /// tokens (control, authsock, otp). Pass the appropriate token to each
+    /// secret-handling method of the store.
+    pub fn build(self) -> StoreBundle {
+        let token = crate::capability::fresh_process_local_token();
+        let cap = Capability { token };
+        StoreBundle {
+            store: Store::new_with_token(token, self.failure_backoff_duration),
+            control_cap: cap.clone(),
+            authsock_cap: cap.clone(),
+            otp_cap: cap,
+        }
+    }
+}
+
+impl Default for StoreBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Store {
+    /// Create a new [`StoreBuilder`] — the canonical entry point for constructing
+    /// a store and obtaining its matching [`Capability`] tokens (DR-0024).
+    pub fn builder() -> StoreBuilder {
+        StoreBuilder::new()
+    }
+
+    /// Construct a store with a pre-issued token and backoff duration.
+    ///
+    /// This is called exclusively by [`StoreBuilder::build`]; it is not
+    /// `pub` to prevent a caller from supplying an arbitrary token and
+    /// bypassing the capability gate.
+    pub(crate) fn new_with_token(token: u128, failure_backoff_duration: std::time::Duration) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            definitions: BTreeMap::new(),
+            failure_backoffs: BTreeMap::new(),
+            failure_backoff_duration,
+            access_token: token,
+        }
+    }
+
+    /// Check that `cap` matches this store's access token (DR-0024).
+    ///
+    /// Cap check runs before backoff, lifecycle, runner, and auth so that an
+    /// unauthorized caller cannot probe any observable state of the store.
+    fn check_cap(&self, cap: &Capability) -> Result<(), CapError> {
+        if cap.token == self.access_token {
+            Ok(())
+        } else {
+            Err(CapError::KeyMismatch)
+        }
     }
 
     /// Remaining backoff duration for `key`, or `None` if no active backoff.
@@ -141,26 +237,41 @@ impl Store {
     /// a value *type* (e.g. otp) lives on the key's definition (DR-0016), so a
     /// preloaded typed value is `set` here while its type rides on the
     /// definition registered separately.
+    ///
+    /// Cap check (DR-0024) runs first: returns [`CapError::KeyMismatch`] if
+    /// `cap` does not match this store's token.
     pub fn set(
         &mut self,
         key: impl Into<String>,
         source: ValueSource,
         value: SecretBytes,
         ttl: Ttl,
+        cap: &Capability,
         clock: &impl Clock,
-    ) {
+    ) -> Result<(), CapError> {
+        self.check_cap(cap)?;
         let entry = CacheEntry::new(source, value, ttl, clock);
         // Inserting overwrites the old entry; the displaced CacheEntry is dropped
         // here, zeroizing its secret.
         self.entries.insert(key.into(), entry);
+        Ok(())
     }
 
     /// Borrow the secret under `key` iff it exists and is currently Active.
     ///
     /// Evaluating may zeroize a hard-expired value as a side effect. Returns
     /// `None` if the key is absent, soft-expired, or hard-expired.
-    pub fn get(&mut self, key: &str, clock: &impl Clock) -> Option<&SecretBytes> {
-        self.entries.get_mut(key)?.get(clock)
+    ///
+    /// Cap check (DR-0024) runs first: returns `Err(CapError::KeyMismatch)` if
+    /// `cap` does not match. On success returns `Ok(None)` or `Ok(Some(&secret))`.
+    pub fn get(
+        &mut self,
+        key: &str,
+        cap: &Capability,
+        clock: &impl Clock,
+    ) -> Result<Option<&SecretBytes>, CapError> {
+        self.check_cap(cap)?;
+        Ok(self.entries.get_mut(key).and_then(|e| e.get(clock)))
     }
 
     /// The current lifecycle state of `key`, or `None` if the key is absent.
@@ -174,7 +285,15 @@ impl Store {
     ///
     /// Returns `Err(ExtendOutcome::NotFound)` if the key is absent, or
     /// `Err(ExtendOutcome::HardExpired)` if the value is already destroyed.
-    pub fn extend(&mut self, key: &str, clock: &impl Clock) -> Result<(), ExtendOutcome> {
+    /// Returns `Err(ExtendOutcome::CapMismatch)` if the capability does not
+    /// match this store (DR-0024 cap check runs first).
+    pub fn extend(
+        &mut self,
+        key: &str,
+        cap: &Capability,
+        clock: &impl Clock,
+    ) -> Result<(), ExtendOutcome> {
+        self.check_cap(cap).map_err(|_| ExtendOutcome::CapMismatch)?;
         match self.entries.get_mut(key) {
             None => Err(ExtendOutcome::NotFound),
             Some(entry) => entry
@@ -205,8 +324,11 @@ impl Store {
         key: &str,
         auth: &(impl Authenticator + ?Sized),
         requester: Option<&[ProcessInfo]>,
+        cap: &Capability,
         clock: &impl Clock,
     ) -> Result<(), ExtendAuthOutcome> {
+        self.check_cap(cap)
+            .map_err(|_| ExtendAuthOutcome::CapMismatch)?;
         let entry = self
             .entries
             .get_mut(key)
@@ -262,8 +384,12 @@ impl Store {
         runner: &impl SourceRunner,
         auth: &(impl Authenticator + ?Sized),
         requester: Option<&[ProcessInfo]>,
+        cap: &Capability,
         clock: &impl Clock,
     ) -> Result<(), RegenerateOutcome> {
+        // DR-0024: cap check runs before backoff, entry lookup, runner, and auth.
+        self.check_cap(cap)
+            .map_err(|_| RegenerateOutcome::CapMismatch)?;
         // DR-0022: check backoff before touching the entry.
         // A backoff window from a previous RunFailed suppresses re-fetch.
         if let Some(remaining) = self.failure_backoff_remaining(key, clock) {
@@ -355,8 +481,11 @@ impl Store {
         deadline: Monotonic,
         auth: &(impl Authenticator + ?Sized),
         requester: Option<&[ProcessInfo]>,
+        cap: &Capability,
         clock: &impl Clock,
     ) -> Result<(), PinAuthOutcome> {
+        self.check_cap(cap)
+            .map_err(|_| PinAuthOutcome::CapMismatch)?;
         let entry = self.entries.get_mut(key).ok_or(PinAuthOutcome::NotFound)?;
         // Reject a destroyed value before bothering the user for biometrics.
         if entry.state(clock) == EntryState::HardExpired {
@@ -371,17 +500,22 @@ impl Store {
 
     /// Drop any active pin on `key`, returning it to normal TTL evaluation.
     ///
-    /// Returns `false` if the key is absent. Unlike [`Store::pin_authenticated`]
-    /// this needs **no** authentication: removing a reprieve only moves the entry
-    /// back toward expiry (the safe direction), so there is nothing to gate.
-    pub fn unpin(&mut self, key: &str) -> bool {
-        match self.entries.get_mut(key) {
+    /// Returns `Ok(false)` if the key is absent, `Ok(true)` if unpinned.
+    /// Returns `Err(CapError::KeyMismatch)` if `cap` does not match.
+    ///
+    /// Unlike [`Store::pin_authenticated`] this needs no *user* authentication
+    /// (removing a reprieve only moves the entry back toward expiry, the safe
+    /// direction), but it still requires a valid [`Capability`] so that an
+    /// unauthorized caller cannot disturb pin state (DR-0024).
+    pub fn unpin(&mut self, key: &str, cap: &Capability) -> Result<bool, CapError> {
+        self.check_cap(cap)?;
+        Ok(match self.entries.get_mut(key) {
             Some(entry) => {
                 entry.unpin();
                 true
             }
             None => false,
-        }
+        })
     }
 
     /// The active pin deadline for `key`, or `None` if absent or not pinned.
@@ -393,11 +527,13 @@ impl Store {
         self.entries.get(key).and_then(CacheEntry::pin_deadline)
     }
 
-    /// Remove `key`, returning `true` if it was present.
+    /// Remove `key`, returning `Ok(true)` if it was present, `Ok(false)` if absent.
     ///
     /// The removed entry is dropped (zeroizing its secret).
-    pub fn delete(&mut self, key: &str) -> bool {
-        self.entries.remove(key).is_some()
+    /// Returns `Err(CapError::KeyMismatch)` if `cap` does not match (DR-0024).
+    pub fn delete(&mut self, key: &str, cap: &Capability) -> Result<bool, CapError> {
+        self.check_cap(cap)?;
+        Ok(self.entries.remove(key).is_some())
     }
 
     /// The keys currently in the store, sorted.
@@ -564,8 +700,12 @@ impl Store {
         runner: &impl SourceRunner,
         auth: &(impl Authenticator + ?Sized),
         requester: Option<&[ProcessInfo]>,
+        cap: &Capability,
         clock: &impl Clock,
     ) -> Result<(), RegenerateDefOutcome> {
+        // DR-0024: cap check runs before definition lookup, backoff, runner, and auth.
+        self.check_cap(cap)
+            .map_err(|_| RegenerateDefOutcome::CapMismatch)?;
         let definition = self
             .definitions
             .get(key)
@@ -634,8 +774,8 @@ impl Store {
         Ok(())
     }
 
-    /// Remove both `key`'s value **and** its definition, returning `true` if
-    /// either was present.
+    /// Remove both `key`'s value **and** its definition, returning `Ok(true)` if
+    /// either was present, `Ok(false)` if the key was unknown entirely.
     ///
     /// This is the `--with-define` variant of DR-0014 §2: plain [`Store::delete`]
     /// drops only the value (the definition survives so the next get
@@ -645,12 +785,19 @@ impl Store {
     /// Also removes the failure-backoff record for `key` (DR-0022): the
     /// backoff lifetime mirrors the definition lifetime — if there is no
     /// definition, there is no lazy-fetch path, so the backoff is meaningless.
-    pub fn delete_with_definition(&mut self, key: &str) -> bool {
+    ///
+    /// Returns `Err(CapError::KeyMismatch)` if `cap` does not match (DR-0024).
+    pub fn delete_with_definition(
+        &mut self,
+        key: &str,
+        cap: &Capability,
+    ) -> Result<bool, CapError> {
+        self.check_cap(cap)?;
         let had_value = self.entries.remove(key).is_some();
         let had_def = self.definitions.remove(key).is_some();
         // DR-0022: failure backoff lifetime = definition lifetime.
         self.failure_backoffs.remove(key);
-        had_value || had_def
+        Ok(had_value || had_def)
     }
 }
 
@@ -661,6 +808,8 @@ pub enum ExtendOutcome {
     NotFound,
     /// The entry exists but its value is already hard-expired (destroyed).
     HardExpired,
+    /// The capability token does not match this store (DR-0024).
+    CapMismatch,
 }
 
 impl std::fmt::Display for ExtendOutcome {
@@ -668,6 +817,7 @@ impl std::fmt::Display for ExtendOutcome {
         match self {
             ExtendOutcome::NotFound => write!(f, "no such key"),
             ExtendOutcome::HardExpired => write!(f, "entry is hard-expired (destroyed)"),
+            ExtendOutcome::CapMismatch => write!(f, "capability does not match this store"),
         }
     }
 }
@@ -683,6 +833,8 @@ pub enum ExtendAuthOutcome {
     HardExpired,
     /// Re-authentication was denied or unavailable.
     AuthFailed(AuthError),
+    /// The capability token does not match this store (DR-0024).
+    CapMismatch,
 }
 
 impl std::fmt::Display for ExtendAuthOutcome {
@@ -693,6 +845,7 @@ impl std::fmt::Display for ExtendAuthOutcome {
                 write!(f, "entry is hard-expired (destroyed); regenerate instead")
             }
             ExtendAuthOutcome::AuthFailed(e) => write!(f, "extend blocked: {e}"),
+            ExtendAuthOutcome::CapMismatch => write!(f, "capability does not match this store"),
         }
     }
 }
@@ -728,6 +881,9 @@ pub enum RegenerateOutcome {
         /// Remaining duration of the backoff window.
         retry_after: std::time::Duration,
     },
+    /// The capability token does not match this store (DR-0024). No backoff,
+    /// entry, runner, or auth state was consulted.
+    CapMismatch,
 }
 
 impl std::fmt::Display for RegenerateOutcome {
@@ -747,6 +903,7 @@ impl std::fmt::Display for RegenerateOutcome {
                 "backoff active; retry after {:.1}s",
                 retry_after.as_secs_f64()
             ),
+            RegenerateOutcome::CapMismatch => write!(f, "capability does not match this store"),
         }
     }
 }
@@ -778,6 +935,8 @@ pub enum PinAuthOutcome {
     HardExpired,
     /// Re-authentication was denied or unavailable; the entry was not pinned.
     AuthFailed(AuthError),
+    /// The capability token does not match this store (DR-0024).
+    CapMismatch,
 }
 
 impl std::fmt::Display for PinAuthOutcome {
@@ -788,6 +947,7 @@ impl std::fmt::Display for PinAuthOutcome {
                 write!(f, "entry is hard-expired (destroyed); cannot pin")
             }
             PinAuthOutcome::AuthFailed(e) => write!(f, "pin blocked: {e}"),
+            PinAuthOutcome::CapMismatch => write!(f, "capability does not match this store"),
         }
     }
 }
@@ -824,6 +984,9 @@ pub enum RegenerateDefOutcome {
         /// Remaining duration of the backoff window.
         retry_after: std::time::Duration,
     },
+    /// The capability token does not match this store (DR-0024). No definition,
+    /// backoff, runner, or auth state was consulted.
+    CapMismatch,
 }
 
 impl std::fmt::Display for RegenerateDefOutcome {
@@ -845,6 +1008,9 @@ impl std::fmt::Display for RegenerateDefOutcome {
                 "backoff active; retry after {:.1}s",
                 retry_after.as_secs_f64()
             ),
+            RegenerateDefOutcome::CapMismatch => {
+                write!(f, "capability does not match this store")
+            }
         }
     }
 }
@@ -870,6 +1036,7 @@ impl RegenerateDefOutcome {
 mod tests {
     use super::*;
     use crate::auth::{AllowAll, DenyAll, RecordingAuthenticator};
+    use crate::capability::Capability;
     use crate::clock::FakeClock;
     use std::time::Duration;
 
@@ -921,19 +1088,20 @@ mod tests {
         }
     }
 
-    fn cmd_entry(s: &mut Store, key: &str, clock: &FakeClock) {
+    fn cmd_entry(s: &mut Store, key: &str, cap: &Capability, clock: &FakeClock) {
         s.set(
             key,
             ValueSource::command(["echo".into(), "v".into()]),
             SecretBytes::from("original"),
             ttl(),
+            cap,
             clock,
-        );
+        ).expect("test cap valid");
     }
 
     #[test]
     fn empty_store() {
-        let s = Store::new();
+        let (s, _cap) = crate::test_helpers::store_with_cap();
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
         assert!(s.list().is_empty());
@@ -942,135 +1110,123 @@ mod tests {
     #[test]
     fn set_then_get_active() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.set(
             "DB",
             ValueSource::Static,
             SecretBytes::from("pw"),
             ttl(),
+            &cap,
             &clock,
-        );
-        assert_eq!(s.get("DB", &clock).unwrap().expose_secret(), b"pw");
+        ).unwrap();
+        assert_eq!(s.get("DB", &cap, &clock).unwrap().unwrap().expose_secret(), b"pw");
     }
 
     #[test]
     fn get_missing_key_is_none() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        assert!(s.get("nope", &clock).is_none());
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        assert!(s.get("nope", &cap, &clock).unwrap().is_none());
     }
 
     #[test]
     fn get_gated_when_soft_expired() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.set(
             "K",
             ValueSource::Static,
             SecretBytes::from("v"),
             ttl(),
+            &cap,
             &clock,
-        );
+        ).unwrap();
         clock.advance(SOFT);
-        assert!(s.get("K", &clock).is_none());
+        assert!(s.get("K", &cap, &clock).unwrap().is_none());
         assert_eq!(s.state_of("K", &clock), Some(EntryState::SoftExpired));
     }
 
     #[test]
     fn get_none_after_hard_expiry() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.set(
             "K",
             ValueSource::Static,
             SecretBytes::from("v"),
             ttl(),
+            &cap,
             &clock,
-        );
+        ).unwrap();
         clock.advance(HARD);
-        assert!(s.get("K", &clock).is_none());
+        assert!(s.get("K", &cap, &clock).unwrap().is_none());
         assert_eq!(s.state_of("K", &clock), Some(EntryState::HardExpired));
     }
 
     #[test]
     fn extend_refreshes_soft_expired_entry() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.set(
             "K",
             ValueSource::Static,
             SecretBytes::from("v"),
             ttl(),
+            &cap,
             &clock,
-        );
+        ).unwrap();
         clock.advance(Duration::from_secs(15));
-        s.extend("K", &clock).unwrap();
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"v");
+        s.extend("K", &cap, &clock).unwrap();
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"v");
     }
 
     #[test]
     fn extend_missing_key_reports_not_found() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        assert_eq!(s.extend("ghost", &clock), Err(ExtendOutcome::NotFound));
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        assert_eq!(s.extend("ghost", &cap, &clock), Err(ExtendOutcome::NotFound));
     }
 
     #[test]
     fn extend_hard_expired_reports_hard_expired() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.set(
             "K",
             ValueSource::Static,
             SecretBytes::from("v"),
             ttl(),
+            &cap,
             &clock,
-        );
+        ).unwrap();
         clock.advance(HARD);
-        assert_eq!(s.extend("K", &clock), Err(ExtendOutcome::HardExpired));
+        assert_eq!(s.extend("K", &cap, &clock), Err(ExtendOutcome::HardExpired));
     }
 
     #[test]
     fn delete_removes_entry() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.set(
             "K",
             ValueSource::Static,
             SecretBytes::from("v"),
             ttl(),
+            &cap,
             &clock,
-        );
-        assert!(s.delete("K"));
-        assert!(!s.delete("K")); // already gone
-        assert!(s.get("K", &clock).is_none());
+        ).unwrap();
+        assert!(s.delete("K", &cap).unwrap());
+        assert!(!s.delete("K", &cap).unwrap()); // already gone
+        assert!(s.get("K", &cap, &clock).unwrap().is_none());
     }
 
     #[test]
     fn list_returns_sorted_keys() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "b",
-            ValueSource::Static,
-            SecretBytes::from("1"),
-            ttl(),
-            &clock,
-        );
-        s.set(
-            "a",
-            ValueSource::Static,
-            SecretBytes::from("2"),
-            ttl(),
-            &clock,
-        );
-        s.set(
-            "c",
-            ValueSource::Static,
-            SecretBytes::from("3"),
-            ttl(),
-            &clock,
-        );
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("b", ValueSource::Static, SecretBytes::from("1"), ttl(), &cap, &clock).unwrap();
+        s.set("a", ValueSource::Static, SecretBytes::from("2"), ttl(), &cap, &clock).unwrap();
+        s.set("c", ValueSource::Static, SecretBytes::from("3"), ttl(), &cap, &clock).unwrap();
         assert_eq!(s.list(), vec!["a", "b", "c"]);
         assert_eq!(s.len(), 3);
     }
@@ -1078,15 +1234,16 @@ mod tests {
     #[test]
     fn source_of_reports_kind_without_exposing_value() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.set(
             "stat",
             ValueSource::Static,
             SecretBytes::from("v"),
             ttl(),
+            &cap,
             &clock,
-        );
-        cmd_entry(&mut s, "cmd", &clock);
+        ).unwrap();
+        cmd_entry(&mut s, "cmd", &cap, &clock);
         assert_eq!(s.source_of("stat"), Some(&ValueSource::Static));
         assert!(s.source_of("cmd").unwrap().is_regenerable());
         assert_eq!(s.source_of("ghost"), None);
@@ -1095,48 +1252,22 @@ mod tests {
     #[test]
     fn set_overwrites_existing_key() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("old"),
-            ttl(),
-            &clock,
-        );
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("new"),
-            ttl(),
-            &clock,
-        );
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("K", ValueSource::Static, SecretBytes::from("old"), ttl(), &cap, &clock).unwrap();
+        s.set("K", ValueSource::Static, SecretBytes::from("new"), ttl(), &cap, &clock).unwrap();
         assert_eq!(s.len(), 1);
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"new");
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"new");
     }
 
     #[test]
     fn re_set_revives_a_hard_expired_static_key() {
-        // A static entry cannot be *extended* after hard expiry, but the caller
-        // may always set it again (the documented recovery path).
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("v"),
-            ttl(),
-            &clock,
-        );
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
         clock.advance(HARD);
-        assert!(s.get("K", &clock).is_none());
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("again"),
-            ttl(),
-            &clock,
-        );
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"again");
+        assert!(s.get("K", &cap, &clock).unwrap().is_none());
+        s.set("K", ValueSource::Static, SecretBytes::from("again"), ttl(), &cap, &clock).unwrap();
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"again");
     }
 
     // ---- extend_authenticated (auth-gated extend) ----
@@ -1144,29 +1275,29 @@ mod tests {
     #[test]
     fn extend_authenticated_prompts_only_when_soft_expired() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
         let auth = RecordingAuthenticator::allowing();
 
         // Active: no prompt, just a window refresh.
-        s.extend_authenticated("K", &auth, None, &clock).unwrap();
+        s.extend_authenticated("K", &auth, None, &cap, &clock).unwrap();
         assert_eq!(auth.call_count(), 0, "Active extend must not prompt");
 
         // Soft-expired: prompts exactly once.
         clock.advance(Duration::from_secs(15));
-        s.extend_authenticated("K", &auth, None, &clock).unwrap();
+        s.extend_authenticated("K", &auth, None, &cap, &clock).unwrap();
         assert_eq!(auth.call_count(), 1);
         assert_eq!(auth.calls()[0], AuthContext::extend("K"));
         // Refreshed to Active and readable.
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"original");
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"original");
     }
 
     #[test]
     fn extend_authenticated_forwards_requester_into_context() {
         use crate::process::ProcessInfo;
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(Duration::from_secs(15));
 
         let chain = vec![ProcessInfo {
@@ -1176,10 +1307,8 @@ mod tests {
             start_time: None,
         }];
         let auth = RecordingAuthenticator::allowing();
-        s.extend_authenticated("K", &auth, Some(&chain), &clock)
+        s.extend_authenticated("K", &auth, Some(&chain), &cap, &clock)
             .unwrap();
-        // The recorded context carries the requester so an Authenticator could
-        // name who is asking.
         assert_eq!(auth.calls()[0].requester.as_deref(), Some(chain.as_slice()));
     }
 
@@ -1187,8 +1316,8 @@ mod tests {
     fn regenerate_forwards_requester_into_context() {
         use crate::process::ProcessInfo;
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
 
         let chain = vec![ProcessInfo {
@@ -1199,7 +1328,7 @@ mod tests {
         }];
         let runner = CountingRunner::new(b"fresh");
         let auth = RecordingAuthenticator::allowing();
-        s.regenerate("K", &runner, &auth, Some(&chain), &clock)
+        s.regenerate("K", &runner, &auth, Some(&chain), &cap, &clock)
             .unwrap();
         assert_eq!(auth.calls()[0].requester.as_deref(), Some(chain.as_slice()));
     }
@@ -1207,36 +1336,36 @@ mod tests {
     #[test]
     fn in_process_call_records_no_requester() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(Duration::from_secs(15));
         let auth = RecordingAuthenticator::allowing();
         // None requester == in-process / unattributed.
-        s.extend_authenticated("K", &auth, None, &clock).unwrap();
+        s.extend_authenticated("K", &auth, None, &cap, &clock).unwrap();
         assert_eq!(auth.calls()[0].requester, None);
     }
 
     #[test]
     fn extend_authenticated_denied_leaves_entry_soft_expired() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(Duration::from_secs(15));
         let err = s
-            .extend_authenticated("K", &DenyAll, None, &clock)
+            .extend_authenticated("K", &DenyAll, None, &cap, &clock)
             .unwrap_err();
         assert_eq!(err, ExtendAuthOutcome::AuthFailed(AuthError::Denied));
         // Still gated (unchanged).
-        assert!(s.get("K", &clock).is_none());
+        assert!(s.get("K", &cap, &clock).unwrap().is_none());
         assert_eq!(s.state_of("K", &clock), Some(EntryState::SoftExpired));
     }
 
     #[test]
     fn extend_authenticated_missing_key() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         assert_eq!(
-            s.extend_authenticated("ghost", &AllowAll, None, &clock),
+            s.extend_authenticated("ghost", &AllowAll, None, &cap, &clock),
             Err(ExtendAuthOutcome::NotFound)
         );
     }
@@ -1244,12 +1373,12 @@ mod tests {
     #[test]
     fn extend_authenticated_hard_expired_reports_hard_expired_without_prompt() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
         let auth = RecordingAuthenticator::allowing();
         assert_eq!(
-            s.extend_authenticated("K", &auth, None, &clock),
+            s.extend_authenticated("K", &auth, None, &cap, &clock),
             Err(ExtendAuthOutcome::HardExpired)
         );
         assert_eq!(auth.call_count(), 0, "no prompt for destroyed value");
@@ -1260,34 +1389,34 @@ mod tests {
     #[test]
     fn regenerate_command_entry_after_hard_expiry_with_auth() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
 
         // Natural flow: read, observe destruction, choose to regenerate.
         clock.advance(HARD);
-        assert!(s.get("K", &clock).is_none());
+        assert!(s.get("K", &cap, &clock).unwrap().is_none());
         assert_eq!(s.state_of("K", &clock), Some(EntryState::HardExpired));
 
         let runner = CountingRunner::new(b"fresh-token");
         let auth = RecordingAuthenticator::allowing();
-        s.regenerate("K", &runner, &auth, None, &clock).unwrap();
+        s.regenerate("K", &runner, &auth, None, &cap, &clock).unwrap();
 
         assert_eq!(runner.runs(), 1);
         assert_eq!(auth.call_count(), 1);
         assert_eq!(auth.calls()[0], AuthContext::regenerate("K"));
         // Back to Active with the new value.
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"fresh-token");
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"fresh-token");
         assert_eq!(s.state_of("K", &clock), Some(EntryState::Active));
     }
 
     #[test]
     fn regenerate_restarts_ttl_window() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
         let runner = CountingRunner::new(b"fresh");
-        s.regenerate("K", &runner, &AllowAll, None, &clock).unwrap();
+        s.regenerate("K", &runner, &AllowAll, None, &cap, &clock).unwrap();
         // The soft window restarts from regeneration time.
         clock.advance(Duration::from_secs(9));
         assert_eq!(s.state_of("K", &clock), Some(EntryState::Active));
@@ -1298,18 +1427,19 @@ mod tests {
     #[test]
     fn regenerate_static_source_is_rejected() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.set(
             "K",
             ValueSource::Static,
             SecretBytes::from("v"),
             ttl(),
+            &cap,
             &clock,
-        );
+        ).unwrap();
         clock.advance(HARD);
         let runner = CountingRunner::new(b"x");
         let err = s
-            .regenerate("K", &runner, &AllowAll, None, &clock)
+            .regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap_err();
         assert_eq!(err, RegenerateOutcome::NotRegenerable);
         assert_eq!(runner.runs(), 0, "must not run for a static source");
@@ -1318,19 +1448,19 @@ mod tests {
     #[test]
     fn regenerate_not_hard_expired_is_rejected() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
         // Active: nothing to regenerate.
         let runner = CountingRunner::new(b"x");
         assert_eq!(
-            s.regenerate("K", &runner, &AllowAll, None, &clock),
+            s.regenerate("K", &runner, &AllowAll, None, &cap, &clock),
             Err(RegenerateOutcome::NotHardExpired)
         );
         assert_eq!(runner.runs(), 0);
         // Soft-expired: also rejected (value still resident; extend instead).
         clock.advance(Duration::from_secs(15));
         assert_eq!(
-            s.regenerate("K", &runner, &AllowAll, None, &clock),
+            s.regenerate("K", &runner, &AllowAll, None, &cap, &clock),
             Err(RegenerateOutcome::NotHardExpired)
         );
         assert_eq!(runner.runs(), 0);
@@ -1339,10 +1469,10 @@ mod tests {
     #[test]
     fn regenerate_missing_key() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
         assert_eq!(
-            s.regenerate("ghost", &runner, &AllowAll, None, &clock),
+            s.regenerate("ghost", &runner, &AllowAll, None, &cap, &clock),
             Err(RegenerateOutcome::NotFound)
         );
     }
@@ -1350,29 +1480,29 @@ mod tests {
     #[test]
     fn regenerate_auth_denied_leaves_entry_destroyed() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
         let runner = CountingRunner::new(b"fresh");
         let err = s
-            .regenerate("K", &runner, &DenyAll, None, &clock)
+            .regenerate("K", &runner, &DenyAll, None, &cap, &clock)
             .unwrap_err();
         assert_eq!(err, RegenerateOutcome::AuthFailed(AuthError::Denied));
         // Command ran (fetch happens before auth), but the value was discarded.
         assert_eq!(runner.runs(), 1);
-        assert!(s.get("K", &clock).is_none());
+        assert!(s.get("K", &cap, &clock).unwrap().is_none());
         assert_eq!(s.state_of("K", &clock), Some(EntryState::HardExpired));
     }
 
     #[test]
     fn regenerate_run_failure_skips_auth_and_keeps_entry_destroyed() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
         let auth = RecordingAuthenticator::allowing();
         let err = s
-            .regenerate("K", &FailingRunner, &auth, None, &clock)
+            .regenerate("K", &FailingRunner, &auth, None, &cap, &clock)
             .unwrap_err();
         assert_eq!(err, RegenerateOutcome::RunFailed(RunError::EmptyOutput));
         assert_eq!(auth.call_count(), 0, "auth must not run if fetch failed");
@@ -1391,16 +1521,10 @@ mod tests {
     fn pin_authenticated_always_prompts_even_when_active() {
         // Unlike extend, pin demands auth from Active too (security-relaxing).
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("v"),
-            ttl(),
-            &clock,
-        );
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
         let auth = RecordingAuthenticator::allowing();
-        s.pin_authenticated("K", deadline_secs(100), &auth, None, &clock)
+        s.pin_authenticated("K", deadline_secs(100), &auth, None, &cap, &clock)
             .unwrap();
         assert_eq!(auth.call_count(), 1, "pin prompts even from Active");
         assert_eq!(auth.calls()[0], AuthContext::pin("K"));
@@ -1409,19 +1533,13 @@ mod tests {
     #[test]
     fn pin_authenticated_keeps_value_gettable_past_ttl() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("v"),
-            ttl(),
-            &clock,
-        );
-        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &clock)
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &cap, &clock)
             .unwrap();
         clock.advance(Duration::from_secs(500)); // past soft and hard windows
         assert_eq!(
-            s.get("K", &clock).unwrap().expose_secret(),
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
             b"v",
             "pinned value survives its TTL"
         );
@@ -1431,16 +1549,10 @@ mod tests {
     #[test]
     fn pin_authenticated_denied_leaves_entry_unpinned() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("v"),
-            ttl(),
-            &clock,
-        );
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
         let err = s
-            .pin_authenticated("K", deadline_secs(1000), &DenyAll, None, &clock)
+            .pin_authenticated("K", deadline_secs(1000), &DenyAll, None, &cap, &clock)
             .unwrap_err();
         assert_eq!(err, PinAuthOutcome::AuthFailed(AuthError::Denied));
         assert_eq!(s.pin_deadline_of("K"), None, "denied pin must not apply");
@@ -1449,9 +1561,9 @@ mod tests {
     #[test]
     fn pin_authenticated_missing_key() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         assert_eq!(
-            s.pin_authenticated("ghost", deadline_secs(100), &AllowAll, None, &clock),
+            s.pin_authenticated("ghost", deadline_secs(100), &AllowAll, None, &cap, &clock),
             Err(PinAuthOutcome::NotFound)
         );
     }
@@ -1459,18 +1571,12 @@ mod tests {
     #[test]
     fn pin_authenticated_hard_expired_is_rejected_without_prompt() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("v"),
-            ttl(),
-            &clock,
-        );
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
         clock.advance(HARD); // hard-expired
         let auth = RecordingAuthenticator::allowing();
         assert_eq!(
-            s.pin_authenticated("K", deadline_secs(1000), &auth, None, &clock),
+            s.pin_authenticated("K", deadline_secs(1000), &auth, None, &cap, &clock),
             Err(PinAuthOutcome::HardExpired)
         );
         assert_eq!(auth.call_count(), 0, "no prompt for a destroyed value");
@@ -1480,14 +1586,8 @@ mod tests {
     fn pin_authenticated_forwards_requester_into_context() {
         use crate::process::ProcessInfo;
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("v"),
-            ttl(),
-            &clock,
-        );
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
         let chain = vec![ProcessInfo {
             pid: 11,
             ppid: Some(1),
@@ -1495,7 +1595,7 @@ mod tests {
             start_time: None,
         }];
         let auth = RecordingAuthenticator::allowing();
-        s.pin_authenticated("K", deadline_secs(100), &auth, Some(&chain), &clock)
+        s.pin_authenticated("K", deadline_secs(100), &auth, Some(&chain), &cap, &clock)
             .unwrap();
         assert_eq!(auth.calls()[0].requester.as_deref(), Some(chain.as_slice()));
     }
@@ -1503,37 +1603,22 @@ mod tests {
     #[test]
     fn re_pin_overwrites_deadline_via_store() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("v"),
-            ttl(),
-            &clock,
-        );
-        s.pin_authenticated("K", deadline_secs(20), &AllowAll, None, &clock)
-            .unwrap();
-        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &clock)
-            .unwrap();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.pin_authenticated("K", deadline_secs(20), &AllowAll, None, &cap, &clock).unwrap();
+        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &cap, &clock).unwrap();
         assert_eq!(s.pin_deadline_of("K"), Some(deadline_secs(1000)));
     }
 
     #[test]
     fn unpin_returns_entry_to_normal_evaluation() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("v"),
-            ttl(),
-            &clock,
-        );
-        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &clock)
-            .unwrap();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &cap, &clock).unwrap();
         clock.advance(Duration::from_secs(15)); // past soft
         assert_eq!(s.state_of("K", &clock), Some(EntryState::Active), "pinned");
-        assert!(s.unpin("K"));
+        assert!(s.unpin("K", &cap).unwrap());
         assert_eq!(s.pin_deadline_of("K"), None);
         assert_eq!(
             s.state_of("K", &clock),
@@ -1544,8 +1629,8 @@ mod tests {
 
     #[test]
     fn unpin_missing_key_is_false() {
-        let mut s = Store::new();
-        assert!(!s.unpin("ghost"));
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        assert!(!s.unpin("ghost", &cap).unwrap());
     }
 
     // ---- definition registry (DR-0014) ----
@@ -1556,9 +1641,7 @@ mod tests {
 
     #[test]
     fn define_registers_without_producing_a_value() {
-        // define is lazy: it stores the definition but runs no command and
-        // produces no value entry (DR-0014 §1).
-        let mut s = Store::new();
+        let (mut s, _cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         assert!(s.is_defined("K"));
         assert!(!s.has_value("K"), "define must not produce a value");
@@ -1568,26 +1651,24 @@ mod tests {
 
     #[test]
     fn define_is_idempotent_for_exact_match() {
-        let mut s = Store::new();
+        let (mut s, _cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
-        // Same argv + TTL again: a silent no-op.
         s.define("K", cmd_source(), ttl()).unwrap();
         assert!(s.is_defined("K"));
     }
 
     #[test]
     fn define_conflicting_argv_is_rejected() {
-        let mut s = Store::new();
+        let (mut s, _cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         let other = ValueSource::command(["op".into(), "read".into(), "op://other".into()]);
         assert_eq!(s.define("K", other, ttl()), Err(DefineError::Conflict));
-        // The original definition is untouched.
         assert_eq!(s.definition_of("K").unwrap().source(), &cmd_source());
     }
 
     #[test]
     fn define_conflicting_ttl_is_rejected() {
-        let mut s = Store::new();
+        let (mut s, _cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         let other_ttl = Ttl::new(Some(Duration::from_secs(5)), Some(HARD)).unwrap();
         assert_eq!(
@@ -1598,7 +1679,7 @@ mod tests {
 
     #[test]
     fn define_rejects_static_source() {
-        let mut s = Store::new();
+        let (mut s, _cap) = crate::test_helpers::store_with_cap();
         assert_eq!(
             s.define("K", ValueSource::Static, ttl()),
             Err(DefineError::StaticNotDefinable)
@@ -1608,35 +1689,32 @@ mod tests {
 
     #[test]
     fn get_or_regenerate_lazily_produces_for_a_definition_only_key() {
-        // The canonical lazy path: a key has a definition but no value yet.
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
-        assert!(s.get("K", &clock).is_none(), "no value before lazy gen");
+        assert!(s.get("K", &cap, &clock).unwrap().is_none(), "no value before lazy gen");
 
         let runner = CountingRunner::new(b"lazy-token");
         let auth = RecordingAuthenticator::allowing();
-        s.get_or_regenerate("K", &runner, &auth, None, &clock)
+        s.get_or_regenerate("K", &runner, &auth, None, &cap, &clock)
             .unwrap();
 
         assert_eq!(runner.runs(), 1);
         assert_eq!(auth.call_count(), 1);
         assert_eq!(auth.calls()[0], AuthContext::regenerate("K"));
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"lazy-token");
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"lazy-token");
         assert_eq!(s.state_of("K", &clock), Some(EntryState::Active));
     }
 
     #[test]
     fn get_or_regenerate_resets_loaded_at_for_a_fresh_hard_window() {
-        // Lazy production resets loaded_at: the hard window starts from now.
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
-        clock.advance(Duration::from_secs(100)); // long after define
+        clock.advance(Duration::from_secs(100));
         let runner = CountingRunner::new(b"v");
-        s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
-        // Active immediately after production, soft-expires HARD-relative to now.
         assert_eq!(s.state_of("K", &clock), Some(EntryState::Active));
         clock.advance(HARD);
         assert_eq!(s.state_of("K", &clock), Some(EntryState::HardExpired));
@@ -1645,10 +1723,10 @@ mod tests {
     #[test]
     fn get_or_regenerate_undefined_key_is_rejected() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
         assert_eq!(
-            s.get_or_regenerate("ghost", &runner, &AllowAll, None, &clock),
+            s.get_or_regenerate("ghost", &runner, &AllowAll, None, &cap, &clock),
             Err(RegenerateDefOutcome::Undefined)
         );
         assert_eq!(runner.runs(), 0);
@@ -1656,17 +1734,15 @@ mod tests {
 
     #[test]
     fn get_or_regenerate_skips_when_value_is_active() {
-        // A resident Active value must not be silently regenerated.
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         let runner = CountingRunner::new(b"first");
-        s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
         assert_eq!(runner.runs(), 1);
-        // Active now: a second call regenerates nothing.
         assert_eq!(
-            s.get_or_regenerate("K", &runner, &AllowAll, None, &clock),
+            s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock),
             Err(RegenerateDefOutcome::ValueResident)
         );
         assert_eq!(runner.runs(), 1, "must not re-run for a resident value");
@@ -1674,17 +1750,16 @@ mod tests {
 
     #[test]
     fn get_or_regenerate_skips_when_value_is_soft_expired() {
-        // SoftExpired means the value is still resident (extend, not regenerate).
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         let runner = CountingRunner::new(b"v");
-        s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
         clock.advance(Duration::from_secs(15)); // SoftExpired
         assert_eq!(s.state_of("K", &clock), Some(EntryState::SoftExpired));
         assert_eq!(
-            s.get_or_regenerate("K", &runner, &AllowAll, None, &clock),
+            s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock),
             Err(RegenerateDefOutcome::ValueResident)
         );
         assert_eq!(runner.runs(), 1);
@@ -1693,28 +1768,27 @@ mod tests {
     #[test]
     fn get_or_regenerate_reproduces_after_hard_expiry() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         let runner = CountingRunner::new(b"v");
-        s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
-        clock.advance(HARD); // value destroyed
+        clock.advance(HARD);
         assert_eq!(s.state_of("K", &clock), Some(EntryState::HardExpired));
-        // Lazy path reproduces it.
-        s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
         assert_eq!(runner.runs(), 2);
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"v");
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"v");
     }
 
     #[test]
     fn get_or_regenerate_run_failure_skips_auth_and_leaves_value_absent() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         let auth = RecordingAuthenticator::allowing();
         let err = s
-            .get_or_regenerate("K", &FailingRunner, &auth, None, &clock)
+            .get_or_regenerate("K", &FailingRunner, &auth, None, &cap, &clock)
             .unwrap_err();
         assert_eq!(err, RegenerateDefOutcome::RunFailed(RunError::EmptyOutput));
         assert_eq!(auth.call_count(), 0, "auth must not run if fetch failed");
@@ -1725,11 +1799,11 @@ mod tests {
     #[test]
     fn get_or_regenerate_auth_denied_discards_value() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         let runner = CountingRunner::new(b"fresh");
         let err = s
-            .get_or_regenerate("K", &runner, &DenyAll, None, &clock)
+            .get_or_regenerate("K", &runner, &DenyAll, None, &cap, &clock)
             .unwrap_err();
         assert_eq!(err, RegenerateDefOutcome::AuthFailed(AuthError::Denied));
         assert_eq!(runner.runs(), 1, "fetch happens before auth");
@@ -1740,7 +1814,7 @@ mod tests {
     fn get_or_regenerate_forwards_requester_into_context() {
         use crate::process::ProcessInfo;
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         let chain = vec![ProcessInfo {
             pid: 13,
@@ -1749,7 +1823,7 @@ mod tests {
             start_time: None,
         }];
         let auth = RecordingAuthenticator::allowing();
-        s.get_or_regenerate("K", &CountingRunner::new(b"v"), &auth, Some(&chain), &clock)
+        s.get_or_regenerate("K", &CountingRunner::new(b"v"), &auth, Some(&chain), &cap, &clock)
             .unwrap();
         assert_eq!(auth.calls()[0].requester.as_deref(), Some(chain.as_slice()));
     }
@@ -1768,10 +1842,7 @@ mod tests {
 
     #[test]
     fn definition_carries_the_type_metadata() {
-        // The value type is a property of the definition, not the value: the core
-        // stores it on the definition and never copies it onto a produced value
-        // (a value is always opaque bytes; DR-0016).
-        let mut s = Store::new();
+        let (mut s, _cap) = crate::test_helpers::store_with_cap();
         s.define_with_meta("OTP", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
         assert_eq!(s.definition_of("OTP").unwrap().meta(), &otp_meta());
@@ -1787,14 +1858,12 @@ mod tests {
 
     #[test]
     fn lazily_produced_value_keeps_its_type_on_the_definition() {
-        // Producing the value does not move the type onto the value entry; the
-        // definition remains the source of truth for the key's type (DR-0016).
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define_with_meta("K", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
         let runner = CountingRunner::new(b"seed-bytes");
-        s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
         assert!(s.has_value("K"));
         assert_eq!(
@@ -1806,16 +1875,14 @@ mod tests {
 
     #[test]
     fn regenerated_value_type_still_read_from_definition() {
-        // After a hard-expiry regeneration the produced value is opaque, but the
-        // definition's type survives, so the key stays otp-typed (DR-0016).
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define_with_meta("K", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
-        s.get_or_regenerate("K", &CountingRunner::new(b"orig"), &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &CountingRunner::new(b"orig"), &AllowAll, None, &cap, &clock)
             .unwrap();
         clock.advance(HARD);
-        s.get_or_regenerate("K", &CountingRunner::new(b"fresh"), &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &CountingRunner::new(b"fresh"), &AllowAll, None, &cap, &clock)
             .unwrap();
         assert_eq!(
             s.definition_of("K").unwrap().meta(),
@@ -1826,15 +1893,11 @@ mod tests {
 
     #[test]
     fn define_meta_participates_in_idempotency_conflict() {
-        // A redefine that only changes the type metadata conflicts (a key cannot
-        // silently change type; DR-0016).
-        let mut s = Store::new();
+        let (mut s, _cap) = crate::test_helpers::store_with_cap();
         s.define_with_meta("K", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
-        // Same definition + same meta: idempotent no-op.
         s.define_with_meta("K", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
-        // Same source/ttl but no meta: a different definition -> conflict.
         assert_eq!(
             s.define("K", cmd_source(), ttl()),
             Err(DefineError::Conflict)
@@ -1845,51 +1908,47 @@ mod tests {
 
     #[test]
     fn delete_drops_value_but_keeps_definition() {
-        // delete invalidates: the value is gone, but the definition survives so
-        // the next get regenerates it.
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
-        s.get_or_regenerate("K", &CountingRunner::new(b"v"), &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &CountingRunner::new(b"v"), &AllowAll, None, &cap, &clock)
             .unwrap();
         assert!(s.has_value("K"));
 
-        assert!(s.delete("K"), "value removed");
+        assert!(s.delete("K", &cap).unwrap(), "value removed");
         assert!(!s.has_value("K"), "value gone");
         assert!(s.is_defined("K"), "definition survives a value-only delete");
 
-        // The next lazy get regenerates from the surviving definition.
         let runner = CountingRunner::new(b"again");
-        s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"again");
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"again");
     }
 
     #[test]
     fn delete_with_definition_forgets_the_key_entirely() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
-        s.get_or_regenerate("K", &CountingRunner::new(b"v"), &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &CountingRunner::new(b"v"), &AllowAll, None, &cap, &clock)
             .unwrap();
 
-        assert!(s.delete_with_definition("K"));
+        assert!(s.delete_with_definition("K", &cap).unwrap());
         assert!(!s.has_value("K"));
         assert!(!s.is_defined("K"), "definition removed too");
-        // No regeneration is possible anymore.
         assert_eq!(
-            s.get_or_regenerate("K", &CountingRunner::new(b"x"), &AllowAll, None, &clock),
+            s.get_or_regenerate("K", &CountingRunner::new(b"x"), &AllowAll, None, &cap, &clock),
             Err(RegenerateDefOutcome::Undefined)
         );
     }
 
     #[test]
     fn delete_with_definition_works_on_definition_only_key() {
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         assert!(!s.has_value("K"));
         assert!(
-            s.delete_with_definition("K"),
+            s.delete_with_definition("K", &cap).unwrap(),
             "removes a definition-only key"
         );
         assert!(!s.is_defined("K"));
@@ -1897,27 +1956,26 @@ mod tests {
 
     #[test]
     fn delete_with_definition_absent_key_is_false() {
-        let mut s = Store::new();
-        assert!(!s.delete_with_definition("ghost"));
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        assert!(!s.delete_with_definition("ghost", &cap).unwrap());
     }
 
     #[test]
     fn plain_delete_of_static_entry_is_unchanged() {
-        // A static value (no definition) keeps the legacy delete semantics:
-        // deleting removes it for good (nothing to regenerate from).
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.set(
             "S",
             ValueSource::Static,
             SecretBytes::from("v"),
             ttl(),
+            &cap,
             &clock,
-        );
-        assert!(s.delete("S"));
+        ).unwrap();
+        assert!(s.delete("S", &cap).unwrap());
         assert!(!s.has_value("S"));
         assert!(!s.is_defined("S"));
-        assert!(s.get("S", &clock).is_none());
+        assert!(s.get("S", &cap, &clock).unwrap().is_none());
     }
 
     // ---- enumeration: definition-only keys are listed (DR-0014 §5) ----
@@ -1925,32 +1983,20 @@ mod tests {
     #[test]
     fn keys_unions_values_and_definitions() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        // value-only (static)
-        s.set(
-            "val",
-            ValueSource::Static,
-            SecretBytes::from("v"),
-            ttl(),
-            &clock,
-        );
-        // definition-only (lazy, not produced)
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
+        s.set("val", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
         s.define("def", cmd_source(), ttl()).unwrap();
-        // both (defined + produced)
         s.define("both", cmd_source(), ttl()).unwrap();
-        s.get_or_regenerate("both", &CountingRunner::new(b"v"), &AllowAll, None, &clock)
+        s.get_or_regenerate("both", &CountingRunner::new(b"v"), &AllowAll, None, &cap, &clock)
             .unwrap();
 
-        // list() is value entries only.
         assert_eq!(s.list(), vec!["both", "val"]);
-        // keys() is the union, sorted and de-duplicated.
         assert_eq!(s.keys(), vec!["both", "def", "val"]);
     }
 
     #[test]
     fn definition_only_key_reports_metadata_without_a_value() {
-        // status/list can introspect a defined-but-unproduced key.
-        let mut s = Store::new();
+        let (mut s, _cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
         assert!(s.is_defined("K"));
         assert!(!s.has_value("K"));
@@ -1966,208 +2012,152 @@ mod tests {
 
     #[test]
     fn defining_a_key_with_a_resident_static_value_is_independent() {
-        // DR-0014 §2: the definition registry and value store are orthogonal.
-        // A static value may already sit under a key; defining (a command source)
-        // for the same key is allowed and does not touch the value. get_or_regenerate
-        // then defers to the live static value rather than regenerating, because a
-        // resident value wins (we don't burn an upstream call while a usable value
-        // is in memory).
         let clock = FakeClock::new();
-        let mut s = Store::new();
+        let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.set(
             "K",
             ValueSource::Static,
             SecretBytes::from("static-val"),
             ttl(),
+            &cap,
             &clock,
-        );
+        ).unwrap();
         s.define("K", cmd_source(), ttl()).unwrap();
-        // The static value is still readable and untouched by define.
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"static-val");
-        // While that value is Active, get_or_regenerate defers to it.
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"static-val");
         let runner = CountingRunner::new(b"regenerated");
         assert_eq!(
-            s.get_or_regenerate("K", &runner, &AllowAll, None, &clock),
+            s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock),
             Err(RegenerateDefOutcome::ValueResident)
         );
         assert_eq!(runner.runs(), 0);
-        // Once the static value hard-expires (and cannot itself regenerate), the
-        // definition takes over and lazily produces a fresh value.
         clock.advance(HARD);
-        s.get_or_regenerate("K", &runner, &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
         assert_eq!(runner.runs(), 1);
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"regenerated");
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"regenerated");
     }
 
     // ---- fetch failure backoff (DR-0022 A-3b) ----
 
     const BACKOFF: Duration = Duration::from_secs(5);
 
-    /// Helper: build a Store with backoff enabled (duration = BACKOFF).
-    fn store_with_backoff() -> Store {
-        let mut s = Store::new();
-        s.set_failure_backoff(BACKOFF);
-        s
-    }
-
-    /// 1. 回帰: failure_backoff_duration = 0 のとき従来通り RunFailed が返る (backoff 機能なし)
+    /// 1. failure_backoff_duration = 0 のとき従来通り RunFailed が返る (backoff 機能なし)
     #[test]
     fn backoff_zero_duration_gives_run_failed_regression() {
         let clock = FakeClock::new();
-        let mut s = Store::new(); // default failure_backoff_duration = Duration::ZERO
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap(); // default = zero backoff
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
         let auth = RecordingAuthenticator::allowing();
         let err = s
-            .regenerate("K", &FailingRunner, &auth, None, &clock)
+            .regenerate("K", &FailingRunner, &auth, None, &cap, &clock)
             .unwrap_err();
-        // With duration = 0, we get RunFailed (no backoff record written because retry_after = 0).
         assert_eq!(err, RegenerateOutcome::RunFailed(RunError::EmptyOutput));
         assert_eq!(auth.call_count(), 0);
     }
 
-    /// 2. 新仕様: fake op exit 1 直後 (clock 進めず) の regenerate は Backoff を返し、
+    /// 2. fake op exit 1 直後 (clock 進めず) の regenerate は Backoff を返し、
     ///    fake op は再実行されない
     #[test]
     fn backoff_active_after_first_failure_blocks_rerun() {
         let clock = FakeClock::new();
-        let mut s = store_with_backoff();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(BACKOFF);
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
 
-        // 1st call: FailingRunner records the failure → backoff inserted
         let err = s
-            .regenerate("K", &FailingRunner, &AllowAll, None, &clock)
+            .regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock)
             .unwrap_err();
         assert_eq!(err, RegenerateOutcome::RunFailed(RunError::EmptyOutput));
 
-        // 2nd call (clock unchanged): should return Backoff without re-running the runner
         let counting = CountingRunner::new(b"v");
         let err2 = s
-            .regenerate("K", &counting, &AllowAll, None, &clock)
+            .regenerate("K", &counting, &AllowAll, None, &cap, &clock)
             .unwrap_err();
         match err2 {
             RegenerateOutcome::Backoff { retry_after } => {
-                assert!(
-                    retry_after > Duration::ZERO,
-                    "retry_after should be positive"
-                );
-                assert!(
-                    retry_after <= BACKOFF,
-                    "retry_after should not exceed backoff period"
-                );
+                assert!(retry_after > Duration::ZERO, "retry_after should be positive");
+                assert!(retry_after <= BACKOFF, "retry_after should not exceed backoff period");
             }
             other => panic!("expected Backoff, got {other:?}"),
         }
-        assert_eq!(
-            counting.runs(),
-            0,
-            "runner must NOT be called during backoff"
-        );
+        assert_eq!(counting.runs(), 0, "runner must NOT be called during backoff");
     }
 
     /// 3. backoff 期間経過後に再呼び出すと fake op が再実行される
     #[test]
     fn backoff_expires_after_duration_allows_rerun() {
         let clock = FakeClock::new();
-        let mut s = store_with_backoff();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(BACKOFF);
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
 
-        // Trigger failure → backoff
-        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &clock);
-
-        // Advance past the backoff window
+        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
         clock.advance(BACKOFF + Duration::from_millis(1));
 
-        // Now the runner should be called again
         let counting = CountingRunner::new(b"fresh");
-        s.regenerate("K", &counting, &AllowAll, None, &clock)
+        s.regenerate("K", &counting, &AllowAll, None, &cap, &clock)
             .unwrap();
-        assert_eq!(
-            counting.runs(),
-            1,
-            "runner must be called after backoff expires"
-        );
-        assert_eq!(s.get("K", &clock).unwrap().expose_secret(), b"fresh");
+        assert_eq!(counting.runs(), 1, "runner must be called after backoff expires");
+        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"fresh");
     }
 
     /// 4. backoff 中に store.set を直接呼び出しても failure_backoffs は残る
-    ///    (set は failure_backoffs を触らない)
     #[test]
     fn store_set_does_not_clear_failure_backoffs() {
         let clock = FakeClock::new();
-        let mut s = store_with_backoff();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(BACKOFF);
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
 
-        // Trigger failure → backoff
-        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
 
-        // Direct store.set (static value injection via adapter) — backoff should remain
-        s.set(
-            "K",
-            ValueSource::Static,
-            SecretBytes::from("injected"),
-            ttl(),
-            &clock,
-        );
-        // The value is there now, but if we tried to regenerate (hypothetically), the
-        // backoff record should still be present.
-        // We verify by checking failure_backoff_remaining returns Some.
+        s.set("K", ValueSource::Static, SecretBytes::from("injected"), ttl(), &cap, &clock).unwrap();
         let remaining = s.failure_backoff_remaining("K", &clock);
         assert!(
             remaining.is_some(),
-            "failure_backoffs must survive a store.set (set is not a regenerate success)"
+            "failure_backoffs must survive a store.set"
         );
     }
 
     /// 5. failure_backoff_duration = 0s で従来動作 (= backoff 機能なし)
-    ///    (テスト 1 と同等だが、明示的に set_failure_backoff(0) を確認)
     #[test]
     fn set_failure_backoff_zero_disables_feature() {
         let clock = FakeClock::new();
-        let mut s = Store::new();
-        s.set_failure_backoff(Duration::ZERO); // explicit 0
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap(); // default = zero backoff
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
 
-        // 1st failure: should return RunFailed, not record any backoff
         let err = s
-            .regenerate("K", &FailingRunner, &AllowAll, None, &clock)
+            .regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock)
             .unwrap_err();
         assert_eq!(err, RegenerateOutcome::RunFailed(RunError::EmptyOutput));
 
-        // 2nd call immediately after (clock unchanged): still RunFailed, never Backoff
         let err2 = s
-            .regenerate("K", &FailingRunner, &AllowAll, None, &clock)
+            .regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock)
             .unwrap_err();
         match err2 {
             RegenerateOutcome::Backoff { .. } => {
                 panic!("Backoff must not be returned when failure_backoff_duration = 0")
             }
-            RegenerateOutcome::RunFailed(_) => {} // correct: no backoff guard, runner is called
+            RegenerateOutcome::RunFailed(_) => {}
             other => panic!("unexpected outcome {other:?}"),
         }
     }
 
-    /// 6. 並行レース: 同一 key に対する 2 回の連続 regenerate で
-    ///    1 個目が失敗した後、2 個目は backoff を返す
+    /// 6. 同一 key に対する 2 回の連続 regenerate で 1 個目が失敗した後、2 個目は backoff を返す
     #[test]
     fn sequential_regenerate_second_sees_backoff_after_first_fails() {
         let clock = FakeClock::new();
-        let mut s = store_with_backoff();
-        cmd_entry(&mut s, "K", &clock);
+        let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(BACKOFF);
+        cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
 
-        // 1st: failure
-        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+        let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
 
-        // 2nd (same Mutex guard context in real use; here sequential): backoff
         let counting = CountingRunner::new(b"v");
         let err2 = s
-            .regenerate("K", &counting, &AllowAll, None, &clock)
+            .regenerate("K", &counting, &AllowAll, None, &cap, &clock)
             .unwrap_err();
         assert!(
             matches!(err2, RegenerateOutcome::Backoff { .. }),
@@ -2180,19 +2170,17 @@ mod tests {
     #[test]
     fn get_or_regenerate_returns_backoff_after_failure() {
         let clock = FakeClock::new();
-        let mut s = store_with_backoff();
+        let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(BACKOFF);
         s.define("K", cmd_source(), ttl()).unwrap();
 
-        // 1st call: fetch fails → backoff inserted
         let err = s
-            .get_or_regenerate("K", &FailingRunner, &AllowAll, None, &clock)
+            .get_or_regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock)
             .unwrap_err();
         assert_eq!(err, RegenerateDefOutcome::RunFailed(RunError::EmptyOutput));
 
-        // 2nd call (clock unchanged): Backoff
         let counting = CountingRunner::new(b"v");
         let err2 = s
-            .get_or_regenerate("K", &counting, &AllowAll, None, &clock)
+            .get_or_regenerate("K", &counting, &AllowAll, None, &cap, &clock)
             .unwrap_err();
         assert!(
             matches!(err2, RegenerateDefOutcome::Backoff { .. }),
@@ -2205,17 +2193,14 @@ mod tests {
     #[test]
     fn delete_with_definition_clears_failure_backoffs() {
         let clock = FakeClock::new();
-        let mut s = store_with_backoff();
+        let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(BACKOFF);
         s.define("K", cmd_source(), ttl()).unwrap();
 
-        // Trigger failure → backoff
-        let _ = s.get_or_regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+        let _ = s.get_or_regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
 
-        // Delete with definition
-        assert!(s.delete_with_definition("K"));
+        assert!(s.delete_with_definition("K", &cap).unwrap());
         assert!(!s.is_defined("K"));
 
-        // failure_backoffs should be cleared
         let remaining = s.failure_backoff_remaining("K", &clock);
         assert!(
             remaining.is_none(),
@@ -2227,18 +2212,15 @@ mod tests {
     #[test]
     fn value_only_delete_keeps_failure_backoffs() {
         let clock = FakeClock::new();
-        let mut s = store_with_backoff();
+        let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(BACKOFF);
         s.define("K", cmd_source(), ttl()).unwrap();
 
-        // Trigger failure → backoff
-        let _ = s.get_or_regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+        let _ = s.get_or_regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
 
-        // Value-only delete (definition survives)
-        s.delete("K");
+        s.delete("K", &cap).unwrap();
         assert!(!s.has_value("K"), "value removed");
         assert!(s.is_defined("K"), "definition survives");
 
-        // failure_backoffs should remain (next lazy load must still see backoff)
         let remaining = s.failure_backoff_remaining("K", &clock);
         assert!(
             remaining.is_some(),
@@ -2250,33 +2232,86 @@ mod tests {
     #[test]
     fn hard_expiry_drop_keeps_failure_backoffs() {
         let clock = FakeClock::new();
-        let mut s = store_with_backoff();
+        let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(BACKOFF);
         s.define("K", cmd_source(), ttl()).unwrap();
 
-        // First produce a value so we have something to expire
         let counting = CountingRunner::new(b"v");
-        s.get_or_regenerate("K", &counting, &AllowAll, None, &clock)
+        s.get_or_regenerate("K", &counting, &AllowAll, None, &cap, &clock)
             .unwrap();
 
-        // Trigger a failure while in HardExpired state to record backoff
         clock.advance(HARD);
         assert_eq!(s.state_of("K", &clock), Some(EntryState::HardExpired));
-        let _ = s.get_or_regenerate("K", &FailingRunner, &AllowAll, None, &clock);
+        let _ = s.get_or_regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
 
-        // Verify backoff is present
         assert!(s.failure_backoff_remaining("K", &clock).is_some());
 
-        // Now the hard-expired entry is "dropped" conceptually (it stays in map as HardExpired
-        // but the key is still defined). The key point: failure_backoffs must remain.
-        // We verify by trying to regenerate with a good runner and expecting Backoff:
         let counting2 = CountingRunner::new(b"v2");
         let err = s
-            .get_or_regenerate("K", &counting2, &AllowAll, None, &clock)
+            .get_or_regenerate("K", &counting2, &AllowAll, None, &cap, &clock)
             .unwrap_err();
         assert!(
             matches!(err, RegenerateDefOutcome::Backoff { .. }),
             "backoff must survive hard-expiry drop, got {err:?}"
         );
         assert_eq!(counting2.runs(), 0);
+    }
+
+    // ---- capability gate (DR-0024) ----
+
+    #[test]
+    fn set_with_wrong_cap_returns_keymismatch() {
+        let clock = FakeClock::new();
+        let (mut store, _cap) = crate::test_helpers::store_with_cap();
+        let wrong_bundle = StoreBuilder::new().build();
+        let wrong_cap = wrong_bundle.control_cap;
+        let err = store
+            .set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &wrong_cap, &clock)
+            .unwrap_err();
+        assert_eq!(err, CapError::KeyMismatch);
+        assert!(!store.has_value("K"), "set must not mutate store on cap mismatch");
+    }
+
+    #[test]
+    fn get_with_wrong_cap_returns_keymismatch() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = crate::test_helpers::store_with_cap();
+        store.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        let wrong_bundle = StoreBuilder::new().build();
+        let wrong_cap = wrong_bundle.control_cap;
+        let err = store.get("K", &wrong_cap, &clock).unwrap_err();
+        assert_eq!(err, CapError::KeyMismatch);
+    }
+
+    #[test]
+    fn cap_mismatch_does_not_touch_backoff_or_runner() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = crate::test_helpers::store_with_cap();
+        store.set("K", ValueSource::command(["echo".into(), "v".into()]), SecretBytes::from("orig"), ttl(), &cap, &clock).unwrap();
+        clock.advance(HARD);
+        let wrong_bundle = StoreBuilder::new().build();
+        let wrong_cap = wrong_bundle.control_cap;
+        let runner = CountingRunner::new(b"fresh");
+        let err = store
+            .regenerate("K", &runner, &AllowAll, None, &wrong_cap, &clock)
+            .unwrap_err();
+        assert_eq!(err, RegenerateOutcome::CapMismatch);
+        assert_eq!(runner.runs(), 0, "runner must not run on cap mismatch");
+        assert!(store.failure_backoff_remaining("K", &clock).is_none());
+    }
+
+    #[test]
+    fn cap_check_runs_before_backoff_check() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = crate::test_helpers::store_with_cap_and_backoff(BACKOFF);
+        store.set("K", ValueSource::command(["echo".into(), "v".into()]), SecretBytes::from("orig"), ttl(), &cap, &clock).unwrap();
+        clock.advance(HARD);
+        let _ = store.regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
+        assert!(store.failure_backoff_remaining("K", &clock).is_some(), "backoff must be active");
+        let wrong_bundle = StoreBuilder::new().build();
+        let wrong_cap = wrong_bundle.control_cap;
+        let err = store
+            .regenerate("K", &CountingRunner::new(b"x"), &AllowAll, None, &wrong_cap, &clock)
+            .unwrap_err();
+        assert_eq!(err, RegenerateOutcome::CapMismatch, "cap check must run before backoff check");
     }
 }

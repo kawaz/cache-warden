@@ -10,9 +10,9 @@
 //! every control-socket command maps onto a [`Store`] operation here.
 
 use cache_warden::{
-    Authenticator, Clock, DefineError, EntryState, ExtendAuthOutcome, PinAuthOutcome, ProcessInfo,
-    RegenerateDefOutcome, RegenerateOutcome, SecretBytes, SourceRunner, Store, Ttl, ValueMeta,
-    ValueSource,
+    Authenticator, CapError, Capability, Clock, DefineError, EntryState, ExtendAuthOutcome,
+    PinAuthOutcome, ProcessInfo, RegenerateDefOutcome, RegenerateOutcome, SecretBytes, SourceRunner,
+    Store, Ttl, ValueMeta, ValueSource,
 };
 
 use crate::otp_type;
@@ -44,6 +44,10 @@ pub struct HandlerCtx<'a, A: ?Sized, R, C> {
     pub runner: &'a R,
     /// Time source for TTL evaluation.
     pub clock: &'a C,
+    /// Capability token for secret-handling store operations (DR-0024).
+    pub store_cap: &'a Capability,
+    /// OTP adapter for deriving TOTP codes from cached seeds (DR-0024 §8).
+    pub otp_adapter: &'a crate::daemon::otp_adapter::OtpAdapter,
     /// Daemon process id (for `status`).
     pub pid: u32,
     /// Daemon version string (for `status`).
@@ -86,9 +90,9 @@ where
         Request::KvList => Response::list(store.keys().iter().map(|s| s.to_string()).collect()),
         Request::KvDel { key, with_define } => {
             let removed = if with_define {
-                store.delete_with_definition(&key)
+                store.delete_with_definition(&key, ctx.store_cap).unwrap_or(false)
             } else {
-                store.delete(&key)
+                store.delete(&key, ctx.store_cap).unwrap_or(false)
             };
             Response::deleted(removed)
         }
@@ -107,13 +111,13 @@ where
         } => handle_define(store, key, source, soft_ttl_secs, hard_ttl_secs, meta),
         Request::KvGet { key, dry_run } => handle_get(store, ctx, key, dry_run),
         Request::KvPin { key, duration_secs } => handle_pin(store, ctx, key, duration_secs),
-        Request::KvUnpin { key } => {
-            if store.unpin(&key) {
-                Response::unpinned(true)
-            } else {
-                Response::error(ErrorKind::NotFound, "no such key")
+        Request::KvUnpin { key } => match store.unpin(&key, ctx.store_cap) {
+            Ok(true) => Response::unpinned(true),
+            Ok(false) => Response::error(ErrorKind::NotFound, "no such key"),
+            Err(CapError::KeyMismatch) | Err(CapError::Unknown) => {
+                Response::error(ErrorKind::Internal, "capability mismatch")
             }
-        }
+        },
     }
 }
 
@@ -252,13 +256,16 @@ where
 
     // `set` injects opaque bytes only — a value type (otp) lives on a definition
     // (DR-0016), so there is no seed validation here.
-    store.set(
-        key,
-        ValueSource::Static,
-        SecretBytes::new(bytes),
-        ttl,
-        ctx.clock,
-    );
+    store
+        .set(
+            key,
+            ValueSource::Static,
+            SecretBytes::new(bytes),
+            ttl,
+            ctx.store_cap,
+            ctx.clock,
+        )
+        .ok();
     Response::set_ack()
 }
 
@@ -350,8 +357,8 @@ where
     }
 
     // Fast path: a live (Active) value.
-    if store.get(&key, ctx.clock).is_some() {
-        return finish_get(store, &key, dry_run, "active", ctx.clock);
+    if store.get(&key, ctx.store_cap, ctx.clock).ok().flatten().is_some() {
+        return finish_get(store, ctx, &key, dry_run, "active");
     }
 
     // Not directly readable. Decide why and try to recover.
@@ -372,9 +379,9 @@ where
             Response::error(ErrorKind::Internal, "entry state changed during read")
         }
         Some(EntryState::SoftExpired) => {
-            match store.extend_authenticated(&key, ctx.auth, ctx.requester, ctx.clock) {
-                Ok(()) => match store.get(&key, ctx.clock) {
-                    Some(_) => finish_get(store, &key, dry_run, "active", ctx.clock),
+            match store.extend_authenticated(&key, ctx.auth, ctx.requester, ctx.store_cap, ctx.clock) {
+                Ok(()) => match store.get(&key, ctx.store_cap, ctx.clock).ok().flatten() {
+                    Some(_) => finish_get(store, ctx, &key, dry_run, "active"),
                     None => Response::error(ErrorKind::Internal, "value gone after extend"),
                 },
                 Err(ExtendAuthOutcome::NotFound) => {
@@ -388,6 +395,9 @@ where
                 Err(ExtendAuthOutcome::AuthFailed(e)) => {
                     Response::error(ErrorKind::AuthFailed, e.to_string())
                 }
+                Err(ExtendAuthOutcome::CapMismatch) => {
+                    Response::error(ErrorKind::Internal, "capability mismatch")
+                }
             }
         }
         Some(EntryState::HardExpired) => {
@@ -397,9 +407,9 @@ where
             if store.is_defined(&key) {
                 return lazy_generate(store, ctx, &key, dry_run);
             }
-            match store.regenerate(&key, ctx.runner, ctx.auth, ctx.requester, ctx.clock) {
-                Ok(()) => match store.get(&key, ctx.clock) {
-                    Some(_) => finish_get(store, &key, dry_run, "active", ctx.clock),
+            match store.regenerate(&key, ctx.runner, ctx.auth, ctx.requester, ctx.store_cap, ctx.clock) {
+                Ok(()) => match store.get(&key, ctx.store_cap, ctx.clock).ok().flatten() {
+                    Some(_) => finish_get(store, ctx, &key, dry_run, "active"),
                     None => Response::error(ErrorKind::Internal, "value gone after regenerate"),
                 },
                 Err(RegenerateOutcome::NotFound) => {
@@ -431,6 +441,9 @@ where
                         ),
                     )
                 }
+                Err(RegenerateOutcome::CapMismatch) => {
+                    Response::error(ErrorKind::Internal, "capability mismatch")
+                }
             }
         }
     }
@@ -444,59 +457,76 @@ where
 /// shapes the response:
 ///
 /// - **opaque value**: returned (reveal) or hidden (dry-run) verbatim.
-/// - **otp-typed value**: the stored *seed* is run through TOTP and only the
-///   derived **code** is returned (reveal). The seed itself **never** leaves the
-///   daemon (DR-0016 §3, write-only). In dry-run nothing is returned either way.
+/// - **otp-typed value**: the stored *seed* is run through the [`OtpAdapter`]
+///   (DR-0024 §8) and only the derived **code** is returned (reveal). The seed
+///   itself **never** leaves the daemon (DR-0016 §3, write-only). In dry-run
+///   nothing is returned either way.
 ///
 /// A seed that cannot be interpreted as TOTP is an error — the code cannot be
 /// produced — and the seed is never echoed (DR-0016 §5).
-fn finish_get<C: Clock>(
+fn finish_get<A, R, C>(
     store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
     key: &str,
     dry_run: bool,
     state: &str,
-    clock: &C,
-) -> Response {
-    // Read the resident value once and copy it out, releasing the mutable borrow
-    // of `store` (the caller guaranteed `key` is readable). The copy is a brief
-    // in-daemon working buffer; an otp seed is converted to a code and dropped
-    // below, and an opaque value is base64-encoded — neither lingers.
-    let value = match store.get(key, clock) {
-        Some(secret) => secret.expose_secret().to_vec(),
-        // Should not happen: the caller just confirmed readability. Be defensive.
-        None => return Response::error(ErrorKind::Internal, "value gone before finish_get"),
-    };
-
-    // The value type lives on the key's definition (DR-0016): a typed key is
-    // always definition-backed, so a value with no definition is opaque. This
-    // read is value-free and free of the value borrow above.
+) -> Response
+where
+    A: Authenticator + ?Sized,
+    R: SourceRunner,
+    C: Clock,
+{
+    // Check the value type before the cap-gated borrow: `definition_of` is cap-free
+    // and tells us whether we need the OTP adapter path.
     let meta = store
         .definition_of(key)
         .map(|d| d.meta().clone())
         .unwrap_or_default();
 
-    if !otp_type::meta_is_otp(&meta) {
-        // Opaque value: dry-run hides it, reveal returns it (DR-0015).
-        return if dry_run {
-            Response::get_verified(state)
-        } else {
-            Response::get(encode_b64(&value))
+    if otp_type::meta_is_otp(&meta) {
+        // OTP path (DR-0024 §8): delegate to the OtpAdapter which performs a
+        // 3-stage borrow (cap-gated read → meta → derive) without leaking the seed.
+        return match ctx.otp_adapter.get_code(store, key, ctx.clock) {
+            Ok(code) => {
+                // The code is itself a value: dry-run masks it (DR-0016 §3 / DR-0015).
+                if dry_run {
+                    Response::get_verified(state)
+                } else {
+                    Response::get(encode_b64(code.as_bytes()))
+                }
+            }
+            // Map adapter errors to the right ErrorKind without leaking the seed
+            // (DR-0024 §Impl §4: cap mismatch is an internal adapter wiring bug,
+            // value-gone is defensive, only a malformed seed is caller-visible).
+            Err(crate::daemon::otp_adapter::OtpError::Cap(_)) => {
+                eprintln!(
+                    "cache-warden: otp adapter: cap rejected for key `{key}` (adapter wiring bug)"
+                );
+                Response::error(ErrorKind::Internal, "internal cap mismatch")
+            }
+            Err(crate::daemon::otp_adapter::OtpError::NoValue) => {
+                Response::error(ErrorKind::Internal, "value gone before otp derive")
+            }
+            Err(e @ crate::daemon::otp_adapter::OtpError::Derive(_)) => {
+                Response::error(ErrorKind::BadRequest, e.to_string())
+            }
         };
     }
 
-    // OTP: the stored value is a *seed* — derive the short-lived code and return
-    // only that (the seed never leaves the daemon; DR-0016 §3, write-only).
-    match otp_type::derive_code(&value, &meta) {
-        Ok(code) => {
-            // The code is itself a value: dry-run masks it (DR-0016 §3 / DR-0015).
-            if dry_run {
-                Response::get_verified(state)
-            } else {
-                Response::get(encode_b64(code.as_bytes()))
-            }
-        }
-        // A bad seed cannot produce a code; report without leaking the seed.
-        Err(msg) => Response::error(ErrorKind::BadRequest, msg),
+    // Opaque path: read the resident value once and copy it out, releasing the
+    // mutable borrow of `store`. The copy is a brief in-daemon working buffer;
+    // base64-encoded — it does not linger.
+    let value = match store.get(key, ctx.store_cap, ctx.clock).ok().flatten() {
+        Some(secret) => secret.expose_secret().to_vec(),
+        // Should not happen: the caller just confirmed readability. Be defensive.
+        None => return Response::error(ErrorKind::Internal, "value gone before finish_get"),
+    };
+
+    // Opaque value: dry-run hides it, reveal returns it (DR-0015).
+    if dry_run {
+        Response::get_verified(state)
+    } else {
+        Response::get(encode_b64(&value))
     }
 }
 
@@ -518,15 +548,15 @@ where
     R: SourceRunner,
     C: Clock,
 {
-    match store.get_or_regenerate(key, ctx.runner, ctx.auth, ctx.requester, ctx.clock) {
-        Ok(()) => match store.get(key, ctx.clock) {
-            Some(_) => finish_get(store, key, dry_run, "active", ctx.clock),
+    match store.get_or_regenerate(key, ctx.runner, ctx.auth, ctx.requester, ctx.store_cap, ctx.clock) {
+        Ok(()) => match store.get(key, ctx.store_cap, ctx.clock).ok().flatten() {
+            Some(_) => finish_get(store, ctx, key, dry_run, "active"),
             None => Response::error(ErrorKind::Internal, "value gone after lazy generation"),
         },
         Err(RegenerateDefOutcome::Undefined) => Response::error(ErrorKind::NotFound, "no such key"),
         // A usable value is resident after all; read it directly.
-        Err(RegenerateDefOutcome::ValueResident) => match store.get(key, ctx.clock) {
-            Some(_) => finish_get(store, key, dry_run, "active", ctx.clock),
+        Err(RegenerateDefOutcome::ValueResident) => match store.get(key, ctx.store_cap, ctx.clock).ok().flatten() {
+            Some(_) => finish_get(store, ctx, key, dry_run, "active"),
             None => Response::error(ErrorKind::Internal, "value resident but unreadable"),
         },
         Err(RegenerateDefOutcome::RunFailed(e)) => {
@@ -544,6 +574,9 @@ where
                     retry_after.as_secs_f64()
                 ),
             )
+        }
+        Err(RegenerateDefOutcome::CapMismatch) => {
+            Response::error(ErrorKind::Internal, "capability mismatch")
         }
     }
 }
@@ -568,7 +601,7 @@ where
         .clock
         .now()
         .saturating_add(std::time::Duration::from_secs(duration_secs));
-    match store.pin_authenticated(&key, deadline, ctx.auth, ctx.requester, ctx.clock) {
+    match store.pin_authenticated(&key, deadline, ctx.auth, ctx.requester, ctx.store_cap, ctx.clock) {
         Ok(()) => Response::pinned(duration_secs),
         Err(PinAuthOutcome::NotFound) => Response::error(ErrorKind::NotFound, "no such key"),
         Err(PinAuthOutcome::HardExpired) => Response::error(
@@ -576,6 +609,7 @@ where
             "entry is hard-expired (destroyed); cannot pin",
         ),
         Err(PinAuthOutcome::AuthFailed(e)) => Response::error(ErrorKind::AuthFailed, e.to_string()),
+        Err(PinAuthOutcome::CapMismatch) => Response::error(ErrorKind::Internal, "capability mismatch"),
     }
 }
 
@@ -641,11 +675,20 @@ mod tests {
         auth: &'a A,
         runner: &'a R,
         clock: &'a FakeClock,
+        cap: &'a cache_warden::Capability,
     ) -> HandlerCtx<'a, A, R, FakeClock> {
+        // Leak a test-only OtpAdapter so it lives long enough for the HandlerCtx
+        // (which is 'a). Using Box::leak here is fine in tests: each call allocates
+        // a small object that lives until process exit, which is acceptable for
+        // unit-test fixtures.
+        let otp_adapter: &'static crate::daemon::otp_adapter::OtpAdapter =
+            Box::leak(Box::new(crate::daemon::otp_adapter::OtpAdapter::new(cap.clone())));
         HandlerCtx {
             auth,
             runner,
             clock,
+            store_cap: cap,
+            otp_adapter,
             pid: 1234,
             version: "test",
             socket: "/tmp/test.sock",
@@ -756,9 +799,9 @@ mod tests {
     fn op_define_shows_uri_in_status_not_a_secret() {
         // DR-0018 §3: an op source's status `source` is its uri reference.
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         assert!(
             handle_request(
                 &mut store,
@@ -779,9 +822,9 @@ mod tests {
         // DR-0018 §3 secret hygiene: a command source's status `source` is just
         // the discriminant (the argv may carry a secret, e.g. `printf %s <seed>`).
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         assert!(
             handle_request(
                 &mut store,
@@ -801,9 +844,9 @@ mod tests {
     #[test]
     fn op_redefine_identical_is_idempotent() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         let def = || define_with("default/GH", op_spec("op://v/i/f", None));
         assert!(handle_request(&mut store, &c, def()).is_ok());
         // Exact same typed source + TTL is a no-op (DR-0018 §1 idempotency).
@@ -816,9 +859,9 @@ mod tests {
         // same key from a command source to an op source is a conflict, even if
         // the lowered argv would coincide.
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         assert!(
             handle_request(
                 &mut store,
@@ -845,9 +888,9 @@ mod tests {
     #[test]
     fn ping_returns_pong() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         let resp = handle_request(&mut store, &c, Request::Ping);
         assert!(resp.is_ok());
     }
@@ -855,9 +898,9 @@ mod tests {
     #[test]
     fn set_then_get_static_value() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
 
         assert!(handle_request(&mut store, &c, set_static(b"hunter2")).is_ok());
         let resp = handle_request(
@@ -898,9 +941,9 @@ mod tests {
     #[test]
     fn dry_run_get_static_value_returns_verified_without_value() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         assert!(handle_request(&mut store, &c, set_static(b"hunter2")).is_ok());
         let resp = handle_request(&mut store, &c, dry_get("default/K"));
         assert_verified(&resp);
@@ -916,9 +959,9 @@ mod tests {
         // DR-0015 §2: dry-run is NOT shallow — a definition-only key is lazily
         // produced (the command runs) even though the value is not returned.
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"from-cmd");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         assert!(handle_request(&mut store, &c, define_cmd("default/K", &["echo", "x"])).is_ok());
         assert_eq!(runner.runs(), 0);
         let resp = handle_request(&mut store, &c, dry_get("default/K"));
@@ -933,9 +976,9 @@ mod tests {
     #[test]
     fn dry_run_get_missing_key_is_not_found() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         let resp = handle_request(&mut store, &c, dry_get("default/ghost"));
         assert_eq!(err_kind(&resp), ErrorKind::NotFound);
     }
@@ -944,9 +987,9 @@ mod tests {
     fn dry_run_get_auth_failure_is_reported_like_reveal() {
         // A dry-run still honors the auth gate (DR-0015 §2: TouchID effects).
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&DenyAll, &runner, &clock);
+        let c = ctx(&DenyAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, define_cmd("default/K", &["echo", "x"]));
         let resp = handle_request(&mut store, &c, dry_get("default/K"));
         assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
@@ -955,9 +998,9 @@ mod tests {
     #[test]
     fn get_missing_key_is_not_found() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         let resp = handle_request(
             &mut store,
             &c,
@@ -974,9 +1017,9 @@ mod tests {
         // DR-0014: define registers but does not run; the first get lazily
         // produces the value (one run), and a second get is a cache hit (no run).
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"from-cmd");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         assert!(handle_request(&mut store, &c, define_cmd("default/K", &["echo", "x"])).is_ok());
         assert_eq!(runner.runs(), 0, "define must not run the command");
         let resp = handle_request(
@@ -1004,9 +1047,9 @@ mod tests {
     #[test]
     fn define_idempotent_same_def_is_ok_conflict_is_bad_request() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         assert!(
             handle_request(
                 &mut store,
@@ -1036,9 +1079,9 @@ mod tests {
     #[test]
     fn define_empty_argv_is_bad_request() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         // An empty `command.argv` is a kind-specific required-field violation
         // (DR-0018 §1): source = "command" requires a non-empty argv.
         let req = Request::KvDefine {
@@ -1057,9 +1100,9 @@ mod tests {
     #[test]
     fn lazy_generate_is_denied_when_auth_fails() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&DenyAll, &runner, &clock);
+        let c = ctx(&DenyAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, define_cmd("default/K", &["echo", "x"]));
         let resp = handle_request(
             &mut store,
@@ -1075,9 +1118,9 @@ mod tests {
     #[test]
     fn set_with_soft_exceeding_hard_is_bad_request() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         let req = Request::KvSet {
             key: "default/K".into(),
             source: SetSource::Static {
@@ -1095,9 +1138,9 @@ mod tests {
     #[test]
     fn invalid_base64_value_is_bad_request() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         let req = Request::KvSet {
             key: "default/K".into(),
             source: SetSource::Static {
@@ -1115,9 +1158,9 @@ mod tests {
     #[test]
     fn get_soft_expired_extends_via_authenticator() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"v"));
         clock.advance(Duration::from_secs(15)); // soft-expired
         let resp = handle_request(
@@ -1134,9 +1177,9 @@ mod tests {
     #[test]
     fn get_soft_expired_denied_is_auth_failed() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&DenyAll, &runner, &clock);
+        let c = ctx(&DenyAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"v"));
         clock.advance(Duration::from_secs(15));
         let resp = handle_request(
@@ -1153,9 +1196,9 @@ mod tests {
     #[test]
     fn get_hard_expired_defined_key_regenerates() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"fresh");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, define_cmd("default/K", &["echo"]));
         // First get lazily produces the value (run 1).
         assert_eq!(
@@ -1185,9 +1228,9 @@ mod tests {
     #[test]
     fn get_hard_expired_static_is_not_regenerable() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"v"));
         clock.advance(Duration::from_secs(HARD));
         let resp = handle_request(
@@ -1204,11 +1247,11 @@ mod tests {
     #[test]
     fn get_hard_expired_command_upstream_failure_is_reported() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         // Define + first get produces the value via a succeeding runner; then
         // swap to a failing runner so the post-hard-expiry regeneration fails.
         let ok_runner = CountingRunner::new(b"v");
-        let c_ok = ctx(&AllowAll, &ok_runner, &clock);
+        let c_ok = ctx(&AllowAll, &ok_runner, &clock, &cap);
         handle_request(&mut store, &c_ok, define_cmd("default/K", &["echo"]));
         // First get lazily produces the value.
         assert_eq!(
@@ -1224,7 +1267,7 @@ mod tests {
         );
         clock.advance(Duration::from_secs(HARD));
         let fail = FailingRunner;
-        let c_fail = ctx(&AllowAll, &fail, &clock);
+        let c_fail = ctx(&AllowAll, &fail, &clock, &cap);
         let resp = handle_request(
             &mut store,
             &c_fail,
@@ -1239,9 +1282,9 @@ mod tests {
     #[test]
     fn list_returns_sorted_keys() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         for k in ["default/b", "default/a", "default/c"] {
             handle_request(
                 &mut store,
@@ -1271,9 +1314,9 @@ mod tests {
     #[test]
     fn del_removes_and_reports() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"v"));
         let resp = handle_request(
             &mut store,
@@ -1311,9 +1354,9 @@ mod tests {
     #[test]
     fn status_lists_entries_without_values() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"secret-value"));
         let resp = handle_request(&mut store, &c, Request::Status);
         let line = serde_json::to_string(&resp).unwrap();
@@ -1349,9 +1392,9 @@ mod tests {
     #[test]
     fn pin_then_get_survives_soft_expiry() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"v"));
         // Pin for 1000s; then let the soft window (10s) lapse.
         let resp = handle_request(&mut store, &c, pin("default/K", 1000));
@@ -1371,9 +1414,9 @@ mod tests {
     #[test]
     fn pin_denied_is_auth_failed() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&DenyAll, &runner, &clock);
+        let c = ctx(&DenyAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"v"));
         let resp = handle_request(&mut store, &c, pin("default/K", 1000));
         assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
@@ -1382,9 +1425,9 @@ mod tests {
     #[test]
     fn pin_missing_key_is_not_found() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, pin("default/ghost", 100))),
             ErrorKind::NotFound
@@ -1394,9 +1437,9 @@ mod tests {
     #[test]
     fn pin_hard_expired_is_rejected() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"v"));
         clock.advance(Duration::from_secs(HARD)); // hard-expired
         assert_eq!(
@@ -1408,9 +1451,9 @@ mod tests {
     #[test]
     fn unpin_returns_to_normal_and_missing_is_not_found() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"v"));
         handle_request(&mut store, &c, pin("default/K", 1000));
         // Unpin then soft-expire: the value is gated again.
@@ -1444,9 +1487,9 @@ mod tests {
     #[test]
     fn status_reports_pin_remaining_seconds() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"v"));
         handle_request(&mut store, &c, pin("default/K", 1000));
         clock.advance(Duration::from_secs(100));
@@ -1494,9 +1537,9 @@ mod tests {
     fn otp_defined_seed_get_returns_code_not_seed() {
         // An otp definition: get derives a 6-digit code, never the seed (write-only).
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = cache_warden::CommandRunner::new();
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         assert!(
             handle_request(
                 &mut store,
@@ -1530,9 +1573,9 @@ mod tests {
     #[test]
     fn otp_digits_param_controls_code_length() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = cache_warden::CommandRunner::new();
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(
             &mut store,
             &c,
@@ -1554,9 +1597,9 @@ mod tests {
         // An otp *definition* (command source): the command yields the seed, and
         // get derives a code from it (the seed is never returned).
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = cache_warden::CommandRunner::new();
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         let define = Request::KvDefine {
             key: "default/OTP".into(),
             source: cmd_spec(&["printf", "%s", OTP_SEED_B32]),
@@ -1582,9 +1625,9 @@ mod tests {
     #[test]
     fn otp_seed_from_otpauth_uri() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = cache_warden::CommandRunner::new();
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         let uri = format!("otpauth://totp/Label?secret={OTP_SEED_B32}&digits=8");
         handle_request(&mut store, &c, define_otp_seed("default/OTP", &uri, &[]));
         let resp = handle_request(
@@ -1602,9 +1645,9 @@ mod tests {
     fn otp_dry_run_masks_the_code() {
         // dry-run never returns the value — code or seed (DR-0015 / DR-0016 §3).
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = cache_warden::CommandRunner::new();
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(
             &mut store,
             &c,
@@ -1632,9 +1675,9 @@ mod tests {
         // A seed that is neither base32 nor a URI: the lazy chain produces it, but
         // derivation fails at get time. The seed is not echoed.
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = cache_warden::CommandRunner::new();
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         let bad = "this-is-not-a-valid-otp-seed";
         assert!(handle_request(&mut store, &c, define_otp_seed("default/OTP", bad, &[])).is_ok());
         let resp = handle_request(
@@ -1653,9 +1696,9 @@ mod tests {
     #[test]
     fn otp_type_appears_in_status_not_the_seed() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = cache_warden::CommandRunner::new();
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         // Define + produce the value so a value entry also exists.
         handle_request(
             &mut store,
@@ -1692,9 +1735,9 @@ mod tests {
         // A non-otp value is returned verbatim (the derivation only triggers on
         // the otp type label).
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock);
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c, set_static(b"plain-secret"));
         let resp = handle_request(
             &mut store,
@@ -1715,13 +1758,18 @@ mod tests {
         auth: &'a A,
         runner: &'a R,
         clock: &'a FakeClock,
+        cap: &'a cache_warden::Capability,
         policies: &'a std::collections::BTreeMap<String, Vec<String>>,
         requester: Option<&'a [ProcessInfo]>,
     ) -> HandlerCtx<'a, A, R, FakeClock> {
+        let otp_adapter: &'static crate::daemon::otp_adapter::OtpAdapter =
+            Box::leak(Box::new(crate::daemon::otp_adapter::OtpAdapter::new(cap.clone())));
         HandlerCtx {
             auth,
             runner,
             clock,
+            store_cap: cap,
+            otp_adapter,
             pid: 1234,
             version: "test",
             socket: "/tmp/test.sock",
@@ -1740,17 +1788,17 @@ mod tests {
     #[test]
     fn get_restricted_key_admits_matching_requester() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
         let pol = policies(&[("default/K", &["ssh"])]);
         let chain = [proc(100, "ssh"), proc(50, "zsh")];
 
         // Seed the value with an unrestricted ctx (set is not gated by the key
         // layer — only get is), then read it through the restricted gate.
-        let c_set = ctx(&AllowAll, &runner, &clock);
+        let c_set = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c_set, set_static(b"hunter2"));
 
-        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
+        let c = ctx_gated(&AllowAll, &runner, &clock, &cap, &pol, Some(&chain));
         let resp = handle_request(
             &mut store,
             &c,
@@ -1765,15 +1813,15 @@ mod tests {
     #[test]
     fn get_restricted_key_denies_non_matching_requester() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
         let pol = policies(&[("default/K", &["ssh"])]);
         let chain = [proc(100, "git"), proc(50, "zsh")];
 
-        let c_set = ctx(&AllowAll, &runner, &clock);
+        let c_set = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c_set, set_static(b"hunter2"));
 
-        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
+        let c = ctx_gated(&AllowAll, &runner, &clock, &cap, &pol, Some(&chain));
         let resp = handle_request(
             &mut store,
             &c,
@@ -1790,15 +1838,15 @@ mod tests {
     #[test]
     fn get_restricted_key_with_unknown_requester_is_fail_closed() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
         let pol = policies(&[("default/K", &["ssh"])]);
 
-        let c_set = ctx(&AllowAll, &runner, &clock);
+        let c_set = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c_set, set_static(b"hunter2"));
 
         // requester == None + a real restriction => fail-closed (denied).
-        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, None);
+        let c = ctx_gated(&AllowAll, &runner, &clock, &cap, &pol, None);
         let resp = handle_request(
             &mut store,
             &c,
@@ -1813,12 +1861,12 @@ mod tests {
     #[test]
     fn get_unrestricted_key_admits_even_unknown_requester() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
         // K has no policy entry => no restriction (the common case).
         let pol = policies(&[("OTHER", &["ssh"])]);
 
-        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, None);
+        let c = ctx_gated(&AllowAll, &runner, &clock, &cap, &pol, None);
         handle_request(&mut store, &c, set_static(b"hunter2"));
         let resp = handle_request(
             &mut store,
@@ -1834,17 +1882,17 @@ mod tests {
     #[test]
     fn dry_run_get_is_also_gated() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
         let pol = policies(&[("default/K", &["ssh"])]);
         let chain = [proc(100, "git")];
 
-        let c_set = ctx(&AllowAll, &runner, &clock);
+        let c_set = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c_set, set_static(b"hunter2"));
 
         // A dry-run get of a restricted key by a non-matching requester is denied
         // exactly like a reveal get (the gate is applied before the chain runs).
-        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
+        let c = ctx_gated(&AllowAll, &runner, &clock, &cap, &pol, Some(&chain));
         let resp = handle_request(
             &mut store,
             &c,
@@ -1861,20 +1909,20 @@ mod tests {
         // The gate must precede the (re-auth / command) retrieval chain: a denied
         // requester must not trigger the source command at all.
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"generated");
         let pol = policies(&[("default/LAZY", &["ssh"])]);
         let chain = [proc(100, "git")];
 
         // Define LAZY (lazy: no value yet). A denied get must not run the command.
-        let c_set = ctx(&AllowAll, &runner, &clock);
+        let c_set = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(
             &mut store,
             &c_set,
             define_cmd("default/LAZY", &["echo", "x"]),
         );
 
-        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
+        let c = ctx_gated(&AllowAll, &runner, &clock, &cap, &pol, Some(&chain));
         let resp = handle_request(
             &mut store,
             &c,
@@ -1898,15 +1946,15 @@ mod tests {
         // is a deliberate scope decision (DR-0012 key layer): the policy controls
         // *value retrieval*, not lifecycle management of the entry.
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
         let pol = policies(&[("default/K", &["ssh"])]);
         let chain = [proc(100, "git")]; // would be denied for a get
 
-        let c_set = ctx(&AllowAll, &runner, &clock);
+        let c_set = ctx(&AllowAll, &runner, &clock, &cap);
         handle_request(&mut store, &c_set, set_static(b"hunter2"));
 
-        let c = ctx_gated(&AllowAll, &runner, &clock, &pol, Some(&chain));
+        let c = ctx_gated(&AllowAll, &runner, &clock, &cap, &pol, Some(&chain));
         // del succeeds (not gated): the entry is removed.
         let resp = handle_request(
             &mut store,

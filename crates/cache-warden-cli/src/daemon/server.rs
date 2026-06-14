@@ -39,8 +39,9 @@ impl From<std::io::Error> for ServerError {
 }
 
 use cache_warden::{
-    AllowAll, Authenticator, CommandAuthenticator, CommandRunner, DefineError, ProcessInfo,
-    ProcessInspector, SourceRunner, Store, SystemClock, SystemInspector, Ttl,
+    AllowAll, Authenticator, Capability, CommandAuthenticator, CommandRunner, DefineError,
+    ProcessInfo, ProcessInspector, SourceRunner, Store, StoreBuilder, SystemClock, SystemInspector,
+    Ttl,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -138,6 +139,9 @@ fn build_authenticator(config: &Config) -> Auth {
 /// socket — both adapters sit in one process around one core (DR-0008).
 pub(crate) struct Shared {
     pub(crate) store: Mutex<Store>,
+    pub(crate) control_cap: Capability,
+    pub(crate) authsock_cap: Capability,
+    pub(crate) otp_adapter: crate::daemon::otp_adapter::OtpAdapter,
     pub(crate) runner: Runner,
     pub(crate) auth: Auth,
     /// One process-lifetime monotonic clock. It must be shared across preload
@@ -182,9 +186,13 @@ impl Shared {
     /// Build a `Shared` directly for tests (no config / socket binding), using
     /// the production [`CommandRunner`]. The authsock unit tests use this to
     /// exercise the local-sign path against a real core.
-    pub(crate) fn new_for_test(store: Store, auth: Auth, clock: SystemClock) -> Self {
+    pub(crate) fn new_for_test(store: Store, cap: Capability, auth: Auth, clock: SystemClock) -> Self {
+        let otp_adapter = crate::daemon::otp_adapter::OtpAdapter::new(cap.clone());
         Self {
             store: Mutex::new(store),
+            control_cap: cap.clone(),
+            authsock_cap: cap,
+            otp_adapter,
             runner: CommandRunner::new(),
             auth,
             clock,
@@ -256,12 +264,15 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
     // definitions are registered (DR-0023 Phase 1): OnceLock allows a single
     // interior write after the Arc has been handed to the serve loop, without
     // needing a Mutex or rebuilding the whole Shared struct.
+    let bundle = StoreBuilder::new()
+        .failure_backoff(config.fetch_failure_backoff())
+        .build();
+    let otp_adapter = crate::daemon::otp_adapter::OtpAdapter::new(bundle.otp_cap);
     let shared = Arc::new(Shared {
-        store: Mutex::new({
-            let mut s = Store::new();
-            s.set_failure_backoff(config.fetch_failure_backoff());
-            s
-        }),
+        store: Mutex::new(bundle.store),
+        control_cap: bundle.control_cap,
+        authsock_cap: bundle.authsock_cap,
+        otp_adapter,
         runner,
         auth: build_authenticator(&config),
         clock,
@@ -325,8 +336,6 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         .iter()
         .map(|d| d.full_key(crate::namespace::DEFAULT_NAMESPACE))
         .collect();
-    let failure_backoff = config.fetch_failure_backoff();
-
     let blocking = tokio::task::spawn_blocking(move || {
         // Write config definitions directly into the shared Store while holding
         // its lock. The serve loop is already running but no client request can
@@ -336,13 +345,13 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
             .store
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        store.set_failure_backoff(failure_backoff);
         register_definitions(
             &mut store,
             &runner_for_task,
             &shared_for_startup.clock,
             &config_defs_for_task,
             &authsock_keys_for_task,
+            &shared_for_startup.control_cap,
         );
 
         // Restore persisted online definitions (DR-0014 §4) inside the same
@@ -539,6 +548,7 @@ fn register_definitions<R, C>(
     clock: &C,
     entries: &[KvDefinition],
     force_eager: &std::collections::HashSet<String>,
+    cap: &Capability,
 ) where
     R: SourceRunner,
     C: cache_warden::Clock,
@@ -601,7 +611,7 @@ fn register_definitions<R, C>(
             let env = source.command_env().clone();
             match runner.run(&argv, cwd.as_deref(), &env) {
                 Ok(value) => {
-                    store.set(full_key.clone(), source, value, ttl, clock);
+                    store.set(full_key.clone(), source, value, ttl, cap, clock).ok();
                 }
                 Err(e) => {
                     // The RunError Display is already secret-free (stderr redacted).
@@ -831,6 +841,8 @@ fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Respons
         auth,
         runner: &shared.runner,
         clock: &shared.clock,
+        store_cap: &shared.control_cap,
+        otp_adapter: &shared.otp_adapter,
         pid: shared.pid,
         version: VERSION,
         socket: &shared.socket_path,
@@ -1068,8 +1080,13 @@ mod tests {
     use tempfile::tempdir;
 
     fn shared() -> Arc<Shared> {
+        let bundle = cache_warden::StoreBuilder::new().build();
+        let otp_adapter = crate::daemon::otp_adapter::OtpAdapter::new(bundle.otp_cap);
         Arc::new(Shared {
-            store: Mutex::new(Store::new()),
+            store: Mutex::new(bundle.store),
+            control_cap: bundle.control_cap,
+            authsock_cap: bundle.authsock_cap,
+            otp_adapter,
             runner: CommandRunner::new(),
             auth: Box::new(AllowAll),
             clock: SystemClock::new(),
@@ -1166,7 +1183,7 @@ mod tests {
         use cache_warden::FakeClock;
         let runner = CommandRunner::new();
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let entries = vec![KvDefinition {
             name: "TOK".into(),
             namespace: None,
@@ -1182,7 +1199,7 @@ mod tests {
             preload: false,
             meta: Default::default(),
         }];
-        register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
+        register_definitions(&mut store, &runner, &clock, &entries, &no_eager(), &cap);
         assert!(store.is_defined("default/TOK"), "definition registered");
         assert!(
             !store.has_value("default/TOK"),
@@ -1197,7 +1214,7 @@ mod tests {
         use cache_warden::FakeClock;
         let runner = CommandRunner::new();
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let entries = vec![KvDefinition {
             name: "TOK".into(),
             namespace: None,
@@ -1213,8 +1230,8 @@ mod tests {
             preload: true,
             meta: Default::default(),
         }];
-        register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
-        let secret = store.get("default/TOK", &clock).expect("entry preloaded");
+        register_definitions(&mut store, &runner, &clock, &entries, &no_eager(), &cap);
+        let secret = store.get("default/TOK", &cap, &clock).ok().flatten().expect("entry preloaded");
         assert_eq!(secret.expose_secret(), b"tok-value");
     }
 
@@ -1226,7 +1243,7 @@ mod tests {
         use cache_warden::FakeClock;
         let runner = CommandRunner::new();
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let entries = vec![
             KvDefinition {
                 name: "AGENT_KEY".into(),
@@ -1261,11 +1278,13 @@ mod tests {
         ];
         let eager: std::collections::HashSet<String> =
             ["default/AGENT_KEY".to_string()].into_iter().collect();
-        register_definitions(&mut store, &runner, &clock, &entries, &eager);
+        register_definitions(&mut store, &runner, &clock, &entries, &eager, &cap);
         // …but the authsock reference forces it resident.
         assert_eq!(
             store
-                .get("default/AGENT_KEY", &clock)
+                .get("default/AGENT_KEY", &cap, &clock)
+                .ok()
+                .flatten()
                 .unwrap()
                 .expose_secret(),
             b"pem-bytes",
@@ -1286,7 +1305,7 @@ mod tests {
         use cache_warden::FakeClock;
         let runner = CommandRunner::new();
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let entries = vec![
             KvDefinition {
                 name: "BAD".into(),
@@ -1319,18 +1338,18 @@ mod tests {
                 meta: Default::default(),
             },
         ];
-        register_definitions(&mut store, &runner, &clock, &entries, &no_eager());
+        register_definitions(&mut store, &runner, &clock, &entries, &no_eager(), &cap);
         // BAD's eager run failed, but its definition survives for regeneration.
         assert!(
             store.is_defined("default/BAD"),
             "definition kept after failed preload"
         );
         assert!(
-            store.get("default/BAD", &clock).is_none(),
+            store.get("default/BAD", &cap, &clock).ok().flatten().is_none(),
             "no value after failed preload"
         );
         assert_eq!(
-            store.get("default/GOOD", &clock).unwrap().expose_secret(),
+            store.get("default/GOOD", &cap, &clock).ok().flatten().unwrap().expose_secret(),
             b"ok",
             "subsequent preload still runs"
         );
@@ -1344,7 +1363,7 @@ mod tests {
         use cache_warden::FakeClock;
         let runner = CommandRunner::new();
         let clock = FakeClock::new();
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let entries = vec![KvDefinition {
             name: "AGENT_KEY".into(),
             namespace: None,
@@ -1362,7 +1381,7 @@ mod tests {
         }];
         let eager: std::collections::HashSet<String> =
             ["default/AGENT_KEY".to_string()].into_iter().collect();
-        register_definitions(&mut store, &runner, &clock, &entries, &eager);
+        register_definitions(&mut store, &runner, &clock, &entries, &eager, &cap);
         assert!(store.is_defined("default/AGENT_KEY"), "definition survives");
         assert!(
             !store.has_value("default/AGENT_KEY"),
@@ -1397,7 +1416,7 @@ mod tests {
 
     #[test]
     fn restore_registers_keys_not_in_config() {
-        let mut store = Store::new();
+        let (mut store, _cap) = cache_warden::test_helpers::store_with_cap();
         let config_names = std::collections::HashSet::new();
         restore_persisted_definitions(
             &mut store,
@@ -1417,7 +1436,7 @@ mod tests {
     fn restore_drops_persisted_key_that_config_already_defines() {
         // Config wins: a clashing persisted entry must not overwrite the config
         // definition, even if its argv differs.
-        let mut store = Store::new();
+        let (mut store, _cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CommandRunner::new();
         let clock = cache_warden::FakeClock::new();
         register_definitions(
@@ -1426,6 +1445,7 @@ mod tests {
             &clock,
             &[pdef("DB", &["config-cmd"], None, None)],
             &no_eager(),
+            &_cap,
         );
         let config_names: std::collections::HashSet<String> =
             ["default/DB".to_string()].into_iter().collect();
@@ -1445,7 +1465,7 @@ mod tests {
 
     #[test]
     fn restore_skips_bad_ttl_without_aborting_others() {
-        let mut store = Store::new();
+        let (mut store, _cap) = cache_warden::test_helpers::store_with_cap();
         let config_names = std::collections::HashSet::new();
         // First entry has soft > hard (invalid Ttl); it must be skipped while the
         // second still registers.

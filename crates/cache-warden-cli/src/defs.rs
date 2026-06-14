@@ -968,7 +968,7 @@ type = "magic"
     fn snapshot_returns_only_definitions_name_sorted() {
         use cache_warden::{FakeClock, SecretBytes, Ttl, ValueMeta, ValueSource};
         use std::time::Duration;
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let ttl = Ttl::new(
             Some(Duration::from_secs(3600)),
             Some(Duration::from_secs(86400)),
@@ -999,13 +999,16 @@ type = "magic"
             .unwrap();
         // A static value-only entry must NOT appear in the snapshot.
         let clock = FakeClock::new();
-        store.set(
-            "default/STATIC",
-            ValueSource::Static,
-            SecretBytes::new(b"v".to_vec()),
-            Ttl::new(None, None).unwrap(),
-            &clock,
-        );
+        store
+            .set(
+                "default/STATIC",
+                ValueSource::Static,
+                SecretBytes::new(b"v".to_vec()),
+                Ttl::new(None, None).unwrap(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
 
         let snap = snapshot_definitions(&store);
         let names: Vec<_> = snap.iter().map(|d| d.name.clone()).collect();
@@ -1029,7 +1032,7 @@ type = "magic"
     #[test]
     fn snapshot_round_trips_through_serialize() {
         use cache_warden::{Ttl, ValueMeta, ValueSource};
-        let mut store = Store::new();
+        let (mut store, _cap) = cache_warden::test_helpers::store_with_cap();
         let src = cmd_src(&["echo", "x"]);
         store
             .define_with_meta(

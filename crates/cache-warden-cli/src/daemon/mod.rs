@@ -20,6 +20,7 @@
 pub mod authsock;
 pub mod handler;
 pub mod hardening;
+pub mod otp_adapter;
 pub mod peer;
 pub mod server;
 pub mod upstream_path;

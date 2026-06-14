@@ -21,6 +21,13 @@ libc = "0.2"
 # emits the events. DR-0002 allows this as a well-established zero-boilerplate
 # observability primitive that does not pull in runtime or network dependencies.
 tracing = "0.1"
+# Capability token generation for DR-0024 capability-based access gate.
+# Called once at startup to seed the per-process random offset; cost is negligible.
+# Same category as zeroize (DR-0005) and libc (DR-0006): intentional minimal dependency exception.
+getrandom = "0.2"
+
+[features]
+test-support = []
 
 [dev-dependencies]
 tempfile = "3"

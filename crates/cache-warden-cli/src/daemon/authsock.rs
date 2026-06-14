@@ -83,11 +83,12 @@ fn build_registry(
     socket_name: &str,
     keys: &[String],
     store: &mut Store,
+    cap: &cache_warden::Capability,
     clock: &impl Clock,
 ) -> PublicKeyRegistry {
     let mut registry = PublicKeyRegistry::new();
     for kv_key in keys {
-        match store.get(kv_key, clock) {
+        match store.get(kv_key, cap, clock).ok().flatten() {
             Some(secret) => {
                 // The PEM is borrowed only for derivation; the registry keeps
                 // the public blob, never the secret.
@@ -287,7 +288,7 @@ pub fn spawn_listeners(
                     continue;
                 }
             };
-            build_registry(&socket.name, &socket.keys, &mut store, &shared.clock)
+            build_registry(&socket.name, &socket.keys, &mut store, &shared.authsock_cap, &shared.clock)
         };
 
         // Add op-sourced keys (lazily loaded at sign time; see [`KeySource::Op`]).
@@ -808,6 +809,7 @@ fn local_sign(state: &SocketState, peer: Option<u32>, msg: &AgentMessage) -> Age
         runner: &state.shared.runner,
         clock: &state.shared.clock,
         kv_process_policies: &state.shared.kv_process_policies,
+        authsock_cap: &state.shared.authsock_cap,
     };
     sign_local_with_ctx(&ctx, requester.as_deref(), msg)
 }
@@ -854,6 +856,8 @@ struct LocalSignCtx<'a, A: ?Sized, R, C> {
     /// carry an internal `__authsock_op:*` KV name that never appears in `[kv.*]`
     /// config, so they are naturally unrestricted here.
     kv_process_policies: &'a std::collections::BTreeMap<String, Vec<String>>,
+    /// Capability token for store access (authsock operations use the authsock cap).
+    authsock_cap: &'a cache_warden::Capability,
 }
 
 /// Pure local-sign dispatch for one SIGN_REQUEST against the core (no socket
@@ -912,12 +916,12 @@ where
     // Fetch the PEM through the same auth gate as the control socket. For an
     // op-sourced key the core entry may not exist yet (lazy NotLoaded): the
     // first sign fetches it via `op item get`, authenticates, and `set`s it.
-    if !ensure_loaded(&mut store, &kv_key, &source, auth, runner, requester, clock) {
+    if !ensure_loaded(&mut store, &kv_key, &source, auth, runner, requester, ctx.authsock_cap, clock) {
         return AgentMessage::failure();
     }
 
     // Borrow the PEM only for the signing call.
-    let signature = match store.get(&kv_key, clock) {
+    let signature = match store.get(&kv_key, ctx.authsock_cap, clock).ok().flatten() {
         Some(secret) => {
             let pem = String::from_utf8_lossy(secret.expose_secret());
             sign(&pem, &fields.data, fields.flags)
@@ -930,7 +934,7 @@ where
             // Idle-extend (DR-0011): a successful sign refreshes the soft window
             // without prompting (the entry is Active here). Best effort — a
             // failure here must not fail the signature.
-            let _ = store.extend(&kv_key, clock);
+            let _ = store.extend(&kv_key, ctx.authsock_cap, clock);
             AgentMessage::sign_response(&blob)
         }
         Err(_) => AgentMessage::failure(),
@@ -961,6 +965,7 @@ fn ensure_loaded<A, R, C>(
     auth: &A,
     runner: &R,
     requester: Option<&[ProcessInfo]>,
+    cap: &cache_warden::Capability,
     clock: &C,
 ) -> bool
 where
@@ -976,19 +981,19 @@ where
         None => match source {
             KeySource::Local => false,
             KeySource::Op { .. } => matches!(
-                store.get_or_regenerate(key, runner, auth, requester, clock),
+                store.get_or_regenerate(key, runner, auth, requester, cap, clock),
                 Ok(()) | Err(RegenerateDefOutcome::ValueResident)
             ),
         },
         Some(EntryState::Active) => true,
         Some(EntryState::SoftExpired) => {
             matches!(
-                store.extend_authenticated(key, auth, requester, clock),
+                store.extend_authenticated(key, auth, requester, cap, clock),
                 Ok(())
             )
         }
         Some(EntryState::HardExpired) => {
-            match store.regenerate(key, runner, auth, requester, clock) {
+            match store.regenerate(key, runner, auth, requester, cap, clock) {
                 Ok(()) => true,
                 // A static hard-expired key cannot regenerate; not signable.
                 // DR-0022: Backoff means a previous fetch failed recently; treat as
@@ -1000,7 +1005,8 @@ where
                     | RegenerateOutcome::NotHardExpired
                     | RegenerateOutcome::RunFailed(_)
                     | RegenerateOutcome::AuthFailed(_)
-                    | RegenerateOutcome::Backoff { .. },
+                    | RegenerateOutcome::Backoff { .. }
+                    | RegenerateOutcome::CapMismatch,
                 ) => false,
             }
         }
@@ -1047,6 +1053,7 @@ mod tests {
         runner: &R,
         clock: &C,
         requester: Option<&[ProcessInfo]>,
+        cap: &cache_warden::Capability,
         msg: &AgentMessage,
     ) -> AgentMessage
     where
@@ -1063,6 +1070,7 @@ mod tests {
             runner,
             clock,
             kv_process_policies: &no_policies,
+            authsock_cap: cap,
         };
         sign_local_with_ctx(&ctx, requester, msg)
     }
@@ -1079,6 +1087,7 @@ mod tests {
         clock: &C,
         requester: Option<&[ProcessInfo]>,
         policies: &std::collections::BTreeMap<String, Vec<String>>,
+        cap: &cache_warden::Capability,
         msg: &AgentMessage,
     ) -> AgentMessage
     where
@@ -1094,6 +1103,7 @@ mod tests {
             runner,
             clock,
             kv_process_policies: policies,
+            authsock_cap: cap,
         };
         sign_local_with_ctx(&ctx, requester, msg)
     }
@@ -1138,17 +1148,20 @@ mod tests {
     }
 
     /// A store with one static Ed25519 PEM under `GITHUB_KEY`, plus a registry.
-    fn fixture(clock: &FakeClock) -> (Mutex<Store>, PublicKeyRegistry) {
-        let mut store = Store::new();
-        store.set(
-            "GITHUB_KEY",
-            ValueSource::Static,
-            SecretBytes::from(ED25519_PEM),
-            ttl(),
-            clock,
-        );
-        let registry = build_registry("test", &["GITHUB_KEY".into()], &mut store, clock);
-        (Mutex::new(store), registry)
+    fn fixture(clock: &FakeClock) -> (Mutex<Store>, cache_warden::Capability, PublicKeyRegistry) {
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        store
+            .set(
+                "GITHUB_KEY",
+                ValueSource::Static,
+                SecretBytes::from(ED25519_PEM),
+                ttl(),
+                &cap,
+                clock,
+            )
+            .unwrap();
+        let registry = build_registry("test", &["GITHUB_KEY".into()], &mut store, &cap, clock);
+        (Mutex::new(store), cap, registry)
     }
 
     fn blob_of(pub_openssh: &str) -> Vec<u8> {
@@ -1173,18 +1186,22 @@ mod tests {
     #[test]
     fn build_registry_skips_missing_keys() {
         let clock = FakeClock::new();
-        let mut store = Store::new();
-        store.set(
-            "GITHUB_KEY",
-            ValueSource::Static,
-            SecretBytes::from(ED25519_PEM),
-            ttl(),
-            &clock,
-        );
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        store
+            .set(
+                "GITHUB_KEY",
+                ValueSource::Static,
+                SecretBytes::from(ED25519_PEM),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
         let reg = build_registry(
             "s",
             &["GITHUB_KEY".into(), "ABSENT".into()],
             &mut store,
+            &cap,
             &clock,
         );
         // Only the present, parseable key is registered.
@@ -1194,7 +1211,7 @@ mod tests {
     #[test]
     fn local_registry_identities_answer_returns_registered_public_key() {
         let clock = FakeClock::new();
-        let (_store, registry) = fixture(&clock);
+        let (_store, _cap, registry) = fixture(&clock);
         // The local-only REQUEST_IDENTITIES answer is built straight from the
         // registry (the async merge layer adds upstreams on top of this).
         let resp = AgentMessage::build_identities_answer(&registry.identities());
@@ -1208,7 +1225,7 @@ mod tests {
     #[test]
     fn sign_request_for_active_key_produces_verifiable_signature() {
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let data = b"agent challenge bytes";
         let req = sign_request(&blob_of(ED25519_PUB), data, 0);
         let resp = handle_local_sign(
@@ -1219,6 +1236,7 @@ mod tests {
             &NoRunner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::SignResponse);
@@ -1239,7 +1257,7 @@ mod tests {
         // GITHUB_KEY restricted to `ssh`; a requester whose ancestry includes ssh
         // is admitted and the signature verifies.
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let pol = key_policies(&[("GITHUB_KEY", &["ssh"])]);
         let chain = [proc(100, "ssh"), proc(50, "zsh")];
         let data = b"agent challenge";
@@ -1253,6 +1271,7 @@ mod tests {
             &clock,
             Some(&chain),
             &pol,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::SignResponse);
@@ -1263,7 +1282,7 @@ mod tests {
         // A requester whose ancestry has no allowed basename is refused with a
         // bare FAILURE (leak nothing) — even though the key is registered/listed.
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let pol = key_policies(&[("GITHUB_KEY", &["ssh"])]);
         let chain = [proc(100, "git"), proc(50, "zsh")];
         let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
@@ -1276,6 +1295,7 @@ mod tests {
             &clock,
             Some(&chain),
             &pol,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
@@ -1286,7 +1306,7 @@ mod tests {
     fn sign_request_restricted_key_with_unknown_requester_is_fail_closed() {
         // requester == None + a real restriction => fail-closed (FAILURE).
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let pol = key_policies(&[("GITHUB_KEY", &["ssh"])]);
         let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
         let resp = handle_local_sign_gated(
@@ -1298,6 +1318,7 @@ mod tests {
             &clock,
             None,
             &pol,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
@@ -1307,7 +1328,7 @@ mod tests {
     fn sign_request_unrestricted_key_admits_even_unknown_requester() {
         // GITHUB_KEY has no policy entry => unrestricted; a None requester signs.
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let pol = key_policies(&[("OTHER", &["ssh"])]);
         let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
         let resp = handle_local_sign_gated(
@@ -1319,6 +1340,7 @@ mod tests {
             &clock,
             None,
             &pol,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::SignResponse);
@@ -1327,7 +1349,7 @@ mod tests {
     #[test]
     fn sign_request_for_unknown_key_is_failure() {
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let req = sign_request(b"bogus-blob", b"data", 0);
         let resp = handle_local_sign(
             &registry,
@@ -1337,6 +1359,7 @@ mod tests {
             &NoRunner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
@@ -1346,7 +1369,7 @@ mod tests {
     fn sign_request_denied_auth_is_failure_and_leaks_nothing() {
         // Soft-expire so a sign needs re-auth; DenyAll blocks it -> FAILURE.
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         clock.advance(Duration::from_secs(SOFT + 1));
         let data = b"data";
         let req = sign_request(&blob_of(ED25519_PUB), data, 0);
@@ -1358,6 +1381,7 @@ mod tests {
             &NoRunner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
@@ -1367,7 +1391,7 @@ mod tests {
     #[test]
     fn sign_request_soft_expired_extends_then_signs_with_allow_all() {
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         clock.advance(Duration::from_secs(SOFT + 1)); // soft-expired
         let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
         let resp = handle_local_sign(
@@ -1378,6 +1402,7 @@ mod tests {
             &NoRunner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::SignResponse);
@@ -1386,7 +1411,7 @@ mod tests {
     #[test]
     fn sign_request_hard_expired_static_key_is_failure() {
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         clock.advance(Duration::from_secs(HARD)); // hard-expired, static => destroyed
         let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
         let resp = handle_local_sign(
@@ -1397,6 +1422,7 @@ mod tests {
             &NoRunner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
@@ -1407,7 +1433,7 @@ mod tests {
         // After a sign while soft-expired-then-extended, a second sign within the
         // refreshed window must not need auth again (idle extend, DR-0011).
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         // Advance near soft expiry, sign (Active -> extend refreshes window).
         clock.advance(Duration::from_secs(SOFT - 1));
         let req = sign_request(&blob_of(ED25519_PUB), b"d1", 0);
@@ -1419,6 +1445,7 @@ mod tests {
             &NoRunner,
             &clock,
             None,
+            &cap,
             &req,
         );
         // Active sign with DenyAll still succeeds (no prompt while Active) and
@@ -1435,6 +1462,7 @@ mod tests {
             &NoRunner,
             &clock,
             None,
+            &cap,
             &req2,
         );
         assert_eq!(
@@ -1449,7 +1477,7 @@ mod tests {
         // A Lock message has no SIGN_REQUEST payload, so the local sign path
         // fails to parse and returns FAILURE.
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let req = AgentMessage::new(MessageType::Lock, bytes::Bytes::new());
         let resp = handle_local_sign(
             &registry,
@@ -1459,6 +1487,7 @@ mod tests {
             &NoRunner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
@@ -1497,7 +1526,7 @@ mod tests {
     /// A registry holding one op-sourced key (no core entry yet — lazy) plus a
     /// store that has the op key's definition registered (as spawn_listeners does
     /// after A-3a). The op key's KV name is namespaced like the production path.
-    fn op_fixture(soft: u64, hard: u64) -> (Mutex<Store>, PublicKeyRegistry) {
+    fn op_fixture(soft: u64, hard: u64) -> (Mutex<Store>, cache_warden::Capability, PublicKeyRegistry) {
         let argv = private_key_argv("/path/cache-warden", "itemABC", Some("kawaz.1password.com"));
         let kv_key = op_kv_key("itemABC");
         let mut registry = PublicKeyRegistry::new();
@@ -1515,7 +1544,7 @@ mod tests {
             .unwrap();
         // Register the definition so get_or_regenerate can lazily produce the value
         // (mirrors what spawn_listeners now does after A-3a).
-        let mut store = Store::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let ttl = Ttl::new(
             Some(Duration::from_secs(soft)),
             Some(Duration::from_secs(hard)),
@@ -1524,13 +1553,13 @@ mod tests {
         store
             .define(kv_key, ValueSource::command(argv), ttl)
             .expect("define must succeed for a fresh store");
-        (Mutex::new(store), registry)
+        (Mutex::new(store), cap, registry)
     }
 
     #[test]
     fn op_key_first_sign_lazily_loads_fetches_and_signs() {
         let clock = FakeClock::new();
-        let (store, registry) = op_fixture(SOFT, HARD);
+        let (store, cap, registry) = op_fixture(SOFT, HARD);
         let runner = PemRunner::new();
         let data = b"agent challenge for op key";
         let req = sign_request(&blob_of(ED25519_PUB), data, 0);
@@ -1542,6 +1571,7 @@ mod tests {
             &runner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::SignResponse);
@@ -1558,13 +1588,13 @@ mod tests {
 
         // The core now holds the op key's value (lazy load created it).
         let key = op_kv_key("itemABC");
-        assert!(store.lock().unwrap().get(&key, &clock).is_some());
+        assert!(store.lock().unwrap().get(&key, &cap, &clock).ok().flatten().is_some());
     }
 
     #[test]
     fn op_key_second_sign_within_soft_hits_cache_no_refetch() {
         let clock = FakeClock::new();
-        let (store, registry) = op_fixture(SOFT, HARD);
+        let (store, cap, registry) = op_fixture(SOFT, HARD);
         let runner = PemRunner::new();
         let req = sign_request(&blob_of(ED25519_PUB), b"d1", 0);
         let r1 = handle_local_sign(
@@ -1575,6 +1605,7 @@ mod tests {
             &runner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(r1.msg_type, MessageType::SignResponse);
@@ -1589,6 +1620,7 @@ mod tests {
             &runner,
             &clock,
             None,
+            &cap,
             &req2,
         );
         assert_eq!(
@@ -1602,7 +1634,7 @@ mod tests {
     #[test]
     fn op_key_after_hard_expiry_regenerates_via_same_command() {
         let clock = FakeClock::new();
-        let (store, registry) = op_fixture(SOFT, HARD);
+        let (store, cap, registry) = op_fixture(SOFT, HARD);
         let runner = PemRunner::new();
         let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
         let _ = handle_local_sign(
@@ -1613,6 +1645,7 @@ mod tests {
             &runner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(runner.runs(), 1);
@@ -1628,6 +1661,7 @@ mod tests {
             &runner,
             &clock,
             None,
+            &cap,
             &req2,
         );
         assert_eq!(r2.msg_type, MessageType::SignResponse);
@@ -1637,7 +1671,7 @@ mod tests {
     #[test]
     fn op_key_first_sign_denied_auth_loads_nothing_and_fails() {
         let clock = FakeClock::new();
-        let (store, registry) = op_fixture(SOFT, HARD);
+        let (store, cap, registry) = op_fixture(SOFT, HARD);
         let runner = PemRunner::new();
         let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
         let resp = handle_local_sign(
@@ -1648,6 +1682,7 @@ mod tests {
             &runner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
@@ -1656,13 +1691,13 @@ mod tests {
         // core entry was created.
         assert_eq!(runner.runs(), 1);
         let key = op_kv_key("itemABC");
-        assert!(store.lock().unwrap().get(&key, &clock).is_none());
+        assert!(store.lock().unwrap().get(&key, &cap, &clock).ok().flatten().is_none());
     }
 
     #[test]
     fn op_key_fetch_failure_skips_auth_and_fails() {
         let clock = FakeClock::new();
-        let (store, registry) = op_fixture(SOFT, HARD);
+        let (store, cap, registry) = op_fixture(SOFT, HARD);
         // NoRunner always fails the fetch (op not signed in / network down).
         let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
         let resp = handle_local_sign(
@@ -1673,17 +1708,18 @@ mod tests {
             &NoRunner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
         let key = op_kv_key("itemABC");
-        assert!(store.lock().unwrap().get(&key, &clock).is_none());
+        assert!(store.lock().unwrap().get(&key, &cap, &clock).ok().flatten().is_none());
     }
 
     #[test]
     fn op_key_unknown_blob_is_failure() {
         let clock = FakeClock::new();
-        let (store, registry) = op_fixture(SOFT, HARD);
+        let (store, cap, registry) = op_fixture(SOFT, HARD);
         let req = sign_request(b"not-a-registered-blob", b"d", 0);
         let resp = handle_local_sign(
             &registry,
@@ -1693,6 +1729,7 @@ mod tests {
             &PemRunner::new(),
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
@@ -1702,7 +1739,7 @@ mod tests {
     fn op_key_filtered_out_is_failure() {
         // A comment filter that hides the op key denies its direct SIGN_REQUEST.
         let clock = FakeClock::new();
-        let (store, registry) = op_fixture(SOFT, HARD);
+        let (store, cap, registry) = op_fixture(SOFT, HARD);
         let filter = parse_filter(&["comment=nope*"]);
         let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
         let resp = handle_local_sign(
@@ -1713,6 +1750,7 @@ mod tests {
             &PemRunner::new(),
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
@@ -1721,7 +1759,7 @@ mod tests {
     #[test]
     fn op_key_enumerates_with_comment_from_title() {
         // The op key shows in REQUEST_IDENTITIES with the item title as its comment.
-        let (_store, registry) = op_fixture(SOFT, HARD);
+        let (_store, _cap, registry) = op_fixture(SOFT, HARD);
         let ids = registry.identities();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].key_blob.as_ref(), blob_of(ED25519_PUB).as_slice());
@@ -1817,7 +1855,7 @@ mod tests {
     #[test]
     fn op_key_registers_definition_in_store_at_spawn() {
         let clock = FakeClock::new();
-        let (store, _registry) = op_fixture(SOFT, HARD);
+        let (store, _cap, _registry) = op_fixture(SOFT, HARD);
         let kv_key = op_kv_key("itemABC");
         assert!(
             store.lock().unwrap().is_defined(&kv_key),
@@ -1831,7 +1869,7 @@ mod tests {
     #[test]
     fn op_key_lazy_load_goes_through_get_or_regenerate() {
         let clock = FakeClock::new();
-        let (store, registry) = op_fixture(SOFT, HARD);
+        let (store, cap, registry) = op_fixture(SOFT, HARD);
         let runner = PemRunner::new();
         let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
         let resp = handle_local_sign(
@@ -1842,6 +1880,7 @@ mod tests {
             &runner,
             &clock,
             None,
+            &cap,
             &req,
         );
         // The runner must have been called exactly once (lazy load via get_or_regenerate).
@@ -1858,7 +1897,7 @@ mod tests {
     #[test]
     fn op_key_fetch_failure_does_not_remove_definition() {
         let clock = FakeClock::new();
-        let (store, registry) = op_fixture(SOFT, HARD);
+        let (store, cap, registry) = op_fixture(SOFT, HARD);
         let kv_key = op_kv_key("itemABC");
 
         // NoRunner always fails the fetch.
@@ -1871,6 +1910,7 @@ mod tests {
             &NoRunner,
             &clock,
             None,
+            &cap,
             &req,
         );
         assert_eq!(
@@ -1979,17 +2019,21 @@ mod tests {
         filter: FilterEvaluator,
     ) -> Arc<SocketState> {
         let clock = SystemClock::new();
-        let mut store = Store::new();
-        store.set(
-            "GITHUB_KEY",
-            ValueSource::Static,
-            SecretBytes::from(ED25519_PEM),
-            ttl(),
-            &clock,
-        );
-        let registry = build_registry("test", &["GITHUB_KEY".into()], &mut store, &clock);
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        store
+            .set(
+                "GITHUB_KEY",
+                ValueSource::Static,
+                SecretBytes::from(ED25519_PEM),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+        let registry = build_registry("test", &["GITHUB_KEY".into()], &mut store, &cap, &clock);
         let shared = Arc::new(crate::daemon::server::Shared::new_for_test(
             store,
+            cap,
             Box::new(AllowAll),
             clock,
         ));
@@ -2162,12 +2206,12 @@ mod tests {
     fn handle_local_sign_with_matching_filter_signs() {
         // A filter that admits the local key (by its fallback comment) signs.
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let filter = parse_filter(&["comment=GITHUB_KEY"]);
         let data = b"filtered-but-allowed";
         let req = sign_request(&blob_of(ED25519_PUB), data, 0);
         let resp = handle_local_sign(
-            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &req,
+            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &cap, &req,
         );
         assert_eq!(resp.msg_type, MessageType::SignResponse);
     }
@@ -2177,11 +2221,11 @@ mod tests {
         // A filter that hides the local key rejects a direct SIGN_REQUEST even
         // though the PEM is reachable (no enumeration needed to deny).
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let filter = parse_filter(&["comment=other-key*"]);
         let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
         let resp = handle_local_sign(
-            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &req,
+            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &cap, &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
         assert!(resp.payload.is_empty(), "FAILURE must carry no detail");
@@ -2191,11 +2235,11 @@ mod tests {
     fn handle_local_sign_blob_filter_admits_ed25519() {
         // A type=ed25519 filter (blob-derived) admits the Ed25519 local key.
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let filter = parse_filter(&["type=ed25519"]);
         let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
         let resp = handle_local_sign(
-            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &req,
+            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &cap, &req,
         );
         assert_eq!(resp.msg_type, MessageType::SignResponse);
     }
@@ -2204,11 +2248,11 @@ mod tests {
     fn handle_local_sign_blob_filter_excludes_other_type() {
         // A type=rsa filter hides the Ed25519 local key.
         let clock = FakeClock::new();
-        let (store, registry) = fixture(&clock);
+        let (store, cap, registry) = fixture(&clock);
         let filter = parse_filter(&["type=rsa"]);
         let req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
         let resp = handle_local_sign(
-            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &req,
+            &registry, &filter, &store, &AllowAll, &NoRunner, &clock, None, &cap, &req,
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
     }

@@ -43,3 +43,4 @@ ssh-key = { version = "0.6", features = ["std", "ed25519", "rsa"] }
 ssh-encoding = "0.2"
 signature = "2"
 bytes = "1"
+cache-warden = { path = "../cache-warden", features = ["test-support"] }
