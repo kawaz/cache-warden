@@ -20,6 +20,14 @@ SSH key management (the former authsock-warden) is absorbed as one protocol adap
 
 ## Install
 
+Homebrew (macOS; ships a signed & notarized `.app`):
+
+```bash
+brew install --cask kawaz/tap/cache-warden
+```
+
+From source:
+
 ```bash
 cargo build --release -p cache-warden-cli
 ```
