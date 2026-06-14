@@ -77,40 +77,7 @@ fn render_response(resp: Response) -> Result<(), String> {
                     } else {
                         println!("entries:");
                         for e in entries {
-                            // Build a value-free attribute list: regenerability,
-                            // whether a definition is registered, whether a value
-                            // is resident, and any active pin (never the value).
-                            let mut attrs: Vec<String> = Vec::new();
-                            attrs.push(
-                                if e.regenerable {
-                                    "regenerable"
-                                } else {
-                                    "static"
-                                }
-                                .to_string(),
-                            );
-                            if let Some(t) = &e.value_type {
-                                attrs.push(format!("type {t}"));
-                            }
-                            // The typed source origin (DR-0018 §3): value-free
-                            // (an op source shows its uri, never the secret).
-                            if let Some(src) = &e.source {
-                                attrs.push(format!("source {src}"));
-                            }
-                            if e.defined {
-                                attrs.push("defined".to_string());
-                            }
-                            attrs.push(
-                                if e.has_value {
-                                    "value present"
-                                } else {
-                                    "no value"
-                                }
-                                .to_string(),
-                            );
-                            if let Some(secs) = e.pin_remaining_secs {
-                                attrs.push(format!("pinned {secs}s"));
-                            }
+                            let attrs = format_entry_attrs(&e);
                             println!("  {} [{}] ({})", e.name, e.state, attrs.join(", "));
                         }
                     }
@@ -836,6 +803,51 @@ fn dispatch_inject(
     Ok(())
 }
 
+/// Build the attribute list for a status entry (value-free: regenerability,
+/// definition presence, value presence, active pin, active backoff).
+///
+/// Extracted for unit-testability. Called once per entry inside
+/// [`render_response`].
+fn format_entry_attrs(e: &protocol::wire::EntryInfo) -> Vec<String> {
+    let mut attrs: Vec<String> = Vec::new();
+    attrs.push(
+        if e.regenerable {
+            "regenerable"
+        } else {
+            "static"
+        }
+        .to_string(),
+    );
+    if let Some(t) = &e.value_type {
+        attrs.push(format!("type {t}"));
+    }
+    // The typed source origin (DR-0018 §3): value-free
+    // (an op source shows its uri, never the secret).
+    if let Some(src) = &e.source {
+        attrs.push(format!("source {src}"));
+    }
+    if e.defined {
+        attrs.push("defined".to_string());
+    }
+    attrs.push(
+        if e.has_value {
+            "value present"
+        } else {
+            "no value"
+        }
+        .to_string(),
+    );
+    if let Some(secs) = e.pin_remaining_secs {
+        attrs.push(format!("pinned {secs}s"));
+    }
+    // Fetch-failure backoff (DR-0022): when active, show remaining seconds so
+    // the user knows re-fetch is suppressed and for how long.
+    if let Some(secs) = e.backoff_until_secs.filter(|&s| s > 0) {
+        attrs.push(format!("backoff: {secs}s"));
+    }
+    attrs
+}
+
 fn main() {
     match run() {
         Ok(()) => {}
@@ -852,5 +864,74 @@ fn main() {
             eprintln!("{}", help().render());
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::wire::EntryInfo;
+
+    fn base_entry() -> EntryInfo {
+        EntryInfo {
+            name: "default/K".into(),
+            state: "active".into(),
+            regenerable: false,
+            defined: false,
+            has_value: true,
+            pin_remaining_secs: None,
+            value_type: None,
+            source: None,
+            backoff_until_secs: None,
+        }
+    }
+
+    #[test]
+    fn format_entry_attrs_no_backoff_omits_backoff_field() {
+        let e = base_entry();
+        let attrs = format_entry_attrs(&e);
+        let joined = attrs.join(", ");
+        assert!(
+            !joined.contains("backoff"),
+            "no backoff_until_secs must not show backoff: {joined}"
+        );
+    }
+
+    #[test]
+    fn format_entry_attrs_backoff_zero_omits_backoff_field() {
+        let mut e = base_entry();
+        e.backoff_until_secs = Some(0);
+        let attrs = format_entry_attrs(&e);
+        let joined = attrs.join(", ");
+        assert!(
+            !joined.contains("backoff"),
+            "backoff_until_secs=0 (expired) must not show backoff: {joined}"
+        );
+    }
+
+    #[test]
+    fn format_entry_attrs_backoff_active_shows_remaining_seconds() {
+        let mut e = base_entry();
+        e.backoff_until_secs = Some(3);
+        let attrs = format_entry_attrs(&e);
+        let joined = attrs.join(", ");
+        assert!(
+            joined.contains("backoff: 3s"),
+            "backoff_until_secs=3 must show 'backoff: 3s': {joined}"
+        );
+    }
+
+    #[test]
+    fn format_entry_attrs_pin_and_backoff_both_shown() {
+        let mut e = base_entry();
+        e.pin_remaining_secs = Some(60);
+        e.backoff_until_secs = Some(5);
+        let attrs = format_entry_attrs(&e);
+        let joined = attrs.join(", ");
+        assert!(joined.contains("pinned 60s"), "pin must be shown: {joined}");
+        assert!(
+            joined.contains("backoff: 5s"),
+            "backoff must be shown: {joined}"
+        );
     }
 }
