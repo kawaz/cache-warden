@@ -26,6 +26,8 @@
 - **prefetch 本体 + authsock NS 正規化** (DR-0018 未着手): `kv prefetch ...` / 起動時 prefetch /
   内部鍵 `__authsock_op:*` を予約 NS `authsock` に正規化。型付きスキーマ自体は v0.17.0 実装済み
 - **op discovery の起動ブロック解消**: `docs/issue/2026-06-13-op-discovery-blocks-startup.md`
+- **FDA チェック&誘導フローの移植** (authsock-warden で解決済み、cache 未対応): op 実行時の TCC
+  ダイアログを Full Disk Access ON で恒久解消する register 統合フロー。`docs/issue/2026-06-14-fda-check-flow-port.md`
 - **鍵形式の残ギャップ**: RSA PKCS#1 / FIDO sk-* / 証明書 (需要次第)。ECDSA は実装済み
 
 ## 中期 (= 構想中)
