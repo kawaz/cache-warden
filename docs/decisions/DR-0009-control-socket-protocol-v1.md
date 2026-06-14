@@ -55,10 +55,16 @@ DR-0002 はライブラリ（`cache-warden`）の依存を最小に保ち、`ser
 |---|---|---|
 | `ping` | なし | `{"ok":true,"pong":true}` |
 | `status` | なし | デーモン情報（pid / version / socket）+ エントリ一覧（名前・状態・regenerable）。**値は含めない** |
-| `kv.set` | `key`, `source`（`static`+`value_b64` または `command`+`argv`）, `soft_ttl_secs?`, `hard_ttl_secs?` | `{"ok":true,"set":true}` |
+| `kv.set` | `key`, `source=static`, `value_b64`, `soft_ttl_secs?`, `hard_ttl_secs?` | `{"ok":true,"set":true}` |
 | `kv.get` | `key` | `{"ok":true,"value_b64":...}` |
 | `kv.del` | `key` | `{"ok":true,"deleted":bool}` |
 | `kv.list` | なし | `{"ok":true,"keys":[...]}`（ソート済み） |
+
+> **[後続改訂]** コマンド体系はその後以下の DR で拡張・改訂された。現行の完全なコマンド一覧は
+> `crates/cache-warden-cli/src/protocol/wire.rs` を正とする:
+> - DR-0014 — `kv.set`（static 専用）/ `kv.define`（command source の登録）への分離
+> - DR-0011 — `kv.pin` / `kv.unpin` の追加
+> - DR-0015 — `kv.get` への `dry_run` フィールド追加
 
 - レスポンスは成功時 `{"ok":true,...}`、失敗時 `{"ok":false,"error":{"kind":...,"message":...}}`。
 - `error.kind` は機械可読カテゴリ: `bad_request` / `not_found` / `auth_failed` /

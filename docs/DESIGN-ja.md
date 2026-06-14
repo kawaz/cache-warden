@@ -112,8 +112,8 @@ cache-warden daemon run（単一プロセス / tokio ランタイム）
   （下記「control socket プロトコル v1」節）。
 - **コアをデーモンの中心に配線する**。コア（実装済み）を run 経路の中心に置き、アダプタはその上に
   薄く乗せる。
-- **サービス登録（launchd / systemd）は単一バイナリ + `daemon run` 引数**で行う（将来は
-  `daemon register` / `daemon unregister` でラップ）。
+- **サービス登録（launchd / systemd）は単一バイナリ + `daemon run` 引数**で行う
+  （`daemon register` / `daemon unregister` でラップ済み、DR-0019）。
 - **同期処理（op CLI 呼び出し等）は `spawn_blocking` で隔離**する。
 - **起動時ハードニング（プロセス全体保護、port plan §3 判断 5）**: 秘密値が Store に入る前に
   2 段の防御を適用する。(a) **コアダンプ抑制**（`RLIMIT_CORE=0`）でクラッシュ時の秘密値ディスク
@@ -168,13 +168,13 @@ CLI サブコマンド体系 v1: `daemon run` / `ping` / `status` /
 定義があれば lazy 生成する。`kv del KEY` は値のみ破棄（定義は残り次の get で再生成）、`kv del KEY --with-define`
 で定義ごと削除。`kv pin <KEY> <DURATION>` は TTL を無視して値を期限まで Active 保持（再認証必須）、`kv unpin <KEY>` は解除。
 
-- **`daemon` グループ**: デーモンのライフサイクル操作を隔離する。`daemon run`（フォアグラウンド起動）
-  のみ実装済み。`daemon register` / `daemon unregister`（launchd/systemd サービス登録）/
-  `daemon status`（プロセス・登録状態）は将来実装で、未実装のうちはグループ help に出さない。
+- **`daemon` グループ**: デーモンのライフサイクル操作を隔離する。`daemon run`（フォアグラウンド起動）/
+  `daemon register` / `daemon unregister`（launchd/systemd サービス登録）/
+  `daemon status`（プロセス・登録状態）はいずれも実装済みでグループ help に出る（DR-0019）。
   トップレベルに `run` を出さないのは、`kv get` 等を日常的に叩くクライアントとして使う中で、
   デーモン起動コマンドを誤操作（意図しない二重起動）する事故を避けるため。
 - **`status` の対比**: トップレベル `status` = キャッシュエントリ一覧（ユーザ向け、値は含めない）。
-  将来の `daemon status` = プロセス・サービス登録状態（運用向け）。同じ語で関心が違うので分ける。
+  `daemon status` = プロセス・サービス登録状態（運用向け）。同じ語で関心が違うので分ける。
 - **トップレベル `run` / `inject`**: トップレベル `run` は op run 相当（秘密値を env 注入して
   子コマンドを exec）、`inject` は op inject 相当（テンプレート中の `cache-warden://KEY` 参照を実値に展開）。
   どちらも control socket クライアントとして実装済み（詳細は「secret reference 注入（run / inject / dry-run）」節、
@@ -493,13 +493,13 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
 
 移行は段階的・可逆に進め、全フェーズで kawaz の日常の鍵利用を中断させない:
 
-| Phase | 内容 |
-|---|---|
-| Phase 0（現状） | authsock-warden が日常稼働。cache-warden は雛形のみ |
-| Phase 1（並走） | cache-warden に KV コア + authsock アダプタを実装、authsock-warden と別ソケットで並走 |
-| Phase 2（パリティ） | authsock アダプタが authsock-warden と機能パリティを達成 |
-| Phase 3（切替） | 利用ソケットを cache-warden 側へ切替。authsock-warden はフォールバック残置 |
-| Phase 4（引退） | 安定確認後、authsock-warden を引退 |
+| Phase | 内容 | 状況 |
+|---|---|---|
+| Phase 0 | authsock-warden が日常稼働。cache-warden は雛形のみ（起点） | 完了 |
+| Phase 1（並走） | cache-warden に KV コア + authsock アダプタを実装、authsock-warden と別ソケットで並走 | 完了 |
+| Phase 2（パリティ） | authsock アダプタが authsock-warden と機能パリティを達成 | 完了 (v0.20.0) |
+| Phase 3（切替） | 利用ソケットを cache-warden 側へ切替。authsock-warden はフォールバック残置 | **現在** (dogfood 検証中、可逆的に authsock-warden へ戻せる) |
+| Phase 4（引退） | 安定確認後、authsock-warden を引退 | 未 |
 
 移植対象資産のコア / アダプタ振り分けは DR-0004 を参照。
 
@@ -512,8 +512,6 @@ cache-warden は authsock-warden の**後継コア**であり、authsock-warden 
 
 ## 将来検討
 
-- **control socket / KV socket API**: 管理 CLI ↔ デーモンの通信と、他プロセスからプログラマティックに
-  KV を操作する経路を 1 本の Unix domain socket プロトコルに統合する（DR-0008、設計は次ステップ）。
 - **自前 TouchID**: 上流（op）に頼らず cache-warden 自身が LocalAuthentication で再認証を発行する。
   SSH 鍵署名のゲートにも転用できる。`[auth]` 型付きスキーマの `type = "touchid"` が着地スロット（DR-0018）。
 - **アダプタの追加**: SSH / KV 以外の秘密値プロトコルを扱うアダプタ。

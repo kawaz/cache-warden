@@ -99,8 +99,8 @@ cache-warden daemon run (single process / tokio runtime)
   (see "Control Socket Protocol v1" below).
 - **The core is wired at the center of the daemon**. The (already-implemented) core sits at the center of the
   `daemon run` path, with adapters layered thinly on top.
-- **Service registration (launchd / systemd) uses the single binary + a `daemon run` argument** (later wrapped by
-  `daemon register` / `daemon unregister`).
+- **Service registration (launchd / systemd) uses the single binary + a `daemon run` argument**
+  (wrapped by `daemon register` / `daemon unregister`, DR-0019).
 - **Synchronous work (e.g. op CLI invocations) is isolated via `spawn_blocking`**.
 - **Startup hardening (process-wide, port plan §3 judgement 5)**: before any secret enters the Store the
   daemon applies two defence layers. (a) **Core-dump suppression** (`RLIMIT_CORE=0`) keeps a crash from
@@ -165,13 +165,13 @@ value is absent / HardExpired. `kv del KEY` drops only the value (the definition
 next get); `kv del KEY --with-define` deletes the definition too.
 `kv pin <KEY> <DURATION>` holds a value Active past its TTL (re-auth required); `kv unpin <KEY>` removes the pin.
 
-- **The `daemon` group** isolates daemon lifecycle operations. Only `daemon run` (foreground start) is
-  implemented; `daemon register` / `daemon unregister` (launchd/systemd service registration) and
-  `daemon status` (process/registration state) are future commands and are not listed in the group help
-  until implemented. `run` is kept off the top level so that, while using the CLI as an everyday client
-  (`kv get`, etc.), the daemon-start command cannot be triggered by mistake (an accidental double start).
-- **`status` contrast**: top-level `status` lists the cache entries (user-facing, value-free); the future
-  `daemon status` will report process/service-registration state (operations-facing). Same word, different
+- **The `daemon` group** isolates daemon lifecycle operations. `daemon run` (foreground start),
+  `daemon register` / `daemon unregister` (launchd/systemd service registration) and `daemon status`
+  (process/registration state) are all implemented and listed in the group help (DR-0019). `run` is kept
+  off the top level so that, while using the CLI as an everyday client (`kv get`, etc.), the daemon-start
+  command cannot be triggered by mistake (an accidental double start).
+- **`status` contrast**: top-level `status` lists the cache entries (user-facing, value-free);
+  `daemon status` reports process/service-registration state (operations-facing). Same word, different
   concern, so they are split.
 - **Top-level `run` / `inject`**: the top-level `run` is the op-run equivalent (inject secret values
   into the environment and exec a child command); `inject` is the op-inject equivalent (expand
@@ -520,13 +520,13 @@ cache-warden is the **successor core** of authsock-warden, porting authsock-ward
 
 Migration proceeds incrementally and reversibly, without interrupting kawaz's day-to-day key usage at any phase:
 
-| Phase | Description |
-|---|---|
-| Phase 0 (current) | authsock-warden runs in daily use. cache-warden is a skeleton only. |
-| Phase 1 (parallel) | Implement KV core + authsock adapter in cache-warden; run in parallel with authsock-warden on a separate socket. |
-| Phase 2 (parity) | authsock adapter reaches feature parity with authsock-warden. |
-| Phase 3 (switchover) | Switch the active socket to cache-warden. authsock-warden remains as a fallback. |
-| Phase 4 (retirement) | After confirming stability, retire authsock-warden. |
+| Phase | Description | Status |
+|---|---|---|
+| Phase 0 | authsock-warden runs in daily use. cache-warden is a skeleton only (starting point). | Done |
+| Phase 1 (parallel) | Implement KV core + authsock adapter in cache-warden; run in parallel with authsock-warden on a separate socket. | Done |
+| Phase 2 (parity) | authsock adapter reaches feature parity with authsock-warden. | Done (v0.20.0) |
+| Phase 3 (switchover) | Switch the active socket to cache-warden. authsock-warden remains as a fallback. | **Current** (dogfood; reversible back to authsock-warden) |
+| Phase 4 (retirement) | After confirming stability, retire authsock-warden. | Not started |
 
 See DR-0004 for the core/adapter assignment of assets being ported.
 
@@ -537,8 +537,6 @@ See DR-0004 for the core/adapter assignment of assets being ported.
 
 ## Future Considerations
 
-- **Control socket / KV socket API**: Unify the management CLI ↔ daemon communication and the path for other processes
-  to interact with the KV programmatically into a single Unix domain socket protocol (DR-0008; design is the next step).
 - **Native TouchID**: cache-warden itself issues re-authentication via LocalAuthentication, without relying on an upstream (op). Can also be repurposed as a gate for SSH key signing. The `[auth]` typed schema (`type = "touchid"`) is the prepared landing slot (DR-0018).
 - **Additional adapters**: Adapters for secret value protocols beyond SSH / KV.
 - **KV definition model (`kv define` / definition layers / definition persistence)**: Split verb

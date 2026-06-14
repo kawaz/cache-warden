@@ -68,14 +68,15 @@ Apple ID / Keychain 操作が必要)。手順は runbook 化する (§4)。
 
 ### 4. ノウハウの移植（warden archive に備える）
 
-warden の以下を cache-warden の docs に**こちらの文脈で書き直して**移植する
+warden の以下を cache-warden の docs にこちらの文脈で書き直して**移植済み**
 (リンクでなくコピー。warden は archive ルートのため):
 
 - `docs/runbooks/release-notarization-403.md` — PLA 再同意 403 の診断と対処
-  (エラー分類表ごと移植)
-- `docs/macos-tcc-fda.md` 相当 — TCC / responsible process の背景知識
-- secrets セットアップ手順 (新規 runbook): App-Specific Password 発行 →
-  p12 エクスポート → `gh secret set` の一連
+  （エラー分類表ごと移植済み）
+- `docs/findings/2026-06-12-macos-tcc-responsible-process.md` — TCC / responsible process
+  の背景知識（macOS TCC の動作・Bundle ID ベース判定の実証知見を記録）
+- `docs/runbooks/apple-signing-secrets-setup.md` — secrets セットアップ手順: App-Specific
+  Password 発行 → p12 エクスポート → `gh secret set` の一連（移植済み）
 
 ## Alternatives Considered
 
@@ -92,12 +93,13 @@ warden の以下を cache-warden の docs に**こちらの文脈で書き直し
 
 ## Consequences
 
-- release.yml の macOS ジョブに署名・notarization が増え、リリースには
-  cache-warden 用 Apple secrets の事前投入が必要になる (未投入だと macOS ジョブが
-  失敗する — 初回リリース前に runbook の手順で投入)。
-- `daemon register` (DR-0019) に .app 検出と `AssociatedBundleIdentifiers` が入る。
-- Homebrew cask/formula は .app 入り tarball を配る形になる (配布詳細は別途)。
-- warden の notarization 知見は cache-warden の docs が正本になる。
+- release.yml の macOS ジョブに署名・notarization が実装済みで、リリースには
+  cache-warden 用 Apple secrets の事前投入が必要（runbooks/apple-signing-secrets-setup.md
+  の手順で投入）。
+- `daemon register` (DR-0019) に .app 検出と `AssociatedBundleIdentifiers` が実装済み。
+- Homebrew cask/formula は .app 入り tarball を配る形（配布詳細は別途）。
+- warden の notarization 知見は cache-warden の docs が正本。TCC / responsible process
+  の背景知見は `docs/findings/2026-06-12-macos-tcc-responsible-process.md` を参照。
 
 ## 関連
 

@@ -1,9 +1,10 @@
 # authsock アダプタ移植計画ドラフト
 
-> Status: ドラフト（kawaz レビュー前の検討資料。DR / INDEX / DESIGN には未反映）
+> Status: 大半 land 済み（移植は v0.20.0 までに完了、各判断は確定 DR に反映済み）。本 doc は移植経緯の記録。
 > Date: 2026-06-10
 > 前提 DR: DR-0003（セキュア KV コア + アダプタ）、DR-0004（authsock-warden 後継・吸収）、
 > DR-0008（単一デーモン直担）、DR-0009（control socket protocol v1）、DR-0010（TOML config + 再認証コマンド）
+> 反映先: 移植の各 Iteration で確定した判断は [decisions/INDEX.md](../decisions/INDEX.md) の DR 群に反映済み
 
 この文書は authsock-warden（SSH agent proxy + 鍵セキュリティ製品）の資産を
 cache-warden 上の「authsock アダプタ」として移植する計画の検討材料である。

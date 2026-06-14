@@ -7,8 +7,8 @@
 
 DR-0013 / DR-0014 の議論の中で「秘密値を見ずに配線を確認したい」ニーズが浮上した。
 典型は AI エージェント: テンプレートや env の参照が正しく解決されるかを確認したいが、
-実値がエージェントの会話ログに流れ込むのは事故である（本気の防御は将来の key 層
-allowed_processes の仕事で、本 DR はその手前の事故防止層）。
+実値がエージェントの会話ログに流れ込むのは事故である（本気の防御は key 層
+allowed_processes（DR-0012 で実装済み）の仕事で、本 DR はその手前の事故防止層）。
 
 設計の参考に op CLI（2.34.0）の実機挙動を確認した:
 
@@ -118,4 +118,4 @@ op の「移送経路は実値」と同じ極性で統一する。
 - [DR-0013-secret-reference-injection](./DR-0013-secret-reference-injection.md) — run / inject 本体（本 DR が検証モードを追加）
 - [DR-0014-kv-definition-model](./DR-0014-kv-definition-model.md) — 定義モデル（dry-run が検証する lazy 生成経路）
 - [DR-0009-control-socket-protocol-v1](./DR-0009-control-socket-protocol-v1.md) — `kv.get` プロトコル（`dry_run` フィールド追加）
-- [DR-0012-process-access-policy](./DR-0012-process-access-policy.md) — 本気のアクセス制御（本 DR は事故防止層、防御は key 層 allowed_processes の将来実装）
+- [DR-0012-process-access-policy](./DR-0012-process-access-policy.md) — 本気のアクセス制御（本 DR は事故防止層、防御は key 層 allowed_processes（実装済み））

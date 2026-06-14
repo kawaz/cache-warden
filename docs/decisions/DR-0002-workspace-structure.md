@@ -10,7 +10,8 @@ stable-which と同じ workspace 分離パターンを採用。
 | Crate | 役割 | 依存 | Publish |
 |---|---|---|---|
 | `cache-warden` | ライブラリ | 最小（std のみ目標） | crates.io |
-| `cache-warden-cli` | CLI バイナリ | cache-warden, serde, serde_json | No（Homebrew 配布） |
+| `cache-warden-authsock` | SSH agent protocol アダプタ lib | cache-warden, ssh-key, tokio, bytes, serde/serde_json, 暗号クレート群（ed25519-dalek/rsa/p256/p384/p521 等） | No（アダプタの重い依存隔離のため別 crate 化。DR-0004 参照） |
+| `cache-warden-cli` | CLI バイナリ | cache-warden + cache-warden-authsock + serde/tokio/base64/toml/libc/hmac/sha1/sha2/stable-which | No（Homebrew 配布） |
 
 ## 理由
 

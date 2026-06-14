@@ -1,5 +1,7 @@
 # handoff: ECDSA / dogfood 切替 / stable-which 連携 — 次セッションへ
 
+> 注（2026-06-14 追記）: 本 handoff の push 残タスク（ECDSA）は v0.20.0 で push/release 済み。CI ブロッカー(§B)は DR-0021 で解決済み。F(stable-which 0.4.0 移行)は未着手のまま（依存は 0.3）。以降の『最初にやること』指示は消化済み。
+
 - Date: 2026-06-13
 
 前セッション (Opus 4.8 メイン) からの引き継ぎ。設計 DR を多数積み実装、v0.19.1 まで

@@ -62,7 +62,7 @@ cache-warden daemon status
 
 `daemon register` の plist/unit に焼き込むバイナリパスは、`current_exe()` をそのまま
 使わず**安定パスへ解決**する。実装は kawaz 製の **`stable-which` ライブラリ**を使う
-(git 依存、tag `v0.3.3` ピン。runtime 依存ゼロで DR-0002 と整合。CLI crate は
+(crates.io 公開版 `stable-which = "0.3"`。runtime 依存ゼロで DR-0002 と整合。CLI crate 自体は
 crates.io 非公開なので publish 競合なし)。
 
 - `stable_which::resolve_stable_path(current_exe, ScoringPolicy::SameBinary)` で
