@@ -2397,7 +2397,7 @@ mod tests {
 
         let fetcher =
             Arc::new(FakeGithubFetcher::new().with_body("kawaz", &format!("{ED25519_PUB}\n")));
-        refresh_due_matchers(&[matcher.clone()], &github_settings(), &fetcher).await;
+        refresh_due_matchers(std::slice::from_ref(&matcher), &github_settings(), &fetcher).await;
 
         // Now the published key is admitted, an unpublished one is not.
         assert!(matcher.matches(&github_identity(ED25519_PUB)));
@@ -2408,7 +2408,7 @@ mod tests {
     async fn github_refresh_failure_is_fail_closed() {
         let matcher = GithubMatcher::new("kawaz");
         let fetcher = Arc::new(FakeGithubFetcher::new().failing_for("kawaz"));
-        refresh_due_matchers(&[matcher.clone()], &github_settings(), &fetcher).await;
+        refresh_due_matchers(std::slice::from_ref(&matcher), &github_settings(), &fetcher).await;
         // A failed fetch must not admit anything.
         assert!(!matcher.matches(&github_identity(ED25519_PUB)));
     }
@@ -2425,7 +2425,7 @@ mod tests {
         // Fetcher returns empty for kawaz now; but the matcher isn't due, so the
         // previously-admitted key stays admitted.
         let fetcher = Arc::new(FakeGithubFetcher::new());
-        refresh_due_matchers(&[matcher.clone()], &github_settings(), &fetcher).await;
+        refresh_due_matchers(std::slice::from_ref(&matcher), &github_settings(), &fetcher).await;
         assert!(matcher.matches(&github_identity(ED25519_PUB)));
     }
 

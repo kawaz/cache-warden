@@ -1680,7 +1680,7 @@ mod tests {
                 // The otp meta came only from the `--type otp` before --command;
                 // no digits param was set from the argv.
                 assert_eq!(meta.type_label.as_deref(), Some("otp"));
-                assert!(meta.params.get("digits").is_none());
+                assert!(!meta.params.contains_key("digits"));
             }
             _ => panic!("expected KvDefine"),
         }

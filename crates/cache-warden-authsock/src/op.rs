@@ -594,7 +594,7 @@ mod tests {
         // quotes a multi-line field, so the plain output is a quoted, multi-line
         // string — NOT a JSON object. Feeding that here must fail to parse (it
         // would never reach the signer as a valid `.value`).
-        let plain_quoted = format!("\"{}\"", PEM_BODY.replace('\n', "\n"));
+        let plain_quoted = format!("\"{}\"", PEM_BODY);
         let op = FakePrivOp {
             private_json: plain_quoted.into_bytes(),
         };
