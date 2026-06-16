@@ -184,7 +184,10 @@ impl Store {
     /// This is called exclusively by [`StoreBuilder::build`]; it is not
     /// `pub` to prevent a caller from supplying an arbitrary token and
     /// bypassing the capability gate.
-    pub(crate) fn new_with_token(token: u128, failure_backoff_duration: std::time::Duration) -> Self {
+    pub(crate) fn new_with_token(
+        token: u128,
+        failure_backoff_duration: std::time::Duration,
+    ) -> Self {
         Self {
             entries: BTreeMap::new(),
             definitions: BTreeMap::new(),
@@ -305,7 +308,8 @@ impl Store {
         cap: &Capability,
         clock: &impl Clock,
     ) -> Result<(), ExtendOutcome> {
-        self.check_cap(cap).map_err(|_| ExtendOutcome::CapMismatch)?;
+        self.check_cap(cap)
+            .map_err(|_| ExtendOutcome::CapMismatch)?;
         match self.entries.get_mut(key) {
             None => Err(ExtendOutcome::NotFound),
             Some(entry) => entry
@@ -782,13 +786,15 @@ impl<'a> ItemRef<'a> {
 
     /// Borrow the [`SourceMeta`] from this key's definition, or `None` if undefined.
     pub fn source_meta(&self) -> Option<&SourceMeta> {
-        self.store.definitions.get(self.key).map(|d| d.source_meta())
+        self.store
+            .definitions
+            .get(self.key)
+            .map(|d| d.source_meta())
     }
 }
 
 // Reopen `impl Store` for the rest of the public API.
 impl Store {
-
     /// Produce (or reproduce) `key`'s value from its registered definition.
     ///
     /// This is the lazy-generation path of DR-0014 §1: when a defined key's value
@@ -1217,7 +1223,8 @@ mod tests {
             ttl(),
             cap,
             clock,
-        ).expect("test cap valid");
+        )
+        .expect("test cap valid");
     }
 
     #[test]
@@ -1241,8 +1248,12 @@ mod tests {
             ttl(),
             &cap,
             &clock,
-        ).unwrap();
-        assert_eq!(s.get("DB", &cap, &clock).unwrap().unwrap().expose_secret(), b"pw");
+        )
+        .unwrap();
+        assert_eq!(
+            s.get("DB", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"pw"
+        );
     }
 
     #[test]
@@ -1263,7 +1274,8 @@ mod tests {
             ttl(),
             &cap,
             &clock,
-        ).unwrap();
+        )
+        .unwrap();
         clock.advance(SOFT);
         assert!(s.get("K", &cap, &clock).unwrap().is_none());
         assert_eq!(s.state_of("K", &clock), Some(EntryState::SoftExpired));
@@ -1280,7 +1292,8 @@ mod tests {
             ttl(),
             &cap,
             &clock,
-        ).unwrap();
+        )
+        .unwrap();
         clock.advance(HARD);
         assert!(s.get("K", &cap, &clock).unwrap().is_none());
         assert_eq!(s.state_of("K", &clock), Some(EntryState::HardExpired));
@@ -1297,17 +1310,24 @@ mod tests {
             ttl(),
             &cap,
             &clock,
-        ).unwrap();
+        )
+        .unwrap();
         clock.advance(Duration::from_secs(15));
         s.extend("K", &cap, &clock).unwrap();
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"v");
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"v"
+        );
     }
 
     #[test]
     fn extend_missing_key_reports_not_found() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        assert_eq!(s.extend("ghost", &cap, &clock), Err(ExtendOutcome::NotFound));
+        assert_eq!(
+            s.extend("ghost", &cap, &clock),
+            Err(ExtendOutcome::NotFound)
+        );
     }
 
     #[test]
@@ -1321,7 +1341,8 @@ mod tests {
             ttl(),
             &cap,
             &clock,
-        ).unwrap();
+        )
+        .unwrap();
         clock.advance(HARD);
         assert_eq!(s.extend("K", &cap, &clock), Err(ExtendOutcome::HardExpired));
     }
@@ -1337,7 +1358,8 @@ mod tests {
             ttl(),
             &cap,
             &clock,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(s.delete("K", &cap).unwrap());
         assert!(!s.delete("K", &cap).unwrap()); // already gone
         assert!(s.get("K", &cap, &clock).unwrap().is_none());
@@ -1347,9 +1369,33 @@ mod tests {
     fn list_returns_sorted_keys() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("b", ValueSource::Static, SecretBytes::from("1"), ttl(), &cap, &clock).unwrap();
-        s.set("a", ValueSource::Static, SecretBytes::from("2"), ttl(), &cap, &clock).unwrap();
-        s.set("c", ValueSource::Static, SecretBytes::from("3"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "b",
+            ValueSource::Static,
+            SecretBytes::from("1"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        s.set(
+            "a",
+            ValueSource::Static,
+            SecretBytes::from("2"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        s.set(
+            "c",
+            ValueSource::Static,
+            SecretBytes::from("3"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         #[allow(deprecated)]
         let result = s.list();
         assert_eq!(result, vec!["a", "b", "c"]);
@@ -1367,7 +1413,8 @@ mod tests {
             ttl(),
             &cap,
             &clock,
-        ).unwrap();
+        )
+        .unwrap();
         cmd_entry(&mut s, "cmd", &cap, &clock);
         assert_eq!(s.source_of("stat"), Some(&ValueSource::Static));
         assert!(s.source_of("cmd").unwrap().is_regenerable());
@@ -1378,21 +1425,59 @@ mod tests {
     fn set_overwrites_existing_key() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("K", ValueSource::Static, SecretBytes::from("old"), ttl(), &cap, &clock).unwrap();
-        s.set("K", ValueSource::Static, SecretBytes::from("new"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("old"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("new"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         assert_eq!(s.len(), 1);
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"new");
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"new"
+        );
     }
 
     #[test]
     fn re_set_revives_a_hard_expired_static_key() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         clock.advance(HARD);
         assert!(s.get("K", &cap, &clock).unwrap().is_none());
-        s.set("K", ValueSource::Static, SecretBytes::from("again"), ttl(), &cap, &clock).unwrap();
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"again");
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("again"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"again"
+        );
     }
 
     // ---- extend_authenticated (auth-gated extend) ----
@@ -1405,16 +1490,21 @@ mod tests {
         let auth = RecordingAuthenticator::allowing();
 
         // Active: no prompt, just a window refresh.
-        s.extend_authenticated("K", &auth, None, &cap, &clock).unwrap();
+        s.extend_authenticated("K", &auth, None, &cap, &clock)
+            .unwrap();
         assert_eq!(auth.call_count(), 0, "Active extend must not prompt");
 
         // Soft-expired: prompts exactly once.
         clock.advance(Duration::from_secs(15));
-        s.extend_authenticated("K", &auth, None, &cap, &clock).unwrap();
+        s.extend_authenticated("K", &auth, None, &cap, &clock)
+            .unwrap();
         assert_eq!(auth.call_count(), 1);
         assert_eq!(auth.calls()[0], AuthContext::extend("K"));
         // Refreshed to Active and readable.
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"original");
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"original"
+        );
     }
 
     #[test]
@@ -1466,7 +1556,8 @@ mod tests {
         clock.advance(Duration::from_secs(15));
         let auth = RecordingAuthenticator::allowing();
         // None requester == in-process / unattributed.
-        s.extend_authenticated("K", &auth, None, &cap, &clock).unwrap();
+        s.extend_authenticated("K", &auth, None, &cap, &clock)
+            .unwrap();
         assert_eq!(auth.calls()[0].requester, None);
     }
 
@@ -1524,13 +1615,17 @@ mod tests {
 
         let runner = CountingRunner::new(b"fresh-token");
         let auth = RecordingAuthenticator::allowing();
-        s.regenerate("K", &runner, &auth, None, &cap, &clock).unwrap();
+        s.regenerate("K", &runner, &auth, None, &cap, &clock)
+            .unwrap();
 
         assert_eq!(runner.runs(), 1);
         assert_eq!(auth.call_count(), 1);
         assert_eq!(auth.calls()[0], AuthContext::regenerate("K"));
         // Back to Active with the new value.
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"fresh-token");
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"fresh-token"
+        );
         assert_eq!(s.state_of("K", &clock), Some(EntryState::Active));
     }
 
@@ -1541,7 +1636,8 @@ mod tests {
         cmd_entry(&mut s, "K", &cap, &clock);
         clock.advance(HARD);
         let runner = CountingRunner::new(b"fresh");
-        s.regenerate("K", &runner, &AllowAll, None, &cap, &clock).unwrap();
+        s.regenerate("K", &runner, &AllowAll, None, &cap, &clock)
+            .unwrap();
         // The soft window restarts from regeneration time.
         clock.advance(Duration::from_secs(9));
         assert_eq!(s.state_of("K", &clock), Some(EntryState::Active));
@@ -1560,7 +1656,8 @@ mod tests {
             ttl(),
             &cap,
             &clock,
-        ).unwrap();
+        )
+        .unwrap();
         clock.advance(HARD);
         let runner = CountingRunner::new(b"x");
         let err = s
@@ -1647,7 +1744,15 @@ mod tests {
         // Unlike extend, pin demands auth from Active too (security-relaxing).
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         let auth = RecordingAuthenticator::allowing();
         s.pin_authenticated("K", deadline_secs(100), &auth, None, &cap, &clock)
             .unwrap();
@@ -1659,7 +1764,15 @@ mod tests {
     fn pin_authenticated_keeps_value_gettable_past_ttl() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &cap, &clock)
             .unwrap();
         clock.advance(Duration::from_secs(500)); // past soft and hard windows
@@ -1675,7 +1788,15 @@ mod tests {
     fn pin_authenticated_denied_leaves_entry_unpinned() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         let err = s
             .pin_authenticated("K", deadline_secs(1000), &DenyAll, None, &cap, &clock)
             .unwrap_err();
@@ -1697,7 +1818,15 @@ mod tests {
     fn pin_authenticated_hard_expired_is_rejected_without_prompt() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         clock.advance(HARD); // hard-expired
         let auth = RecordingAuthenticator::allowing();
         assert_eq!(
@@ -1712,7 +1841,15 @@ mod tests {
         use crate::process::ProcessInfo;
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         let chain = vec![ProcessInfo {
             pid: 11,
             ppid: Some(1),
@@ -1729,9 +1866,19 @@ mod tests {
     fn re_pin_overwrites_deadline_via_store() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
-        s.pin_authenticated("K", deadline_secs(20), &AllowAll, None, &cap, &clock).unwrap();
-        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        s.pin_authenticated("K", deadline_secs(20), &AllowAll, None, &cap, &clock)
+            .unwrap();
+        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &cap, &clock)
+            .unwrap();
         assert_eq!(s.pin_deadline_of("K"), Some(deadline_secs(1000)));
     }
 
@@ -1739,8 +1886,17 @@ mod tests {
     fn unpin_returns_entry_to_normal_evaluation() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
-        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        s.pin_authenticated("K", deadline_secs(1000), &AllowAll, None, &cap, &clock)
+            .unwrap();
         clock.advance(Duration::from_secs(15)); // past soft
         assert_eq!(s.state_of("K", &clock), Some(EntryState::Active), "pinned");
         assert!(s.unpin("K", &cap).unwrap());
@@ -1817,7 +1973,10 @@ mod tests {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
-        assert!(s.get("K", &cap, &clock).unwrap().is_none(), "no value before lazy gen");
+        assert!(
+            s.get("K", &cap, &clock).unwrap().is_none(),
+            "no value before lazy gen"
+        );
 
         let runner = CountingRunner::new(b"lazy-token");
         let auth = RecordingAuthenticator::allowing();
@@ -1827,7 +1986,10 @@ mod tests {
         assert_eq!(runner.runs(), 1);
         assert_eq!(auth.call_count(), 1);
         assert_eq!(auth.calls()[0], AuthContext::regenerate("K"));
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"lazy-token");
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"lazy-token"
+        );
         assert_eq!(s.state_of("K", &clock), Some(EntryState::Active));
     }
 
@@ -1903,7 +2065,10 @@ mod tests {
         s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
         assert_eq!(runner.runs(), 2);
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"v");
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"v"
+        );
     }
 
     #[test]
@@ -1948,8 +2113,15 @@ mod tests {
             start_time: None,
         }];
         let auth = RecordingAuthenticator::allowing();
-        s.get_or_regenerate("K", &CountingRunner::new(b"v"), &auth, Some(&chain), &cap, &clock)
-            .unwrap();
+        s.get_or_regenerate(
+            "K",
+            &CountingRunner::new(b"v"),
+            &auth,
+            Some(&chain),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         assert_eq!(auth.calls()[0].requester.as_deref(), Some(chain.as_slice()));
     }
 
@@ -2004,11 +2176,25 @@ mod tests {
         let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define_with_meta("K", cmd_source(), ttl(), otp_meta(), SourceMeta::new())
             .unwrap();
-        s.get_or_regenerate("K", &CountingRunner::new(b"orig"), &AllowAll, None, &cap, &clock)
-            .unwrap();
+        s.get_or_regenerate(
+            "K",
+            &CountingRunner::new(b"orig"),
+            &AllowAll,
+            None,
+            &cap,
+            &clock,
+        )
+        .unwrap();
         clock.advance(HARD);
-        s.get_or_regenerate("K", &CountingRunner::new(b"fresh"), &AllowAll, None, &cap, &clock)
-            .unwrap();
+        s.get_or_regenerate(
+            "K",
+            &CountingRunner::new(b"fresh"),
+            &AllowAll,
+            None,
+            &cap,
+            &clock,
+        )
+        .unwrap();
         assert_eq!(
             s.definition_of("K").unwrap().meta(),
             &otp_meta(),
@@ -2036,8 +2222,15 @@ mod tests {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
-        s.get_or_regenerate("K", &CountingRunner::new(b"v"), &AllowAll, None, &cap, &clock)
-            .unwrap();
+        s.get_or_regenerate(
+            "K",
+            &CountingRunner::new(b"v"),
+            &AllowAll,
+            None,
+            &cap,
+            &clock,
+        )
+        .unwrap();
         assert!(s.has_value("K"));
 
         assert!(s.delete("K", &cap).unwrap(), "value removed");
@@ -2047,7 +2240,10 @@ mod tests {
         let runner = CountingRunner::new(b"again");
         s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"again");
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"again"
+        );
     }
 
     #[test]
@@ -2055,14 +2251,28 @@ mod tests {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
         s.define("K", cmd_source(), ttl()).unwrap();
-        s.get_or_regenerate("K", &CountingRunner::new(b"v"), &AllowAll, None, &cap, &clock)
-            .unwrap();
+        s.get_or_regenerate(
+            "K",
+            &CountingRunner::new(b"v"),
+            &AllowAll,
+            None,
+            &cap,
+            &clock,
+        )
+        .unwrap();
 
         assert!(s.delete_with_definition("K", &cap).unwrap());
         assert!(!s.has_value("K"));
         assert!(!s.is_defined("K"), "definition removed too");
         assert_eq!(
-            s.get_or_regenerate("K", &CountingRunner::new(b"x"), &AllowAll, None, &cap, &clock),
+            s.get_or_regenerate(
+                "K",
+                &CountingRunner::new(b"x"),
+                &AllowAll,
+                None,
+                &cap,
+                &clock
+            ),
             Err(RegenerateDefOutcome::Undefined)
         );
     }
@@ -2096,7 +2306,8 @@ mod tests {
             ttl(),
             &cap,
             &clock,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(s.delete("S", &cap).unwrap());
         assert!(!s.has_value("S"));
         assert!(!s.is_defined("S"));
@@ -2109,11 +2320,26 @@ mod tests {
     fn keys_unions_values_and_definitions() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("val", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "val",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         s.define("def", cmd_source(), ttl()).unwrap();
         s.define("both", cmd_source(), ttl()).unwrap();
-        s.get_or_regenerate("both", &CountingRunner::new(b"v"), &AllowAll, None, &cap, &clock)
-            .unwrap();
+        s.get_or_regenerate(
+            "both",
+            &CountingRunner::new(b"v"),
+            &AllowAll,
+            None,
+            &cap,
+            &clock,
+        )
+        .unwrap();
 
         #[allow(deprecated)]
         let list_result = s.list();
@@ -2150,9 +2376,13 @@ mod tests {
             ttl(),
             &cap,
             &clock,
-        ).unwrap();
+        )
+        .unwrap();
         s.define("K", cmd_source(), ttl()).unwrap();
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"static-val");
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"static-val"
+        );
         let runner = CountingRunner::new(b"regenerated");
         assert_eq!(
             s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock),
@@ -2163,7 +2393,10 @@ mod tests {
         s.get_or_regenerate("K", &runner, &AllowAll, None, &cap, &clock)
             .unwrap();
         assert_eq!(runner.runs(), 1);
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"regenerated");
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"regenerated"
+        );
     }
 
     // ---- fetch failure backoff (DR-0022 A-3b) ----
@@ -2205,12 +2438,22 @@ mod tests {
             .unwrap_err();
         match err2 {
             RegenerateOutcome::Backoff { retry_after } => {
-                assert!(retry_after > Duration::ZERO, "retry_after should be positive");
-                assert!(retry_after <= BACKOFF, "retry_after should not exceed backoff period");
+                assert!(
+                    retry_after > Duration::ZERO,
+                    "retry_after should be positive"
+                );
+                assert!(
+                    retry_after <= BACKOFF,
+                    "retry_after should not exceed backoff period"
+                );
             }
             other => panic!("expected Backoff, got {other:?}"),
         }
-        assert_eq!(counting.runs(), 0, "runner must NOT be called during backoff");
+        assert_eq!(
+            counting.runs(),
+            0,
+            "runner must NOT be called during backoff"
+        );
     }
 
     /// 3. backoff 期間経過後に再呼び出すと fake op が再実行される
@@ -2227,8 +2470,15 @@ mod tests {
         let counting = CountingRunner::new(b"fresh");
         s.regenerate("K", &counting, &AllowAll, None, &cap, &clock)
             .unwrap();
-        assert_eq!(counting.runs(), 1, "runner must be called after backoff expires");
-        assert_eq!(s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(), b"fresh");
+        assert_eq!(
+            counting.runs(),
+            1,
+            "runner must be called after backoff expires"
+        );
+        assert_eq!(
+            s.get("K", &cap, &clock).unwrap().unwrap().expose_secret(),
+            b"fresh"
+        );
     }
 
     /// 4. backoff 中に store.set を直接呼び出しても failure_backoffs は残る
@@ -2241,7 +2491,15 @@ mod tests {
 
         let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
 
-        s.set("K", ValueSource::Static, SecretBytes::from("injected"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("injected"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         let remaining = s.failure_backoff_remaining("K", &clock);
         assert!(
             remaining.is_some(),
@@ -2394,17 +2652,36 @@ mod tests {
         let wrong_bundle = StoreBuilder::new().build();
         let wrong_cap = wrong_bundle.control_cap;
         let err = store
-            .set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &wrong_cap, &clock)
+            .set(
+                "K",
+                ValueSource::Static,
+                SecretBytes::from("v"),
+                ttl(),
+                &wrong_cap,
+                &clock,
+            )
             .unwrap_err();
         assert_eq!(err, CapError::KeyMismatch);
-        assert!(!store.has_value("K"), "set must not mutate store on cap mismatch");
+        assert!(
+            !store.has_value("K"),
+            "set must not mutate store on cap mismatch"
+        );
     }
 
     #[test]
     fn get_with_wrong_cap_returns_keymismatch() {
         let clock = FakeClock::new();
         let (mut store, cap) = crate::test_helpers::store_with_cap();
-        store.set("K", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        store
+            .set(
+                "K",
+                ValueSource::Static,
+                SecretBytes::from("v"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
         let wrong_bundle = StoreBuilder::new().build();
         let wrong_cap = wrong_bundle.control_cap;
         let err = store.get("K", &wrong_cap, &clock).unwrap_err();
@@ -2415,7 +2692,16 @@ mod tests {
     fn cap_mismatch_does_not_touch_backoff_or_runner() {
         let clock = FakeClock::new();
         let (mut store, cap) = crate::test_helpers::store_with_cap();
-        store.set("K", ValueSource::command(["echo".into(), "v".into()]), SecretBytes::from("orig"), ttl(), &cap, &clock).unwrap();
+        store
+            .set(
+                "K",
+                ValueSource::command(["echo".into(), "v".into()]),
+                SecretBytes::from("orig"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
         clock.advance(HARD);
         let wrong_bundle = StoreBuilder::new().build();
         let wrong_cap = wrong_bundle.control_cap;
@@ -2432,16 +2718,39 @@ mod tests {
     fn cap_check_runs_before_backoff_check() {
         let clock = FakeClock::new();
         let (mut store, cap) = crate::test_helpers::store_with_cap_and_backoff(BACKOFF);
-        store.set("K", ValueSource::command(["echo".into(), "v".into()]), SecretBytes::from("orig"), ttl(), &cap, &clock).unwrap();
+        store
+            .set(
+                "K",
+                ValueSource::command(["echo".into(), "v".into()]),
+                SecretBytes::from("orig"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
         clock.advance(HARD);
         let _ = store.regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
-        assert!(store.failure_backoff_remaining("K", &clock).is_some(), "backoff must be active");
+        assert!(
+            store.failure_backoff_remaining("K", &clock).is_some(),
+            "backoff must be active"
+        );
         let wrong_bundle = StoreBuilder::new().build();
         let wrong_cap = wrong_bundle.control_cap;
         let err = store
-            .regenerate("K", &CountingRunner::new(b"x"), &AllowAll, None, &wrong_cap, &clock)
+            .regenerate(
+                "K",
+                &CountingRunner::new(b"x"),
+                &AllowAll,
+                None,
+                &wrong_cap,
+                &clock,
+            )
             .unwrap_err();
-        assert_eq!(err, RegenerateOutcome::CapMismatch, "cap check must run before backoff check");
+        assert_eq!(
+            err,
+            RegenerateOutcome::CapMismatch,
+            "cap check must run before backoff check"
+        );
     }
 
     // ---- list_filtered / ItemRef (DR-0025) ----
@@ -2452,21 +2761,31 @@ mod tests {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
         // value only
-        s.set("value_only", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
-        // definition only (command source required)
-        s.define(
-            "def_only",
-            ValueSource::command(["echo".into()]),
+        s.set(
+            "value_only",
+            ValueSource::Static,
+            SecretBytes::from("v"),
             ttl(),
-        ).unwrap();
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        // definition only (command source required)
+        s.define("def_only", ValueSource::command(["echo".into()]), ttl())
+            .unwrap();
         // both: a key can appear in both entries and definitions simultaneously.
         // set() inserts into entries, define() inserts into definitions — separate maps.
-        s.define(
+        s.define("both_key", ValueSource::command(["echo".into()]), ttl())
+            .unwrap();
+        s.set(
             "both_key",
             ValueSource::command(["echo".into()]),
+            SecretBytes::from("v"),
             ttl(),
-        ).unwrap();
-        s.set("both_key", ValueSource::command(["echo".into()]), SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+            &cap,
+            &clock,
+        )
+        .unwrap();
 
         #[allow(deprecated)]
         let expected = s.keys();
@@ -2479,9 +2798,26 @@ mod tests {
         // list_filtered(|r| r.entry().is_some()) must match the deprecated list().
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("a", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
-        s.set("b", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
-        s.define("def_only", ValueSource::command(["echo".into()]), ttl()).unwrap();
+        s.set(
+            "a",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        s.set(
+            "b",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        s.define("def_only", ValueSource::command(["echo".into()]), ttl())
+            .unwrap();
 
         #[allow(deprecated)]
         let expected = s.list();
@@ -2500,7 +2836,15 @@ mod tests {
     fn list_filtered_false_returns_empty() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("a", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "a",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         let result = s.list_filtered(|_| false);
         assert!(result.is_empty());
     }
@@ -2509,8 +2853,17 @@ mod tests {
     fn list_filtered_definition_only_filter() {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("value_only", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
-        s.define("def_only", ValueSource::command(["echo".into()]), ttl()).unwrap();
+        s.set(
+            "value_only",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        s.define("def_only", ValueSource::command(["echo".into()]), ttl())
+            .unwrap();
 
         let result = s.list_filtered(|r| r.definition().is_some());
         assert_eq!(result, vec!["def_only"]);
@@ -2521,14 +2874,30 @@ mod tests {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(Duration::from_secs(60));
         // Insert a value then expire it so regenerate can run.
-        s.set("K", ValueSource::command(["echo".into()]), SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::command(["echo".into()]),
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         clock.advance(HARD);
         let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
         // Now K has a failure record.
         let result = s.list_filtered(|r| r.failure().is_some());
         assert_eq!(result, vec!["K"]);
         // A key without failure should not appear.
-        s.set("clean", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "clean",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         let result2 = s.list_filtered(|r| r.failure().is_some());
         assert_eq!(result2, vec!["K"]);
     }
@@ -2540,7 +2909,15 @@ mod tests {
         // because ItemRef::state does not call evaluate/zeroize.
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
-        s.set("K", ValueSource::Static, SecretBytes::from("secret"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::Static,
+            SecretBytes::from("secret"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         clock.advance(HARD);
 
         // Access via list_filtered with state — pure read, no zeroize.
@@ -2548,12 +2925,17 @@ mod tests {
             // Inside the callback the value entry must still be present
             // (not zeroized), since ItemRef::state is pure read.
             assert!(r.entry().is_some(), "entry must be present before zeroize");
-            r.state(&clock).map(|st| st == EntryState::HardExpired).unwrap_or(false)
+            r.state(&clock)
+                .map(|st| st == EntryState::HardExpired)
+                .unwrap_or(false)
         });
         assert_eq!(states, vec!["K"]);
 
         // The entry must still be there (not zeroized by the filter above).
-        assert!(s.entries.contains_key("K"), "entry still present after pure-read filter");
+        assert!(
+            s.entries.contains_key("K"),
+            "entry still present after pure-read filter"
+        );
     }
 
     #[test]
@@ -2567,12 +2949,24 @@ mod tests {
             ttl(),
             meta.clone(),
             crate::meta::SourceMeta::new(),
-        ).unwrap();
+        )
+        .unwrap();
         // Undefined key: value_meta returns None.
-        s.set("plain", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "plain",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
 
         let found_typed = s.list_filtered(|r| {
-            r.value_meta().and_then(|m| m.type_label()).map(|t| t == "otp").unwrap_or(false)
+            r.value_meta()
+                .and_then(|m| m.type_label())
+                .map(|t| t == "otp")
+                .unwrap_or(false)
         });
         assert_eq!(found_typed, vec!["typed_key"]);
 
@@ -2585,7 +2979,15 @@ mod tests {
         let clock = FakeClock::new();
         let backoff = Duration::from_secs(60);
         let (mut s, cap) = crate::test_helpers::store_with_cap_and_backoff(backoff);
-        s.set("K", ValueSource::command(["echo".into()]), SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
+        s.set(
+            "K",
+            ValueSource::command(["echo".into()]),
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
         clock.advance(HARD);
         let _ = s.regenerate("K", &FailingRunner, &AllowAll, None, &cap, &clock);
 
@@ -2594,9 +2996,8 @@ mod tests {
         let item_remaining = s.list_filtered(|r| r.failure_remaining(&clock).is_some());
         assert_eq!(item_remaining, vec!["K"]);
         // Check the actual remaining value matches.
-        let via_filter: Vec<_> = s.list_filtered(|r| {
-            r.failure_remaining(&clock) == expected_remaining
-        });
+        let via_filter: Vec<_> =
+            s.list_filtered(|r| r.failure_remaining(&clock) == expected_remaining);
         assert_eq!(via_filter, vec!["K"]);
     }
 
@@ -2606,13 +3007,31 @@ mod tests {
         let clock = FakeClock::new();
         let (mut s, cap) = crate::test_helpers::store_with_cap();
         // "shared" appears in both maps.
-        s.define("shared", ValueSource::command(["echo".into()]), ttl()).unwrap();
+        s.define("shared", ValueSource::command(["echo".into()]), ttl())
+            .unwrap();
         // Produce a value (would need get_or_regenerate, but just set for simplicity):
         // Actually, we can't set a value AND keep the definition since define requires command.
         // We can set a command-sourced value directly using set().
-        s.set("shared", ValueSource::command(["echo".into()]), SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
-        s.set("z", ValueSource::Static, SecretBytes::from("v"), ttl(), &cap, &clock).unwrap();
-        s.define("a", ValueSource::command(["echo".into()]), ttl()).unwrap();
+        s.set(
+            "shared",
+            ValueSource::command(["echo".into()]),
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        s.set(
+            "z",
+            ValueSource::Static,
+            SecretBytes::from("v"),
+            ttl(),
+            &cap,
+            &clock,
+        )
+        .unwrap();
+        s.define("a", ValueSource::command(["echo".into()]), ttl())
+            .unwrap();
 
         let result = s.list_filtered(|_| true);
         // "shared" appears in both entries and definitions, must be deduped.

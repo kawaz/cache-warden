@@ -288,7 +288,13 @@ pub fn spawn_listeners(
                     continue;
                 }
             };
-            build_registry(&socket.name, &socket.keys, &mut store, &shared.authsock_cap, &shared.clock)
+            build_registry(
+                &socket.name,
+                &socket.keys,
+                &mut store,
+                &shared.authsock_cap,
+                &shared.clock,
+            )
         };
 
         // Add op-sourced keys (lazily loaded at sign time; see [`KeySource::Op`]).
@@ -916,7 +922,16 @@ where
     // Fetch the PEM through the same auth gate as the control socket. For an
     // op-sourced key the core entry may not exist yet (lazy NotLoaded): the
     // first sign fetches it via `op item get`, authenticates, and `set`s it.
-    if !ensure_loaded(&mut store, &kv_key, &source, auth, runner, requester, ctx.authsock_cap, clock) {
+    if !ensure_loaded(
+        &mut store,
+        &kv_key,
+        &source,
+        auth,
+        runner,
+        requester,
+        ctx.authsock_cap,
+        clock,
+    ) {
         return AgentMessage::failure();
     }
 
@@ -1526,7 +1541,10 @@ mod tests {
     /// A registry holding one op-sourced key (no core entry yet — lazy) plus a
     /// store that has the op key's definition registered (as spawn_listeners does
     /// after A-3a). The op key's KV name is namespaced like the production path.
-    fn op_fixture(soft: u64, hard: u64) -> (Mutex<Store>, cache_warden::Capability, PublicKeyRegistry) {
+    fn op_fixture(
+        soft: u64,
+        hard: u64,
+    ) -> (Mutex<Store>, cache_warden::Capability, PublicKeyRegistry) {
         let argv = private_key_argv("/path/cache-warden", "itemABC", Some("kawaz.1password.com"));
         let kv_key = op_kv_key("itemABC");
         let mut registry = PublicKeyRegistry::new();
@@ -1588,7 +1606,15 @@ mod tests {
 
         // The core now holds the op key's value (lazy load created it).
         let key = op_kv_key("itemABC");
-        assert!(store.lock().unwrap().get(&key, &cap, &clock).ok().flatten().is_some());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get(&key, &cap, &clock)
+                .ok()
+                .flatten()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1691,7 +1717,15 @@ mod tests {
         // core entry was created.
         assert_eq!(runner.runs(), 1);
         let key = op_kv_key("itemABC");
-        assert!(store.lock().unwrap().get(&key, &cap, &clock).ok().flatten().is_none());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get(&key, &cap, &clock)
+                .ok()
+                .flatten()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1713,7 +1747,15 @@ mod tests {
         );
         assert_eq!(resp.msg_type, MessageType::Failure);
         let key = op_kv_key("itemABC");
-        assert!(store.lock().unwrap().get(&key, &cap, &clock).ok().flatten().is_none());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get(&key, &cap, &clock)
+                .ok()
+                .flatten()
+                .is_none()
+        );
     }
 
     #[test]

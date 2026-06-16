@@ -11,8 +11,8 @@
 
 use cache_warden::{
     Authenticator, CapError, Capability, Clock, DefineError, EntryState, ExtendAuthOutcome,
-    PinAuthOutcome, ProcessInfo, RegenerateDefOutcome, RegenerateOutcome, SecretBytes, SourceRunner,
-    Store, Ttl, ValueMeta, ValueSource,
+    PinAuthOutcome, ProcessInfo, RegenerateDefOutcome, RegenerateOutcome, SecretBytes,
+    SourceRunner, Store, Ttl, ValueMeta, ValueSource,
 };
 
 use crate::otp_type;
@@ -93,7 +93,9 @@ where
         }
         Request::KvDel { key, with_define } => {
             let removed = if with_define {
-                store.delete_with_definition(&key, ctx.store_cap).unwrap_or(false)
+                store
+                    .delete_with_definition(&key, ctx.store_cap)
+                    .unwrap_or(false)
             } else {
                 store.delete(&key, ctx.store_cap).unwrap_or(false)
             };
@@ -167,8 +169,7 @@ where
             // ItemRef::state is only accessible via list_filtered's callback.
             // For single-key lookup, we use entry().state() directly, which is
             // the same CacheEntry::state (pure read) that ItemRef::state calls.
-            store
-                .entry_state_pure(&name, ctx.clock)
+            store.entry_state_pure(&name, ctx.clock)
         };
         let state = match item_state {
             Some(s) => state_str(s).to_string(),
@@ -381,7 +382,12 @@ where
     }
 
     // Fast path: a live (Active) value.
-    if store.get(&key, ctx.store_cap, ctx.clock).ok().flatten().is_some() {
+    if store
+        .get(&key, ctx.store_cap, ctx.clock)
+        .ok()
+        .flatten()
+        .is_some()
+    {
         return finish_get(store, ctx, &key, dry_run, "active");
     }
 
@@ -403,7 +409,13 @@ where
             Response::error(ErrorKind::Internal, "entry state changed during read")
         }
         Some(EntryState::SoftExpired) => {
-            match store.extend_authenticated(&key, ctx.auth, ctx.requester, ctx.store_cap, ctx.clock) {
+            match store.extend_authenticated(
+                &key,
+                ctx.auth,
+                ctx.requester,
+                ctx.store_cap,
+                ctx.clock,
+            ) {
                 Ok(()) => match store.get(&key, ctx.store_cap, ctx.clock).ok().flatten() {
                     Some(_) => finish_get(store, ctx, &key, dry_run, "active"),
                     None => Response::error(ErrorKind::Internal, "value gone after extend"),
@@ -431,7 +443,14 @@ where
             if store.is_defined(&key) {
                 return lazy_generate(store, ctx, &key, dry_run);
             }
-            match store.regenerate(&key, ctx.runner, ctx.auth, ctx.requester, ctx.store_cap, ctx.clock) {
+            match store.regenerate(
+                &key,
+                ctx.runner,
+                ctx.auth,
+                ctx.requester,
+                ctx.store_cap,
+                ctx.clock,
+            ) {
                 Ok(()) => match store.get(&key, ctx.store_cap, ctx.clock).ok().flatten() {
                     Some(_) => finish_get(store, ctx, &key, dry_run, "active"),
                     None => Response::error(ErrorKind::Internal, "value gone after regenerate"),
@@ -572,17 +591,26 @@ where
     R: SourceRunner,
     C: Clock,
 {
-    match store.get_or_regenerate(key, ctx.runner, ctx.auth, ctx.requester, ctx.store_cap, ctx.clock) {
+    match store.get_or_regenerate(
+        key,
+        ctx.runner,
+        ctx.auth,
+        ctx.requester,
+        ctx.store_cap,
+        ctx.clock,
+    ) {
         Ok(()) => match store.get(key, ctx.store_cap, ctx.clock).ok().flatten() {
             Some(_) => finish_get(store, ctx, key, dry_run, "active"),
             None => Response::error(ErrorKind::Internal, "value gone after lazy generation"),
         },
         Err(RegenerateDefOutcome::Undefined) => Response::error(ErrorKind::NotFound, "no such key"),
         // A usable value is resident after all; read it directly.
-        Err(RegenerateDefOutcome::ValueResident) => match store.get(key, ctx.store_cap, ctx.clock).ok().flatten() {
-            Some(_) => finish_get(store, ctx, key, dry_run, "active"),
-            None => Response::error(ErrorKind::Internal, "value resident but unreadable"),
-        },
+        Err(RegenerateDefOutcome::ValueResident) => {
+            match store.get(key, ctx.store_cap, ctx.clock).ok().flatten() {
+                Some(_) => finish_get(store, ctx, key, dry_run, "active"),
+                None => Response::error(ErrorKind::Internal, "value resident but unreadable"),
+            }
+        }
         Err(RegenerateDefOutcome::RunFailed(e)) => {
             Response::error(ErrorKind::UpstreamFailed, e.to_string())
         }
@@ -625,7 +653,14 @@ where
         .clock
         .now()
         .saturating_add(std::time::Duration::from_secs(duration_secs));
-    match store.pin_authenticated(&key, deadline, ctx.auth, ctx.requester, ctx.store_cap, ctx.clock) {
+    match store.pin_authenticated(
+        &key,
+        deadline,
+        ctx.auth,
+        ctx.requester,
+        ctx.store_cap,
+        ctx.clock,
+    ) {
         Ok(()) => Response::pinned(duration_secs),
         Err(PinAuthOutcome::NotFound) => Response::error(ErrorKind::NotFound, "no such key"),
         Err(PinAuthOutcome::HardExpired) => Response::error(
@@ -633,7 +668,9 @@ where
             "entry is hard-expired (destroyed); cannot pin",
         ),
         Err(PinAuthOutcome::AuthFailed(e)) => Response::error(ErrorKind::AuthFailed, e.to_string()),
-        Err(PinAuthOutcome::CapMismatch) => Response::error(ErrorKind::Internal, "capability mismatch"),
+        Err(PinAuthOutcome::CapMismatch) => {
+            Response::error(ErrorKind::Internal, "capability mismatch")
+        }
     }
 }
 
@@ -705,8 +742,9 @@ mod tests {
         // (which is 'a). Using Box::leak here is fine in tests: each call allocates
         // a small object that lives until process exit, which is acceptable for
         // unit-test fixtures.
-        let otp_adapter: &'static crate::daemon::otp_adapter::OtpAdapter =
-            Box::leak(Box::new(crate::daemon::otp_adapter::OtpAdapter::new(cap.clone())));
+        let otp_adapter: &'static crate::daemon::otp_adapter::OtpAdapter = Box::leak(Box::new(
+            crate::daemon::otp_adapter::OtpAdapter::new(cap.clone()),
+        ));
         HandlerCtx {
             auth,
             runner,
@@ -1786,8 +1824,9 @@ mod tests {
         policies: &'a std::collections::BTreeMap<String, Vec<String>>,
         requester: Option<&'a [ProcessInfo]>,
     ) -> HandlerCtx<'a, A, R, FakeClock> {
-        let otp_adapter: &'static crate::daemon::otp_adapter::OtpAdapter =
-            Box::leak(Box::new(crate::daemon::otp_adapter::OtpAdapter::new(cap.clone())));
+        let otp_adapter: &'static crate::daemon::otp_adapter::OtpAdapter = Box::leak(Box::new(
+            crate::daemon::otp_adapter::OtpAdapter::new(cap.clone()),
+        ));
         HandlerCtx {
             auth,
             runner,

@@ -186,7 +186,12 @@ impl Shared {
     /// Build a `Shared` directly for tests (no config / socket binding), using
     /// the production [`CommandRunner`]. The authsock unit tests use this to
     /// exercise the local-sign path against a real core.
-    pub(crate) fn new_for_test(store: Store, cap: Capability, auth: Auth, clock: SystemClock) -> Self {
+    pub(crate) fn new_for_test(
+        store: Store,
+        cap: Capability,
+        auth: Auth,
+        clock: SystemClock,
+    ) -> Self {
         let otp_adapter = crate::daemon::otp_adapter::OtpAdapter::new(cap.clone());
         Self {
             store: Mutex::new(store),
@@ -611,7 +616,9 @@ fn register_definitions<R, C>(
             let env = source.command_env().clone();
             match runner.run(&argv, cwd.as_deref(), &env) {
                 Ok(value) => {
-                    store.set(full_key.clone(), source, value, ttl, cap, clock).ok();
+                    store
+                        .set(full_key.clone(), source, value, ttl, cap, clock)
+                        .ok();
                 }
                 Err(e) => {
                     // The RunError Display is already secret-free (stderr redacted).
@@ -1231,7 +1238,11 @@ mod tests {
             meta: Default::default(),
         }];
         register_definitions(&mut store, &runner, &clock, &entries, &no_eager(), &cap);
-        let secret = store.get("default/TOK", &cap, &clock).ok().flatten().expect("entry preloaded");
+        let secret = store
+            .get("default/TOK", &cap, &clock)
+            .ok()
+            .flatten()
+            .expect("entry preloaded");
         assert_eq!(secret.expose_secret(), b"tok-value");
     }
 
@@ -1345,11 +1356,20 @@ mod tests {
             "definition kept after failed preload"
         );
         assert!(
-            store.get("default/BAD", &cap, &clock).ok().flatten().is_none(),
+            store
+                .get("default/BAD", &cap, &clock)
+                .ok()
+                .flatten()
+                .is_none(),
             "no value after failed preload"
         );
         assert_eq!(
-            store.get("default/GOOD", &cap, &clock).ok().flatten().unwrap().expose_secret(),
+            store
+                .get("default/GOOD", &cap, &clock)
+                .ok()
+                .flatten()
+                .unwrap()
+                .expose_secret(),
             b"ok",
             "subsequent preload still runs"
         );
