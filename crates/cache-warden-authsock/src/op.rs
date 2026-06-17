@@ -19,12 +19,91 @@
 //! An `op://` source member is parsed into an [`OpSource`] vault/item filter,
 //! exactly as authsock-warden did, so the same `op://` strings carry over.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
+
+/// Wall-clock cap on a single `op` CLI invocation.
+///
+/// The op CLI itself has no read timeout on its 1Password.app integration
+/// channel: a daemon-launched op (= launchd context) whose biometric path
+/// cannot reach the user GUI session blocks indefinitely. That hang propagates
+/// up through `discover_keys` to the daemon's `spawn_listeners` await, so no
+/// agent socket is ever bound (see docs/issue/2026-06-13-op-discovery-blocks-startup.md
+/// and docs/journal/2026-06-17-cw-discovery-block-incident.md).
+///
+/// Capping the child at 30s ensures the hang surfaces as a `KeyStore` error
+/// instead of stranding the daemon's startup. 30s is enough for a real op call
+/// (typical 0.5–2s, ~20s worst case for a slow biometric prompt) but short
+/// enough that a stuck op is killed before the watchdog window matters.
+const OP_CLI_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval for `Child::try_wait` while waiting on an `op` subprocess.
+///
+/// 50ms is fast enough that a typical sub-second `op` call doesn't add visible
+/// latency yet slow enough that the wait loop is CPU-noise (~600 wakeups for
+/// the 30s timeout cap).
+const OP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Spawn `cmd` and return its stdout, killing the child if it exceeds `timeout`.
+///
+/// Returns `KeyStore` errors for spawn failure, non-success exit status (with
+/// stderr included), or timeout (with the elapsed budget). Stdout/stderr are
+/// piped so `wait_with_output` can collect them after the child exits.
+///
+/// The timeout exists because `op` CLI has no read timeout on its 1Password.app
+/// integration channel — a stuck op (e.g. force-quit + relaunched 1Password
+/// leaves the in-flight request orphaned) hangs forever. See [`OP_CLI_TIMEOUT`].
+pub(crate) fn run_command_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    what: &str,
+) -> Result<Vec<u8>> {
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        Error::KeyStore(format!(
+            "failed to execute op CLI: {e}. Is the 1Password CLI installed?"
+        ))
+    })?;
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| Error::KeyStore(format!("failed to read op CLI output: {e}")))?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(Error::KeyStore(format!("{what} failed: {}", stderr.trim())));
+                }
+                return Ok(output.stdout);
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::KeyStore(format!(
+                        "{what} timed out after {}s (op CLI did not return; \
+                         check that 1Password.app is running and the CLI \
+                         integration is enabled in Settings → Developer)",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(OP_POLL_INTERVAL);
+            }
+            Err(e) => {
+                return Err(Error::KeyStore(format!("op CLI wait failed: {e}")));
+            }
+        }
+    }
+}
 
 /// A vault/item filter parsed from an `op://...` source member.
 ///
@@ -156,17 +235,14 @@ impl RealOpClient {
     /// Run an `op` subcommand and return stdout, mapping failures to `KeyStore`
     /// errors whose message never includes secret material (only stderr, which
     /// `op` does not write secrets to, trimmed).
+    ///
+    /// The child is capped at [`OP_CLI_TIMEOUT`] wall-clock to keep a stuck
+    /// `op` (= 1Password integration channel hung) from stranding the daemon's
+    /// startup discovery indefinitely.
     fn run(&self, args: &[&str], what: &str) -> Result<Vec<u8>> {
-        let output = self.command().args(args).output().map_err(|e| {
-            Error::KeyStore(format!(
-                "failed to execute op CLI: {e}. Is the 1Password CLI installed?"
-            ))
-        })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::KeyStore(format!("{what} failed: {}", stderr.trim())));
-        }
-        Ok(output.stdout)
+        let mut cmd = self.command();
+        cmd.args(args);
+        run_command_with_timeout(cmd, OP_CLI_TIMEOUT, what)
     }
 }
 
@@ -357,6 +433,79 @@ pub fn fetch_op_private_key(client: &impl OpClient, item_id: &str) -> Result<Zer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- run_command_with_timeout ----
+
+    #[test]
+    fn timeout_kills_long_running_child_and_returns_keystore_error() {
+        // `sleep 60` stands in for an op CLI hung on a biometric prompt that
+        // never returns (2026-06-17 incident root cause). A 100ms cap must
+        // kill the child and surface a KeyStore error rather than block.
+        let cmd = Command::new("sleep");
+        let mut cmd = cmd;
+        cmd.arg("60");
+        let start = Instant::now();
+        let err =
+            run_command_with_timeout(cmd, Duration::from_millis(100), "test sleep").unwrap_err();
+        let elapsed = start.elapsed();
+        // The poll interval is 50ms, so the kill happens within one poll past
+        // the 100ms cap. Allow generous slack for CI scheduling jitter while
+        // still proving we didn't block the full 60s.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "timeout took {elapsed:?}, expected < 2s"
+        );
+        match err {
+            Error::KeyStore(msg) => {
+                assert!(msg.contains("timed out"), "unexpected error: {msg}");
+                assert!(msg.contains("test sleep"), "missing `what` label: {msg}");
+            }
+            other => panic!("expected KeyStore error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fast_child_returns_stdout_without_waiting_for_timeout() {
+        // A child that exits well before the timeout must return its stdout
+        // verbatim (the timeout cap is a ceiling, not a floor).
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'hello-op-stdout'");
+        let out = run_command_with_timeout(cmd, Duration::from_secs(30), "test echo").unwrap();
+        assert_eq!(out, b"hello-op-stdout");
+    }
+
+    #[test]
+    fn nonzero_exit_status_returns_keystore_error_with_stderr() {
+        // A non-success exit must propagate stderr (trimmed) so discovery
+        // failures stay diagnosable without leaking secrets (op writes secrets
+        // to stdout, never stderr).
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'op: not signed in' >&2; exit 1");
+        let err = run_command_with_timeout(cmd, Duration::from_secs(30), "test fail").unwrap_err();
+        match err {
+            Error::KeyStore(msg) => {
+                assert!(msg.contains("test fail"), "missing `what` label: {msg}");
+                assert!(msg.contains("op: not signed in"), "missing stderr: {msg}");
+            }
+            other => panic!("expected KeyStore error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_failure_returns_keystore_error_mentioning_op_install() {
+        // A missing binary must surface as a KeyStore error with the
+        // "is op installed?" hint — the same diagnostic the original
+        // `.output()` path used.
+        let cmd = Command::new("definitely-not-on-path-cache-warden-test");
+        let err =
+            run_command_with_timeout(cmd, Duration::from_secs(30), "test missing").unwrap_err();
+        match err {
+            Error::KeyStore(msg) => {
+                assert!(msg.contains("op CLI"), "expected op CLI hint, got: {msg}");
+            }
+            other => panic!("expected KeyStore error, got {other:?}"),
+        }
+    }
 
     // ---- OpSource::parse ----
 
