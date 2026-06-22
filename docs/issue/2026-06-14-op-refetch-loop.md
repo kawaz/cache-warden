@@ -4,6 +4,7 @@
 - 発見: 2026-06-13 (Phase 3 dogfood 切替直後、離席中に観測)
 - 元記録: `docs/journal/2026-06-13-handoff-ecdsa-dogfood-stablewhich.md` §A (本 issue で独立昇格)
 - 関連: DR-0018 (型付き source、prefetch で起動時 warm 化することで二次的に緩和し得る) / [2026-06-13-op-discovery-blocks-startup.md](./2026-06-13-op-discovery-blocks-startup.md) (起動時 op 同期ブロック、同じ op fetch 経路)
+- last_read: 2026-06-22T17:14:30+09:00
 
 ## 解決方法 (= code complete、実機検証待ち、2026-06-14)
 
