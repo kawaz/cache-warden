@@ -122,6 +122,7 @@ dependencies = [
  "cache-warden-authsock",
  "hmac",
  "libc",
+ "macos-tcc",
  "serde",
  "serde_json",
  "sha1",

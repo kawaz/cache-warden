@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 cache-warden = { path = "../cache-warden" }
+macos-tcc = { path = "../macos-tcc" }
 # SSH agent adapter: codec, public-key registry, local signer (port Iteration 1).
 cache-warden-authsock = { path = "../cache-warden-authsock" }
 serde = { version = "1", features = ["derive"] }

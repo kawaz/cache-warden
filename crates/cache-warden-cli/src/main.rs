@@ -175,6 +175,17 @@ fn run() -> Result<(), CliError> {
         return commands::op_private_key::run(tail).map_err(CliError::Message);
     }
 
+    // Hidden `internal` subcommand group: subprocess helpers invoked by the
+    // daemon itself (e.g. `fda-check` for TCC authorization probing).
+    // Dispatched before config loading. Never shown in help.
+    if command == "internal" {
+        let code = dispatch_internal(tail);
+        if code != 0 {
+            process::exit(code);
+        }
+        return Ok(());
+    }
+
     // Resolve --socket (anywhere in the tail) once; None means "not on the CLI".
     let (cli_socket, rest) = commands::take_socket_flag(tail)?;
 
@@ -846,6 +857,30 @@ fn format_entry_attrs(e: &protocol::wire::EntryInfo) -> Vec<String> {
         attrs.push(format!("backoff: {secs}s"));
     }
     attrs
+}
+
+/// Dispatch `cache-warden internal <subcommand>` without loading config.
+///
+/// Returns an exit code: 0 on success, 1 on error.
+fn dispatch_internal(args: &[String]) -> i32 {
+    if args.is_empty() {
+        eprintln!("cache-warden internal: missing subcommand");
+        eprintln!("Available: fda-check");
+        return 1;
+    }
+    match args[0].as_str() {
+        "fda-check" => match commands::internal_cmd::fda_check(&args[1..]) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("cache-warden internal fda-check: {e}");
+                1
+            }
+        },
+        other => {
+            eprintln!("cache-warden internal: unknown subcommand: {other}");
+            1
+        }
+    }
 }
 
 fn main() {
