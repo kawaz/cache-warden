@@ -312,17 +312,36 @@ fn build_definition(
     def
 }
 
+/// Return `true` when the config has at least one `op`-sourced kv entry or
+/// `op`-kind authsock source, indicating that Full Disk Access is needed for
+/// `op` CLI invocations at runtime.
+fn has_op_sources(config: &Config) -> bool {
+    let has_kv_op = config
+        .kv
+        .values()
+        .any(|entry| entry.source.as_deref() == Some("op"));
+    let has_authsock_op = config
+        .authsock
+        .sources
+        .values()
+        .any(|src| src.kind.as_str() == "op");
+    has_kv_op || has_authsock_op
+}
+
 /// Execute `daemon register` (DR-0019 §1/§2/§3).
 ///
-/// `config_path` is the register-time resolved config file path (the dispatcher
-/// passes `LoadedConfig.path`); it is baked into the definition so the service
-/// runs with the same config that was in effect at register time. `cli_socket`
-/// is the explicitly-requested `--socket` from the top-level parser (stripped
-/// before `args` reaches here); it is baked into the service start command. A
-/// `--socket` that reaches `args` (the fallback parse path) takes precedence.
-/// With `--print`, the definition is written to stdout and nothing is installed.
+/// `config` is the loaded configuration (used to check whether the FDA setup
+/// flow is needed). `config_path` is the register-time resolved config file
+/// path (the dispatcher passes `LoadedConfig.path`); it is baked into the
+/// definition so the service runs with the same config that was in effect at
+/// register time. `cli_socket` is the explicitly-requested `--socket` from the
+/// top-level parser (stripped before `args` reaches here); it is baked into
+/// the service start command. A `--socket` that reaches `args` (the fallback
+/// parse path) takes precedence. With `--print`, the definition is written to
+/// stdout and nothing is installed.
 pub fn register(
     args: &[String],
+    config: Config,
     config_path: Option<PathBuf>,
     cli_socket: Option<&str>,
 ) -> Result<(), String> {
@@ -356,6 +375,82 @@ pub fn register(
         print!("{}", backend.render_definition(&def));
         return Ok(());
     }
+
+    // macOS FDA setup flow: if the config uses op sources, the daemon needs
+    // Full Disk Access so that `op` can run from a launchd agent. Walk the
+    // user through the System Settings grant flow when FDA is not yet set.
+    #[cfg(target_os = "macos")]
+    {
+        if has_op_sources(&config) {
+            let self_check_args = &["internal", "fda-check", "--raw"];
+            match macos_tcc::current_app_bundle() {
+                Some(app_path) => {
+                    // Try up to 3 times in case the first probe fails transiently.
+                    let mut fda_state = macos_tcc::AuthState::Unknown;
+                    for _ in 0..3 {
+                        match macos_tcc::check_via_app_bundle(
+                            macos_tcc::Permission::FullDiskAccess,
+                            &app_path,
+                            self_check_args,
+                        ) {
+                            Ok(state) => {
+                                fda_state = state;
+                                break;
+                            }
+                            Err(_) => {
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                            }
+                        }
+                    }
+                    if fda_state != macos_tcc::AuthState::Granted {
+                        eprintln!("cache-warden: Full Disk Access の設定が必要です。");
+                        eprintln!(
+                            "cache-warden は 1Password CLI (op) を使ってシークレットを取得するため、"
+                        );
+                        eprintln!("フルディスクアクセスの権限が必要です。");
+                        eprintln!("フルディスクアクセスの設定画面を開きます...");
+                        let _ = macos_tcc::open_settings(macos_tcc::Permission::FullDiskAccess);
+                        eprintln!("「CacheWarden」を ON にしてから Enter キーを押すか、");
+                        eprintln!(
+                            "設定が完了するまでお待ちください。(スキップするには Enter を押してください)"
+                        );
+                        let outcome = macos_tcc::wait_for_grant(
+                            macos_tcc::Permission::FullDiskAccess,
+                            &app_path,
+                            self_check_args,
+                            macos_tcc::WaitOpts::default(),
+                        );
+                        match outcome {
+                            macos_tcc::WaitOutcome::Granted => {
+                                eprintln!("cache-warden: Full Disk Access が許可されました。");
+                                // Close System Settings.
+                                let _ = std::process::Command::new("osascript")
+                                    .args(["-e", "tell application \"System Settings\" to quit"])
+                                    .output();
+                            }
+                            macos_tcc::WaitOutcome::UserSkipped
+                            | macos_tcc::WaitOutcome::TimedOut => {
+                                eprintln!(
+                                    "cache-warden: 警告: Full Disk Access なしで続行します。\
+                                     op コマンドが失敗する可能性があります。"
+                                );
+                            }
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "cache-warden: warning: not running from a .app bundle; \
+                         skipping FDA check (run from /Applications/CacheWarden.app \
+                         for the FDA setup flow)"
+                    );
+                }
+            }
+        }
+    }
+    // Suppress unused-variable warning on non-macOS.
+    #[cfg(not(target_os = "macos"))]
+    let _ = &config;
 
     backend.register(&def)?;
     println!(

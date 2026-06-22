@@ -263,7 +263,7 @@ fn dispatch_daemon(
             }
             let sock = cli_socket.map(|p| p.to_string_lossy().into_owned());
             or_usage(
-                commands::daemon_cmd::register(tail, config_path, sock.as_deref()),
+                commands::daemon_cmd::register(tail, config, config_path, sock.as_deref()),
                 help::daemon_register,
             )
         }
