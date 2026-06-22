@@ -2,6 +2,7 @@
 
 - status: open
 - 記録: 2026-06-14（kawaz 指摘。authsock-warden で解決済みだが cache-warden 未対応）
+- last_read: 2026-06-22T20:37:32+09:00
 - 知見 doc: [2026-06-14-macos-tcc-fda.md](../findings/2026-06-14-macos-tcc-fda.md)
 - 関連: DR-0019（daemon register）/ DR-0020（.app + AssociatedBundleIdentifiers、TCC 永続化の前提は実装済み）
 
