@@ -47,3 +47,50 @@ FDA の検出（TCC.db read）/ .app 経由起動 / System Settings 誘導 / ポ
 ## 決定の所属
 
 移植判断・FDA 誘導 UX は DR 級（DR-0019/0020 の macOS 系列に連なる）。実装着手時に DR 化を検討。
+
+## 2026-06-22 設計方針追加: workspace crate 化前提で進める
+
+本 issue の移植実装は **cache-warden ワークスペース内に新規 crate `crates/macos-tcc/` を切る形**で進める。authsock-warden の `src/cli/commands/service.rs` 内 FDA flow を直接 cache-warden `commands/service.rs` に貼るのではなく、再利用可能な crate として最初から分離。
+
+### 理由
+
+- cache-warden は authsock-warden / 将来の kawaz/* macOS dogfood 系で **共通基盤**として再利用される見込み (= TCC check は OSS dogfood 系で頻出パターン)
+- 既存 OSS の `veecore/permission-flow` は Swift backend 依存で重い。cache-warden / kawaz/* の Pure Rust 路線と相性悪い
+- 最初から crate IF を切っておけば後の repo 分離 (= `kawaz/macos-tcc` として export) コスト最小、開発中は path dep で iterate 高速
+
+### crate 設計 IF (= 2026-06-22 セッション議論結果)
+
+```rust
+pub enum Permission { FullDiskAccess, Accessibility, ScreenRecording, ... }
+pub enum AuthState { Granted, NotGranted, Unknown }
+
+// Stage 1: 自己判定 (UI なし、即時)
+pub fn check(p: Permission) -> AuthState;
+
+// 自分の binary path から .app 抽出 (path 操作のみ、FFI 不要)
+pub fn current_app_bundle() -> Option<PathBuf>;
+
+// Stage 2: .app self-check (= 別 process で .app 起動して権限取得)
+pub fn check_via_app_bundle(p: Permission, app: &Path, self_check_args: &[&str]) -> io::Result<AuthState>;
+
+// Stage 3: Settings 誘導 + ポーリング
+pub fn open_settings(p: Permission) -> io::Result<()>;
+pub fn wait_for_grant(p: Permission, app: &Path, self_check_args: &[&str], opts: WaitOpts) -> WaitOutcome;
+```
+
+設計原則:
+- Pure Rust + libc FFI、Swift 不要
+- macOS only、non-macOS は no-op shim
+- feature flag で framework 依存分離 (`default = ["fda"]` / `accessibility` / `screen-recording` 等)
+- UI 描画は提供しない (= Settings 開くまでで止める、in-app drag-drop UI は利用側で)
+- **プロセス探査系 (祖先遡上 / unique pid / SO_PEERPID 等) は当 crate に含めない** (= 別 issue `crate-macos-process-inspect` の対象、責務分離)
+
+### 別 repo 化のタイミング
+
+cache-warden 内で 1-2 cycle dogfood して IF が安定したら `kawaz/macos-tcc` repo を切って publish。crates.io 登録時の競合は事前確認 (= `tcc-check` / `macos-tcc-check` 等の代替候補も検討)。
+
+### 関連 issue
+
+- 2026-06-22-crate-macos-process-inspect (= peer process inspection 用の別 crate、当 crate と相補的)
+- 2026-06-22-kv-get-peer-identity-guard (= peer-identity guard、process-inspect crate が前提)
+- 2026-06-22-custom-touchid-dialog (= cw 独自 TouchID dialog、process-inspect crate が前提)
