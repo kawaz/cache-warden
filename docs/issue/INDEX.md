@@ -3,3 +3,4 @@
 | date | category | status | slug | 概要 |
 |------|----------|--------|------|------|
 | 2026-06-22 | request | open | [cli-display-backoff-until](./2026-06-22-cli-display-backoff-until.md) | CLI で backoff 中 key を可視化する (status / kv list に `backoff_until` フィールド追加) |
+| 2026-06-22 | design | open | [crate-macos-process-inspect](./2026-06-22-crate-macos-process-inspect.md) | macOS プロセス多面 inspect crate 切り出し (Pure Rust + libc FFI、peer-identity guard / TouchID dialog の共通基盤) |
