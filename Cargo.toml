@@ -3,6 +3,7 @@ members = [
     "crates/cache-warden",
     "crates/cache-warden-authsock",
     "crates/cache-warden-cli",
+    "crates/macos-tcc",
 ]
 resolver = "2"
 

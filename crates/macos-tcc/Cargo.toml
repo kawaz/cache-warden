@@ -1,0 +1,11 @@
+[package]
+name = "macos-tcc"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kawaz/cache-warden"
+description = "macOS TCC (Transparency, Consent, Control) permission inspection and Settings-guided grant flow"
+
+[features]
+default = ["fda"]
+fda = []
