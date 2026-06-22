@@ -468,9 +468,21 @@ pub enum OkPayload {
         state: String,
     },
     /// Reply to [`Request::KvList`].
+    ///
+    /// `keys` is the sorted name list (the historical payload). `entries` is a
+    /// parallel value-free metadata array (same length, same order) carrying the
+    /// same per-entry fields `status` exposes — for `kv list` clients that want
+    /// to show backoff / pin / state hints next to the name (DR-0022 §3,
+    /// DR-0009 minor extension). An older daemon may omit it; an older client
+    /// simply ignores it.
     List {
         /// The key names, sorted.
         keys: Vec<String>,
+        /// Per-key value-free metadata, parallel to `keys` and in the same
+        /// order. Omitted on the wire when empty so an older daemon that does
+        /// not populate it stays byte-compatible.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        entries: Vec<EntryInfo>,
     },
     /// Reply to [`Request::KvDel`].
     Deleted {
@@ -625,11 +637,35 @@ impl Response {
         })
     }
 
-    /// Construct a `list` success response.
+    /// Construct a `list` success response with key names only (no metadata).
+    ///
+    /// Test helper — production callers use [`Self::list_with_entries`] so the
+    /// reply also carries the parallel value-free metadata. Kept under
+    /// `#[cfg(test)]` to avoid an unused-API dead-code warning in the binary.
+    #[cfg(test)]
     pub fn list(keys: Vec<String>) -> Self {
         Response::Ok(OkResponse {
             ok: true,
-            payload: OkPayload::List { keys },
+            payload: OkPayload::List {
+                keys,
+                entries: Vec::new(),
+            },
+        })
+    }
+
+    /// Construct a `list` success response carrying both the key names and the
+    /// parallel value-free metadata (one [`EntryInfo`] per key, same order).
+    /// Used by the daemon so `cache-warden kv list` can render backoff / pin /
+    /// state hints next to each name (DR-0022 §3).
+    pub fn list_with_entries(keys: Vec<String>, entries: Vec<EntryInfo>) -> Self {
+        debug_assert_eq!(
+            keys.len(),
+            entries.len(),
+            "list_with_entries: keys and entries must be parallel"
+        );
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::List { keys, entries },
         })
     }
 
@@ -958,6 +994,64 @@ mod tests {
     #[test]
     fn list_response_roundtrips() {
         roundtrip_response(&Response::list(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn list_without_entries_omits_field_for_backwards_compat() {
+        // DR-0009 minor extension: an older daemon that returns only `keys`
+        // must serialize without an `entries` field at all (skip_if_empty),
+        // and a newer client must decode that into an empty entries array.
+        let resp = Response::list(vec!["a".into()]);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !line.contains("entries"),
+            "names-only list must omit `entries`: {line}"
+        );
+        let back: Response = serde_json::from_str(&line).unwrap();
+        match back {
+            Response::Ok(OkResponse {
+                payload: OkPayload::List { keys, entries },
+                ..
+            }) => {
+                assert_eq!(keys, vec!["a".to_string()]);
+                assert!(entries.is_empty(), "absent entries decodes to empty");
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_with_entries_roundtrips_and_carries_backoff_until_secs() {
+        // DR-0022 §3: kv.list reply can carry per-key value-free metadata,
+        // including `backoff_until_secs`, parallel to `keys`.
+        let info = EntryInfo {
+            name: "default/K".into(),
+            state: "defined".into(),
+            regenerable: true,
+            defined: true,
+            has_value: false,
+            pin_remaining_secs: None,
+            value_type: None,
+            source: None,
+            backoff_until_secs: Some(3),
+        };
+        let resp = Response::list_with_entries(vec!["default/K".into()], vec![info.clone()]);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(
+            line.contains(r#""backoff_until_secs":3"#),
+            "entries must carry backoff_until_secs: {line}"
+        );
+        let back: Response = serde_json::from_str(&line).unwrap();
+        match back {
+            Response::Ok(OkResponse {
+                payload: OkPayload::List { keys, entries },
+                ..
+            }) => {
+                assert_eq!(keys, vec!["default/K".to_string()]);
+                assert_eq!(entries, vec![info]);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
     }
 
     #[test]

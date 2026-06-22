@@ -995,10 +995,23 @@ where
         // load, so it stays a failure.
         None => match source {
             KeySource::Local => false,
-            KeySource::Op { .. } => matches!(
-                store.get_or_regenerate(key, runner, auth, requester, cap, clock),
-                Ok(()) | Err(RegenerateDefOutcome::ValueResident)
-            ),
+            KeySource::Op { .. } => {
+                match store.get_or_regenerate(key, runner, auth, requester, cap, clock) {
+                    Ok(()) | Err(RegenerateDefOutcome::ValueResident) => true,
+                    // DR-0022 §3: same observability hook on the lazy NotLoaded path —
+                    // an op-sourced key whose first fetch is still inside the backoff
+                    // window from a previous failure surfaces as `agent refused`, with
+                    // this single stderr line so the cause is not opaque.
+                    Err(RegenerateDefOutcome::Backoff { retry_after }) => {
+                        eprintln!(
+                            "cache-warden: sign refused for `{key}` (backoff active for {:.1}s after previous fetch failure)",
+                            retry_after.as_secs_f64()
+                        );
+                        false
+                    }
+                    Err(_) => false,
+                }
+            }
         },
         Some(EntryState::Active) => true,
         Some(EntryState::SoftExpired) => {
@@ -1014,13 +1027,23 @@ where
                 // DR-0022: Backoff means a previous fetch failed recently; treat as
                 // non-signable (agent refused). The ssh client side retries via
                 // ConnectionAttempts / ssh-retry wrappers after the backoff elapses.
+                Err(RegenerateOutcome::Backoff { retry_after }) => {
+                    // Emit a one-line stderr diagnostic so an operator watching
+                    // the daemon log can tell "agent refused" was caused by a
+                    // recent fetch failure (DR-0022 §3 observability), not by a
+                    // missing or filtered key. The key name is value-free.
+                    eprintln!(
+                        "cache-warden: sign refused for `{key}` (backoff active for {:.1}s after previous fetch failure)",
+                        retry_after.as_secs_f64()
+                    );
+                    false
+                }
                 Err(
                     RegenerateOutcome::NotFound
                     | RegenerateOutcome::NotRegenerable
                     | RegenerateOutcome::NotHardExpired
                     | RegenerateOutcome::RunFailed(_)
                     | RegenerateOutcome::AuthFailed(_)
-                    | RegenerateOutcome::Backoff { .. }
                     | RegenerateOutcome::CapMismatch,
                 ) => false,
             }

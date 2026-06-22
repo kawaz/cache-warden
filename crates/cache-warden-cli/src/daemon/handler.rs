@@ -87,10 +87,10 @@ where
         Request::Status => handle_status(store, ctx),
         // `kv.list` surfaces definition-only keys too (DR-0014 §6): use the full
         // union via list_filtered (DR-0025), replacing the deprecated `keys()`.
-        Request::KvList => {
-            let keys = store.list_filtered(|_| true);
-            Response::list(keys.iter().map(|s| s.to_string()).collect())
-        }
+        // The reply carries both the names (the historical payload) and the
+        // parallel value-free metadata (DR-0022 §3 / DR-0009 minor extension)
+        // so a client can show backoff / pin / state hints alongside each name.
+        Request::KvList => handle_list(store, ctx),
         Request::KvDel { key, with_define } => {
             let removed = if with_define {
                 store
@@ -139,74 +139,74 @@ where
     A: ?Sized,
     C: Clock,
 {
-    // Collect the union of all known keys via list_filtered (DR-0025).
-    // Clone to String so the immutable borrow from list_filtered is released
-    // before any accessor needs the store again.
+    let entries = collect_entry_infos(store, ctx.clock);
+    Response::status(
+        ctx.pid,
+        ctx.version.to_string(),
+        ctx.socket.to_string(),
+        entries,
+    )
+}
+
+/// Handle `kv.list`: return both the sorted key names (historical payload) and
+/// the parallel value-free metadata (DR-0022 §3 / DR-0009 minor extension).
+///
+/// Older clients keep reading `keys`; newer clients render hints from `entries`.
+fn handle_list<A, R, C>(store: &mut Store, ctx: &HandlerCtx<'_, A, R, C>) -> Response
+where
+    A: ?Sized,
+    C: Clock,
+{
+    let entries = collect_entry_infos(store, ctx.clock);
+    let keys: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+    Response::list_with_entries(keys, entries)
+}
+
+/// Build a parallel [`EntryInfo`] vector for every key in the union of
+/// `entries` + `definitions` (sorted), in the same order [`Store::list_filtered`]
+/// returns them.
+///
+/// Shared between `status` and `kv.list` so both reflect the same value-free
+/// view (state / pin / typed source / backoff). All metadata is read through
+/// the immutable `Store` accessors (no zeroize side effect — DR-0025 §Impl).
+/// A key whose entry+definition both vanish between the union call and the
+/// per-key probe is dropped defensively.
+fn collect_entry_infos<C: Clock>(store: &Store, clock: &C) -> Vec<EntryInfo> {
     let names: Vec<String> = store
         .list_filtered(|_| true)
         .into_iter()
         .map(|s| s.to_string())
         .collect();
-    let now = ctx.clock.now();
+    let now = clock.now();
     let mut entries = Vec::with_capacity(names.len());
     for name in names {
-        // Use ItemRef accessors (immutable, pure read) for all metadata fields.
-        // DR-0025 §Implementation Notes: status display uses ItemRef::state
-        // (pure read, no zeroize). Zeroize occurs naturally via store.get /
-        // store.state_of on the next active retrieval path.
         let has_value = store.has_value(&name);
         let defined = store.is_defined(&name);
-        // A definition-only key (no value entry yet) has no lifecycle state; it
-        // reports the synthetic `"defined"` state. Otherwise use the value's
-        // real state via ItemRef::state (pure read — no zeroize side effect).
-        let item_state = {
-            // Construct a temporary ItemRef via list_filtered by filtering for
-            // the specific key. Since list_filtered releases its borrow before
-            // this block, we can call store.list_filtered again for a single key.
-            // However, it is more efficient to use the Store's public accessor
-            // methods directly for individual key lookup.
-            //
-            // ItemRef::state is only accessible via list_filtered's callback.
-            // For single-key lookup, we use entry().state() directly, which is
-            // the same CacheEntry::state (pure read) that ItemRef::state calls.
-            store.entry_state_pure(&name, ctx.clock)
-        };
+        let item_state = store.entry_state_pure(&name, clock);
         let state = match item_state {
             Some(s) => state_str(s).to_string(),
             None if defined => "defined".to_string(),
-            // Neither a value nor a definition: nothing to report (shouldn't
-            // happen for a name list_filtered returned, but skip defensively).
             None => continue,
         };
-        // A defined key is always command-backed (regenerable); for a value-only
-        // entry, ask its source. Either presence implies regenerability here.
         let regenerable = defined
             || store
                 .source_of(&name)
                 .map(|s| s.is_regenerable())
                 .unwrap_or(false);
-        // Remaining pin seconds (None when not pinned; 0 once the deadline has
-        // passed). Never exposes the value.
         let pin_remaining_secs = store
             .pin_deadline_of(&name)
             .map(|deadline| deadline.saturating_duration_since(now).as_secs());
-        // The opaque value type (DR-0016) is a property of the key's definition,
-        // so it is read from there (a typed key always has one). Never the secret.
         let value_type = store
             .definition_of(&name)
             .map(|d| d.meta())
             .and_then(|m| m.type_label())
             .filter(|t| !t.is_empty())
             .map(|t| t.to_string());
-        // The typed source origin (DR-0018 §2/§3), value-free: for an `op`
-        // source the reference (uri) is shown, never the fetched secret.
         let source = store
             .definition_of(&name)
             .and_then(|d| crate::protocol::wire::source_meta_display(d.source_meta()));
-        // Remaining backoff seconds (DR-0022): how long until re-fetch is allowed.
-        // Reported as seconds (ceiling), or None when no active backoff.
         let backoff_until_secs = store
-            .failure_backoff_remaining(&name, ctx.clock)
+            .failure_backoff_remaining(&name, clock)
             .map(|d| d.as_secs());
         entries.push(EntryInfo {
             name,
@@ -220,12 +220,7 @@ where
             backoff_until_secs,
         });
     }
-    Response::status(
-        ctx.pid,
-        ctx.version.to_string(),
-        ctx.socket.to_string(),
-        entries,
-    )
+    entries
 }
 
 /// Enforce the composed-key shape at the protocol boundary (DR-0017 §1.5):
@@ -1364,8 +1359,14 @@ mod tests {
         let resp = handle_request(&mut store, &c, Request::KvList);
         match resp {
             Response::Ok(ok) => match ok.payload {
-                OkPayload::List { keys } => {
-                    assert_eq!(keys, vec!["default/a", "default/b", "default/c"])
+                OkPayload::List { keys, entries } => {
+                    assert_eq!(keys, vec!["default/a", "default/b", "default/c"]);
+                    // The metadata array is parallel and same length (DR-0009 minor).
+                    assert_eq!(entries.len(), keys.len());
+                    assert!(
+                        entries.iter().zip(keys.iter()).all(|(e, k)| &e.name == k),
+                        "entries.name must align with keys"
+                    );
                 }
                 _ => panic!("not list"),
             },
@@ -2028,5 +2029,114 @@ mod tests {
             },
         );
         assert!(resp.is_ok(), "del is not gated by the key layer: {resp:?}");
+    }
+
+    // ---- DR-0022 §3: kv.list / status carry backoff_until_secs ----
+
+    /// Build a store + cap with a non-zero failure-backoff window so the
+    /// regenerate path will actually record a `failure_backoffs` entry.
+    fn store_with_backoff(d: Duration) -> (Store, cache_warden::Capability) {
+        let bundle = Store::builder().failure_backoff(d).build();
+        (bundle.store, bundle.control_cap)
+    }
+
+    /// Trigger a fetch failure on `key` so the store records an active backoff
+    /// window. Returns once the runner has been invoked once and failed.
+    fn arm_backoff(
+        store: &mut Store,
+        c: &HandlerCtx<'_, impl Authenticator + ?Sized, impl SourceRunner, FakeClock>,
+        key: &str,
+    ) {
+        // Register a definition whose runner will fail, then trigger a get so
+        // get_or_regenerate runs it and records the backoff record on failure.
+        let _ = handle_request(store, c, define_cmd(key, &["fail"]));
+        let _ = handle_request(
+            store,
+            c,
+            Request::KvGet {
+                key: key.into(),
+                dry_run: false,
+            },
+        );
+    }
+
+    #[test]
+    fn status_reports_backoff_until_secs_when_active() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = store_with_backoff(Duration::from_secs(5));
+        let runner = FailingRunner;
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        arm_backoff(&mut store, &c, "default/K");
+
+        let resp = handle_request(&mut store, &c, Request::Status);
+        match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::Status { entries, .. } => {
+                    let e = entries.into_iter().find(|e| e.name == "default/K").unwrap();
+                    assert!(
+                        e.backoff_until_secs.is_some_and(|s| s > 0),
+                        "status must surface an active backoff window: {:?}",
+                        e.backoff_until_secs
+                    );
+                }
+                _ => panic!("not status"),
+            },
+            _ => panic!("expected ok"),
+        }
+    }
+
+    #[test]
+    fn list_carries_parallel_entries_with_backoff_until_secs() {
+        // DR-0022 §3 / DR-0009 minor extension: `kv.list` returns `keys` AND a
+        // parallel `entries` array carrying value-free metadata so a client can
+        // render backoff / pin / state hints next to each name.
+        let clock = FakeClock::new();
+        let (mut store, cap) = store_with_backoff(Duration::from_secs(5));
+        let runner = FailingRunner;
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        arm_backoff(&mut store, &c, "default/K");
+
+        let resp = handle_request(&mut store, &c, Request::KvList);
+        match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::List { keys, entries } => {
+                    assert_eq!(keys, vec!["default/K".to_string()]);
+                    assert_eq!(entries.len(), 1, "entries must be parallel to keys");
+                    assert_eq!(entries[0].name, "default/K");
+                    assert!(
+                        entries[0].backoff_until_secs.is_some_and(|s| s > 0),
+                        "kv.list entry must carry an active backoff: {:?}",
+                        entries[0].backoff_until_secs
+                    );
+                }
+                _ => panic!("not list"),
+            },
+            _ => panic!("expected ok"),
+        }
+    }
+
+    #[test]
+    fn list_entries_have_none_backoff_when_inactive() {
+        // No backoff window has been armed: the metadata slot is None, but the
+        // entries array is still parallel + same length as keys.
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        handle_request(&mut store, &c, set_static(b"v"));
+
+        let resp = handle_request(&mut store, &c, Request::KvList);
+        match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::List { keys, entries } => {
+                    assert_eq!(keys.len(), 1);
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].name, keys[0]);
+                    assert_eq!(entries[0].backoff_until_secs, None);
+                }
+                _ => panic!("not list"),
+            },
+            _ => panic!("expected ok"),
+        }
     }
 }

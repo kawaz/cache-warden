@@ -46,7 +46,10 @@ fn render_response(resp: Response) -> Result<(), String> {
                 OkPayload::Unpinned { unpinned } => {
                     println!("{}", if unpinned { "unpinned" } else { "not found" })
                 }
-                OkPayload::List { keys } => {
+                OkPayload::List { keys, .. } => {
+                    // Generic renderer (no namespace view, no metadata view):
+                    // names only. The namespace-aware `kv list` renderer in
+                    // `dispatch_kv_list` consumes `entries` directly.
                     for k in keys {
                         println!("{k}");
                     }
@@ -501,10 +504,8 @@ fn dispatch_kv_list(
     let resp = client::round_trip(socket, &protocol::wire::Request::KvList)?;
     match resp {
         Response::Ok(ok) => match ok.payload {
-            OkPayload::List { keys } => {
-                for k in filter_ns_keys(keys, ns, all) {
-                    println!("{k}");
-                }
+            OkPayload::List { keys, entries } => {
+                render_kv_list(keys, entries, ns, all);
                 Ok(())
             }
             other => Err(CliError::Message(format!(
@@ -515,17 +516,39 @@ fn dispatch_kv_list(
     }
 }
 
-/// Apply the namespace view to a list of composed keys (DR-0017 §2): with
-/// `all`, every key passes through verbatim (`NS/KEY` form); otherwise only
-/// keys in `ns` remain, with the prefix stripped.
-fn filter_ns_keys(keys: Vec<String>, ns: &str, all: bool) -> Vec<String> {
-    if all {
-        return keys;
-    }
+/// Render `kv list` output with the namespace view (DR-0017 §2) and, when the
+/// daemon supplied per-key metadata, an inline backoff hint after each name
+/// (DR-0022 §3).
+///
+/// `entries` is the parallel value-free metadata (one per key, same order) when
+/// the daemon is new enough to populate it, or empty when it is not — in the
+/// latter case we degrade to the historical name-only output, no error.
+fn render_kv_list(keys: Vec<String>, entries: Vec<protocol::wire::EntryInfo>, ns: &str, all: bool) {
     let prefix = format!("{ns}/");
-    keys.into_iter()
-        .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
-        .collect()
+    let parallel = keys.len() == entries.len();
+    for (i, k) in keys.iter().enumerate() {
+        // Apply the namespace view: filter + strip the prefix unless --all.
+        let display_name: String = if all {
+            k.clone()
+        } else if let Some(stripped) = k.strip_prefix(&prefix) {
+            stripped.to_string()
+        } else {
+            continue;
+        };
+        // Backoff hint comes from the parallel `entries` slot (if present).
+        // We only emit it when the daemon supplied metadata and the backoff is
+        // active (> 0 seconds remaining), keeping unaffected keys quiet.
+        let hint = if parallel {
+            entries[i]
+                .backoff_until_secs
+                .filter(|&s| s > 0)
+                .map(|s| format!("  backoff: {s}s"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        println!("{display_name}{hint}");
+    }
 }
 
 /// Register every definition in one or more `--defs` files in bulk (DR-0014 §4).
@@ -968,5 +991,72 @@ mod tests {
             joined.contains("backoff: 5s"),
             "backoff must be shown: {joined}"
         );
+    }
+
+    // ---- render_kv_list (DR-0022 §3, DR-0017 §2 namespace view) ----
+    //
+    // `render_kv_list` writes straight to stdout; we exercise its decision logic
+    // indirectly by recreating the same selection rules in a pure helper. The
+    // CLI integration paths (tests/cli/*) cover the actual stdout shape; here we
+    // only pin down the *backoff hint vs name-only* decision boundary, which is
+    // the part most likely to silently regress.
+    fn select_kv_list_line(
+        key: &str,
+        entry: Option<&protocol::wire::EntryInfo>,
+        ns: &str,
+        all: bool,
+    ) -> Option<String> {
+        let prefix = format!("{ns}/");
+        let name = if all {
+            key.to_string()
+        } else {
+            key.strip_prefix(&prefix)?.to_string()
+        };
+        let hint = entry
+            .and_then(|e| e.backoff_until_secs)
+            .filter(|&s| s > 0)
+            .map(|s| format!("  backoff: {s}s"))
+            .unwrap_or_default();
+        Some(format!("{name}{hint}"))
+    }
+
+    #[test]
+    fn kv_list_strips_namespace_prefix_by_default() {
+        let line = select_kv_list_line("default/K", None, "default", false);
+        assert_eq!(line, Some("K".to_string()));
+    }
+
+    #[test]
+    fn kv_list_all_keeps_composed_name() {
+        let line = select_kv_list_line("default/K", None, "default", true);
+        assert_eq!(line, Some("default/K".to_string()));
+    }
+
+    #[test]
+    fn kv_list_filters_out_other_namespaces_unless_all() {
+        let line = select_kv_list_line("other/K", None, "default", false);
+        assert_eq!(line, None, "other-namespace keys hidden without --all");
+    }
+
+    #[test]
+    fn kv_list_renders_backoff_hint_when_active() {
+        let mut e = base_entry();
+        e.name = "default/K".into();
+        e.backoff_until_secs = Some(3);
+        let line = select_kv_list_line("default/K", Some(&e), "default", false);
+        assert_eq!(line.as_deref(), Some("K  backoff: 3s"));
+    }
+
+    #[test]
+    fn kv_list_omits_backoff_hint_when_zero_or_absent() {
+        let mut e = base_entry();
+        e.name = "default/K".into();
+        e.backoff_until_secs = Some(0);
+        let line = select_kv_list_line("default/K", Some(&e), "default", false);
+        assert_eq!(line.as_deref(), Some("K"));
+
+        e.backoff_until_secs = None;
+        let line = select_kv_list_line("default/K", Some(&e), "default", false);
+        assert_eq!(line.as_deref(), Some("K"));
     }
 }
