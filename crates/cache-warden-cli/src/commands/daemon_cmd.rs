@@ -315,6 +315,7 @@ fn build_definition(
 /// Return `true` when the config has at least one `op`-sourced kv entry or
 /// `op`-kind authsock source, indicating that Full Disk Access is needed for
 /// `op` CLI invocations at runtime.
+#[cfg(target_os = "macos")]
 fn has_op_sources(config: &Config) -> bool {
     let has_kv_op = config
         .kv
