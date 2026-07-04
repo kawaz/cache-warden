@@ -1,6 +1,6 @@
 ---
 title: release.yml semver gate を canonical pattern に合わせる (latest-release 並列 check 追加)
-status: open
+status: resolved
 category: request
 created: 2026-06-28T19:58:11+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-04T09:46:53+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:semver gate 追加 (commit da14588701dd)。canonical との差分: trigger が Cargo.toml のため既 release green-skip を gate より前に配置 (依存変更 push の CI 赤化防止)"]
 blocked_by:
 origin: bump-semver dogfood
 ---
@@ -63,6 +63,8 @@ gh release view "v${CURRENT}" --repo "$REPO" >/dev/null 2>&1 || echo "changed=tr
 
 ## 受け入れ条件
 
-- [ ] release.yml の check-version step が `bump-semver compare gt` による semver gate を含む
-- [ ] latest-release / latest-tag の両方を並列 check する pattern になっている
-- [ ] downgrade 時に release が止まることを確認
+- [x] release.yml の check-version step が `bump-semver compare gt` による semver gate を含む
+- [x] latest-release / latest-tag の両方を並列 check する pattern になっている
+- [x] downgrade 時に release が止まることを確認 (gate コマンド列を実データでローカル
+      シミュレーション: 0.22.2 → BLOCKED / 0.22.3 → 既 release green-skip /
+      0.22.4 → PASS。CI 実機確認は次回 version bump push の workflow watch で行う)
