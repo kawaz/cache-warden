@@ -36,6 +36,19 @@ brew install --cask kawaz/tap/cache-warden
 cargo build --release -p cache-warden-cli
 ```
 
+## macOS: Full Disk Access (FDA)
+
+`op`（1Password CLI）をアップストリームコマンドとして使う設定（kv エントリの
+`source = "op"`、または authsock ソースの `kind = "op"`）の場合、macOS では
+Full Disk Access の付与が必要になる。`daemon register` 実行時に未設定であれば
+自動的に案内が表示され、System Settings の Full Disk Access 設定画面が開く。
+「CacheWarden」を ON にするだけで設定は完了する（この自動案内は `.app` から
+実行した場合のみ働く。ソースビルドしたバイナリから `register` した場合は
+案内をスキップする旨の警告が表示される）。
+
+FDA なしでも動作するが、daemon の起動やアップグレードのたびに TCC ダイアログ
+が表示される。
+
 ## ドキュメント
 
 - [DESIGN-ja.md](./docs/DESIGN-ja.md) — 現実装の説明 (ドメイン + アーキテクチャ)

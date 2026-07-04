@@ -32,6 +32,20 @@ From source:
 cargo build --release -p cache-warden-cli
 ```
 
+## macOS: Full Disk Access (FDA)
+
+If the config uses `op` (1Password CLI) as an upstream command (a kv entry
+with `source = "op"`, or an authsock source with `kind = "op"`), macOS
+requires Full Disk Access to be granted. `daemon register` automatically
+walks you through the grant flow when it isn't set yet: it opens the System
+Settings Full Disk Access pane, and turning "CacheWarden" on is all that's
+needed (this auto-guidance only works when running from the `.app`;
+registering from a source-built binary prints a warning and skips the
+check).
+
+It still works without FDA, but a TCC dialog appears on every daemon launch
+and upgrade.
+
 ## Documentation
 
 - [DESIGN.md](./docs/DESIGN.md) — Current implementation (domain + architecture)
