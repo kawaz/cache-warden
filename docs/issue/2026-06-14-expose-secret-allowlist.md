@@ -122,3 +122,12 @@ DR-0024 land 後の dogfood で「cap gate を入れたら expose_secret 呼出�
 2. dogfood で `expose_secret` 呼出点の現状 audit (= rustdoc JSON で path リスト出力 + 各 path のレビュー)。
 3. 案 A-D の評価を加えて DR-0027 候補として起票するか決定。
 4. 不要なら本 issue を `pending-sublimation` で close。
+
+## 2026-07-04 追記 (triage sweep)
+
+DR-0024 (capability-based access gate) は `Status: Accepted` かつ実装済みと確認した
+(`crates/cache-warden/src/capability.rs` に `Capability` 構造体、`Store::get` /
+`delete` / `unpin` が `&Capability` を要求)。「次のアクション 1」の DR-0024 land 条件は
+満たされている。ただし `SecretBytes::expose_secret` (`crates/cache-warden/src/secret.rs:90`)
+は現状も `pub` のまま、`with_exposed` は未実装。本 issue は解消されておらず re-evaluate /
+実装着手が可能な状態。status は open のまま継続。

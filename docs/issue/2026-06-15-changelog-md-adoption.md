@@ -1,17 +1,17 @@
 ---
 title: CHANGELOG.md 採用検討 (= リリースノート / breaking change 履歴の明示経路)
-status: open
+status: pending-sublimation
 category: design
 created: 2026-06-15T12:00:00+09:00
 last_read:
 open_entered: 2026-06-15T12:00:00+09:00
 wip_entered:
 blocked_entered:
-pending_entered:
+pending_entered: 2026-07-04T09:33:55+09:00
 discarded_entered:
 resolved_entered:
 discard_reason:
-pending_reason:
+pending_reason: ["case-A confirmed: release.yml gh release create already uses --generate-notes","defer: CHANGELOG.md adoption revisit at pre-1.0 prep"]
 close_reason:
 blocked_by:
 origin:
@@ -134,3 +134,12 @@ release.yml の `gh release create` step で commit log + DR file から structu
 - `justfile bump-version` task (= 案 1 採用時の改修対象)
 - 参考: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 - 参考: [Semantic Versioning 2.0.0](https://semver.org/) (= pre-1.0 minor breaking の扱い)
+
+## 2026-07-04 追記 (triage sweep, 「現状確認」節の調査結果)
+
+- `.github/workflows/release.yml` の `publish-release` job (`gh release create`) は
+  `--generate-notes` フラグ使用を確認 (= **case A**: release body 自動生成済み)。
+- `CHANGELOG.md` は未作成 (`ls CHANGELOG*` no match)。
+
+→ 「推奨」節の**短期アクション (案 2 = 現状維持) は既に満たされている**、今すぐの
+追加作業は不要。中期 (= 1.0 直前) の案 1 移行タイミングまで `pending-sublimation` とする。

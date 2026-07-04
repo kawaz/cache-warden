@@ -159,3 +159,12 @@ DR-0024 land 後の dogfood で「mlock 半減 path が本当に脅威モデル�
 3. OTP adapter (= DR-0024 §8 で新設) の `get_code` 内部 `seed_bytes` も同様に `Zeroizing` で包む。
 4. テスト: `Vec` reallocation が起きない code path であることを実装で担保 (= push / extend を使わない)、CI で lint。
 5. process memory dump test は本 issue scope 外 (= release blocker でない)、future hardening の余地として残す。
+
+## 2026-07-04 追記 (triage sweep)
+
+DR-0024 は実装済みと確認した (詳細は `2026-06-14-expose-secret-allowlist.md` の同日追記参照)。
+ただし `crates/cache-warden-cli/src/daemon/handler.rs::finish_get` の opaque path は
+現在も `secret.expose_secret().to_vec()` のままで `Zeroizing` 等のラップは無い
+(OTP path は `OtpAdapter::get_code` に既に分離済みだが、そちらの seed_bytes 側の
+zeroize 有無は本 triage では未確認)。問題は解消されておらず本 issue は引き続き有効。
+DR-0024 land 条件を満たしたため follow-up PR 着手可能な状態。status は open のまま継続。
