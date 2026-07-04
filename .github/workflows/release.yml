@@ -14,22 +14,97 @@ jobs:
       changed: ${{ steps.version.outputs.changed }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # bump-semver の `vcs get latest-tag` で全 tag が必要
+
+      # semver gate 用に bump-semver を install (latest release を利用)
+      - name: Install bump-semver
+        run: |
+          set -euo pipefail
+          LATEST=$(gh release list --repo kawaz/bump-semver --limit 1 --json tagName -q '.[0].tagName' | sed 's/^v//')
+          curl -fsSL --retry 5 --retry-delay 2 --max-time 60 \
+            "https://github.com/kawaz/bump-semver/releases/download/v${LATEST}/bump-semver-linux-amd64" \
+            -o /usr/local/bin/bump-semver
+          chmod +x /usr/local/bin/bump-semver
+          bump-semver --version
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Check version change
         id: version
-        run: |
-          CURRENT_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          # Check if a GitHub release with this version already exists
-          if gh release view "v${CURRENT_VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "Version unchanged: v${CURRENT_VERSION} already released"
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "New version detected: v${CURRENT_VERSION}"
-          fi
-          echo "current=${CURRENT_VERSION}" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          CURRENT_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "current=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+
+          # semver 形式の検証 (bump-semver get -qq で exit code のみ検証)
+          if ! bump-semver get "$CURRENT_VERSION" -qq; then
+            echo "::error::Invalid version format in Cargo.toml: ${CURRENT_VERSION}"
+            exit 1
+          fi
+
+          # 既 release 済みなら green skip (= semver gate より前に置く)
+          #
+          # Design rationale: canonical (kawaz/bump-semver) は gate を先に置き
+          # not-greater を常に赤にするが、それは trigger が paths:["VERSION"]
+          # で同 version の再発火が起きない前提。cache-warden の trigger は
+          # paths:["Cargo.toml"] で、依存変更のみの push でも発火する (= 同
+          # version での再発火が正常系)。先に既 release 確認で green skip
+          # しないと、依存変更 push のたびに CI が赤になる。
+          if gh release view "v${CURRENT_VERSION}" --repo "$REPO" >/dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Version unchanged: v${CURRENT_VERSION} already released"
+            exit 0
+          fi
+
+          # ---- semver gate (= release.yml canonical pattern) ----
+          #
+          # CURRENT_VERSION が「過去の release / tag いずれよりも大」を
+          # 並列 check する。両 source を短絡せず評価し、どちらかの gate を
+          # 越えなかったら release を作らない (= downgrade を止める):
+          #   - latest-release: GH の release 一覧 (= 過去リリース済 versions)
+          #   - latest-tag    : git tag (= origin の git ref)
+          #
+          # なぜ両方必要か: `gh release create` は GH 内部に release + tag を
+          # 作るが origin の git ref には tag を push しない (cli/cli#4357)。
+          # よって checkout 後の `vcs get latest-tag` は GH の最新 release より
+          # 古い tag を返すケースがあり、そのギャップを `latest-release` が埋める。
+          #
+          # なぜ `gh` の `--latest=automatic` に任せないか: date を含む
+          # スコアリング (= SemVer 厳格でない) で後発の小 version が Latest に
+          # 昇格する観測あり。後段 (homebrew tap 更新等) は現 push version を
+          # 信用するため、この段階で gate して release を作らせない。
+          #
+          # 初回 release / bootstrap: latest-release / latest-tag のどちらも
+          # 空 (= exit 非 0) はあり得る。その軸の gate は skip、他方の軸だけで判定。
+          FAIL=0
+          if LATEST_REL=$(bump-semver vcs get latest-release --repository "$REPO" 2>/dev/null); then
+            echo "latest-release: ${LATEST_REL}"
+            if ! bump-semver compare gt "$CURRENT_VERSION" "$LATEST_REL" -qq; then
+              echo "::error::v${CURRENT_VERSION} is not greater than latest GH release v${LATEST_REL}"
+              FAIL=1
+            fi
+          else
+            echo "latest-release: (none yet); bootstrap"
+          fi
+          if LATEST_TAG=$(bump-semver vcs get latest-tag --include-prerelease --vcs git 2>/dev/null); then
+            echo "latest-tag: ${LATEST_TAG}"
+            if ! bump-semver compare gt "$CURRENT_VERSION" "$LATEST_TAG" -qq; then
+              echo "::error::v${CURRENT_VERSION} is not greater than latest git tag v${LATEST_TAG}"
+              FAIL=1
+            fi
+          else
+            echo "latest-tag: (none yet); bootstrap"
+          fi
+          if [ "$FAIL" = "1" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "New version detected: v${CURRENT_VERSION}"
 
   build-release:
     needs: check-version
