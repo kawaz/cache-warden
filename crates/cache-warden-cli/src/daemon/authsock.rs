@@ -58,10 +58,10 @@ use cache_warden::{
     ValueSource,
 };
 use cache_warden_authsock::{
-    AgentCodec, AgentMessage, DiscoveredKey, FilterEvaluator, GithubFetcher, GithubMatcher,
-    Identity, KeySource, MessageType, OpKeyCache, OpSource, PublicKeyRegistry, RealGithubFetcher,
-    RealOpClient, RegisteredKey, Upstream, chain_gate_passes, discover_keys, private_key_argv,
-    sign,
+    AgentCodec, AgentMessage, DiscoveredKey, DiscoveryOutcome, FilterEvaluator, GithubFetcher,
+    GithubMatcher, Identity, KeySource, MessageType, OpKeyCache, OpSource, PublicKeyRegistry,
+    RealGithubFetcher, RealOpClient, RegisteredKey, Upstream, chain_gate_passes, discover_keys,
+    private_key_argv, sign,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
@@ -160,11 +160,27 @@ pub fn discover_all_sources(sources: &[AuthsockSource]) -> BTreeMap<String, Vec<
             .filter_map(|m| OpSource::parse(m))
             .collect();
         let cache = OpKeyCache::load();
-        match discover_keys(&client, &op_sources, cache) {
-            Ok((keys, fresh_cache)) => {
+        match discover_keys(&client, &op_sources, source.op_account.as_deref(), cache) {
+            Ok(DiscoveryOutcome::Fresh {
+                keys,
+                cache: fresh_cache,
+            }) => {
                 fresh_cache.save();
                 println!(
                     "cache-warden: authsock source `{}`: discovered {} op key(s)",
+                    source.name,
+                    keys.len()
+                );
+                out.insert(source.name.clone(), keys);
+            }
+            Ok(DiscoveryOutcome::Stale { keys, error }) => {
+                // `op item list` failed: serve the last-known keys recovered from
+                // the disk cache (bounded to this source's account + members).
+                // The cache is intentionally NOT re-saved on this path — a
+                // transient op outage must never discard the known-good mapping.
+                eprintln!(
+                    "cache-warden: authsock source `{}`: op discovery failed ({error}); \
+                     serving {} key(s) from stale cache",
                     source.name,
                     keys.len()
                 );

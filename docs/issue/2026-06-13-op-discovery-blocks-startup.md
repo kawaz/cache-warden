@@ -88,3 +88,22 @@ DR-0022 backoff 検証のため fg daemon (= terminal 経由起動、UI session 
 = 「launchd context では biometric 認可路が UI session に届かないため op item list が永久 hang」の既存仮説 (本 issue 「## 影響」節記述) が更に強い傍証で支持される。
 
 未解決継続。本 issue は dogfood の致命症状として open のまま。
+
+## 2026-07-04 部分解消 (DR-0026: disk-cache fallback)
+
+残存症状を P1/P2/P3 に分解し、P2 を解消した:
+
+- **P2 (解消)**: discovery 失敗時の 0-key serving。`discover_keys` が
+  `DiscoveryOutcome::Stale` で disk cache から前回 public key を復元して serving
+  継続するようになった (provenance = 発見時 op account で source 境界を強制)。
+  判断記録は DR-0026、実装は `op_discovery.rs::fallback_from_cache` +
+  `op_cache.rs::CacheProvenance`
+- **P1 (残存)**: `spawn_listeners` が discovery await 後のため、op hang 時は
+  listener 起動が最大 30s 遅延する。DR-0023 Phase 2 (listener 先行 bind +
+  disk-cache seed + background discovery) で扱う
+- **P3 (残存、コード外)**: launchd context で op の biometric 認可が UI session
+  に届かない構造制約。lazy 化しても初回 sign の op fetch は同条件。本筋は
+  ssh-agent-provider-architecture (1Password agent socket 経由列挙)、または
+  DR-0019 register フローでの session type 調整 (要実機検証)
+
+P1 が残るため issue は open 継続。

@@ -21,6 +21,25 @@ const CACHE_VERSION: u32 = 1;
 const CACHE_FILENAME: &str = "op_map.json";
 const APP_DIR: &str = "cache-warden";
 
+/// Domain provenance of a cached key: which 1Password domain it was discovered
+/// from. Recorded so the discovery-failure fallback ([`crate::discover_keys`])
+/// can offer a cached key **only** for a source whose domain matches — never
+/// letting one account's key stand in for another's.
+///
+/// The bounding identity is the `op --account` the key was discovered under, a
+/// stable domain fact (not the `[authsock.sources.NAME]` config label, which a
+/// user can rename freely). The vault is kept on [`CachedKey`] itself and paired
+/// with the source's `op://VAULT` members to bound within an account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheProvenance {
+    /// The `op --account` this key was discovered under. `None` means the source
+    /// configured no `op_account`, i.e. the `op` CLI's default account — a value
+    /// distinct from "provenance unknown" (a legacy entry, where the whole
+    /// [`CacheProvenance`] is absent). See [`CachedKey::provenance`].
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
 /// One cached public key, keyed in the file by its fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedKey {
@@ -32,8 +51,17 @@ pub struct CachedKey {
     pub public_key: String,
     /// Item title (the key's comment).
     pub title: String,
-    /// Vault name (display only).
+    /// Vault name (display only, and — with [`provenance`](Self::provenance) — a
+    /// fallback bound: matched against a source's `op://VAULT` members).
     pub vault: String,
+    /// Domain provenance recorded at discovery. `#[serde(default)]` keeps files
+    /// written by a pre-provenance schema loadable: their entries deserialize to
+    /// `None`, and `None` is **never** eligible for the discovery-failure
+    /// fallback (we cannot prove which source such an entry belongs to, so the
+    /// conservative choice is to ignore it there). Such an entry is still a valid
+    /// warm-cache hint for a *successful* discovery (the fingerprint fast path).
+    #[serde(default)]
+    pub provenance: Option<CacheProvenance>,
 }
 
 /// The whole cache file: a version tag plus a flat list of cached keys.
@@ -145,6 +173,11 @@ mod tests {
             public_key: format!("ssh-ed25519 AAAA{id}"),
             title: format!("key-{id}"),
             vault: "Private".into(),
+            // A freshly discovered key carries provenance (the account it came
+            // from); the round-trip test asserts it survives save/load.
+            provenance: Some(CacheProvenance {
+                account: Some("kawaz.1password.com".into()),
+            }),
         }
     }
 
@@ -175,6 +208,69 @@ mod tests {
         let loaded = OpKeyCache::load_from(&path);
         assert_eq!(loaded.keys.len(), 1);
         assert_eq!(loaded.keys[0].item_id, "itemx");
+        // Provenance survives the round trip: the fallback boundary is only as
+        // sound as the account recorded here, so it must persist verbatim.
+        assert_eq!(
+            loaded.keys[0].provenance,
+            Some(CacheProvenance {
+                account: Some("kawaz.1password.com".into())
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_entry_without_provenance_loads_as_none() {
+        // A cache file written by a pre-provenance schema has no `provenance`
+        // field. `#[serde(default)]` must load it (not reject the whole file)
+        // with `provenance == None` — the marker that this entry is ineligible
+        // for the discovery-failure fallback (conservative: we cannot prove its
+        // source). It is still a usable warm-cache hint for successful discovery.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"keys":[
+                {"item_id":"id1","fingerprint":"SHA256:fp1",
+                 "public_key":"ssh-ed25519 AAAALEGACY","title":"Old Key",
+                 "vault":"Private"}
+            ]}"#,
+        )
+        .unwrap();
+        let loaded = OpKeyCache::load_from(&path);
+        assert_eq!(loaded.keys.len(), 1, "legacy file must still load");
+        assert_eq!(loaded.keys[0].item_id, "id1");
+        assert_eq!(
+            loaded.keys[0].provenance, None,
+            "a pre-provenance entry has unknown provenance"
+        );
+    }
+
+    #[test]
+    fn provenance_default_account_is_distinct_from_absent_provenance() {
+        // A source with no `op_account` records `Some(CacheProvenance { account:
+        // None })` — the default op account, which IS a known provenance. This
+        // must be distinguishable from a legacy entry (`provenance == None`):
+        // the former is fallback-eligible for a default-account source, the
+        // latter is never fallback-eligible.
+        let default_acct = CachedKey {
+            item_id: "id".into(),
+            fingerprint: "SHA256:fp".into(),
+            public_key: "ssh-ed25519 AAAA".into(),
+            title: "t".into(),
+            vault: "Private".into(),
+            provenance: Some(CacheProvenance { account: None }),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default_acct.json");
+        let mut c = OpKeyCache::new();
+        c.keys.push(default_acct);
+        c.save_to(&path);
+        let loaded = OpKeyCache::load_from(&path);
+        assert_eq!(
+            loaded.keys[0].provenance,
+            Some(CacheProvenance { account: None }),
+            "default-account provenance is known (Some), not absent (None)"
+        );
     }
 
     #[test]
