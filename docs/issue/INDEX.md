@@ -7,7 +7,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-06-14 | idea | idea | [graceful-restart-state-handoff](./2026-06-14-graceful-restart-state-handoff.md) | **そもそも kv を維持したい根本理由 = op の TouchID サイクルに引き戻されたくない**。 |
 | 2026-06-14 | idea | idea | [ssh-agent-provider-architecture](./2026-06-14-ssh-agent-provider-architecture.md) | 現状の authsock アダプタは **「中継役（relay）」前提**の名残: |
 | 2026-06-14 | bug | idea | [touchid-blocks-blocking-pool](./2026-06-14-touchid-blocks-blocking-pool.md) | SIGN_REQUEST 処理は `spawn_blocking` で blocking pool に乗せ、その中で **`store` の `std::sy… |
-| 2026-07-04 | task | open | [fda-readme-section-cache-warden](./2026-07-04-fda-readme-section-cache-warden.md) | README.md / README-ja.md に「macOS: Full Disk Access」節を追加する。未設定の場合は… |
 | 2026-06-28 | request | open | [release-yml-semver-gate-canonical-pattern](./2026-06-28-release-yml-semver-gate-canonical-pattern.md) | `gh release view` の重複確認だけで semver compare gate が無い現状を修正し、bump-semver canonical … |
 | 2026-06-22 | design | open | [crate-macos-process-inspect](./2026-06-22-crate-macos-process-inspect.md) | macOS で **socket 対抗プロセスや任意 pid の出自を多面的に inspect** する Rust crate を切り出す。Pure Rust… |
 | 2026-06-14 | design | open | [expose-secret-allowlist](./2026-06-14-expose-secret-allowlist.md) | DR-0024 で `Store::get(key, cap, clock) -> Result<Option<&SecretBytes>, CapError… |
