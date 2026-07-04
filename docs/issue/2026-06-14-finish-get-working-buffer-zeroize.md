@@ -1,6 +1,24 @@
+---
+title: "`finish_get` working buffer (`Vec<u8>`) の zeroize 整合"
+status: open
+category: design
+created: 2026-06-14T12:00:00+09:00
+last_read:
+open_entered: 2026-06-14T12:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin:
+---
+
 # `finish_get` working buffer (`Vec<u8>`) の zeroize 整合
 
-- status: open / 設計未確定 (= DR-0024 と独立だが併走検討)
 - 記録: 2026-06-14 (= DR-0024 cap-access-gate 起草時に Critical adversarial review で析出した「mlock 半減 path」)
 - 関連: **DR-0024 (capability-based access gate L1、本 issue の親、Open Q Q12)** / DR-0007 (mlock memory pinning、本 issue の動機) / DR-0016 (OTP value type、seed bytes が `Vec<u8>` に copy される path) / DR-0005 (zeroize crate の依存採用)
 

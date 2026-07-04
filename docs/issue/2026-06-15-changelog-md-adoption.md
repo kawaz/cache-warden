@@ -1,6 +1,24 @@
+---
+title: CHANGELOG.md 採用検討 (= リリースノート / breaking change 履歴の明示経路)
+status: open
+category: design
+created: 2026-06-15T12:00:00+09:00
+last_read:
+open_entered: 2026-06-15T12:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin:
+---
+
 # CHANGELOG.md 採用検討 (= リリースノート / breaking change 履歴の明示経路)
 
-- status: open / 設計判断待ち (= kawaz の運用方針確認)
 - 記録: 2026-06-15 (= DR-0024 G-2 実装中のペルソナ視点発掘で析出)
 - 関連: DR-0024 §Consequences (= 「CHANGELOG / commit message に明示」記述あり) / DR-0025 §Consequences (= 「CHANGELOG.md に明示」記述あり) / release.yml (= 現状 trigger は `Cargo.toml` paths)
 

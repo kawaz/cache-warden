@@ -1,6 +1,24 @@
+---
+title: ssh-agent Provider 再設計（アイデア記録）
+status: idea
+category: idea
+created: 2026-06-14T10:08:57+09:00
+last_read:
+open_entered:
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin:
+---
+
 # ssh-agent Provider 再設計（アイデア記録）
 
-- status: idea
 - 記録: 2026-06-14（kawaz との議論メモ。命名は暫定、未決）
 - 関連: DR-0004（authsock 後継）/ DR-0018（型付き source・authsock NS）を拡張ないし supersede する候補。DR-0014（kv definition）/ DR-0017（namespace）の思想と一貫。
 - 関連 issue: [2026-06-13-op-discovery-blocks-startup](./2026-06-13-op-discovery-blocks-startup.md)（この再設計の pubkey 列挙/秘密 lazy 分離で解消できる）

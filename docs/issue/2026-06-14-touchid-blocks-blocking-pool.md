@@ -1,7 +1,25 @@
+---
+title: TouchID 待ち中の Mutex 保持が blocking pool を直列化する (副次問題)
+status: idea
+category: bug
+created: 2026-06-14T13:05:13+09:00
+last_read:
+open_entered:
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin:
+---
+
 # TouchID 待ち中の Mutex 保持が blocking pool を直列化する (副次問題)
 
-- status: open / idea 段階
-- 派生: 2026-06-14 [2026-06-14-op-refetch-loop.md](./2026-06-14-op-refetch-loop.md) の追加調査中に副次的に判明
+- 派生: 2026-06-14 [2026-06-14-op-refetch-loop.md](./archive/2026-06-14-op-refetch-loop.md) の追加調査中に副次的に判明 (元 issue は close 済み、archive 参照)
 - 関連: DR-0008 (単一 daemon)、DR-0009 (control socket)、`crates/cache-warden-cli/src/daemon/authsock.rs:sign_local_with_ctx` / `ensure_loaded` / `lazy_load_op_key`
 
 ## 現象 (コード根拠から推測)

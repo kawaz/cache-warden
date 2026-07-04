@@ -1,6 +1,24 @@
+---
+title: "`SecretBytes::expose_secret` 呼出点の allowlist 化"
+status: open
+category: design
+created: 2026-06-14T12:00:00+09:00
+last_read:
+open_entered: 2026-06-14T12:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin:
+---
+
 # `SecretBytes::expose_secret` 呼出点の allowlist 化
 
-- status: open / 設計未確定 (= DR-0024 と独立だが併走検討)
 - 記録: 2026-06-14 (= DR-0024 cap-access-gate 起草時に Critical adversarial review で析出した「cap gate の射程外の穴」)
 - 関連: **DR-0024 (capability-based access gate L1、本 issue の親、Open Q Q11)** / DR-0007 (mlock memory pinning、本 issue の動機) / DR-0016 (OTP value type、`expose_secret` 経由で seed が handler に出ている path)
 

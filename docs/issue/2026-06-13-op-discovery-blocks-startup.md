@@ -1,8 +1,25 @@
+---
+title: op discovery がデーモン startup を同期ブロックする
+status: open
+category: bug
+created: 2026-06-13T19:20:55+09:00
+last_read: 2026-06-22T20:25:26+09:00
+open_entered: 2026-06-13T19:20:55+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin:
+---
+
 # op discovery がデーモン startup を同期ブロックする
 
-- status: open
 - 発見: 2026-06-13 (DR-0021 のシグナル調査中に sample で観測)
-- last_read: 2026-06-22T20:25:26+09:00
 
 ## 現象
 

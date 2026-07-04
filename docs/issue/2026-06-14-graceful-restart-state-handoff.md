@@ -1,6 +1,24 @@
+---
+title: "graceful restart: kv + endpoint fd を引き継いで新バイナリへ（アイデア記録）"
+status: idea
+category: idea
+created: 2026-06-14T10:08:58+09:00
+last_read:
+open_entered:
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin:
+---
+
 # graceful restart: kv + endpoint fd を引き継いで新バイナリへ（アイデア記録）
 
-- status: idea
 - 記録: 2026-06-14（kawaz との議論メモ。未着手・未決）
 - 関連: DR-0021（signal/shutdown。本件はその「理想形 restart」）/ `justfile on-success-release` の daemon 再起動案内（= 非 graceful 経路の現状）/ [2026-06-14-ssh-agent-provider-architecture](./2026-06-14-ssh-agent-provider-architecture.md)（kv に秘密集約・公開鍵 index の構造と直結）
 

@@ -1,6 +1,24 @@
+---
+title: コア公開 API レイヤで KEY / NS validation 強制 (= アダプタからの内部 bypass を物理的に不可能化)
+status: open
+category: bug
+created: 2026-06-14T12:00:00+09:00
+last_read:
+open_entered: 2026-06-14T12:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin:
+---
+
 # コア公開 API レイヤで KEY / NS validation 強制 (= アダプタからの内部 bypass を物理的に不可能化)
 
-- status: open / 設計確定 (= アーキテクチャ違反の是正、2026-06-14 kawaz 指摘で本質確定)
 - 記録: 2026-06-14 (kawaz 指摘の経緯: dogfood 復活直後の `zl4...` 鍵 regression 観察 → 「forget できない」現象 → 「NS 正規化」表層解 → **「コア API validation 欠落のアーキテクチャ違反」根本問題発見**)
 - 関連: **DR-0003 (コアとアダプタの責務分離、本 issue の根本)** / DR-0017 (KV NS / KEY 文字種規定) / DR-0014 (kv definition model) / DR-0018 §4.5 (authsock NS 正規化、本 issue で具体化) / DR-0022 (failure_backoffs)
 

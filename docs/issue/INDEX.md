@@ -1,9 +1,32 @@
-# docs/issue INDEX
+# Issue INDEX
+
+active な issue の一覧。close 済みは archive/ にあり、ここには載せない。
 
 | date | category | status | slug | 概要 |
-|------|----------|--------|------|------|
-| 2026-07-03 | task | idea | [docs-issue-triage-sweep](./2026-07-03-docs-issue-triage-sweep.md) | open issue 13 件の triage 棚卸し (外部監査フラグ) |
-| 2026-06-28 | request | open | [release-yml-semver-gate-canonical-pattern](./2026-06-28-release-yml-semver-gate-canonical-pattern.md) | release.yml semver gate を canonical pattern に合わせる (latest-release 並列 check 追加) |
-| 2026-06-22 | design | open | [crate-macos-process-inspect](./2026-06-22-crate-macos-process-inspect.md) | macOS プロセス多面 inspect crate 切り出し (Pure Rust + libc FFI、peer-identity guard / TouchID dialog の共通基盤) |
-| 2026-06-22 | design | open | [kv-get-peer-identity-guard](./2026-06-22-kv-get-peer-identity-guard.md) | kv get 時に peer-identity constraint を評価して認可する (同 SHELL / codesign / uid ガード) |
-| 2026-06-22 | design | open | [custom-touchid-dialog](./2026-06-22-custom-touchid-dialog.md) | cache-warden 独自 TouchID 認証 dialog (要求元プロセス透明性の向上) |
+|---|---|---|---|---|
+| 2026-07-03 | task | idea | [docs-issue-triage-sweep](./2026-07-03-docs-issue-triage-sweep.md) | `docs/issue/` 配下の open 状態 issue 数が 13 件に達している。放置日数順に |
+| 2026-06-14 | idea | idea | [graceful-restart-state-handoff](./2026-06-14-graceful-restart-state-handoff.md) | **そもそも kv を維持したい根本理由 = op の TouchID サイクルに引き戻されたくない**。 |
+| 2026-06-14 | idea | idea | [ssh-agent-provider-architecture](./2026-06-14-ssh-agent-provider-architecture.md) | 現状の authsock アダプタは **「中継役（relay）」前提**の名残: |
+| 2026-06-14 | bug | idea | [touchid-blocks-blocking-pool](./2026-06-14-touchid-blocks-blocking-pool.md) | SIGN_REQUEST 処理は `spawn_blocking` で blocking pool に乗せ、その中で **`store` の `std::sy… |
+| 2026-06-28 | request | open | [release-yml-semver-gate-canonical-pattern](./2026-06-28-release-yml-semver-gate-canonical-pattern.md) | `gh release view` の重複確認だけで semver compare gate が無い現状を修正し、bump-semver canonical … |
+| 2026-06-22 | design | open | [crate-macos-process-inspect](./2026-06-22-crate-macos-process-inspect.md) | macOS で **socket 対抗プロセスや任意 pid の出自を多面的に inspect** する Rust crate を切り出す。Pure Rust… |
+| 2026-06-22 | design | open | [custom-touchid-dialog](./2026-06-22-custom-touchid-dialog.md) | cache-warden 独自の TouchID 認証 dialog を実装し、**要求元プロセスの透明性**を 1Password 既定の dialog よ… |
+| 2026-06-22 | design | open | [kv-get-peer-identity-guard](./2026-06-22-kv-get-peer-identity-guard.md) | cache-warden の `kv set` 時に **peer-identity constraint** を declarative に付与し、`kv … |
+| 2026-06-15 | design | open | [changelog-md-adoption](./2026-06-15-changelog-md-adoption.md) | DR-0024 / DR-0025 のような minor breaking change (= pre-1.0 で minor bump、API surfac… |
+| 2026-06-14 | design | open | [expose-secret-allowlist](./2026-06-14-expose-secret-allowlist.md) | DR-0024 で `Store::get(key, cap, clock) -> Result<Option<&SecretBytes>, CapError… |
+| 2026-06-14 | task | open | [fda-check-flow-port](./2026-06-14-fda-check-flow-port.md) | cache-warden daemon が `op` CLI を実行すると、macOS で **新バイナリ（responsible process のパス変化… |
+| 2026-06-14 | design | open | [finish-get-working-buffer-zeroize](./2026-06-14-finish-get-working-buffer-zeroize.md) | `crates/cache-warden-cli/src/daemon/handler.rs::finish_get` (L460-L476) は **OTP… |
+| 2026-06-14 | bug | open | [internal-key-forget-interface](./2026-06-14-internal-key-forget-interface.md) | DR-0003 は「コア (`cache-warden` lib) とアダプタ (`cache-warden-authsock` lib) の責務分離」を確立… |
+| 2026-06-13 | bug | open | [op-discovery-blocks-startup](./2026-06-13-op-discovery-blocks-startup.md) | `[authsock.sockets.*].keys` を持つ config で起動すると、`run()` の |
+
+<!--
+雛形メモ (migrate sub-command 用):
+
+- 列構成は固定 (= 上記 5 列、列名と順序を変えない)
+- 行の {{rows}} は migrate が走査後の active issue から生成 (= 全件再生成)
+- ソート規約:
+  1. status 優先順: idea → open → wip → blocked → pending-sublimation
+  2. 同 status 内は date 降順 (= 新しい起票が上)
+- 各行: 日付 / category / status / [slug](リンク) / 本文 1 行目から 80 文字以内 の 5 列
+- 概要は 80 文字を超えたら末尾を「…」で省略
+-->

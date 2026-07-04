@@ -1,8 +1,25 @@
+---
+title: FDA チェック & 誘導フローの移植（authsock-warden → cache-warden）
+status: open
+category: task
+created: 2026-06-14T10:22:02+09:00
+last_read: 2026-06-22T20:37:32+09:00
+open_entered: 2026-06-14T10:22:02+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin:
+---
+
 # FDA チェック & 誘導フローの移植（authsock-warden → cache-warden）
 
-- status: open
 - 記録: 2026-06-14（kawaz 指摘。authsock-warden で解決済みだが cache-warden 未対応）
-- last_read: 2026-06-22T20:37:32+09:00
 - 知見 doc: [2026-06-14-macos-tcc-fda.md](../findings/2026-06-14-macos-tcc-fda.md)
 - 関連: DR-0019（daemon register）/ DR-0020（.app + AssociatedBundleIdentifiers、TCC 永続化の前提は実装済み）
 
