@@ -589,20 +589,24 @@ where
         };
     }
 
-    // Opaque path: read the resident value once and copy it out, releasing the
-    // mutable borrow of `store`. The copy is a brief in-daemon working buffer;
-    // base64-encoded — it does not linger.
-    let value = match store.get(key, ctx.store_cap, ctx.clock).ok().flatten() {
-        Some(secret) => secret.expose_secret().to_vec(),
+    // Opaque path: read the resident value and shape the response inside a
+    // scope-limited closure (DR-0028). The raw bytes are base64-encoded within
+    // `with_exposed`, so the plaintext never lives in an owned `Vec<u8>` working
+    // buffer that would linger un-zeroized in process memory (DR-0007 / issue
+    // 2026-06-14-finish-get-working-buffer-zeroize). Only the encoded response
+    // value — which must go out on the wire anyway — leaves the closure.
+    match store.get(key, ctx.store_cap, ctx.clock).ok().flatten() {
+        // dry-run hides the value, reveal returns it (DR-0015). The bytes are
+        // exposed only on the reveal branch.
+        Some(secret) => {
+            if dry_run {
+                Response::get_verified(state)
+            } else {
+                secret.with_exposed(|bytes| Response::get(encode_b64(bytes)))
+            }
+        }
         // Should not happen: the caller just confirmed readability. Be defensive.
-        None => return Response::error(ErrorKind::Internal, "value gone before finish_get"),
-    };
-
-    // Opaque value: dry-run hides it, reveal returns it (DR-0015).
-    if dry_run {
-        Response::get_verified(state)
-    } else {
-        Response::get(encode_b64(&value))
+        None => Response::error(ErrorKind::Internal, "value gone before finish_get"),
     }
 }
 

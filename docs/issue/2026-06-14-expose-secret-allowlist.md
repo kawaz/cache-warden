@@ -131,3 +131,43 @@ DR-0024 (capability-based access gate) は `Status: Accepted` かつ実装済み
 満たされている。ただし `SecretBytes::expose_secret` (`crates/cache-warden/src/secret.rs:90`)
 は現状も `pub` のまま、`with_exposed` は未実装。本 issue は解消されておらず re-evaluate /
 実装着手が可能な状態。status は open のまま継続。
+
+## 2026-07-06 実装（DR-0028）
+
+**案 A + 案 C の合成**を実装した（推奨通り）。ただし案 A の「`pub(crate)` 化」は
+`#[cfg(test)] pub(crate)` に精緻化（下記）。DR-0028 として起草（core 公開 API surface
+変更のため）。姉妹 issue `2026-06-14-finish-get-working-buffer-zeroize.md` と **同一 API
+（`with_exposed`）で統合解決**した。
+
+- `SecretBytes::with_exposed<F, R>(&self, f: F) -> R where F: FnOnce(&[u8]) -> R` を
+  core (`crates/cache-warden/src/secret.rs`) に public 追加。crate 外から平文を読む
+  唯一の経路。closure が borrow を scope するので生の `&[u8]` を owned buffer へ move
+  できない。
+- `SecretBytes::expose_secret` を `pub` → `#[cfg(test)] pub(crate)` へ。production /
+  adapter からの呼出はゼロ。core crate 自身の test だけが簡潔アサーション用に使う。
+  → **crate 外から raw `&[u8]` を得る手段が構造的に消滅**。allowlist が CI lint（案 D）
+  でなく **コンパイル時保証**になった。
+- adapter 全呼出点を `with_exposed` に変換:
+  `handler.rs::finish_get`（opaque）/ `otp_adapter.rs::get_code` /
+  `authsock.rs::build_registry` / `authsock.rs` SIGN_REQUEST 署名。
+- 案 D（clippy / rustdoc JSON diff）は不採用: コンパイル時保証で足りるため lint pipeline
+  保守が不要。
+
+### expose_secret 呼出点の before → after
+
+| 呼出点 | before | after |
+|---|---|---|
+| core `SecretBytes::expose_secret` 定義 | `pub fn` | `#[cfg(test)] pub(crate) fn`（非公開・test 専用） |
+| `handler.rs::finish_get`（opaque） | `expose_secret().to_vec()` | `with_exposed(\|b\| Response::get(encode_b64(b)))` |
+| `otp_adapter.rs::get_code` | `expose_secret().to_vec()` | `with_exposed(\|seed\| derive_code(seed, &meta))` |
+| `authsock.rs::build_registry` | `String::from_utf8_lossy(expose_secret())` | `with_exposed(\|b\| register_from_pem(...))` |
+| `authsock.rs` 署名 | `String::from_utf8_lossy(expose_secret())` | `with_exposed(\|b\| sign(...))` |
+| core test（store/source/entry/secret.rs） | `expose_secret()` | 変更なし（同一 crate + `#[cfg(test)]` で引き続き呼べる） |
+| cli test（server.rs ×3） | `expose_secret()` | `with_exposed(\|b\| assert_eq!(...))` |
+
+### 残タスク / 判断
+
+- 案 C の「戻り値 `R` に `!Copy` / zeroize-aware 制約」は不採用（現呼出点は全て派生値を
+  返すので過剰、`s.with_exposed(\|b\| b.to_vec())` の抜け道を型で塞ぐのは将来余地）。
+- authsock 署名 path の PEM `String` copy は署名処理内在で本 issue 射程外（future
+  hardening）。

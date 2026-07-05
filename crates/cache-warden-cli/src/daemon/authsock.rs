@@ -14,7 +14,7 @@
 //! back to a core KV key; the daemon fetches that key's value through the
 //! **same auth gate** as the control socket (`extend_authenticated` on soft
 //! expiry, `regenerate` on hard expiry for command sources), borrows the PEM via
-//! `expose_secret` just long enough to sign, and — on success — calls `extend`
+//! `with_exposed` just long enough to sign, and — on success — calls `extend`
 //! to refresh the idle window (DR-0011 idle-extend semantics).
 //!
 //! Any failure (unknown key, denied auth, hard-expired static key, malformed
@@ -90,10 +90,13 @@ fn build_registry(
     for kv_key in keys {
         match store.get(kv_key, cap, clock).ok().flatten() {
             Some(secret) => {
-                // The PEM is borrowed only for derivation; the registry keeps
-                // the public blob, never the secret.
-                let pem = String::from_utf8_lossy(secret.expose_secret());
-                match registry.register_from_pem(kv_key.clone(), &pem) {
+                // The PEM is borrowed only for derivation (scoped by `with_exposed`,
+                // DR-0028); the registry keeps the public blob, never the secret.
+                let outcome = secret.with_exposed(|bytes| {
+                    let pem = String::from_utf8_lossy(bytes);
+                    registry.register_from_pem(kv_key.clone(), &pem)
+                });
+                match outcome {
                     Ok(()) => {}
                     Err(e) => eprintln!(
                         "cache-warden: authsock `{socket_name}`: key `{kv_key}` is not a usable \
@@ -986,12 +989,13 @@ where
         return AgentMessage::failure();
     }
 
-    // Borrow the PEM only for the signing call.
+    // Borrow the PEM only for the signing call, scoped by `with_exposed` (DR-0028)
+    // so the private key never escapes into an owned buffer.
     let signature = match store.get(&kv_key, ctx.authsock_cap, clock).ok().flatten() {
-        Some(secret) => {
-            let pem = String::from_utf8_lossy(secret.expose_secret());
+        Some(secret) => secret.with_exposed(|bytes| {
+            let pem = String::from_utf8_lossy(bytes);
             sign(&pem, &fields.data, fields.flags)
-        }
+        }),
         None => return AgentMessage::failure(),
     };
 

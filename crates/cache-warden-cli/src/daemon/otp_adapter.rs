@@ -44,32 +44,34 @@ impl OtpAdapter {
 
     /// Derive a TOTP code from the seed cached under `key`.
     ///
-    /// 3-stage borrow (DR-0024 §8):
-    /// 1. cap-gated raw read で seed を `Vec<u8>` working buffer にコピー (= `&mut Store` 借用を解放)
-    /// 2. `definition_of` で meta を読む (= 不変借用)
-    /// 3. TOTP derive (CPU 計算のみ、Store 借用なし)
+    /// Borrow order (DR-0024 §8 / DR-0028):
+    /// 1. `definition_of` で meta を読み clone (= 不変借用、cap 不要、この時点で借用解放)
+    /// 2. cap-gated raw read → `with_exposed` closure 内で TOTP derive
+    ///
+    /// seed は `with_exposed` の closure scope に閉じ込められ、owned `Vec<u8>` に
+    /// 複写されない (DR-0028)。process memory に残る un-zeroize な seed working
+    /// buffer が生まれないので DR-0007 mlock / DR-0016 write-only の意義を保つ。
+    /// closure を抜けるのは派生した TOTP code だけ (= seed 自身は出ない)。
     pub fn get_code<C: Clock>(
         &self,
         store: &mut Store,
         key: &str,
         clock: &C,
     ) -> Result<String, OtpError> {
-        // stage 1: cap-gated raw read → owned bytes
-        let seed_bytes: Vec<u8> = {
-            let secret = store
-                .get(key, &self.store_cap, clock)
-                .map_err(OtpError::Cap)?
-                .ok_or(OtpError::NoValue)?;
-            secret.expose_secret().to_vec()
-        };
-
-        // stage 2: definition meta (= 不変借用、cap 不要)
+        // step 1: definition meta を先に owned 化 (不変借用を解放してから step 2 の
+        // `&mut` 借用に入る)。
         let meta = store
             .definition_of(key)
             .map(|d| d.meta().clone())
             .unwrap_or_default();
 
-        // stage 3: derive
-        otp_type::derive_code(&seed_bytes, &meta).map_err(OtpError::Derive)
+        // step 2: cap-gated read → closure 内で derive。seed は closure の外に出ない。
+        let secret = store
+            .get(key, &self.store_cap, clock)
+            .map_err(OtpError::Cap)?
+            .ok_or(OtpError::NoValue)?;
+        secret
+            .with_exposed(|seed| otp_type::derive_code(seed, &meta))
+            .map_err(OtpError::Derive)
     }
 }

@@ -1249,7 +1249,7 @@ mod tests {
             .ok()
             .flatten()
             .expect("entry preloaded");
-        assert_eq!(secret.expose_secret(), b"tok-value");
+        secret.with_exposed(|b| assert_eq!(b, b"tok-value"));
     }
 
     #[test]
@@ -1297,16 +1297,17 @@ mod tests {
             ["default/AGENT_KEY".to_string()].into_iter().collect();
         register_definitions(&mut store, &runner, &clock, &entries, &eager, &cap);
         // …but the authsock reference forces it resident.
-        assert_eq!(
-            store
-                .get("default/AGENT_KEY", &cap, &clock)
-                .ok()
-                .flatten()
-                .unwrap()
-                .expose_secret(),
-            b"pem-bytes",
-            "authsock-referenced key is eagerly materialized"
-        );
+        store
+            .get("default/AGENT_KEY", &cap, &clock)
+            .ok()
+            .flatten()
+            .unwrap()
+            .with_exposed(|b| {
+                assert_eq!(
+                    b, b"pem-bytes",
+                    "authsock-referenced key is eagerly materialized"
+                )
+            });
         // The unreferenced key stays lazy.
         assert!(store.is_defined("default/OTHER"));
         assert!(
@@ -1369,16 +1370,12 @@ mod tests {
                 .is_none(),
             "no value after failed preload"
         );
-        assert_eq!(
-            store
-                .get("default/GOOD", &cap, &clock)
-                .ok()
-                .flatten()
-                .unwrap()
-                .expose_secret(),
-            b"ok",
-            "subsequent preload still runs"
-        );
+        store
+            .get("default/GOOD", &cap, &clock)
+            .ok()
+            .flatten()
+            .unwrap()
+            .with_exposed(|b| assert_eq!(b, b"ok", "subsequent preload still runs"));
     }
 
     #[test]

@@ -168,3 +168,44 @@ DR-0024 は実装済みと確認した (詳細は `2026-06-14-expose-secret-allo
 (OTP path は `OtpAdapter::get_code` に既に分離済みだが、そちらの seed_bytes 側の
 zeroize 有無は本 triage では未確認)。問題は解消されておらず本 issue は引き続き有効。
 DR-0024 land 条件を満たしたため follow-up PR 着手可能な状態。status は open のまま継続。
+
+## 2026-07-06 実装（DR-0028）
+
+推奨は案 A（`Zeroizing<Vec<u8>>`）だったが、姉妹 issue
+`2026-06-14-expose-secret-allowlist.md` の `with_exposed` API と **統合**する形で
+**案 B 路線**を採った（issue 本文「両 issue を統合的に解決する DR を起こす場合は案 B 路線」
+に整合）。DR-0028 として起草。
+
+- `SecretBytes::with_exposed<F, R>` を core に追加（詳細は姉妹 issue / DR-0028）。
+- `handler.rs::finish_get`（opaque path）: `expose_secret().to_vec()` を廃し、
+  `with_exposed(|bytes| Response::get(encode_b64(bytes)))` で **closure 内で base64 化**。
+  → owned `Vec<u8>` working buffer が消滅。
+- `otp_adapter.rs::get_code`: `definition_of` の meta を先に clone して不変借用を解放 →
+  `store.get`（`&mut`）→ `with_exposed(|seed| derive_code(seed, &meta))` で
+  **closure 内で TOTP derive**。→ `seed_bytes: Vec<u8>` working buffer が消滅。
+
+### 案 A でなく「owned buffer を作らない」を選んだ理由
+
+案 A（`Zeroizing<Vec<u8>>`）は copy 自体は残り、`Vec` reallocation 時に旧 buffer が
+zeroize されない制約を将来 path に負わせる。本実装は **owned copy をそもそも生成しない**
+ため、zeroize すべき中間バッファが存在せず保証が強い。DR-0007 mlock / DR-0016 seed
+write-only の意義を保つ。
+
+### zeroize の検証について（テスト設計の判断）
+
+「drop 後にメモリが平文を含まない」は直接 assert できない（process memory dump test は
+本 issue scope 外、次のアクション 5）。本実装は **型 / 構造レベルの guard** で保証する:
+
+- **owned `Vec<u8>` を生成しない構造**をコードで担保（`with_exposed` closure）。grep で
+  `expose_secret().to_vec()` が handler / otp_adapter から消えたことを確認（0 件）。
+- backing buffer は `SecretBytes` の mlock + zeroize-on-drop 対象そのもの（既存 test
+  `nonempty_secret_is_locked_on_unix` / `purge_*` が保護を検証済み）。`with_exposed` は
+  この buffer を借りるだけでコピーを作らないので、新たに zeroize 対象が生まれない。
+- `with_exposed` の契約 test（`with_exposed_passes_bytes_and_returns_closure_result` /
+  `with_exposed_on_empty_secret_sees_empty_slice`）を core に追加。
+- 既存の handler / otp / authsock / server test 群が振る舞い等価の regression net。
+
+### 残タスク
+
+- process memory dump test（次のアクション 5）は本 issue scope 外・release blocker で
+  ない、future hardening として残す。

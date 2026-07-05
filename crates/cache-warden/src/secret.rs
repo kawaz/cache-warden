@@ -82,13 +82,37 @@ impl SecretBytes {
         self.data.is_empty()
     }
 
-    /// Borrow the raw secret bytes.
+    /// Test-only terse accessor for the plaintext (core-crate tests only).
     ///
-    /// This is the single, explicitly named accessor for the plaintext. Callers
-    /// must name `expose_secret` so that secret access is greppable and obvious
-    /// at the call site.
-    pub fn expose_secret(&self) -> &[u8] {
+    /// Production and adapter code reads secrets **exclusively** through
+    /// [`SecretBytes::with_exposed`] (DR-0028) — there is no non-test caller of
+    /// this method. It is compiled only under `#[cfg(test)]` so the core's own
+    /// unit tests can keep writing `assert_eq!(s.expose_secret(), b"...")` without
+    /// wrapping every assertion in a closure, while the public API still exposes
+    /// no way to obtain a raw `&[u8]` that could outlive the borrow.
+    #[cfg(test)]
+    pub(crate) fn expose_secret(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Run `f` with a scoped borrow of the raw secret bytes, returning its result.
+    ///
+    /// This is the **only** way to read the plaintext from outside the core crate
+    /// (DR-0028). The `&[u8]` is valid only for the duration of the closure, so
+    /// the raw bytes cannot be moved into a caller-owned buffer that lingers
+    /// un-zeroized in process memory (which would defeat `mlock` / zeroize —
+    /// DR-0007). Only the closure's return value `R` leaves the call; a caller
+    /// that returns a *derived* value (a base64 string, a TOTP code, a signature)
+    /// never keeps the seed itself.
+    ///
+    /// The borrow is of the pinned, zeroize-on-drop backing buffer —
+    /// `with_exposed` creates no copy of its own, so there is nothing extra to
+    /// wipe afterwards.
+    pub fn with_exposed<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.data)
     }
 
     /// Whether the backing buffer is currently pinned in memory via `mlock`.
@@ -112,8 +136,9 @@ impl SecretBytes {
     /// Zeroize the backing buffer immediately, leaving an empty secret.
     ///
     /// Used when a value reaches its hard TTL and must be destroyed while the
-    /// holder still lives. After this call [`SecretBytes::expose_secret`]
-    /// returns an empty slice and [`SecretBytes::is_locked`] is `false`.
+    /// holder still lives. After this call the secret is empty
+    /// ([`SecretBytes::with_exposed`] sees an empty slice) and
+    /// [`SecretBytes::is_locked`] is `false`.
     pub fn purge(&mut self) {
         self.zeroize_buffer();
         // `zeroize` on a Vec sets the length to 0 but keeps the (now-zeroed)
@@ -195,6 +220,30 @@ mod tests {
     fn from_str_wraps_utf8_bytes() {
         let s = SecretBytes::from("hunter2");
         assert_eq!(s.expose_secret(), b"hunter2");
+    }
+
+    // `with_exposed` is the public, scope-limited plaintext accessor (DR-0028):
+    // the closure sees the exact backing bytes and its return value is what
+    // leaves the call. This is the contract every out-of-crate adapter relies on
+    // (handler base64, OTP derive, authsock sign) — the raw `&[u8]` never escapes
+    // as an owned buffer, only the derived `R` does.
+    #[test]
+    fn with_exposed_passes_bytes_and_returns_closure_result() {
+        let s = SecretBytes::from("hunter2");
+        // The closure observes the exact plaintext…
+        let seen_len = s.with_exposed(|b| {
+            assert_eq!(b, b"hunter2");
+            b.len()
+        });
+        // …and only its return value (here a derived length) leaves the call.
+        assert_eq!(seen_len, 7);
+    }
+
+    #[test]
+    fn with_exposed_on_empty_secret_sees_empty_slice() {
+        // A purged / empty secret exposes an empty slice, never a dangling one.
+        let s = SecretBytes::new(Vec::new());
+        s.with_exposed(|b| assert!(b.is_empty()));
     }
 
     #[test]
