@@ -18,6 +18,20 @@
 /// The built-in default namespace (DR-0017 §1).
 pub const DEFAULT_NAMESPACE: &str = "default";
 
+/// The reserved namespace for authsock adapter-internal keys (DR-0018 §4.5).
+///
+/// The daemon composes op-sourced private keys into `authsock/op_<item_id>` and
+/// serves them only over the SSH agent protocol. A user's `kv set` / `kv define`
+/// into this namespace is refused (see [`is_reserved_namespace`]) so the reserved
+/// space cannot be shadowed or seeded from the outside.
+pub const RESERVED_NAMESPACE_AUTHSOCK: &str = "authsock";
+
+/// Whether `ns` is a reserved namespace that user writes (`kv set` / `kv define`)
+/// must not target (DR-0018 §4.5).
+pub fn is_reserved_namespace(ns: &str) -> bool {
+    ns == RESERVED_NAMESPACE_AUTHSOCK
+}
+
 /// `true` if `s` is a valid KEY / NS identifier: `[A-Za-z0-9_]+` (DR-0017 §1.5).
 pub fn is_valid_identifier(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -179,6 +193,20 @@ mod tests {
         let err = validate_identifier("a.b", "KEY").unwrap_err();
         assert!(err.contains("KEY"), "msg: {err}");
         assert!(err.contains("A-Za-z0-9_"), "msg: {err}");
+    }
+
+    // ---- reserved namespace (DR-0018 §4.5) ----
+
+    #[test]
+    fn authsock_is_the_only_reserved_namespace() {
+        // `authsock` is reserved for daemon-internal op keys; ordinary names —
+        // including the default namespace and a key that merely contains the word
+        // — are not reserved.
+        assert!(is_reserved_namespace(RESERVED_NAMESPACE_AUTHSOCK));
+        assert!(is_reserved_namespace("authsock"));
+        for ok in [DEFAULT_NAMESPACE, "projA", "Authsock", "authsock2", "auth"] {
+            assert!(!is_reserved_namespace(ok), "{ok:?} must not be reserved");
+        }
     }
 
     // ---- compose / split / qualify ----

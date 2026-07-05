@@ -355,7 +355,8 @@ allowed_processes = ["ssh"]                  # processes allowed to use this soc
     leak-nothing convention). **REQUEST_IDENTITIES enumeration is not filtered** (matching
     authsock-warden's per-key behaviour and cache-warden's "key existence may be listed, values and
     details are withheld" principle: enumerate, then refuse at signing time). The internal op-key KV
-    names (`__authsock_op:*`) never appear in config `[kv.*]`, so they are naturally unrestricted.
+    names (`authsock/op_*`, the reserved `authsock` namespace) never appear in config `[kv.*]`, so
+    they are naturally unrestricted.
 - **Failures leak nothing**: an unknown key, a filtered-out key, denied re-auth, hard-expired static
   key, malformed request, signing error, or all-upstreams-failed all return `SSH_AGENT_FAILURE` (empty
   payload). No error detail reaches the agent protocol.
@@ -419,10 +420,13 @@ different definitions. A namespace is a **CLI / protocol-layer concept**: the in
 into `NS/KEY` and flows into the core's flat store (the core is unchanged). The default namespace is
 `"default"`.
 
-- **Charset**: KEY and NS are both `[A-Za-z0-9_]+` (single segment). Enforced at creation time at the
-  protocol boundary (`kv.set` / `kv.define`), so a key that cannot be referenced or written into config
-  never exists (the authsock-internal `__authsock_op:*` keys never cross the protocol, so they are
-  unaffected).
+- **Charset**: KEY and NS are both `[A-Za-z0-9_]+` (single segment). Enforced at two layers: the
+  protocol boundary (`kv.set` / `kv.define`) requires a full `NS/KEY`, and the **core store's write
+  API** (`set` / `define` / `define_with_meta`) enforces the composed-key syntax (one or two segments)
+  on every caller so no in-process adapter can bypass it (DR-0027). A key that cannot be referenced or
+  written into config never exists. The authsock-internal op keys are composed into the reserved
+  `authsock` namespace (`authsock/op_*`, DR-0018 §4.5), so they satisfy the charset and are created
+  in-process without ever crossing the protocol.
 - **CLI**: every kv verb plus `run` / `inject` / `status` takes `--namespace NS`. Embedding `ns/key`
   in a KEY argument is rejected (the flag is the only selection path). The default resolves as
   `--namespace` > `CACHE_WARDEN_NAMESPACE` > `[cli].namespace` > `"default"` (export it from a

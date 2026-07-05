@@ -1032,6 +1032,44 @@ type = "magic"
     }
 
     #[test]
+    fn snapshot_excludes_authsock_op_definitions_never_persisting_them() {
+        // An authsock op key is registered via a plain `define` (no typed source
+        // origin — `SourceMeta::new()`), exactly as `register_op_keys` does. Such
+        // a definition has no `source_meta`, so `SourceSpecWire::from_source_meta`
+        // yields None and `snapshot_definitions` drops it. This is what keeps the
+        // reserved `authsock/op_*` keys memory-only (daemon-restart volatile) and
+        // out of the persisted-definitions file (DR-0018 §4.5): they never reach
+        // disk regardless of `persist-definitions`.
+        use cache_warden::{Ttl, ValueSource};
+        let (mut store, _cap) = cache_warden::test_helpers::store_with_cap();
+        store
+            .define(
+                "authsock/op_itemABC",
+                ValueSource::command(vec![
+                    "cache-warden".into(),
+                    "__authsock-op-private-key".into(),
+                    "itemABC".into(),
+                ]),
+                Ttl::new(None, None).unwrap(),
+            )
+            .expect("authsock op key uses a valid composed key");
+        assert!(
+            store.is_defined("authsock/op_itemABC"),
+            "registered in memory"
+        );
+        // But it is absent from the snapshot the persistence layer serializes.
+        let snap = snapshot_definitions(&store);
+        assert!(
+            snap.iter()
+                .all(|d| d.full_key("default") != "authsock/op_itemABC"),
+            "authsock op definition must never be persisted, got {:?}",
+            snap.iter()
+                .map(|d| d.full_key("default"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn snapshot_round_trips_through_serialize() {
         use cache_warden::{Ttl, ValueMeta, ValueSource};
         let (mut store, _cap) = cache_warden::test_helpers::store_with_cap();

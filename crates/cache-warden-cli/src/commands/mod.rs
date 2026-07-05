@@ -235,6 +235,24 @@ pub fn validate_cli_key(key: &str, verb: &str) -> Result<(), String> {
     crate::namespace::validate_identifier(key, "KEY")
 }
 
+/// Reject a write verb (`set` / `define`) targeting a reserved namespace
+/// (DR-0018 §4.5).
+///
+/// The `authsock` namespace holds adapter-internal op keys the daemon composes
+/// itself; a user's `kv set` / `kv define` into it is refused here so the error
+/// is friendly and early (the daemon's wire handler is the backstop that also
+/// catches a raw request). Only write verbs are gated — read/lifecycle verbs
+/// (`get` / `del` / `pin` / `unpin`) are out of this bouncer's scope.
+pub fn reject_reserved_write_namespace(ns: &str, verb: &str) -> Result<(), String> {
+    if crate::namespace::is_reserved_namespace(ns) {
+        return Err(format!(
+            "`kv {verb}` cannot target the reserved namespace {ns:?} (DR-0018); \
+             it holds daemon-internal keys"
+        ));
+    }
+    Ok(())
+}
+
 /// Parse the arguments to `kv set ...` into a [`Request::KvSet`].
 ///
 /// Grammar:
@@ -343,6 +361,7 @@ pub fn parse_kv_set(
         return Err(format!("unexpected argument: {extra}"));
     }
     validate_cli_key(&key, "set")?;
+    reject_reserved_write_namespace(ns, "set")?;
 
     let bytes = match value {
         Some(v) => v.into_bytes(),
@@ -568,6 +587,7 @@ pub fn parse_kv_define(args: &[String], ns: &str) -> Result<Request, String> {
         return Err(format!("unexpected argument: {extra}"));
     }
     validate_cli_key(&key, "define")?;
+    reject_reserved_write_namespace(ns, "define")?;
 
     // A cwd/env flag only makes sense with a `command` source.
     if source.is_some() && (command_cwd.is_some() || !command_env.is_empty()) {
@@ -1157,6 +1177,31 @@ mod tests {
                 "kv {verb} must steer to --namespace: {err}"
             );
         }
+    }
+
+    // ---- reserved-namespace bouncer (DR-0018 §4.5) ----
+
+    #[test]
+    fn kv_set_into_reserved_authsock_namespace_is_rejected() {
+        // `--namespace authsock` (resolved to `ns = "authsock"`) on a write verb
+        // is refused at the CLI with a steer, before any request is built.
+        let err = parse_kv_set(&s(&["K", "v"]), "authsock", false, no_stdin).unwrap_err();
+        assert!(err.contains("reserved"), "must name the reservation: {err}");
+        assert!(err.contains("authsock"), "must name the namespace: {err}");
+    }
+
+    #[test]
+    fn kv_define_into_reserved_authsock_namespace_is_rejected() {
+        let err = parse_kv_define(&s(&["K", "--source", "op://v/i/f"]), "authsock").unwrap_err();
+        assert!(err.contains("reserved"), "must name the reservation: {err}");
+        assert!(err.contains("authsock"), "must name the namespace: {err}");
+    }
+
+    #[test]
+    fn kv_set_and_define_into_ordinary_namespace_are_fine() {
+        // The bouncer is reservation-specific: an ordinary namespace still works.
+        assert!(parse_kv_set(&s(&["K", "v"]), "default", false, no_stdin).is_ok());
+        assert!(parse_kv_define(&s(&["K", "--source", "op://v/i/f"]), "projA").is_ok());
     }
 
     #[test]

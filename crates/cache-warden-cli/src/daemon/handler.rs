@@ -227,7 +227,12 @@ fn collect_entry_infos<C: Clock>(store: &Store, clock: &C) -> Vec<EntryInfo> {
 /// every key created via `kv.set` / `kv.define` must be `NS/KEY` with both
 /// segments in `[A-Za-z0-9_]+`. This keeps "a key that cannot be referenced or
 /// written into config" from ever existing. Internal daemon keys
-/// (`__authsock_op:*`) never pass through this path, so they are unaffected.
+/// (`authsock/op_*`) are composed inside the daemon and never pass through this
+/// wire path, so they are unaffected.
+///
+/// This is the wire-adapter's **semantic** gate: it requires a full `NS/KEY`
+/// (the core's own syntax gate is looser — it also accepts a bare `KEY` — because
+/// namespace policy is an adapter concern, DR-0017 §1/§2).
 fn validate_protocol_key(key: &str) -> Result<(), Response> {
     if crate::namespace::split_composed(key).is_some() {
         Ok(())
@@ -239,6 +244,22 @@ fn validate_protocol_key(key: &str) -> Result<(), Response> {
                  [A-Za-z0-9_]+ (DR-0017)"
             ),
         ))
+    }
+}
+
+/// Reject a `kv.set` / `kv.define` targeting a reserved namespace (DR-0018 §4.5).
+///
+/// The `authsock` namespace holds adapter-internal op keys the daemon composes
+/// itself and serves only over the SSH agent protocol; an external write into it
+/// is refused so it cannot be shadowed or seeded from the outside. Assumes the
+/// key already passed [`validate_protocol_key`] (so `split_composed` succeeds).
+fn reject_reserved_namespace_write(key: &str) -> Result<(), Response> {
+    match crate::namespace::split_composed(key) {
+        Some((ns, _)) if crate::namespace::is_reserved_namespace(ns) => Err(Response::error(
+            ErrorKind::BadRequest,
+            format!("namespace {ns:?} is reserved and cannot be written to (DR-0018)"),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -258,6 +279,9 @@ where
     if let Err(resp) = validate_protocol_key(&key) {
         return resp;
     }
+    if let Err(resp) = reject_reserved_namespace_write(&key) {
+        return resp;
+    }
     let ttl = match Ttl::new(
         soft_ttl_secs.map(std::time::Duration::from_secs),
         hard_ttl_secs.map(std::time::Duration::from_secs),
@@ -275,18 +299,26 @@ where
     };
 
     // `set` injects opaque bytes only — a value type (otp) lives on a definition
-    // (DR-0016), so there is no seed validation here.
-    store
-        .set(
-            key,
-            ValueSource::Static,
-            SecretBytes::new(bytes),
-            ttl,
-            ctx.store_cap,
-            ctx.clock,
-        )
-        .ok();
-    Response::set_ack()
+    // (DR-0016), so there is no seed validation here. The key already passed the
+    // wire syntax gate, so a core InvalidKey cannot occur; a CapMismatch would be
+    // an internal wiring bug (the handler always holds the store cap). Both are
+    // reported defensively rather than swallowed.
+    match store.set(
+        key,
+        ValueSource::Static,
+        SecretBytes::new(bytes),
+        ttl,
+        ctx.store_cap,
+        ctx.clock,
+    ) {
+        Ok(()) => Response::set_ack(),
+        Err(cache_warden::SetError::InvalidKey(e)) => {
+            Response::error(ErrorKind::BadRequest, e.to_string())
+        }
+        Err(cache_warden::SetError::CapMismatch) => {
+            Response::error(ErrorKind::Internal, "capability mismatch")
+        }
+    }
 }
 
 /// Register a command-source definition (DR-0014 §1).
@@ -303,6 +335,9 @@ fn handle_define(
     meta: ValueMetaWire,
 ) -> Response {
     if let Err(resp) = validate_protocol_key(&key) {
+        return resp;
+    }
+    if let Err(resp) = reject_reserved_namespace_write(&key) {
         return resp;
     }
     // Validate the selected kind's required fields (DR-0018 §1: a kind-specific
@@ -336,6 +371,9 @@ fn handle_define(
             ErrorKind::BadRequest,
             "static sources cannot be defined; use `kv set` instead",
         ),
+        // The key already passed the wire syntax gate, so a core InvalidKey
+        // cannot occur here; reported defensively rather than swallowed.
+        Err(DefineError::InvalidKey(e)) => Response::error(ErrorKind::BadRequest, e.to_string()),
     }
 }
 
@@ -1131,6 +1169,98 @@ mod tests {
             define_cmd("default/K", &["op", "read", "b"]),
         );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+    }
+
+    // ---- reserved-namespace bouncer (DR-0018 §4.5) ----
+
+    #[test]
+    fn set_into_reserved_authsock_namespace_is_bad_request() {
+        // A wire `kv.set` targeting the reserved `authsock` namespace is refused:
+        // that space holds daemon-internal op keys, never user writes. The store
+        // must not gain the key.
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        let req = Request::KvSet {
+            key: "authsock/op_itemABC".into(),
+            source: SetSource::Static {
+                value_b64: encode_b64(b"v"),
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+        };
+        assert_eq!(
+            err_kind(&handle_request(&mut store, &c, req)),
+            ErrorKind::BadRequest
+        );
+        assert!(
+            !store.has_value("authsock/op_itemABC"),
+            "reserved write must not land"
+        );
+    }
+
+    #[test]
+    fn define_into_reserved_authsock_namespace_is_bad_request() {
+        // The same bouncer applies to `kv.define`: a user cannot register a
+        // definition inside the reserved namespace (DR-0018 §4.5).
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        let resp = handle_request(
+            &mut store,
+            &c,
+            define_cmd("authsock/op_itemABC", &["echo", "x"]),
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+        assert!(
+            !store.is_defined("authsock/op_itemABC"),
+            "reserved define must not land"
+        );
+    }
+
+    #[test]
+    fn set_non_reserved_namespace_still_works() {
+        // The bouncer is namespace-specific: an ordinary namespace is unaffected
+        // (a key merely *containing* the reserved word as a KEY is fine too).
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        // `default/authsock` = namespace `default`, key `authsock` — allowed.
+        let req = Request::KvSet {
+            key: "default/authsock".into(),
+            source: SetSource::Static {
+                value_b64: encode_b64(b"v"),
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+        };
+        assert!(handle_request(&mut store, &c, req).is_ok());
+        assert!(store.has_value("default/authsock"));
+    }
+
+    #[test]
+    fn set_non_ns_key_is_bad_request() {
+        // The wire semantic gate still requires a full NS/KEY (DR-0017 §2): a bare
+        // KEY on the wire is refused even though the core would accept it.
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        let req = Request::KvSet {
+            key: "BARE".into(),
+            source: SetSource::Static {
+                value_b64: encode_b64(b"v"),
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+        };
+        assert_eq!(
+            err_kind(&handle_request(&mut store, &c, req)),
+            ErrorKind::BadRequest
+        );
     }
 
     #[test]

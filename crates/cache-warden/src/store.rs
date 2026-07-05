@@ -17,6 +17,7 @@ use crate::capability::{CapError, Capability};
 use crate::clock::{Clock, Monotonic};
 use crate::definition::{DefineError, Definition};
 use crate::entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl};
+use crate::key::{InvalidKey, validate_key_syntax};
 use crate::meta::{SourceMeta, ValueMeta};
 use crate::process::ProcessInfo;
 use crate::secret::SecretBytes;
@@ -241,8 +242,10 @@ impl Store {
     /// preloaded typed value is `set` here while its type rides on the
     /// definition registered separately.
     ///
-    /// Cap check (DR-0024) runs first: returns [`CapError::KeyMismatch`] if
-    /// `cap` does not match this store's token.
+    /// Cap check (DR-0024) runs first: returns [`SetError::CapMismatch`] if
+    /// `cap` does not match this store's token. The key is then validated for the
+    /// composed-key syntax (DR-0017 §1.5); a malformed key is rejected with
+    /// [`SetError::InvalidKey`] and the store is left untouched.
     pub fn set(
         &mut self,
         key: impl Into<String>,
@@ -251,12 +254,16 @@ impl Store {
         ttl: Ttl,
         cap: &Capability,
         clock: &impl Clock,
-    ) -> Result<(), CapError> {
-        self.check_cap(cap)?;
+    ) -> Result<(), SetError> {
+        // Cap first (DR-0024): an unauthorized caller learns nothing and mutates
+        // nothing. Key syntax is checked only after authorization succeeds.
+        self.check_cap(cap).map_err(|_| SetError::CapMismatch)?;
+        let key = key.into();
+        validate_key_syntax(&key)?;
         let entry = CacheEntry::new(source, value, ttl, clock);
         // Inserting overwrites the old entry; the displaced CacheEntry is dropped
         // here, zeroizing its secret.
-        self.entries.insert(key.into(), entry);
+        self.entries.insert(key, entry);
         Ok(())
     }
 
@@ -635,10 +642,14 @@ impl Store {
         meta: ValueMeta,
         source_meta: SourceMeta,
     ) -> Result<(), DefineError> {
+        // Validate the composed-key syntax before anything else (DR-0017 §1.5):
+        // `define` is not cap-gated (a definition is value-free metadata, DR-0024),
+        // so the key grammar is the first and only gate on the key here.
+        let key = key.into();
+        validate_key_syntax(&key)?;
         let candidate = Definition::new(source, ttl)?
             .with_meta(meta)
             .with_source_meta(source_meta);
-        let key = key.into();
         match self.definitions.get(&key) {
             Some(existing) if *existing == candidate => Ok(()), // idempotent no-op
             Some(_) => Err(DefineError::Conflict),
@@ -925,6 +936,41 @@ impl Store {
         // DR-0022: failure backoff lifetime = definition lifetime.
         self.failure_backoffs.remove(key);
         Ok(had_value || had_def)
+    }
+}
+
+/// Error from [`Store::set`] when it cannot inject a value.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetError {
+    /// The key is not a syntactically valid composed key (DR-0017 §1.5). The
+    /// store was not mutated.
+    InvalidKey(InvalidKey),
+    /// The capability token does not match this store (DR-0024). No key syntax
+    /// check ran and the store was not mutated.
+    CapMismatch,
+}
+
+impl From<InvalidKey> for SetError {
+    fn from(e: InvalidKey) -> Self {
+        SetError::InvalidKey(e)
+    }
+}
+
+impl std::fmt::Display for SetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetError::InvalidKey(e) => write!(f, "{e}"),
+            SetError::CapMismatch => write!(f, "capability does not match this store"),
+        }
+    }
+}
+
+impl std::error::Error for SetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SetError::InvalidKey(e) => Some(e),
+            SetError::CapMismatch => None,
+        }
     }
 }
 
@@ -2646,7 +2692,7 @@ mod tests {
     // ---- capability gate (DR-0024) ----
 
     #[test]
-    fn set_with_wrong_cap_returns_keymismatch() {
+    fn set_with_wrong_cap_returns_cap_mismatch() {
         let clock = FakeClock::new();
         let (mut store, _cap) = crate::test_helpers::store_with_cap();
         let wrong_bundle = StoreBuilder::new().build();
@@ -2661,11 +2707,94 @@ mod tests {
                 &clock,
             )
             .unwrap_err();
-        assert_eq!(err, CapError::KeyMismatch);
+        // Cap check runs before key syntax (DR-0024): a valid key + wrong cap is
+        // a CapMismatch, and the store is untouched.
+        assert_eq!(err, SetError::CapMismatch);
         assert!(
             !store.has_value("K"),
             "set must not mutate store on cap mismatch"
         );
+    }
+
+    // ---- composed-key syntax gate (DR-0017 §1.5, enforced in the core) ----
+
+    #[test]
+    fn set_rejects_a_syntactically_invalid_key() {
+        // The core write gate refuses a key outside the composed-key grammar
+        // (here the `:`-bearing pseudo-prefix the old `__authsock_op:` path used).
+        // The store must be left untouched — a bad key never becomes an entry.
+        let clock = FakeClock::new();
+        let (mut store, cap) = crate::test_helpers::store_with_cap();
+        let err = store
+            .set(
+                "__authsock_op:itemABC",
+                ValueSource::Static,
+                SecretBytes::from("v"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap_err();
+        match err {
+            SetError::InvalidKey(e) => assert_eq!(e.key(), "__authsock_op:itemABC"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+        assert!(!store.has_value("__authsock_op:itemABC"));
+    }
+
+    #[test]
+    fn set_accepts_bare_and_namespaced_keys() {
+        // Both a bare KEY and a composed NS/KEY are valid store keys (the core is
+        // a generic KV; the daemon composes NS/KEY on top).
+        let clock = FakeClock::new();
+        let (mut store, cap) = crate::test_helpers::store_with_cap();
+        for key in ["K", "default/K", "authsock/op_itemABC"] {
+            store
+                .set(
+                    key,
+                    ValueSource::Static,
+                    SecretBytes::from("v"),
+                    ttl(),
+                    &cap,
+                    &clock,
+                )
+                .unwrap_or_else(|e| panic!("{key:?} must be accepted: {e}"));
+            assert!(store.has_value(key));
+        }
+    }
+
+    #[test]
+    fn define_rejects_a_syntactically_invalid_key() {
+        // The definition registry shares the same core key gate: an adapter
+        // calling `define` directly (the actual bypass this closes) cannot slip a
+        // malformed key past it either.
+        let (mut store, _cap) = crate::test_helpers::store_with_cap();
+        let err = store
+            .define(
+                "__authsock_op:itemABC",
+                ValueSource::command(["echo".into(), "x".into()]),
+                ttl(),
+            )
+            .unwrap_err();
+        match err {
+            DefineError::InvalidKey(e) => assert_eq!(e.key(), "__authsock_op:itemABC"),
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+        assert!(!store.is_defined("__authsock_op:itemABC"));
+    }
+
+    #[test]
+    fn define_accepts_a_namespaced_key() {
+        // The composed form the authsock adapter now uses for op keys.
+        let (mut store, _cap) = crate::test_helpers::store_with_cap();
+        store
+            .define(
+                "authsock/op_itemABC",
+                ValueSource::command(["op".into(), "read".into(), "op://v/i/f".into()]),
+                ttl(),
+            )
+            .expect("a valid composed key must be definable");
+        assert!(store.is_defined("authsock/op_itemABC"));
     }
 
     #[test]

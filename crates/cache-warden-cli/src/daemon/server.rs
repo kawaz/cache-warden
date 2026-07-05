@@ -602,6 +602,12 @@ fn register_definitions<R, C>(
                 eprintln!("cache-warden: definition `{full_key}` skipped: static source");
                 continue;
             }
+            Err(DefineError::InvalidKey(e)) => {
+                // Unreachable from config: `full_key` is composed from a
+                // charset-validated NS + KEY. Reported defensively.
+                eprintln!("cache-warden: definition `{full_key}` skipped: {e}");
+                continue;
+            }
         }
 
         // Lazy by default; `preload = true` or an authsock-referenced key runs

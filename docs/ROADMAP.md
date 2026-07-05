@@ -23,8 +23,9 @@
   クライアント切断でも完遂・キャッシュするように。`docs/journal/2026-06-13-handoff-ecdsa-dogfood-stablewhich.md` bug A 参照
 - **stable-which 0.4.0 移行** (F): 現状 0.3 + 自前 `is_unstable_resolution` 判定 (versioned-managed
   を見落とす潜在バグ)。0.4.0 の `is_stable()`/`tags()` 経由に書き換えで同時に埋まる — DR-0019、journal 参照
-- **prefetch 本体 + authsock NS 正規化** (DR-0018 未着手): `kv prefetch ...` / 起動時 prefetch /
-  内部鍵 `__authsock_op:*` を予約 NS `authsock` に正規化。型付きスキーマ自体は v0.17.0 実装済み
+- **prefetch 本体** (DR-0018 未着手): `kv prefetch ...` / 起動時 prefetch。型付きスキーマ自体は
+  v0.17.0 実装済み。authsock NS 正規化 (内部鍵 `__authsock_op:*` → 予約 NS `authsock/op_*` +
+  reserved NS bouncer) は DR-0027 で実装済み。`authsock` NS の `kv.get` 拒否 (DR-0018 §4.5) は残タスク
 - **op discovery の起動ブロック解消**: `docs/issue/2026-06-13-op-discovery-blocks-startup.md`
 - **FDA チェック&誘導フローの移植** (authsock-warden で解決済み、cache 未対応): op 実行時の TCC
   ダイアログを Full Disk Access ON で恒久解消する register 統合フロー。`docs/issue/2026-06-14-fda-check-flow-port.md`

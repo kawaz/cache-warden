@@ -67,6 +67,7 @@ mod child_process;
 mod clock;
 mod definition;
 mod entry;
+mod key;
 mod meta;
 mod process;
 mod secret;
@@ -84,11 +85,12 @@ pub use child_process::spawn_with_clean_signal_mask;
 pub use clock::{Clock, FakeClock, Monotonic, SystemClock};
 pub use definition::{DefineError, Definition};
 pub use entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl, TtlError};
+pub use key::{InvalidKey, validate_key_syntax};
 pub use meta::{SourceMeta, ValueMeta};
 pub use process::{FakeInspector, InspectError, ProcessInfo, ProcessInspector, SystemInspector};
 pub use secret::SecretBytes;
 pub use source::{CommandRunner, RunError, SourceRunner, TrailingNewline, ValueSource};
 pub use store::{
     ExtendAuthOutcome, ExtendOutcome, FailureRecord, ItemRef, PinAuthOutcome, RegenerateDefOutcome,
-    RegenerateOutcome, Store, StoreBuilder, StoreBundle,
+    RegenerateOutcome, SetError, Store, StoreBuilder, StoreBundle,
 };

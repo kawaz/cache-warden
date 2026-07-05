@@ -129,6 +129,15 @@ pub enum DefineError {
     /// because a static source has nothing to re-run to lazily produce a value;
     /// use `set` for static values (DR-0014 §2).
     StaticNotDefinable,
+    /// The key is not a syntactically valid composed key (DR-0017 §1.5). The
+    /// definition registry was not mutated.
+    InvalidKey(crate::key::InvalidKey),
+}
+
+impl From<crate::key::InvalidKey> for DefineError {
+    fn from(e: crate::key::InvalidKey) -> Self {
+        DefineError::InvalidKey(e)
+    }
 }
 
 impl std::fmt::Display for DefineError {
@@ -142,11 +151,19 @@ impl std::fmt::Display for DefineError {
             DefineError::StaticNotDefinable => {
                 write!(f, "static sources cannot be defined; use set instead")
             }
+            DefineError::InvalidKey(e) => write!(f, "{e}"),
         }
     }
 }
 
-impl std::error::Error for DefineError {}
+impl std::error::Error for DefineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DefineError::InvalidKey(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

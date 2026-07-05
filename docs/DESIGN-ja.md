@@ -336,7 +336,7 @@ allowed_processes = ["ssh"]                  # この socket を使えるプロ�
   - **authsock SIGN_REQUEST**: KV ローカル鍵を引くとき、その鍵の `allowed_processes` を requester で照合。拒否は
     `SSH_AGENT_FAILURE`（payload 空＝既存の何も漏らさない流儀）。**REQUEST_IDENTITIES の列挙からは除外しない**
     （warden の鍵単位挙動および cache-warden の「キー存在は list で見えてよい、値・詳細は出さない」原則に合わせ、
-    列挙はするが署名時に拒否）。op 鍵の内部 KV 名 `__authsock_op:*` は config `[kv.*]` に出ないので自然と無制限。
+    列挙はするが署名時に拒否）。op 鍵の内部 KV 名 `authsock/op_*`（予約 `authsock` NS）は config `[kv.*]` に出ないので自然と無制限。
 - **失敗は何も漏らさない**: 未知鍵 / フィルタ除外 / 認証拒否 / hard 切れ static / 不正要求 / 署名失敗 /
   全 upstream 失敗はすべて `SSH_AGENT_FAILURE`（payload 空）。エラー詳細を agent protocol に出さない。
 - **隔離**: KV ローカル署名のハンドラは control socket と同じく `spawn_blocking` で隔離する（再認証
@@ -390,9 +390,12 @@ define（`cache-warden://KEY?argv=...`）は v1 では未実装（DR-0014）。
 namespace は **CLI / プロトコル層の概念**で、内部キーは `NS/KEY` に合成されてコアの flat な
 Store に流れる（コアは不変）。デフォルト NS は `"default"`。
 
-- **文字種**: KEY / NS とも `[A-Za-z0-9_]+`（単一セグメント）。`kv.set` / `kv.define` の
-  プロトコル境界で生成時に強制され、「参照も config 記述もできない不整形キー」は存在しない
-  （authsock 内部キー `__authsock_op:*` はプロトコルを通らないため適用外）。
+- **文字種**: KEY / NS とも `[A-Za-z0-9_]+`（単一セグメント）。2 層で強制する:
+  プロトコル境界（`kv.set` / `kv.define`）は完全な `NS/KEY` を要求し、さらに **コア Store の
+  書込 API**（`set` / `define` / `define_with_meta`）が合成キー文法（1 or 2 セグメント）を
+  全呼出者に強制するため、in-process アダプタからの bypass も不可能（DR-0027）。「参照も config
+  記述もできない不整形キー」は存在しない。authsock 内部 op 鍵は予約 `authsock` NS に合成
+  （`authsock/op_*`、DR-0018 §4.5）され、文字種を満たし、プロトコルを通らず daemon 内で生成される。
 - **CLI**: kv 全動詞 + `run` / `inject` / `status` に `--namespace NS`。KEY 引数への
   `ns/key` 埋め込みは拒否（指定経路はフラグ一本）。デフォルトの解決は
   `--namespace` > `CACHE_WARDEN_NAMESPACE` > `[cli].namespace` > `"default"`

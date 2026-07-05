@@ -204,9 +204,11 @@ pub fn discover_all_sources(sources: &[AuthsockSource]) -> BTreeMap<String, Vec<
 /// Each discovered key becomes a [`KeySource::Op`] entry: the public key is
 /// enumerable now (REQUEST_IDENTITIES), and the private PEM is fetched lazily at
 /// first sign via `op item get` (the argv built by [`private_key_argv`]). The
-/// core KV key is namespaced (`__authsock_op:<item_id>`) so it never collides
-/// with a manual `[kv.*]` entry. A key whose public blob fails to parse is
-/// logged and skipped. Returns how many keys were registered.
+/// core KV key is composed into the reserved `authsock` namespace
+/// ([`OpKvKey`], `authsock/op_<item_id>`) so it never collides with a manual
+/// `[kv.*]` entry and satisfies the core's composed-key syntax gate (DR-0018
+/// §4.5). A key whose item id is not composable, or whose public blob fails to
+/// parse, is logged and skipped. Returns how many keys were registered.
 fn register_op_keys(
     socket_name: &str,
     exe: &str,
@@ -216,14 +218,21 @@ fn register_op_keys(
 ) -> usize {
     let mut n = 0;
     for key in keys {
-        let kv_key = op_kv_key(&key.item_id);
+        let Some(kv_key) = OpKvKey::new(&key.item_id) else {
+            eprintln!(
+                "cache-warden: authsock `{socket_name}`: op key `{}` has a non-alphanumeric item \
+                 id, skipping (cannot form a valid store key)",
+                key.title
+            );
+            continue;
+        };
         let argv = private_key_argv(exe, &key.item_id, source.op_account.as_deref());
         let src = KeySource::Op {
             argv,
             soft_ttl_secs: source.soft_ttl_secs,
             hard_ttl_secs: source.hard_ttl_secs,
         };
-        match registry.register_op_key(&kv_key, &key.public_key, &key.title, src) {
+        match registry.register_op_key(kv_key.as_str(), &key.public_key, &key.title, src) {
             Ok(()) => n += 1,
             Err(e) => eprintln!(
                 "cache-warden: authsock `{socket_name}`: op key `{}` is not a usable public \
@@ -235,10 +244,36 @@ fn register_op_keys(
     n
 }
 
-/// The core KV key name for an op-sourced key (namespaced to avoid `[kv.*]`
-/// collisions). The item id is alphanumeric (validated at fetch time).
-fn op_kv_key(item_id: &str) -> String {
-    format!("__authsock_op:{item_id}")
+/// The core KV key for an op-sourced private key: the reserved `authsock`
+/// namespace composed with an `op_<item_id>` segment (`authsock/op_<item_id>`,
+/// DR-0018 §4.5). Built only from an alphanumeric op item id, so its serialized
+/// form is always a valid composed key the core accepts — never the retired
+/// `:`-bearing `__authsock_op:` pseudo-prefix that violated the DR-0017 §1.5
+/// charset. This adapter owns the serialization so the core stays a generic
+/// syntax gate rather than learning the authsock key shape.
+struct OpKvKey(String);
+
+impl OpKvKey {
+    /// Compose the KV key for `item_id`, or `None` if the id is not composable.
+    ///
+    /// 1Password item ids are alphanumeric; an empty or non-alphanumeric id
+    /// (never observed from op) is refused rather than composed into a segment
+    /// the core would reject, so a bad id degrades to a skipped key instead of a
+    /// hard error deep in `store.define`.
+    fn new(item_id: &str) -> Option<Self> {
+        if item_id.is_empty() || !item_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return None;
+        }
+        Some(Self(format!(
+            "{}/op_{item_id}",
+            crate::namespace::RESERVED_NAMESPACE_AUTHSOCK
+        )))
+    }
+
+    /// The composed key as a string slice.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Spawn one listener task per validated `[authsock.sockets.*]`.
@@ -875,7 +910,7 @@ struct LocalSignCtx<'a, A: ?Sized, R, C> {
     /// consults for `kv.get`. A SIGN_REQUEST resolving a restricted KV key is
     /// admitted only when the requester's ancestry passes the gate (fail-closed on
     /// an unknown requester); a key absent from the table is unrestricted. op-keys
-    /// carry an internal `__authsock_op:*` KV name that never appears in `[kv.*]`
+    /// carry an internal `authsock/op_*` KV name that never appears in `[kv.*]`
     /// config, so they are naturally unrestricted here.
     kv_process_policies: &'a std::collections::BTreeMap<String, Vec<String>>,
     /// Capability token for store access (authsock operations use the authsock cap).
@@ -921,7 +956,7 @@ where
     // refused with a plain SSH_AGENT_FAILURE — the same "leak nothing" response as
     // an unknown or filtered-out key (the connection already enumerated this key,
     // mirroring the socket layer's per-key warden behaviour: the key may be listed
-    // but cannot be signed with). An op-key's internal `__authsock_op:*` name never
+    // but cannot be signed with). An op-key's internal `authsock/op_*` name never
     // appears in `[kv.*]` config, so it is unrestricted here.
     if let Some(allowed) = ctx.kv_process_policies.get(&kv_key)
         && !chain_gate_passes(requester, allowed)
@@ -1160,6 +1195,16 @@ mod tests {
             authsock_cap: cap,
         };
         sign_local_with_ctx(&ctx, requester, msg)
+    }
+
+    /// The composed core KV key for an op item id, in the reserved `authsock`
+    /// namespace (`authsock/op_<item_id>`). A thin wrapper over the production
+    /// [`OpKvKey`] so tests read against the same serialization the daemon uses.
+    fn op_kv_key(item_id: &str) -> String {
+        OpKvKey::new(item_id)
+            .expect("test item id is alphanumeric")
+            .as_str()
+            .to_string()
     }
 
     /// A resolved `ProcessInfo` (basename present) for fake requester chains.
@@ -1869,7 +1914,10 @@ mod tests {
         let n = register_op_keys("sock", "/path/cache-warden", &source, &keys, &mut registry);
         assert_eq!(n, 1);
         let reg = registry.lookup(&blob_of(ED25519_PUB)).unwrap();
-        assert_eq!(reg.kv_key, "__authsock_op:itemABC");
+        // The core KV key is composed into the reserved `authsock` namespace
+        // (DR-0018 §4.5): `authsock/op_<item_id>`, replacing the retired
+        // `__authsock_op:` pseudo-prefix that violated the DR-0017 §1.5 charset.
+        assert_eq!(reg.kv_key, "authsock/op_itemABC");
         assert_eq!(reg.comment, "kawaz key");
         match &reg.source {
             KeySource::Op {
@@ -1920,6 +1968,55 @@ mod tests {
         let mut registry = PublicKeyRegistry::new();
         let n = register_op_keys("sock", "/path/cache-warden", &source, &keys, &mut registry);
         assert_eq!(n, 1, "the unparseable key is skipped");
+    }
+
+    #[test]
+    fn op_kv_key_composes_into_the_reserved_authsock_namespace() {
+        // The domain type owns the serialization: an alphanumeric item id yields
+        // `authsock/op_<id>`, which is a valid composed key the core accepts.
+        let key = OpKvKey::new("itemABC").unwrap();
+        assert_eq!(key.as_str(), "authsock/op_itemABC");
+        // The composed form must pass the core's own syntax gate (the whole point
+        // of moving off the `:`-bearing prefix — DR-0017 §1.5 / DR-0018 §4.5).
+        assert!(cache_warden::validate_key_syntax(key.as_str()).is_ok());
+    }
+
+    #[test]
+    fn op_kv_key_rejects_non_alphanumeric_item_ids() {
+        // A `:` in an item id can never be composed (it would reproduce the old
+        // charset violation); the same for other non-alphanumeric bytes and the
+        // empty id. Rejecting here degrades to a skipped key, not a store error.
+        for bad in [
+            "", "item:ABC", "item-abc", "item/abc", "item abc", "item_abc",
+        ] {
+            assert!(
+                OpKvKey::new(bad).is_none(),
+                "{bad:?} must not compose into a store key"
+            );
+        }
+    }
+
+    #[test]
+    fn register_op_keys_skips_a_non_composable_item_id() {
+        // A discovered key whose item id cannot form a valid segment is skipped
+        // rather than registered — the socket still serves the composable keys.
+        let source = AuthsockSource {
+            name: "default".into(),
+            op_account: None,
+            members: vec!["op://".into()],
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+        };
+        let keys = vec![DiscoveredKey {
+            item_id: "bad:id".into(),
+            public_key: ED25519_PUB.into(),
+            title: "weird".into(),
+            fingerprint: "SHA256:z".into(),
+            vault: "v".into(),
+        }];
+        let mut registry = PublicKeyRegistry::new();
+        let n = register_op_keys("sock", "/path/cache-warden", &source, &keys, &mut registry);
+        assert_eq!(n, 0, "a non-composable item id registers no key");
     }
 
     // ---- A-3a: op key definition registration + get_or_regenerate unification ----
