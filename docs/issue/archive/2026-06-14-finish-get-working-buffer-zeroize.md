@@ -1,6 +1,6 @@
 ---
 title: "`finish_get` working buffer (`Vec<u8>`) の zeroize 整合"
-status: open
+status: resolved
 category: design
 created: 2026-06-14T12:00:00+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-06T08:07:35+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:DR-0028 (with_exposed で owned working buffer 自体を構造的に消滅、Zeroizing 案より強い保証、commit dde2dfad3f27)"]
 blocked_by:
 origin:
 ---
