@@ -1,6 +1,6 @@
 ---
 title: コア公開 API レイヤで KEY / NS validation 強制 (= アダプタからの内部 bypass を物理的に不可能化)
-status: open
+status: resolved
 category: bug
 created: 2026-06-14T12:00:00+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-06T07:52:08+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:DR-0027 (コア syntax gate + OpKvKey + reserved NS bouncer、commit 64b8315eed09)。kv.get の authsock NS 拒否 (DR-0018 §4.5 confidentiality 軸) は射程外で残タスク"]
 blocked_by:
 origin:
 ---
@@ -167,17 +167,45 @@ A-3a 以降の authsock adapter は既に `Store::define / get_or_regenerate` �
 
 加えて、kawaz が冒頭で「コードも把握して」と言ったのは **まさにこのアーキテクチャ違反を最初に発見させたかったから** (`crates/cache-warden/src/store.rs` の API signature を Read すれば `String` を素通しで受けてるのが 5 秒で分かる、`crates/cache-warden-cli/src/daemon/authsock.rs:218` で `:` 含むキーを Store に push してるのも 5 秒で分かる)。memory `feedback-session-init-deep-code-read`。
 
+## 実装結果 (2026-07-06) — 案 A → 案 B に改訂して実装
+
+上記「真の解」の案 A (= コアに `StoreKey` newtype を導入し型レベル強制) は、確定フィードバック
+「**ドメイン型はアダプタに置き、コアは generic に保つ**」(memory `feedback-domain-types-in-adapters-not-core`)
+と食い違う。コアに authsock 固有のキー形状を教えるのは責務分離の逆方向の侵犯になるため、**案 B**
+(= コアに generic な runtime 文字種ゲート + アダプタにドメイン型) で実装した。判断の正本は
+[DR-0027](../decisions/DR-0027-core-key-syntax-gate.md)。
+
+実装内容:
+
+1. **コア generic syntax gate**: `crates/cache-warden/src/key.rs` に `validate_key_syntax`
+   (`[A-Za-z0-9_]+` が `/` 区切りで 1 or 2 セグメント) + `InvalidKey` を新設。`Store::set` /
+   `define` / `define_with_meta` の頭で強制 (`set` は cap → key syntax の順で DR-0024 を維持)。
+   `set` の戻り値を `Result<(), SetError>` に、`DefineError::InvalidKey` を追加。
+   **コアは syntax のみ、NS semantics はアダプタ責務** (コアが 1 or 2 セグメント両方許すのは
+   generic KV の性質。wire は `NS/KEY` を要求し続ける)。
+2. **authsock ドメイン型**: `op_kv_key` 関数を廃止し `OpKvKey` 型 (`authsock/op_<item_id>`、
+   item_id 英数字 validate、非適合は skip) に置換。DR-0026 fallback 経路も同じ `OpKvKey::new` を通る。
+3. **reserved NS bouncer**: `authsock` NS への `kv.set` / `kv.define` を wire
+   (`reject_reserved_namespace_write`、最後の砦) + CLI (`reject_reserved_write_namespace`、前段) で拒否。
+4. **旧形式の永続化検証**: `__authsock_op:` (旧) も `authsock/op_*` (新) も `store.define`
+   (空 source_meta) で登録され、`snapshot_definitions` が空 source_meta を skip するため **disk に
+   到達しない** (メモリのみ、daemon 再起動で消える)。regression test
+   (`snapshot_excludes_authsock_op_definitions_never_persisting_them`) で guard。移行レイヤ不要。
+
+残タスク: `authsock` NS の `kv.get` 拒否 (confidentiality 軸、DR-0018 §4.5) は本実装の射程外。
+CLI 入口の validation (`validate_cli_key`) は多層防御の前段として維持済み。
+
 ## 関連
 
-- `crates/cache-warden/src/store.rs` (= 公開 API、本 issue で `StoreKey` 受けるように改修)
-- `crates/cache-warden/src/key.rs` (= 新規、`StoreKey` newtype 定義)
-- `crates/cache-warden-cli/src/namespace.rs` (= `validate_identifier` 等の既存 validation、`StoreKey::parse` で流用)
-- `crates/cache-warden-cli/src/daemon/authsock.rs:218 op_kv_key` (= 廃止、`StoreKey::compose` 経由に置き換え)
-- `crates/cache-warden-cli/src/daemon/handler.rs` (= wire request からの key 抽出を `StoreKey::parse` 経由に)
-- `crates/cache-warden-cli/src/commands/mod.rs validate_cli_key` (= 維持、多層防御の前段)
+- `crates/cache-warden/src/store.rs` (= 公開 API、set/define/define_with_meta で文法強制)
+- `crates/cache-warden/src/key.rs` (= 新規、`validate_key_syntax` + `InvalidKey`。案 B のため newtype ではなく runtime 検証)
+- `crates/cache-warden-cli/src/namespace.rs` (= `validate_identifier` 等の既存 validation、多層防御の前段として維持)
+- `crates/cache-warden-cli/src/daemon/authsock.rs` (= `op_kv_key` 関数廃止、`OpKvKey` ドメイン型に置換)
+- `crates/cache-warden-cli/src/daemon/handler.rs` (= wire の reserved NS bouncer `reject_reserved_namespace_write`)
+- `crates/cache-warden-cli/src/commands/mod.rs validate_cli_key` (= 維持、多層防御の前段。`reject_reserved_write_namespace` 追加)
 - **DR-0003** (= コアとアダプタの責務分離、本 issue で実装の整合性を担保)
 - DR-0017 (= 文字種規定、本 issue で型レベル強制に格上げ)
 - DR-0018 §4.5 (= authsock NS 正規化、本 issue 内で完了)
 - DR-0014 / DR-0022 (= del セマンティクス、変更不要)
 - 関連 memory: `feedback-core-api-validation-not-cli-edge` / `feedback-session-init-deep-code-read` / `feedback-check-existing-api-before-proposing-new` / `feedback-security-dimensions-not-tradeoff`
-- 関連 issue [2026-06-14-op-refetch-loop.md](./2026-06-14-op-refetch-loop.md) (= `zl4...` regression 観察起点)
+- 関連 issue [2026-06-14-op-refetch-loop.md](./archive/2026-06-14-op-refetch-loop.md) (= `zl4...` regression 観察起点、close 済み)
