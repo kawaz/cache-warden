@@ -61,8 +61,52 @@ register が中断すると daemon 不在 + socket 消失 = signing 停止状態
 
 ## 受け入れ条件
 
-- [ ] register のエラー経路で help が出力されるケースがあるか code reading
+- [x] register のエラー経路で help が出力されるケースがあるか code reading
       で特定
-- [ ] bootout 後 bootstrap 前に fail した場合の状態 (service 不在) を
+- [x] bootout 後 bootstrap 前に fail した場合の状態 (service 不在) を
       rollback または明示エラーにできるか検討
 - [ ] 次回 upgrade 時の register で再観測
+
+## 調査結果 (code reading, 2026-07-06)
+
+### 受け入れ条件 1: help 出力経路の特定
+
+cache-warden は clap 不使用、hand-rolled dispatch (`main.rs:3`, DR-0002)。
+`daemon register` のエラー経路は 2 系統に分離されている:
+
+- **flag parse エラー**: `parse_register_args` が失敗すると `or_usage(...)`
+  経由で `CliError::Usage{msg, help: help::daemon_register}` になり、
+  `main()` (`main.rs:934-940`) がエラーメッセージ + `help::daemon_register()
+  .render()` を stderr に出力する。**これが help 出力の実際の経路**
+- **runtime/environment エラー** (bootout/bootstrap 等):
+  `commands::daemon_cmd::register()` 内の失敗は `.map_err(CliError::Message)`
+  (`main.rs:279`) でラップされ、`cache-warden: <msg>` のみ出力、help は出ない。
+  `main.rs:267-272` のコメントに「runtime/environment failure に help dump を
+  付けると本当の原因が埋もれる」と明記されている
+
+= 観測された help tail は **bootout/bootstrap 失敗由来ではありえない**。
+`daemon register` 呼び出し時の flag parse エラー (`or_usage` 経路、leaf help
+`help::daemon_register()`) が実際の出力元と考えられる。要因 (何が argv を
+不正解釈させたか) は未特定。
+
+なお `EDITOR / VISUAL` 節は `help.rs:64-87` の共通 `ENVIRONMENT` const で、
+`show_global: true` を持つ全レベル (`daemon_register` 含む、`help.rs:317-372`)
+に付与される。top-level help と `daemon register` leaf help のどちらでも
+同一テキストが出るため、tail だけでは両者を区別できない (leaf help 説と矛盾しない)。
+
+### 受け入れ条件 2: bootout 後 bootstrap 前 fail 時の rollback / 明示エラー
+
+`LaunchdBackend::register` (`service.rs:467-502`): bootout は best-effort
+(エラー握り潰し、488-490)、bootstrap 失敗時は
+`Err(launchctl_bootstrap_failure_message(...))` を返す (`service.rs:417-424`、
+「re-run `cache-warden daemon register` to recover」を含む明示メッセージ)。
+
+`service.rs:403-412` のコメントで **rollback は意図的に非実装**と明記:
+「the prior instance's exact state cannot be reconstructed」。機械的には
+retry-loop は feasible だが、「re-run register で recover (= idempotent)」を
+設計方針として採用し rollback を却下している。
+
+→ 明示エラーは既存。rollback は検討済みの上で不採用 (設計判断)。DR-0019
+(`docs/decisions/DR-0019-daemon-service-registration.md`) は
+register/bootstrap/bootout の全体設計を記すが、rollback trade-off 自体は
+`service.rs` のコード comment にのみ残る (DR 未反映)。
