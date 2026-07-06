@@ -400,11 +400,37 @@ pub fn default_log_path() -> Option<String> {
     })
 }
 
+/// Build the `launchctl bootstrap` failure message for `daemon register`.
+///
+/// `register` always runs `bootout` on any prior instance before `bootstrap`
+/// (the idempotent re-register path); a `bootstrap` failure therefore leaves
+/// the service unloaded — the prior instance is already gone and the new one
+/// never started, i.e. signing support has stopped. A full rollback (e.g.
+/// deleting the freshly-written plist) is not attempted because the prior
+/// instance's exact state cannot be reconstructed; instead the message keeps
+/// the raw `launchctl` stderr and points at the recovery path: re-running
+/// `register` is idempotent and will retry the same bootstrap.
+///
+/// Pure (string in, string out) so the message shape is unit-tested without
+/// shelling out to `launchctl`.
+#[cfg(any(target_os = "macos", test))]
+fn launchctl_bootstrap_failure_message(stderr: &str) -> String {
+    format!(
+        "launchctl bootstrap failed: {}\n\
+         the previous service instance may already be stopped; \
+         re-run `cache-warden daemon register` to recover",
+        stderr.trim()
+    )
+}
+
 // ---- launchd live backend (macOS) --------------------------------------
 
 #[cfg(target_os = "macos")]
 pub mod launchd {
-    use super::{Backend, ServiceDefinition, ServiceStatus, render_launchd_plist};
+    use super::{
+        Backend, ServiceDefinition, ServiceStatus, launchctl_bootstrap_failure_message,
+        render_launchd_plist,
+    };
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -468,9 +494,8 @@ pub mod launchd {
                 .output()
                 .map_err(|e| format!("failed to run launchctl bootstrap: {e}"))?;
             if !out.status.success() {
-                return Err(format!(
-                    "launchctl bootstrap failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
+                return Err(launchctl_bootstrap_failure_message(
+                    &String::from_utf8_lossy(&out.stderr),
                 ));
             }
             Ok(())
@@ -746,6 +771,30 @@ mod tests {
             Some("/home/k/.config/cache-warden/config.toml")
         );
         assert!(d.env.contains_key("PATH"));
+    }
+
+    // ---- launchctl bootstrap failure message (daemon register error path) ----
+
+    #[test]
+    fn launchctl_bootstrap_failure_message_keeps_stderr_and_adds_recovery_hint() {
+        let msg = launchctl_bootstrap_failure_message("Bootstrap failed: 5: Input/output error");
+        assert!(
+            msg.contains("Bootstrap failed: 5: Input/output error"),
+            "must keep the launchctl stderr verbatim: {msg}"
+        );
+        assert!(
+            msg.contains("cache-warden daemon register"),
+            "must point at the idempotent recovery command: {msg}"
+        );
+    }
+
+    #[test]
+    fn launchctl_bootstrap_failure_message_trims_stderr_whitespace() {
+        let msg = launchctl_bootstrap_failure_message("  noisy stderr\n\n");
+        assert!(
+            msg.starts_with("launchctl bootstrap failed: noisy stderr"),
+            "leading/trailing stderr whitespace must be trimmed: {msg}"
+        );
     }
 
     // ---- launchd plist golden ----

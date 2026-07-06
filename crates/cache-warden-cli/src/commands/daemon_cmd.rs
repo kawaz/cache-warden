@@ -331,24 +331,28 @@ fn has_op_sources(config: &Config) -> bool {
 
 /// Execute `daemon register` (DR-0019 §1/§2/§3).
 ///
-/// `config` is the loaded configuration (used to check whether the FDA setup
-/// flow is needed). `config_path` is the register-time resolved config file
-/// path (the dispatcher passes `LoadedConfig.path`); it is baked into the
-/// definition so the service runs with the same config that was in effect at
-/// register time. `cli_socket` is the explicitly-requested `--socket` from the
-/// top-level parser (stripped before `args` reaches here); it is baked into
-/// the service start command. A `--socket` that reaches `args` (the fallback
-/// parse path) takes precedence. With `--print`, the definition is written to
-/// stdout and nothing is installed.
+/// `parsed` is the already-parsed `daemon register` flags: the dispatcher
+/// calls [`parse_register_args`] itself and turns a parse failure into a
+/// usage error, so every error this function returns is a runtime /
+/// environment failure (e.g. an unresolvable binary path or a launchd
+/// `bootstrap` failure) and must not carry a usage/help dump. `config` is the
+/// loaded configuration (used to check whether the FDA setup flow is needed).
+/// `config_path` is the register-time resolved config file path (the
+/// dispatcher passes `LoadedConfig.path`); it is baked into the definition so
+/// the service runs with the same config that was in effect at register time.
+/// `cli_socket` is the explicitly-requested `--socket` from the top-level
+/// parser; it is baked into the service start command. A `--socket` already
+/// present on `parsed` (the fallback parse path) takes precedence. With
+/// `--print`, the definition is written to stdout and nothing is installed.
 pub fn register(
-    args: &[String],
+    mut parsed: RegisterArgs,
     config: Config,
     config_path: Option<PathBuf>,
     cli_socket: Option<&str>,
 ) -> Result<(), String> {
-    let mut parsed = parse_register_args(args)?;
-    // The global `--socket` (already stripped from `args`) is the usual source;
-    // a `--socket` left in `args` (fallback) wins if present.
+    // The global `--socket` (already stripped from the CLI args before
+    // parsing) is the usual source; a `--socket` already on `parsed` (the
+    // fallback parse path) wins if present.
     if parsed.socket.is_none() {
         parsed.socket = cli_socket.map(str::to_string);
     }
@@ -474,8 +478,11 @@ pub fn register(
 
 /// Execute `daemon unregister` (DR-0019 §1): stop + unload + delete the
 /// definition. A not-registered label is a no-op (idempotent).
-pub fn unregister(args: &[String]) -> Result<(), String> {
-    let parsed = parse_unregister_args(args)?;
+///
+/// `parsed` is the already-parsed flags (the dispatcher calls
+/// [`parse_unregister_args`] itself and turns a parse failure into a usage
+/// error); every error this function returns is a backend failure.
+pub fn unregister(parsed: UnregisterArgs) -> Result<(), String> {
     let label = parsed
         .label
         .unwrap_or_else(|| service::default_label().to_string());
@@ -487,13 +494,12 @@ pub fn unregister(args: &[String]) -> Result<(), String> {
 
 /// Execute `daemon status` (DR-0019 §1): print the service registration /
 /// running state as a one-screen table.
-pub fn status(args: &[String]) -> Result<(), String> {
-    // `daemon status` takes only an optional `--label`.
-    let parsed = parse_unregister_args(args).map_err(|e| {
-        // Reuse the unregister flag parser (same `--label` grammar) but reword
-        // the "unknown option" message for this subcommand.
-        e.replace("daemon unregister", "daemon status")
-    })?;
+///
+/// `parsed` is the already-parsed flags (`daemon status` reuses the
+/// `unregister` flag grammar; the dispatcher reworks the "unknown option"
+/// wording for this subcommand before calling here). Every error this
+/// function returns is a backend failure.
+pub fn status(parsed: UnregisterArgs) -> Result<(), String> {
     let label = parsed
         .label
         .unwrap_or_else(|| service::default_label().to_string());

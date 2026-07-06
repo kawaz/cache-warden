@@ -264,28 +264,44 @@ fn dispatch_daemon(
                 println!("{}", help::daemon_register().render());
                 return Ok(());
             }
-            let sock = cli_socket.map(|p| p.to_string_lossy().into_owned());
-            or_usage(
-                commands::daemon_cmd::register(tail, config, config_path, sock.as_deref()),
+            // Only the flag parse is a usage error (the operator mistyped a
+            // flag): show the leaf help for that. Everything `register()`
+            // does afterwards — resolving the binary path, launchd/systemd
+            // calls — is a runtime/environment failure and must not carry a
+            // help dump, which would bury the real cause under an unrelated
+            // flag list.
+            let parsed = or_usage(
+                commands::daemon_cmd::parse_register_args(tail),
                 help::daemon_register,
-            )
+            )?;
+            let sock = cli_socket.map(|p| p.to_string_lossy().into_owned());
+            commands::daemon_cmd::register(parsed, config, config_path, sock.as_deref())
+                .map_err(CliError::Message)
         }
         "unregister" => {
             if help::wants_help(tail) {
                 println!("{}", help::daemon_unregister().render());
                 return Ok(());
             }
-            or_usage(
-                commands::daemon_cmd::unregister(tail),
+            let parsed = or_usage(
+                commands::daemon_cmd::parse_unregister_args(tail),
                 help::daemon_unregister,
-            )
+            )?;
+            commands::daemon_cmd::unregister(parsed).map_err(CliError::Message)
         }
         "status" => {
             if help::wants_help(tail) {
                 println!("{}", help::daemon_status().render());
                 return Ok(());
             }
-            or_usage(commands::daemon_cmd::status(tail), help::daemon_status)
+            // `daemon status` reuses the `unregister` flag grammar (`--label`
+            // only); reword the "unknown option" message for this subcommand.
+            let parsed = or_usage(
+                commands::daemon_cmd::parse_unregister_args(tail)
+                    .map_err(|e| e.replace("daemon unregister", "daemon status")),
+                help::daemon_status,
+            )?;
+            commands::daemon_cmd::status(parsed).map_err(CliError::Message)
         }
         other => Err(CliError::Message(format!(
             "unknown daemon subcommand: {other} (try `{NAME} daemon --help`)"
@@ -930,6 +946,10 @@ mod tests {
     use super::*;
     use protocol::wire::EntryInfo;
 
+    fn s(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
     fn base_entry() -> EntryInfo {
         EntryInfo {
             name: "default/K".into(),
@@ -1058,5 +1078,50 @@ mod tests {
         e.backoff_until_secs = None;
         let line = select_kv_list_line("default/K", Some(&e), "default", false);
         assert_eq!(line.as_deref(), Some("K"));
+    }
+
+    // ---- daemon register: usage vs runtime-failure classification ----
+    //
+    // `or_usage` must wrap only the *parse* of `daemon register`'s flags: a
+    // bad/missing flag value is the operator's mistake and should show the
+    // leaf help so they see the accepted flags. Everything `register()` does
+    // afterwards (resolving the binary path, launchd/systemd calls) is a
+    // runtime/environment failure and must not carry a help dump — that would
+    // bury the real cause under an unrelated flag list.
+
+    #[test]
+    fn daemon_register_parse_failure_is_usage_error() {
+        let config = config::Config::parse("").unwrap();
+        // `--socket` with no value is a parse error.
+        let rest = s(&["register", "--socket"]);
+        let err =
+            dispatch_daemon(&rest, PathBuf::from("/tmp/x.sock"), config, None, None).unwrap_err();
+        match err {
+            CliError::Usage { msg, .. } => {
+                assert!(msg.contains("--socket requires a PATH argument"), "{msg}");
+            }
+            CliError::Message(msg) => panic!("parse failure must stay a usage error: {msg}"),
+        }
+    }
+
+    #[test]
+    fn daemon_register_runtime_failure_is_message_not_usage() {
+        let config = config::Config::parse("").unwrap();
+        // A well-formed `--executable` pointing at a path that does not exist
+        // parses fine; it fails inside register()'s binary resolution, well
+        // past the parse step, and must not carry the leaf help dump.
+        let rest = s(&[
+            "register",
+            "--executable",
+            "/no/such/cache-warden-binary-xyz",
+        ]);
+        let err =
+            dispatch_daemon(&rest, PathBuf::from("/tmp/x.sock"), config, None, None).unwrap_err();
+        match err {
+            CliError::Message(msg) => assert!(msg.contains("does not exist"), "{msg}"),
+            CliError::Usage { msg, .. } => {
+                panic!("runtime failure must not dump the leaf help: {msg}")
+            }
+        }
     }
 }

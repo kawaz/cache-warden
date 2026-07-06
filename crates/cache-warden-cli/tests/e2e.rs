@@ -72,12 +72,22 @@ fn b64(bytes: &[u8]) -> String {
 fn full_lifecycle_over_control_socket() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
+    // Pin an empty config via `$CACHE_WARDEN_CONFIG` (unlike the `--socket`
+    // path exercised here, every other spawn in this file already isolates
+    // its config via `spawn_with_config` / an explicit `.env(...)`). Without
+    // this, the daemon falls through to any ambient
+    // `$XDG_CONFIG_HOME/cache-warden/config.toml` / `~/.config/...`, and a
+    // config with `[authsock.sources]` would seed real `op`-discovered keys
+    // into `kv.list`, breaking the exact-list assertion below.
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "").expect("write empty config");
 
     let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
         .arg("daemon")
         .arg("run")
         .arg("--socket")
         .arg(&socket)
+        .env("CACHE_WARDEN_CONFIG", &config_path)
         .spawn()
         .expect("spawn daemon");
     let mut daemon = Daemon { child };
