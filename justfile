@@ -90,7 +90,12 @@ bump-version level="patch": ensure-clean
 # push to origin/main with gates
 push: ci check-outdated-translations check-version-bumped
     bump-semver vcs push --branch main --jj-bookmark-auto-advance
-    @echo "[hint] gh-monitor:watch-workflow --sha $(bump-semver vcs get commit-id --rev main) --on-success release.yml 'just on-success-release' kawaz/cache-warden"
+    @cmux-msg notify --self --text "Monitor で 'just watch' を起動して" 2>/dev/null || true
+
+# push 済み main の CI/Release workflow を SHA-pinned で監視 (全 check 終了で自動 exit)
+# watch-workflow.sh は gh-monitor plugin 提供 (PATH に latest scripts/ が通っている前提)
+watch:
+    watch-workflow.sh --sha $(bump-semver vcs get commit-id --rev main) --on-success release.yml 'just on-success-release' kawaz/cache-warden
 
 # release.yml workflow が success になった時に AI が実行する action
 # (watch-workflow の `--on-success release.yml 'just on-success-release'` 経由で
