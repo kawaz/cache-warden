@@ -7,7 +7,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-06-14 | idea | idea | [graceful-restart-state-handoff](./2026-06-14-graceful-restart-state-handoff.md) | **そもそも kv を維持したい根本理由 = op の TouchID サイクルに引き戻されたくない**。 |
 | 2026-06-14 | idea | idea | [ssh-agent-provider-architecture](./2026-06-14-ssh-agent-provider-architecture.md) | 現状の authsock アダプタは **「中継役（relay）」前提**の名残: |
 | 2026-06-14 | bug | idea | [touchid-blocks-blocking-pool](./2026-06-14-touchid-blocks-blocking-pool.md) | SIGN_REQUEST 処理は `spawn_blocking` で blocking pool に乗せ、その中で **`store` の `std::sy… |
-| 2026-07-06 | task | open | [authsock-ns-kv-get-reject](./2026-07-06-authsock-ns-kv-get-reject.md) | DR-0027 で `authsock` NS への **書込** (`kv.set` / `kv.define`) は wire + CLI の bouncer で拒否… |
 | 2026-06-22 | design | open | [crate-macos-process-inspect](./2026-06-22-crate-macos-process-inspect.md) | macOS で **socket 対抗プロセスや任意 pid の出自を多面的に inspect** する Rust crate を切り出す。Pure Rust… |
 | 2026-06-13 | bug | open | [op-discovery-blocks-startup](./2026-06-13-op-discovery-blocks-startup.md) | `[authsock.sockets.*].keys` を持つ config で起動すると、`run()` の |
 | 2026-06-22 | design | blocked | [custom-touchid-dialog](./2026-06-22-custom-touchid-dialog.md) | cache-warden 独自の TouchID 認証 dialog を実装し、**要求元プロセスの透明性**を 1Password 既定の dialog よ… |

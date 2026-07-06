@@ -1,6 +1,6 @@
 ---
 title: authsock NS の kv.get を wire/CLI で拒否する (DR-0018 §4.5 confidentiality 軸)
-status: open
+status: resolved
 category: task
 created: 2026-07-06T07:52:08+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-06T12:16:13+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:wire/CLI の read bouncer 追加 (commit 91735da6a014)。del/pin/unpin/list は値非露出のため非ゲート"]
 blocked_by:
 origin: issue 2026-06-14-internal-key-forget-interface close 時の残タスク切り出し
 ---
@@ -38,9 +38,9 @@ authsock 内部鍵 (`authsock/op_<item_id>` = op 秘密鍵 PEM) は control sock
 
 ## 受け入れ条件
 
-- [ ] wire (`Request::KvGet` 系) で `authsock/` prefix キーの get を拒否
-- [ ] CLI 入口でも同様 (親切な前段)
-- [ ] テスト: 拒否 response の輪郭 (存在秘匿にするか error 明示にするか は設計判断)
+- [x] wire (`Request::KvGet` 系) で `authsock/` prefix キーの get を拒否
+- [x] CLI 入口でも同様 (親切な前段)
+- [x] テスト: 拒否 response の輪郭 (書込側先例に合わせ明示 error で統一、存在秘匿にしない)
 
 ## 関連
 
