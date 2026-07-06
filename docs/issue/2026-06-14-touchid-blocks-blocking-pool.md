@@ -59,3 +59,20 @@ SIGN_REQUEST 処理は `spawn_blocking` で blocking pool に乗せ、その中�
 本 issue は **派生 issue として記録のみ**。本体 (op-refetch loop) の修正完了後に再評価する。
 
 graceful restart や Provider 再設計の文脈で構造変更が入るなら、その流れで吸収するのが筋。単独修正で済ますなら案 Y が最小侵襲。
+
+## 2026-07-06 再評価 (条件成立、判断は保留)
+
+再評価条件 (= 本体 op-refetch loop の修正完了) は成立済み (DR-0022 backoff land +
+issue close)。加えて DR-0023 Phase 2 のレビューで現状を再確認した:
+
+- Phase 2 (2026-07-06 land) は **registry RwLock の guard スコープは狭めた**
+  (鍵解決のみ、`sign_with_resolved_key` 分割) が、**store Mutex を op fetch
+  (TouchID 待ち、最大 ~30s) を跨いで保持する構造は不変** (= 本 issue の現象は現存)
+- レビュー指摘の failure scenario でも「sign1 が store lock を取って op item get
+  中、sign2 が store lock 待ち」の直列化が具体的に再確認された
+
+対応の着手は保留のまま: 案 X/Y/Z の選択は Provider 再設計
+([2026-06-14-ssh-agent-provider-architecture](./2026-06-14-ssh-agent-provider-architecture.md))
+の方向性と不可分で、Phase 2 直後に同じ hot path の並行性再設計を重ねるのは
+dogfood リスクも高い。**kawaz の設計判断待ち** (単独修正なら案 Y が最小侵襲、
+Provider 再設計をやるならそちらで吸収)。
