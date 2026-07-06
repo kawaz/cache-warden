@@ -272,6 +272,15 @@ allowed_processes = ["ssh"]                  # この socket を使えるプロ�
   公開鍵は常に列挙でき、秘密値の在否は完全にコアの TTL 状態に委ねられる（warden の NotLoaded を
   アダプタ側で吸収、DR-0004）。`keys` で参照される KV キーは（DR-0014 で `[kv.*]` が lazy デフォルトに
   なった後も）公開鍵導出のため起動時に**自動で eager 実体化**されるので、`preload = true` を別途書く必要はない。
+- **op source 発見 — 先に bind、discovery は背景で（DR-0023 Phase 2）**: op `source` を持つ socket は、
+  起動時に **即座に bind** し、初期 registry を on-disk 公開鍵キャッシュ（`op_map.json`、境界規則は
+  DR-0026 の discovery 失敗 fallback と同一の provenance / vault）から seed する（= 起動が `op` に
+  律速されない）。その後、background task が blocking `op item list` discovery を async runtime の外で
+  回し、**初回成功で**各 socket の registry を新しい鍵に **hot-swap** する（それまでは capped で
+  shutdown 割り込み可能な backoff で retry）。cold first-start は seed 空で bind し、discovery が
+  populate するまで空のまま。seed が運ぶのは**公開鍵 index** で、秘密鍵は従来どおり初回 sign 時に lazy
+  fetch する。これで、launchd context で op の biometric 認可が UI session に届かず `op` timeout まで
+  agent socket が bind されなかった P1 症状を解消する。
 - **署名**: SIGN_REQUEST が来ると、key_blob からコアの KV キーを引き、**control socket と同じ
   認証ゲート**で秘密値を取得する（SoftExpired は再認証して extend、command 型の HardExpired は
   再生成、peer pid → 祖先チェーンを requester として渡す）。取得した PEM を `expose_secret()` で

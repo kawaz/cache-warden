@@ -77,7 +77,9 @@ pub use op::{
     private_key_argv, validate_item_id,
 };
 pub use op_cache::{CacheProvenance, CachedKey, OpKeyCache, default_cache_path};
-pub use op_discovery::{DiscoveredKey, DiscoveryOutcome, discover_keys};
+pub use op_discovery::{
+    DiscoveredKey, DiscoveryOutcome, discover_keys, merge_source_cache, seed_from_cache,
+};
 pub use process_policy::{chain_allowed, chain_gate_passes};
 pub use registry::{KeySource, PublicKeyRegistry, RegisteredKey};
 pub use signer::sign;

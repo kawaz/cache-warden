@@ -274,6 +274,16 @@ allowed_processes = ["ssh"]                  # processes allowed to use this soc
   the core's TTL state (the adapter absorbs authsock-warden's "NotLoaded", DR-0004). A KV key referenced
   by `keys` is **eagerly materialized at startup** (to derive its public key) even after DR-0014 made
   `[kv.*]` lazy by default, so there is no need to also set `preload = true`.
+- **Op-sourced discovery — bind first, discover in the background (DR-0023 Phase 2)**: for a socket
+  with an op `source`, the agent socket **binds immediately** at startup, seeded from the on-disk
+  public-key cache (`op_map.json`, using the same provenance / vault boundary as the DR-0026
+  discovery-failure fallback) — startup never blocks on `op`. A background task then runs the
+  (blocking) `op item list` discovery off the async runtime and, on the first success, **hot-swaps**
+  each socket's registry with the freshly discovered keys (retrying with a capped, shutdown-interruptible
+  backoff until then). A cold first-ever start seeds nothing and the socket binds empty until discovery
+  populates it. The public-key index is what the seed carries; the private key is still fetched lazily
+  at first sign (unchanged). This removes the P1 symptom where a launchd-context daemon whose biometric
+  path never reaches the GUI session left the agent socket unbound until `op` timed out.
 - **Signing**: on SIGN_REQUEST the key blob maps back to a core KV key, whose value is fetched through
   the **same auth gate as the control socket** (re-auth + extend on soft expiry; regenerate for a
   command source on hard expiry; the peer pid → ancestry chain is passed as the requester). The PEM is

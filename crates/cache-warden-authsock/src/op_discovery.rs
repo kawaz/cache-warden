@@ -161,6 +161,25 @@ pub fn discover_keys(
     })
 }
 
+/// Seed a source's keys from the disk `cache` **without** invoking `op`
+/// (DR-0023 Phase 2: bind the agent socket immediately from the last-known keys,
+/// before background discovery runs).
+///
+/// Identical boundary rules to the discovery-failure fallback: only entries with
+/// a recorded [`CacheProvenance`] whose `account` matches, falling inside a
+/// source's vault/item filter, holding a non-empty public key, are offered
+/// (legacy no-provenance entries excluded; de-duplicated by fingerprint). The
+/// seed and the failure fallback are the *same* conversion by construction — a
+/// socket that binds on the seed enumerates exactly what a discovery failure
+/// would have served — so this delegates to the one implementation.
+pub fn seed_from_cache(
+    cache: &OpKeyCache,
+    sources: &[OpSource],
+    account: Option<&str>,
+) -> Vec<DiscoveredKey> {
+    fallback_from_cache(cache, sources, account)
+}
+
 /// Recover a source's keys from the disk `cache` when `op item list` failed.
 ///
 /// Only entries that (1) carry a recorded [`CacheProvenance`] whose `account`
@@ -208,6 +227,41 @@ fn fallback_from_cache(
         });
     }
     out
+}
+
+/// Merge a freshly-discovered source's keys into `cache` (DR-0023 Phase 2
+/// multi-source persistence).
+///
+/// Drops `cache`'s prior entries that **belong to this source** — the same
+/// provenance (`account`) + vault/item boundary the discovery-failure fallback
+/// uses — then appends the `fresh` entries. Entries belonging to *other* sources,
+/// and legacy entries with no recorded provenance, are preserved untouched.
+///
+/// This is what lets [`discover_keys`]-per-source persist **one merged cache**
+/// instead of each source's own `OpKeyCache` clobbering the shared
+/// `op_map.json` down to the last source's keys (which would erase a sibling
+/// source's keys from the disk seed Phase 2 binds from). A key removed from this
+/// source's vault is still pruned — it is absent from `fresh`, and its prior entry
+/// belonged to this source, so the retain drops it.
+pub fn merge_source_cache(
+    cache: &mut OpKeyCache,
+    sources: &[OpSource],
+    account: Option<&str>,
+    fresh: OpKeyCache,
+) {
+    cache.keys.retain(|entry| {
+        // Keep everything that does NOT belong to this source. Belonging = a known
+        // provenance whose account matches AND falling inside a member's filter. A
+        // legacy entry (`provenance == None`) never "belongs" here, so it is kept
+        // (it is ignored by the seed/fallback anyway, DR-0026).
+        let belongs = entry
+            .provenance
+            .as_ref()
+            .is_some_and(|p| p.account.as_deref() == account)
+            && sources.iter().any(|s| source_matches(s, entry));
+        !belongs
+    });
+    cache.keys.extend(fresh.keys);
 }
 
 /// Whether a cached `entry` falls inside `source`'s vault/item filter.
@@ -609,6 +663,155 @@ mod tests {
             keys.is_empty(),
             "empty-pubkey entries add no signing capacity"
         );
+    }
+
+    // ---- seed_from_cache (DR-0023 Phase 2 registry seed) ----
+    //
+    // `seed_from_cache` is the startup seed that lets the agent socket bind
+    // *before* background op discovery runs. It is the same conversion as the
+    // discovery-failure fallback (both must serve identical keys, so a socket
+    // that binds on the seed enumerates exactly what a failed discovery would
+    // have), so these tests assert the shared boundary rules hold through the
+    // public seed entry point.
+
+    #[test]
+    fn seed_from_cache_serves_provenance_matching_keys() {
+        // The steady-state Phase 2 startup: the disk cache holds keys discovered
+        // under this source's account, so the socket can enumerate them at bind
+        // time with no op call at all (op discovery then refreshes in the
+        // background). A different account's key is never seeded (provenance is
+        // the source boundary, same as the failure fallback).
+        let mut cache = OpKeyCache::new();
+        cache.keys.push(cached(
+            "mine",
+            "SHA256:fpA",
+            "Private",
+            Some(Some("acct-a")),
+        ));
+        cache.keys.push(cached(
+            "theirs",
+            "SHA256:fpB",
+            "Private",
+            Some(Some("acct-b")),
+        ));
+        let keys = seed_from_cache(&cache, &[OpSource::default()], Some("acct-a"));
+        assert_eq!(keys.len(), 1, "only the same-account key is seeded");
+        assert_eq!(keys[0].item_id, "mine");
+    }
+
+    #[test]
+    fn seed_from_cache_empty_cache_seeds_nothing() {
+        // A cold first-ever start (no cache yet): the seed is empty, so the
+        // socket binds with zero op keys and background discovery populates it.
+        // The socket still binds — that is the whole point of the Phase 2 split.
+        let keys = seed_from_cache(&OpKeyCache::new(), &[OpSource::default()], None);
+        assert!(
+            keys.is_empty(),
+            "an empty cache seeds no keys (bind still happens)"
+        );
+    }
+
+    #[test]
+    fn seed_from_cache_excludes_legacy_entries() {
+        // A legacy (pre-provenance) entry cannot prove its source, so — exactly
+        // as with the failure fallback — it is never seeded across a boundary.
+        let mut cache = OpKeyCache::new();
+        cache
+            .keys
+            .push(cached("legacy", "SHA256:fpL", "Private", None));
+        let keys = seed_from_cache(&cache, &[OpSource::default()], None);
+        assert!(keys.is_empty(), "legacy entries are not seed-eligible");
+    }
+
+    // ---- merge_source_cache (DR-0023 Phase 2 multi-source persistence) ----
+    //
+    // A per-source `save()` would clobber the shared `op_map.json` down to the
+    // last source's keys. `merge_source_cache` instead updates one source's slice
+    // of a merged cache while preserving every sibling source's entries, so the
+    // disk seed Phase 2 binds from keeps all sources' keys.
+
+    /// Build the `fresh` cache a Fresh discovery of one source returns: its keys,
+    /// each stamped with `account` provenance (what `discover_keys` produces).
+    fn fresh_cache(account: Option<&str>, keys: &[(&str, &str, &str)]) -> OpKeyCache {
+        let mut c = OpKeyCache::new();
+        for (id, fp, vault) in keys {
+            c.keys.push(CachedKey {
+                item_id: (*id).into(),
+                fingerprint: (*fp).into(),
+                public_key: format!("ssh-ed25519 AAAA{id}"),
+                title: format!("title-{id}"),
+                vault: (*vault).into(),
+                provenance: Some(CacheProvenance {
+                    account: account.map(str::to_string),
+                }),
+            });
+        }
+        c
+    }
+
+    #[test]
+    fn merge_preserves_other_sources_while_replacing_this_one() {
+        // A cache holding source A's key (account acct-a) and source B's key
+        // (account acct-b). Re-merging a fresh discovery of A (account acct-a)
+        // must replace A's entry and leave B's untouched — the multi-source
+        // clobber fix: persisting A never erases B from the disk seed.
+        let mut cache = OpKeyCache::new();
+        cache
+            .keys
+            .push(cached("a", "SHA256:fpA", "Private", Some(Some("acct-a"))));
+        cache
+            .keys
+            .push(cached("b", "SHA256:fpB", "Private", Some(Some("acct-b"))));
+
+        // Fresh discovery of A returns a NEW key set for acct-a (a2 replaces a).
+        let fresh = fresh_cache(Some("acct-a"), &[("a2", "SHA256:fpA2", "Private")]);
+        merge_source_cache(&mut cache, &[OpSource::default()], Some("acct-a"), fresh);
+
+        let ids: Vec<&str> = cache.keys.iter().map(|k| k.item_id.as_str()).collect();
+        assert!(ids.contains(&"b"), "sibling source B's key is preserved");
+        assert!(ids.contains(&"a2"), "source A's fresh key is present");
+        assert!(
+            !ids.contains(&"a"),
+            "A's vault-deleted key is pruned (absent from the fresh set)"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_legacy_entries() {
+        // A legacy entry (no provenance) cannot be proven to belong to this
+        // source, so the merge never prunes it (it is ignored by the seed anyway).
+        let mut cache = OpKeyCache::new();
+        cache
+            .keys
+            .push(cached("legacy", "SHA256:fpL", "Private", None));
+        let fresh = fresh_cache(Some("acct-a"), &[("a", "SHA256:fpA", "Private")]);
+        merge_source_cache(&mut cache, &[OpSource::default()], Some("acct-a"), fresh);
+        let ids: Vec<&str> = cache.keys.iter().map(|k| k.item_id.as_str()).collect();
+        assert!(ids.contains(&"legacy"), "legacy entry is not pruned");
+        assert!(ids.contains(&"a"), "fresh key is appended");
+    }
+
+    #[test]
+    fn merge_respects_vault_boundary() {
+        // A source bound to vault "Private" must not prune an entry (same account)
+        // that lives in a different vault — that entry belongs to a sibling source
+        // filtered to "Work".
+        let mut cache = OpKeyCache::new();
+        cache
+            .keys
+            .push(cached("work", "SHA256:fpW", "Work", Some(Some("acct-a"))));
+        let source = OpSource {
+            vault: Some("Private".into()),
+            item: None,
+        };
+        let fresh = fresh_cache(Some("acct-a"), &[("priv", "SHA256:fpP", "Private")]);
+        merge_source_cache(&mut cache, &[source], Some("acct-a"), fresh);
+        let ids: Vec<&str> = cache.keys.iter().map(|k| k.item_id.as_str()).collect();
+        assert!(
+            ids.contains(&"work"),
+            "an entry outside the source's vault is preserved"
+        );
+        assert!(ids.contains(&"priv"), "the source's fresh key is present");
     }
 
     #[test]

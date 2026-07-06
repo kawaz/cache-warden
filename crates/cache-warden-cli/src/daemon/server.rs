@@ -447,76 +447,50 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
             .unwrap_or_else(|_| std::time::Duration::from_secs(10)),
     };
 
-    // Run op discovery on the blocking pool (DR-0023 Phase 1): `op item list` and
-    // `op item get` are synchronous CLI calls (`std::process::Command::output()`)
-    // that must not block an async worker. A concurrent `select!` on the shutdown
-    // notify lets a SIGTERM received during discovery abort immediately.
-    //
-    // `spawn_listeners` spawns async tasks (`tokio::spawn`) and therefore must run
-    // on the async runtime — only `discover_all_sources` (the blocking part) moves
-    // to the thread pool. The discovered map is passed into `spawn_listeners` as an
-    // argument, keeping the two concerns cleanly separated.
+    // Bind the authsock listeners immediately, seeded from the disk cache
+    // (DR-0023 Phase 2): startup never blocks on `op`. `op item list` /
+    // `op item get` are synchronous CLI calls that can hang for tens of seconds (a
+    // launchd-context daemon whose biometric path never reaches the GUI session),
+    // so instead of running discovery *before* binding, each socket binds from the
+    // last-known keys in the disk cache and a background task refreshes them once
+    // `op` is reachable. A cold first-ever start seeds nothing and the sockets bind
+    // empty until the background discovery populates them. This removes the P1
+    // symptom (`docs/issue/2026-06-13`): listeners no longer wait on `op`.
     let authsock_sources = config.authsock_sources();
     let authsock_sockets = config.authsock_sockets();
-    let discovered = if authsock_sources.is_empty() {
-        // No op sources configured: skip blocking discovery entirely.
-        std::collections::BTreeMap::new()
-    } else {
-        let sources_for_discover = authsock_sources.clone();
-        eprintln!("cache-warden: discovering op-backed keys ...");
-        let t_discover = std::time::Instant::now();
+    let seed = super::authsock::seed_all_sources_from_cache(&authsock_sources);
 
-        let discover_task = tokio::task::spawn_blocking(move || {
-            super::authsock::discover_all_sources(&sources_for_discover)
-        });
-
-        #[cfg(unix)]
-        let result = {
-            match &shutdown_notify {
-                Some(notify) => {
-                    tokio::select! {
-                        res = discover_task => {
-                            res.map_err(|e| ServerError::Io(
-                                io::Error::other(format!("op discovery task panicked: {e}"))
-                            ))?
-                        }
-                        _ = notify.notified() => {
-                            eprintln!("cache-warden: shutdown signal received during op discovery");
-                            let _ = shutdown_tx.send(true);
-                            let _ = server.await;
-                            let _ = std::fs::remove_file(&socket_path);
-                            return Err(ServerError::ShutdownDuringStartup);
-                        }
-                    }
-                }
-                None => discover_task.await.map_err(|e| {
-                    ServerError::Io(io::Error::other(format!("op discovery task panicked: {e}")))
-                })?,
-            }
-        };
-        #[cfg(not(unix))]
-        let result = discover_task.await.map_err(|e| {
-            ServerError::Io(io::Error::other(format!("op discovery task panicked: {e}")))
-        })?;
-
-        let total_keys: usize = result.values().map(|v| v.len()).sum();
-        eprintln!(
-            "cache-warden: discovery completed in {:.2}s ({} sources, {} keys)",
-            t_discover.elapsed().as_secs_f64(),
-            result.len(),
-            total_keys,
-        );
-        result
-    };
-
-    let authsock_handles = super::authsock::spawn_listeners(
+    let super::authsock::ListenerSet {
+        mut handles,
+        discovery_targets,
+        exe,
+    } = super::authsock::spawn_listeners(
         &authsock_sockets,
         &authsock_sources,
-        discovered,
+        seed,
         github_settings,
         Arc::clone(&shared),
-        shutdown_rx,
+        shutdown_rx.clone(),
     );
+
+    // Spawn the background op discovery (DR-0023 Phase 2): it runs the blocking
+    // `op item list` off the async runtime, retries with a capped backoff until
+    // the first success, and then hot-updates each socket's registry. It is
+    // select-able with the shutdown channel, so a stop signal is honoured at once
+    // even while discovery hangs (the sockets are already bound above, so there is
+    // no startup block to interrupt). Pushed into `handles` so shutdown awaits it
+    // like the github refresh task.
+    if !authsock_sources.is_empty() && !discovery_targets.is_empty() {
+        let refresh = tokio::spawn(super::authsock::op_discovery_refresh(
+            discovery_targets,
+            authsock_sources,
+            exe,
+            Arc::clone(&shared),
+            shutdown_rx.clone(),
+        ));
+        handles.push((PathBuf::new(), refresh));
+    }
+    let authsock_handles = handles;
 
     #[cfg(unix)]
     wait_for_shutdown(shutdown_notify).await;

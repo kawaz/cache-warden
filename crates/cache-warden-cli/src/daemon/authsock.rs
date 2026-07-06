@@ -48,9 +48,9 @@
 //! block on a user prompt for minutes, which must not pin an async worker. The
 //! upstream calls are async (non-blocking socket I/O) and stay on the runtime.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use cache_warden::{
     Authenticator, Clock, DefineError, EntryState, ProcessInfo, ProcessInspector,
@@ -60,8 +60,8 @@ use cache_warden::{
 use cache_warden_authsock::{
     AgentCodec, AgentMessage, DiscoveredKey, DiscoveryOutcome, FilterEvaluator, GithubFetcher,
     GithubMatcher, Identity, KeySource, MessageType, OpKeyCache, OpSource, PublicKeyRegistry,
-    RealGithubFetcher, RealOpClient, RegisteredKey, Upstream, chain_gate_passes, discover_keys,
-    private_key_argv, sign,
+    RealGithubFetcher, RealOpClient, RegisteredKey, SignRequestFields, Upstream, chain_gate_passes,
+    discover_keys, merge_source_cache, private_key_argv, seed_from_cache, sign,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
@@ -119,7 +119,16 @@ struct SocketState {
     name: String,
     /// Public keys this socket serves (REQUEST_IDENTITIES) and can sign with
     /// **locally** (their PEMs live in the core KV).
-    registry: PublicKeyRegistry,
+    ///
+    /// Behind an `RwLock` so background op discovery (DR-0023 Phase 2) can
+    /// hot-swap the freshly discovered op-key set after the socket has already
+    /// bound and started serving the disk-cache seed. Every hot-path read is
+    /// **brief**: REQUEST_IDENTITIES snapshots the identities, and a local sign
+    /// takes the read lock only to resolve the key (blob → KV key) then drops it
+    /// before the auth gate / op fetch ([`local_sign`]). The refresh takes the
+    /// write lock only to swap the whole registry, so it never waits behind (nor
+    /// stalls new readers during) a slow sign.
+    registry: Arc<RwLock<PublicKeyRegistry>>,
     /// Upstream agents this socket forwards to (keys merged, signatures
     /// relayed). Resolved paths (macOS TCC symlink applied); empty for a
     /// local-only socket. Cheap to clone per connection.
@@ -138,20 +147,59 @@ struct SocketState {
     shared: Arc<Shared>,
 }
 
+/// The result of one [`discover_all_sources`] pass (DR-0023 Phase 2).
+pub struct SourceDiscovery {
+    /// `source name → discovered keys`. On a `Stale`/`Err` source the map still
+    /// carries whatever the disk-cache fallback recovered (possibly empty), so a
+    /// registry rebuilt from this never drops below the seed it was serving.
+    pub keys: BTreeMap<String, Vec<DiscoveredKey>>,
+    /// The names of the sources whose `op item list` succeeded (`Fresh`) this
+    /// pass. Tracked **per source** (not a single global flag) so the background
+    /// refresh can hot-swap each source's registry the moment *that* source
+    /// enumerates live, and keep retrying only the sources still unavailable — a
+    /// permanently-unreachable source must not withhold a healthy source's freshly
+    /// discovered keys, nor keep the whole retry loop spinning `op item list` for
+    /// sources already resolved.
+    pub fresh: BTreeSet<String>,
+}
+
+impl SourceDiscovery {
+    /// A "nothing discovered, nothing fresh" result — used when the background
+    /// discovery task itself panics, so the caller retries after backoff rather
+    /// than treating the panic as success.
+    fn failed() -> Self {
+        Self {
+            keys: BTreeMap::new(),
+            fresh: BTreeSet::new(),
+        }
+    }
+}
+
 /// Discover the keys of every `[authsock.sources.*]` once, with the production
 /// `op` CLI client. A source's discovery failure (op not signed in, network
-/// down) is logged and the source yields no keys — startup is never blocked, and
-/// the socket comes up so a later `refresh` can populate it (port plan §2).
+/// down, launchd-context biometric unreachable) is logged and the source falls
+/// back to the disk cache (DR-0026); the returned `fresh` set records **which**
+/// sources enumerated live so the background refresh (DR-0023 Phase 2) can apply
+/// each resolved source at once and keep retrying only the ones still down.
 ///
-/// Returns a `source name → discovered keys` map. Sharing one discovery across
-/// every socket that references the same source mirrors authsock-warden's shared
-/// op state (one TouchID-bearing `op item list`, not one per socket).
+/// Sharing one discovery across every socket that references the same source
+/// mirrors authsock-warden's shared op state (one TouchID-bearing `op item
+/// list`, not one per socket).
 ///
-/// `pub` so `server::run` can invoke it on the blocking pool (DR-0023 Phase 1):
 /// `op item list` / `op item get` are synchronous CLI calls that must not block
-/// the async runtime workers.
-pub fn discover_all_sources(sources: &[AuthsockSource]) -> BTreeMap<String, Vec<DiscoveredKey>> {
+/// the async runtime workers, so the caller runs this on the blocking pool.
+pub fn discover_all_sources(sources: &[AuthsockSource]) -> SourceDiscovery {
     let mut out = BTreeMap::new();
+    let mut fresh = BTreeSet::new();
+    // Merge every Fresh source's keys into one cache loaded once, saved once at the
+    // end (below). A per-source `fresh_cache.save()` would clobber the shared
+    // `op_map.json` down to the last source's keys — each `discover_keys` rebuilds
+    // its cache from only its own source — erasing sibling sources' keys from the
+    // disk seed Phase 2 binds from. For a single source the merged result is
+    // identical to the old per-source save; multi-source now preserves every
+    // source's keys (see `merge_source_cache`).
+    let mut merged = OpKeyCache::load();
+    let mut any_fresh = false;
     for source in sources {
         let client = match &source.op_account {
             Some(a) => RealOpClient::with_account(a.clone()),
@@ -162,18 +210,28 @@ pub fn discover_all_sources(sources: &[AuthsockSource]) -> BTreeMap<String, Vec<
             .iter()
             .filter_map(|m| OpSource::parse(m))
             .collect();
-        let cache = OpKeyCache::load();
-        match discover_keys(&client, &op_sources, source.op_account.as_deref(), cache) {
+        // The warm-cache hint is the current merged view (this run's earlier
+        // sources included), so a fingerprint another source already resolved is
+        // reused without a second `op item get`.
+        let hint = merged.clone();
+        match discover_keys(&client, &op_sources, source.op_account.as_deref(), hint) {
             Ok(DiscoveryOutcome::Fresh {
                 keys,
                 cache: fresh_cache,
             }) => {
-                fresh_cache.save();
+                merge_source_cache(
+                    &mut merged,
+                    &op_sources,
+                    source.op_account.as_deref(),
+                    fresh_cache,
+                );
+                any_fresh = true;
                 println!(
                     "cache-warden: authsock source `{}`: discovered {} op key(s)",
                     source.name,
                     keys.len()
                 );
+                fresh.insert(source.name.clone());
                 out.insert(source.name.clone(), keys);
             }
             Ok(DiscoveryOutcome::Stale { keys, error }) => {
@@ -181,6 +239,7 @@ pub fn discover_all_sources(sources: &[AuthsockSource]) -> BTreeMap<String, Vec<
                 // the disk cache (bounded to this source's account + members).
                 // The cache is intentionally NOT re-saved on this path — a
                 // transient op outage must never discard the known-good mapping.
+                // Not in `fresh`: the background refresh must retry this source.
                 eprintln!(
                     "cache-warden: authsock source `{}`: op discovery failed ({error}); \
                      serving {} key(s) from stale cache",
@@ -198,6 +257,47 @@ pub fn discover_all_sources(sources: &[AuthsockSource]) -> BTreeMap<String, Vec<
                 out.insert(source.name.clone(), Vec::new());
             }
         }
+    }
+    // Persist the merged cache once (best effort). Only when at least one source
+    // was Fresh: an all-Stale pass has nothing new to save and must not rewrite the
+    // file (a transient op outage must never discard the known-good mapping).
+    if any_fresh {
+        merged.save();
+    }
+    SourceDiscovery { keys: out, fresh }
+}
+
+/// Seed every source's keys from the disk cache **without** invoking `op`
+/// (DR-0023 Phase 2): lets the agent sockets bind immediately from the
+/// last-known keys instead of blocking startup on `op item list`. Background
+/// discovery ([`op_discovery_refresh`]) then replaces the seed with a live set.
+///
+/// Uses the same per-source account/vault boundary as [`discover_all_sources`]
+/// (via [`seed_from_cache`]), so the seed enumerates exactly the subset a live
+/// discovery-failure fallback would have served. A cold first-ever start (no
+/// cache) seeds nothing and the sockets bind empty — still an improvement over
+/// blocking until `op` returns (or hangs).
+pub fn seed_all_sources_from_cache(
+    sources: &[AuthsockSource],
+) -> BTreeMap<String, Vec<DiscoveredKey>> {
+    let mut out = BTreeMap::new();
+    for source in sources {
+        let op_sources: Vec<OpSource> = source
+            .members
+            .iter()
+            .filter_map(|m| OpSource::parse(m))
+            .collect();
+        let cache = OpKeyCache::load();
+        let keys = seed_from_cache(&cache, &op_sources, source.op_account.as_deref());
+        if !keys.is_empty() {
+            println!(
+                "cache-warden: authsock source `{}`: seeded {} op key(s) from disk cache \
+                 (live discovery pending in background)",
+                source.name,
+                keys.len()
+            );
+        }
+        out.insert(source.name.clone(), keys);
     }
     out
 }
@@ -279,21 +379,126 @@ impl OpKvKey {
     }
 }
 
+/// A socket whose op-sourced registry can be refreshed once background op
+/// discovery completes (DR-0023 Phase 2).
+///
+/// Holds the immutable local `base` (the config `keys`' public halves, derived
+/// once at bind time and **never re-read from the core**, so a local key present
+/// at bind can never vanish on a refresh even if its TTL later expires) and a
+/// handle to the `live` registry the hot path reads. A refresh rebuilds
+/// `base.clone()` + freshly discovered op keys and swaps it into `live`.
+pub struct DiscoveryTarget {
+    /// The socket this target refreshes (its `source` name and diagnostics name).
+    socket: AuthsockSocket,
+    /// Immutable local-key base, cloned on every rebuild.
+    base: PublicKeyRegistry,
+    /// The live registry the hot path reads; the swap target on a refresh.
+    live: Arc<RwLock<PublicKeyRegistry>>,
+}
+
+/// What [`spawn_listeners`] hands back.
+pub struct ListenerSet {
+    /// `(socket_path, JoinHandle)` pairs the caller awaits on shutdown (and whose
+    /// socket file it removes). Includes the github-refresh task (empty path).
+    pub handles: Vec<(PathBuf, JoinHandle<()>)>,
+    /// Per-socket refresh targets for the background op-discovery task. Empty
+    /// when no socket has an op `source` (or the own-binary path is unknown).
+    pub discovery_targets: Vec<DiscoveryTarget>,
+    /// The resolved own-binary path op keys re-exec to fetch their PEM. Passed to
+    /// the background refresh so it can build op keys the same way. `None` when it
+    /// could not be resolved (op keys are then unavailable — fail-closed).
+    pub exe: Option<String>,
+}
+
+/// Register a socket's op-sourced keys as core definitions so `get_or_regenerate`
+/// (DR-0014 lazy path) can produce their PEMs at sign time.
+///
+/// Takes the **store lock only** (never while a registry lock is held) so it
+/// cannot invert against [`local_sign`]'s registry-read → store-lock order. A
+/// `Conflict` is a no-op (idempotent re-start, a shared source across sockets, or
+/// a background refresh re-registering the same key); a bad TTL / other error is
+/// logged and that key skipped.
+fn register_op_definitions(shared: &Arc<Shared>, registry: &PublicKeyRegistry, socket_name: &str) {
+    let mut store = match shared.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            eprintln!(
+                "cache-warden: authsock `{socket_name}`: store lock poisoned; skipping op key \
+                 definition registration"
+            );
+            return;
+        }
+    };
+    for reg in registry.all_keys() {
+        if let KeySource::Op {
+            argv,
+            soft_ttl_secs,
+            hard_ttl_secs,
+        } = &reg.source
+        {
+            let ttl = match Ttl::new(
+                soft_ttl_secs.map(std::time::Duration::from_secs),
+                hard_ttl_secs.map(std::time::Duration::from_secs),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!(
+                        "cache-warden: authsock `{socket_name}`: op key `{}` has invalid TTL \
+                         configuration ({e}); skipping definition registration",
+                        reg.kv_key
+                    );
+                    continue;
+                }
+            };
+            match store.define(&reg.kv_key, ValueSource::command(argv.clone()), ttl) {
+                Ok(()) | Err(DefineError::Conflict) => {} // ok or idempotent
+                Err(e) => {
+                    eprintln!(
+                        "cache-warden: authsock `{socket_name}`: failed to register definition for \
+                         op key `{}` ({e}); lazy loading via get_or_regenerate unavailable",
+                        reg.kv_key
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Build a socket's full registry: the immutable local `base` plus this run's
+/// op-sourced keys. Pure (no store / lock) so the background refresh rebuilds off
+/// the same base without re-reading the core. Returns the merged registry and how
+/// many op keys were layered on (0 when `exe` is unknown — op keys unavailable).
+fn op_registry_from(
+    base: &PublicKeyRegistry,
+    socket_name: &str,
+    exe: Option<&str>,
+    source: &AuthsockSource,
+    keys: &[DiscoveredKey],
+) -> (PublicKeyRegistry, usize) {
+    let mut registry = base.clone();
+    let op_key_count = match exe {
+        Some(exe) => register_op_keys(socket_name, exe, source, keys, &mut registry),
+        None => 0,
+    };
+    (registry, op_key_count)
+}
+
 /// Spawn one listener task per validated `[authsock.sockets.*]`.
 ///
-/// Returns `(socket_path, JoinHandle)` pairs so the caller can await each task
-/// on shutdown and remove its socket file. A socket whose registry ends up
-/// empty (no key resolved) is still bound — it simply answers REQUEST_IDENTITIES
-/// with an empty list until a key is set.
+/// Returns a [`ListenerSet`]: the join handles (awaited on shutdown), the
+/// per-socket [`DiscoveryTarget`]s for background op discovery, and the resolved
+/// own-binary path. A socket whose registry ends up empty (no key resolved) is
+/// still bound — it answers REQUEST_IDENTITIES with an empty list until a key is
+/// set (or background discovery populates it).
 ///
 /// `sources` are the validated `[authsock.sources.*]`.
 ///
-/// `discovered` is the pre-computed `source name → discovered keys` map produced
-/// by [`discover_all_sources`] **before** this call. The caller is responsible for
-/// running discovery (on the blocking pool, DR-0023 Phase 1) and passing the
-/// result here so `spawn_listeners` can stay free of synchronous blocking work
-/// (it spawns async `tokio::spawn` tasks and must not call `tokio::spawn` from
-/// inside a `spawn_blocking` closure).
+/// `discovered` is the **seed** `source name → keys` map (from the disk cache,
+/// [`seed_all_sources_from_cache`]) — not a live discovery. The socket binds
+/// immediately from this seed (DR-0023 Phase 2: startup never blocks on `op`); a
+/// background task ([`op_discovery_refresh`]) then replaces it with a live set.
+/// `spawn_listeners` stays free of synchronous blocking work (it spawns async
+/// tasks and must not call `tokio::spawn` from inside a `spawn_blocking` closure).
 pub fn spawn_listeners(
     sockets: &[AuthsockSocket],
     sources: &[AuthsockSource],
@@ -301,7 +506,7 @@ pub fn spawn_listeners(
     github: GithubSettings,
     shared: Arc<Shared>,
     shutdown_rx: watch::Receiver<bool>,
-) -> Vec<(PathBuf, JoinHandle<()>)> {
+) -> ListenerSet {
     let source_by_name: BTreeMap<&str, &AuthsockSource> =
         sources.iter().map(|s| (s.name.as_str(), s)).collect();
 
@@ -327,11 +532,11 @@ pub fn spawn_listeners(
     let mut github_matchers: Vec<GithubMatcher> = Vec::new();
 
     let mut handles = Vec::new();
+    let mut discovery_targets = Vec::new();
     for socket in sockets {
-        // Derive this socket's public-key registry up front (under the store
-        // lock) from the configured keys' currently-cached PEMs, then add any
-        // op-sourced keys from the source it references.
-        let mut registry = {
+        // Derive this socket's immutable local base registry up front (under the
+        // store lock) from the configured keys' currently-cached PEMs.
+        let base = {
             let mut store = match shared.store.lock() {
                 Ok(g) => g,
                 Err(_) => {
@@ -351,69 +556,35 @@ pub fn spawn_listeners(
             )
         };
 
-        // Add op-sourced keys (lazily loaded at sign time; see [`KeySource::Op`]).
-        // Skipped entirely when the binary path is unknown (fail-closed above).
+        // Layer this socket's op-sourced keys onto a copy of the base, seeded from
+        // the disk-cache `discovered` map (lazily loaded at sign time; see
+        // [`KeySource::Op`]). Skipped when the binary path is unknown (fail-closed
+        // above) — that socket then never gets a refresh target either.
+        let socket_source: Option<&AuthsockSource> = socket
+            .source
+            .as_deref()
+            .and_then(|n| source_by_name.get(n).copied());
+        let mut registry = base.clone();
         let mut op_key_count = 0;
-        if let Some(exe) = &exe
-            && let Some(source_name) = &socket.source
-            && let (Some(source), Some(keys)) = (
-                source_by_name.get(source_name.as_str()),
-                discovered.get(source_name),
-            )
+        let has_op_source = if let (Some(exe_path), Some(source)) = (exe.as_deref(), socket_source)
         {
-            op_key_count = register_op_keys(&socket.name, exe, source, keys, &mut registry);
-        }
+            let seed_keys = socket
+                .source
+                .as_deref()
+                .and_then(|n| discovered.get(n))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            op_key_count =
+                register_op_keys(&socket.name, exe_path, source, seed_keys, &mut registry);
+            true
+        } else {
+            false
+        };
 
         // Register definitions for all op-sourced keys in the core Store so that
         // get_or_regenerate (DR-0014 lazy path) can produce their values. This
         // replaces the former lazy_load_op_key independent fetch/set path (A-3a).
-        //
-        // Conflict is treated as a no-op (idempotent re-start or two sockets
-        // sharing the same op source are fine). Any other DefineError (which is
-        // currently only StaticNotDefinable, i.e. unreachable here since we always
-        // pass a command source) is logged and the key is skipped — the socket
-        // still serves the keys that did register.
-        if let Ok(mut store) = shared.store.lock() {
-            for reg in registry.all_keys() {
-                if let KeySource::Op {
-                    argv,
-                    soft_ttl_secs,
-                    hard_ttl_secs,
-                } = &reg.source
-                {
-                    let ttl = match Ttl::new(
-                        soft_ttl_secs.map(std::time::Duration::from_secs),
-                        hard_ttl_secs.map(std::time::Duration::from_secs),
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            eprintln!(
-                                "cache-warden: authsock `{}`: op key `{}` has invalid TTL \
-                                 configuration ({e}); skipping definition registration",
-                                socket.name, reg.kv_key
-                            );
-                            continue;
-                        }
-                    };
-                    match store.define(&reg.kv_key, ValueSource::command(argv.clone()), ttl) {
-                        Ok(()) | Err(DefineError::Conflict) => {} // ok or idempotent
-                        Err(e) => {
-                            eprintln!(
-                                "cache-warden: authsock `{}`: failed to register definition for \
-                                 op key `{}` ({e}); lazy loading via get_or_regenerate unavailable",
-                                socket.name, reg.kv_key
-                            );
-                        }
-                    }
-                }
-            }
-        } else {
-            eprintln!(
-                "cache-warden: authsock `{}`: store lock poisoned; skipping op key \
-                 definition registration",
-                socket.name
-            );
-        }
+        register_op_definitions(&shared, &registry, &socket.name);
 
         let listener = match bind_control_socket(&socket.path) {
             Ok(l) => l,
@@ -453,19 +624,34 @@ pub fn spawn_listeners(
         // socket's filter reads). The refresh task fetches their keys.
         github_matchers.extend(filter.github_matchers().into_iter().cloned());
 
+        let registry_len = registry.len();
         println!(
             "cache-warden: authsock `{}` listening on {} ({} key(s) incl. {} op, {} upstream(s), {} filter term(s))",
             socket.name,
             socket.path.display(),
-            registry.len(),
+            registry_len,
             op_key_count,
             upstreams.len(),
             filter.len()
         );
 
+        // The live registry the hot path reads; background op discovery swaps it.
+        let live = Arc::new(RwLock::new(registry));
+
+        // A socket with a resolvable op source gets a refresh target: the
+        // background task rebuilds `base` + freshly discovered op keys and swaps
+        // `live`. Local-only sockets never change after bind, so they need none.
+        if has_op_source {
+            discovery_targets.push(DiscoveryTarget {
+                socket: socket.clone(),
+                base,
+                live: Arc::clone(&live),
+            });
+        }
+
         let state = Arc::new(SocketState {
             name: socket.name.clone(),
-            registry,
+            registry: live,
             upstreams,
             filter,
             allowed_processes: socket.allowed_processes.clone(),
@@ -491,7 +677,206 @@ pub fn spawn_listeners(
         // caller's cleanup ignores (remove_file on a non-path is best-effort).
         handles.push((PathBuf::new(), task));
     }
-    handles
+    ListenerSet {
+        handles,
+        discovery_targets,
+        exe,
+    }
+}
+
+/// Task-level retry backoff bounds for background op discovery (DR-0023 Phase 2).
+///
+/// Distinct from DR-0022's *per-key fetch* backoff: this governs how often the
+/// daemon retries the **whole** `op item list` discovery until it first
+/// succeeds. The first success replaces the disk-cache seed with a live set and
+/// stops the loop — thereafter op keys are re-fetched lazily at sign time
+/// (DR-0014), so a warm registry needs no polling.
+const DISCOVERY_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Upper bound on the retry delay (a launchd-context daemon whose biometric path
+/// is unreachable keeps serving the seed rather than spinning tightly).
+const DISCOVERY_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The next retry delay: double the current one, capped at [`DISCOVERY_RETRY_MAX`].
+/// Pure so the backoff progression is unit-tested without real waiting.
+fn next_backoff(current: std::time::Duration) -> std::time::Duration {
+    (current * 2).min(DISCOVERY_RETRY_MAX)
+}
+
+/// Rebuild one target's registry from its immutable local base plus the freshly
+/// discovered op keys, register the op-key definitions in the core, and swap the
+/// result into the live registry the hot path reads.
+///
+/// Locks are never nested: the fresh registry is built lock-free
+/// ([`op_registry_from`]), definitions are registered under the store lock alone
+/// ([`register_op_definitions`]), and the swap takes the registry write lock
+/// alone. Combined with [`local_sign`] holding the registry read lock only to
+/// resolve the key (never across the store lock), no lock is ever held while
+/// acquiring another here — so this cannot deadlock or invert against a sign.
+///
+/// Runs on the blocking pool (see [`op_discovery_refresh`]): the store lock it
+/// takes can be held by a concurrent sign across an `op item get` / TouchID, so
+/// this synchronous wait must stay off the async workers (DR-0008).
+fn apply_discovery(
+    target: &DiscoveryTarget,
+    exe: Option<&str>,
+    source: &AuthsockSource,
+    keys: &[DiscoveredKey],
+    shared: &Arc<Shared>,
+) {
+    let (registry, op_key_count) =
+        op_registry_from(&target.base, &target.socket.name, exe, source, keys);
+    // Store lock only (no registry lock held) — see the lock-ordering note above.
+    register_op_definitions(shared, &registry, &target.socket.name);
+    // Registry write lock only.
+    *target.live.write().unwrap_or_else(|e| e.into_inner()) = registry;
+    println!(
+        "cache-warden: authsock `{}`: op discovery updated registry ({} op key(s))",
+        target.socket.name, op_key_count
+    );
+}
+
+/// Background op discovery (DR-0023 Phase 2).
+///
+/// The agent sockets have already bound and are serving the disk-cache seed. This
+/// task runs the (blocking) `op item list` discovery off the async runtime and
+/// hot-updates each target's registry **per source**, the moment that source
+/// enumerates live — a healthy source's freshly discovered keys are served at
+/// once even while another source is still unreachable. It keeps retrying (capped
+/// task-level backoff) only the sources not yet resolved, and stops once every
+/// op-`source` socket serves a live registry. A source that is permanently
+/// unreachable (a launchd-context daemon whose biometric path never reaches the
+/// GUI session) keeps serving its seed and is retried on the backoff, without
+/// withholding any resolved source's keys.
+///
+/// There is no periodic re-discovery of an already-resolved source — op keys are
+/// re-fetched lazily at sign time (DR-0014), so a warm registry needs no polling
+/// (DR-0023: "成功後は既存 refresh 経路に委ねる"). Every wait — the discovery
+/// itself, the (blocking-pool) apply, and the backoff — is select-able with the
+/// shutdown channel so a stop signal is honoured immediately even mid-discovery /
+/// mid-apply / mid-backoff (DR-0023 Phase 1 responsiveness, carried forward).
+pub async fn op_discovery_refresh(
+    targets: Vec<DiscoveryTarget>,
+    sources: Vec<AuthsockSource>,
+    exe: Option<String>,
+    shared: Arc<Shared>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    // The op-`source` names whose sockets have a refresh target — the set the loop
+    // must resolve before it is done. `Arc` so the blocking-pool apply closure can
+    // borrow every target without moving them out of the task.
+    let targets = Arc::new(targets);
+    let pending_sources: BTreeSet<String> = targets
+        .iter()
+        .filter_map(|t| t.socket.source.clone())
+        .collect();
+    // Sources already hot-swapped to a live registry: never re-discovered or
+    // re-applied, and — once this covers every `pending_sources` entry — the loop
+    // is done.
+    let mut applied: BTreeSet<String> = BTreeSet::new();
+    let mut backoff = DISCOVERY_RETRY_INITIAL;
+
+    loop {
+        // Discover only the sources not yet resolved: an already-applied source is
+        // never re-run through `op item list` (no periodic re-discovery, DR-0023
+        // §4; a resolved source keeps no session-warming biometric traffic alive).
+        let sources_for_task: Vec<AuthsockSource> = sources
+            .iter()
+            .filter(|s| !applied.contains(&s.name))
+            .cloned()
+            .collect();
+        // Run the synchronous op CLI discovery on the blocking pool so a hung
+        // `op` never pins an async worker (it cannot be aborted — the process
+        // exit / DR-0021 watchdog bounds a truly wedged op).
+        let discover = tokio::task::spawn_blocking(move || discover_all_sources(&sources_for_task));
+        let discovery = tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() { return; }
+                continue;
+            }
+            res = discover => match res {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("cache-warden: authsock: background discovery task panicked ({e})");
+                    SourceDiscovery::failed()
+                }
+            },
+        };
+
+        // Hot-swap every source that enumerated live this pass and has a target —
+        // per source, so a healthy source is served immediately even while another
+        // stays unreachable. The apply runs on the blocking pool: `apply_discovery`
+        // takes the store lock (op-key definition registration) and the registry
+        // write lock, and a concurrent sign can hold the store lock across an
+        // `op item get` / TouchID — that synchronous wait must not pin an async
+        // worker (DR-0008).
+        let newly_fresh: Vec<String> = discovery
+            .fresh
+            .iter()
+            .filter(|name| pending_sources.contains(*name) && !applied.contains(*name))
+            .cloned()
+            .collect();
+        if !newly_fresh.is_empty() {
+            let targets_apply = Arc::clone(&targets);
+            let shared_apply = Arc::clone(&shared);
+            let exe_apply = exe.clone();
+            let sources_apply = sources.clone();
+            let apply_set: BTreeSet<String> = newly_fresh.iter().cloned().collect();
+            let keys_apply: BTreeMap<String, Vec<DiscoveredKey>> = newly_fresh
+                .iter()
+                .filter_map(|n| discovery.keys.get(n).map(|k| (n.clone(), k.clone())))
+                .collect();
+            let apply = tokio::task::spawn_blocking(move || {
+                let source_by_name: BTreeMap<&str, &AuthsockSource> =
+                    sources_apply.iter().map(|s| (s.name.as_str(), s)).collect();
+                for target in targets_apply.iter() {
+                    let Some(name) = target.socket.source.as_deref() else {
+                        continue;
+                    };
+                    if !apply_set.contains(name) {
+                        continue;
+                    }
+                    if let (Some(source), Some(keys)) =
+                        (source_by_name.get(name).copied(), keys_apply.get(name))
+                    {
+                        apply_discovery(target, exe_apply.as_deref(), source, keys, &shared_apply);
+                    }
+                }
+            });
+            // Await the apply but stay responsive to a stop signal — the apply's
+            // blocking-pool task completes (or is torn down at process exit) even
+            // if we return early on shutdown.
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() { return; }
+                }
+                _ = apply => {}
+            }
+            applied.extend(newly_fresh);
+        }
+
+        // Every op-`source` socket now serves a live registry: done.
+        if pending_sources.iter().all(|n| applied.contains(n)) {
+            eprintln!("cache-warden: authsock: background op discovery complete");
+            return;
+        }
+
+        // Some source is still unavailable (op down / hung / not signed in): keep
+        // serving its seed and retry after a bounded, shutdown-interruptible wait.
+        eprintln!(
+            "cache-warden: authsock: op discovery incomplete ({}/{} source(s) live); \
+             retrying in {:.0}s (serving disk-cache seed for the rest)",
+            applied.len(),
+            pending_sources.len(),
+            backoff.as_secs_f64()
+        );
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() { return; }
+            }
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = next_backoff(backoff);
+    }
 }
 
 /// Settings for the github key-refresh task: how long a fetched set is reused
@@ -722,12 +1107,17 @@ async fn request_identities(
 ) -> AgentMessage {
     // Local identities first so they win de-dup against any upstream copy. Apply
     // the filter on the full comment-bearing identity (the registry keeps it).
-    let mut merged: Vec<Identity> = state
-        .registry
-        .identities()
-        .into_iter()
-        .filter(|id| state.filter.matches(id))
-        .collect();
+    // A brief read lock snapshots the identities into an owned Vec before the
+    // async upstream loop below, so the guard is never held across an await
+    // (background discovery's write swap is not blocked by a slow upstream).
+    let mut merged: Vec<Identity> = {
+        let registry = state.registry.read().unwrap_or_else(|e| e.into_inner());
+        registry
+            .identities()
+            .into_iter()
+            .filter(|id| state.filter.matches(id))
+            .collect()
+    };
     let mut seen: std::collections::HashSet<Vec<u8>> =
         merged.iter().map(|id| id.key_blob.to_vec()).collect();
 
@@ -793,8 +1183,13 @@ async fn sign_request(
     // 1. A blob we can sign locally (Iteration 1 path) is signed on the blocking
     //    pool through the core auth gate. The filter is enforced inside the sign
     //    path (via `signable_kv_key`, using the registry's comment), so a key this
-    //    socket hides yields FAILURE even though its PEM is reachable.
-    if state.registry.lookup(&key_blob).is_some() {
+    //    socket hides yields FAILURE even though its PEM is reachable. The read
+    //    lock is dropped before dispatching (local_sign re-takes it).
+    let known_local = {
+        let registry = state.registry.read().unwrap_or_else(|e| e.into_inner());
+        registry.lookup(&key_blob).is_some()
+    };
+    if known_local {
         let state = Arc::clone(state);
         let msg = msg.clone();
         return tokio::task::spawn_blocking(move || local_sign(&state, peer, &msg))
@@ -861,9 +1256,28 @@ async fn forward_sign(upstream: &Upstream, msg: &AgentMessage) -> Option<AgentMe
 fn local_sign(state: &SocketState, peer: Option<u32>, msg: &AgentMessage) -> AgentMessage {
     let requester: Option<Vec<ProcessInfo>> =
         peer.and_then(|pid| SystemInspector::new().ancestry(pid).ok());
-    let ctx = LocalSignCtx {
-        registry: &state.registry,
-        filter: &state.filter,
+    let fields = match msg.parse_sign_request() {
+        Ok(f) => f,
+        Err(_) => return AgentMessage::failure(),
+    };
+
+    // Take the registry read lock **only to resolve the key** (blob → KV key +
+    // source, applying the socket filter), then drop it before the sign's auth
+    // gate / `op item get` / TouchID — which can block for tens of seconds. The
+    // resolved `kv_key` / `source` are cloned, so the sign never needs the
+    // registry again. Holding the read guard across that wait would let a queued
+    // background-discovery write lock (`apply_discovery`) block *new* readers on
+    // the std `RwLock` (writer-preferring on this platform), stalling every fresh
+    // REQUEST_IDENTITIES / SIGN dispatch on the async workers for the whole fetch.
+    let (kv_key, source) = {
+        let registry = state.registry.read().unwrap_or_else(|e| e.into_inner());
+        match signable_key(&registry, &state.filter, &fields.key_blob) {
+            Some(registered) => (registered.kv_key.clone(), registered.source.clone()),
+            None => return AgentMessage::failure(),
+        }
+    };
+
+    let exec = SignExecCtx {
         store: &state.shared.store,
         auth: state.shared.auth.as_ref(),
         runner: &state.shared.runner,
@@ -871,7 +1285,7 @@ fn local_sign(state: &SocketState, peer: Option<u32>, msg: &AgentMessage) -> Age
         kv_process_policies: &state.shared.kv_process_policies,
         authsock_cap: &state.shared.authsock_cap,
     };
-    sign_local_with_ctx(&ctx, requester.as_deref(), msg)
+    sign_with_resolved_key(&exec, requester.as_deref(), &kv_key, &source, &fields)
 }
 
 /// Resolve the registered key a SIGN_REQUEST may use, or `None` to reject it.
@@ -895,6 +1309,11 @@ fn signable_key<'r>(
 /// keeps a small argument list (the alternative — passing five separate borrows
 /// — trips `clippy::too_many_arguments`). Each field is a short-lived borrow of a
 /// `Shared` member; nothing here owns a secret.
+///
+/// Test-only: production signs via [`local_sign`] → [`sign_with_resolved_key`]
+/// (resolving the key under a brief registry read lock). The unit tests drive the
+/// same resolve-then-sign composition through [`sign_local_with_ctx`].
+#[cfg(test)]
 struct LocalSignCtx<'a, A: ?Sized, R, C> {
     /// The registered public keys (blob → KV key) this socket can sign with.
     registry: &'a PublicKeyRegistry,
@@ -920,15 +1339,13 @@ struct LocalSignCtx<'a, A: ?Sized, R, C> {
     authsock_cap: &'a cache_warden::Capability,
 }
 
-/// Pure local-sign dispatch for one SIGN_REQUEST against the core (no socket
-/// I/O). The blob is assumed to be in `ctx.registry` (the async caller checked).
-///
-/// Factored out of the async server so the SIGN_REQUEST → core → signature path
-/// is unit-testable without a runtime. Resolves the key blob to a signable KV key
-/// via [`signable_kv_key`] (registry lookup **and** the socket filter), fetches
-/// the PEM through the auth gate, signs, refreshes the idle window, returns
-/// SIGN_RESPONSE. Any failure (unknown, filtered out, denied, hard-expired
-/// static, sign error) is SSH_AGENT_FAILURE.
+/// Test-only resolve-then-sign shim (no socket I/O): resolves the key blob to a
+/// signable KV key via [`signable_key`] (registry lookup **and** the socket
+/// filter), then delegates to [`sign_with_resolved_key`]. It mirrors the exact
+/// composition production runs (`local_sign` does the same resolve + delegate,
+/// but under a live socket's registry read lock), so the SIGN_REQUEST → core →
+/// signature path stays unit-testable without a runtime or a full `SocketState`.
+#[cfg(test)]
 fn sign_local_with_ctx<A, R, C>(
     ctx: &LocalSignCtx<'_, A, R, C>,
     requester: Option<&[ProcessInfo]>,
@@ -944,14 +1361,67 @@ where
         Err(_) => return AgentMessage::failure(),
     };
     // Unknown key or filtered-out key: do not reveal which keys exist beyond
-    // IDENTITIES. Clone the small bits we need so the registry borrow ends before
-    // we take the store lock (the source carries the op fetch spec).
+    // IDENTITIES. Clone the small bits we need so the registry borrow ends here,
+    // before the (possibly slow) auth gate / op fetch (the source carries the op
+    // fetch spec). `local_sign` relies on the same split to bound its registry
+    // read-lock hold to just this resolution (see its lock-ordering note).
     let Some(registered) = signable_key(ctx.registry, ctx.filter, &fields.key_blob) else {
         return AgentMessage::failure();
     };
     let kv_key = registered.kv_key.clone();
     let source = registered.source.clone();
 
+    let exec = SignExecCtx {
+        store: ctx.store,
+        auth: ctx.auth,
+        runner: ctx.runner,
+        clock: ctx.clock,
+        kv_process_policies: ctx.kv_process_policies,
+        authsock_cap: ctx.authsock_cap,
+    };
+    sign_with_resolved_key(&exec, requester, &kv_key, &source, &fields)
+}
+
+/// The borrowed core services the **post-resolution** half of a local sign needs
+/// (no registry / filter — the key is already resolved). Grouped so the signing
+/// helper keeps a small argument list (`clippy::too_many_arguments`). Each field
+/// is a short-lived borrow of a `Shared` member; nothing here owns a secret.
+struct SignExecCtx<'a, A: ?Sized, R, C> {
+    /// The core store holding the private-key PEMs.
+    store: &'a std::sync::Mutex<Store>,
+    /// The re-authentication gate (shared with the control socket).
+    auth: &'a A,
+    /// The command runner used to regenerate a hard-expired command source.
+    runner: &'a R,
+    /// The monotonic clock for TTL evaluation.
+    clock: &'a C,
+    /// Key-level process-access policies (DR-0012 key layer): KV key name → its
+    /// non-empty `allowed_processes` list.
+    kv_process_policies: &'a std::collections::BTreeMap<String, Vec<String>>,
+    /// Capability token for store access (authsock operations use the authsock cap).
+    authsock_cap: &'a cache_warden::Capability,
+}
+
+/// Sign a SIGN_REQUEST whose key is already resolved to `kv_key` / `source`
+/// (registry lookup + filter applied by the caller). Runs the key-level process
+/// gate, fetches the PEM through the auth gate (lazily fetching an op key on its
+/// first use), signs, refreshes the idle window, and returns SIGN_RESPONSE. Any
+/// failure (denied, hard-expired static, sign error) is SSH_AGENT_FAILURE.
+///
+/// Takes **no registry borrow**, so a caller ([`local_sign`]) can drop its
+/// registry read lock before this (potentially slow, TouchID-bearing) call.
+fn sign_with_resolved_key<A, R, C>(
+    ctx: &SignExecCtx<'_, A, R, C>,
+    requester: Option<&[ProcessInfo]>,
+    kv_key: &str,
+    source: &KeySource,
+    fields: &SignRequestFields,
+) -> AgentMessage
+where
+    A: Authenticator + ?Sized,
+    R: SourceRunner,
+    C: Clock,
+{
     // Key-level process-access gate (DR-0012 key layer). When this KV key carries
     // an `allowed_processes` restriction, the requester's ancestry must pass the
     // shared gate (fail-closed on an unknown requester) before the PEM is fetched
@@ -961,7 +1431,7 @@ where
     // mirroring the socket layer's per-key warden behaviour: the key may be listed
     // but cannot be signed with). An op-key's internal `authsock/op_*` name never
     // appears in `[kv.*]` config, so it is unrestricted here.
-    if let Some(allowed) = ctx.kv_process_policies.get(&kv_key)
+    if let Some(allowed) = ctx.kv_process_policies.get(kv_key)
         && !chain_gate_passes(requester, allowed)
     {
         return AgentMessage::failure();
@@ -978,8 +1448,8 @@ where
     // first sign fetches it via `op item get`, authenticates, and `set`s it.
     if !ensure_loaded(
         &mut store,
-        &kv_key,
-        &source,
+        kv_key,
+        source,
         auth,
         runner,
         requester,
@@ -991,7 +1461,7 @@ where
 
     // Borrow the PEM only for the signing call, scoped by `with_exposed` (DR-0028)
     // so the private key never escapes into an owned buffer.
-    let signature = match store.get(&kv_key, ctx.authsock_cap, clock).ok().flatten() {
+    let signature = match store.get(kv_key, ctx.authsock_cap, clock).ok().flatten() {
         Some(secret) => secret.with_exposed(|bytes| {
             let pem = String::from_utf8_lossy(bytes);
             sign(&pem, &fields.data, fields.flags)
@@ -1004,7 +1474,7 @@ where
             // Idle-extend (DR-0011): a successful sign refreshes the soft window
             // without prompting (the entry is Active here). Best effort — a
             // failure here must not fail the signature.
-            let _ = store.extend(&kv_key, ctx.authsock_cap, clock);
+            let _ = store.extend(kv_key, ctx.authsock_cap, clock);
             AgentMessage::sign_response(&blob)
         }
         Err(_) => AgentMessage::failure(),
@@ -2221,7 +2691,7 @@ mod tests {
         ));
         Arc::new(SocketState {
             name: "test".into(),
-            registry,
+            registry: Arc::new(RwLock::new(registry)),
             upstreams: upstream_paths.iter().map(Upstream::new).collect(),
             filter,
             // The unit tests here exercise the per-message respond/sign paths; the
@@ -2767,5 +3237,149 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    // ---- DR-0023 Phase 2: background op discovery refresh ----
+
+    /// Build a `DiscoveredKey` from a public OpenSSH line (op item id + title are
+    /// the metadata the registry keeps as the `ssh-add -l` comment / kv key).
+    fn discovered(item_id: &str, public_openssh: &str, title: &str) -> DiscoveredKey {
+        DiscoveredKey {
+            item_id: item_id.into(),
+            public_key: public_openssh.into(),
+            title: title.into(),
+            fingerprint: format!("SHA256:{item_id}"),
+            vault: "Private".into(),
+        }
+    }
+
+    /// A default op source (bare `op://`, no account) with TTLs — the shape
+    /// `AuthsockSource::validate` produces for a `[authsock.sources.*] kind="op"`
+    /// with no `members`.
+    fn op_source() -> AuthsockSource {
+        AuthsockSource {
+            name: "src".into(),
+            op_account: None,
+            members: vec!["op://".into()],
+            soft_ttl_secs: Some(3600),
+            hard_ttl_secs: Some(86400),
+        }
+    }
+
+    /// The wire blob of an OpenSSH public-key line (the SIGN/IDENTITIES id).
+    fn openssh_blob(public_openssh: &str) -> Vec<u8> {
+        use ssh_encoding::Encode;
+        let pk = ssh_key::PublicKey::from_openssh(public_openssh).unwrap();
+        let mut b = Vec::new();
+        pk.key_data().encode(&mut b).unwrap();
+        b
+    }
+
+    #[test]
+    fn next_backoff_doubles_then_caps() {
+        // The task-level retry delay doubles each attempt and never exceeds the
+        // cap, so a persistently unavailable op (launchd biometric unreachable) is
+        // retried on a widening interval instead of a tight spin (DR-0023 Phase 2:
+        // 無限 tight loop 禁止). This is the `(e) 失敗 retry が backoff する` case.
+        let d = std::time::Duration::from_secs;
+        assert_eq!(
+            next_backoff(DISCOVERY_RETRY_INITIAL),
+            d(4),
+            "2s doubles to 4s"
+        );
+        assert_eq!(next_backoff(d(4)), d(8));
+        assert_eq!(next_backoff(d(16)), d(32));
+        assert_eq!(
+            next_backoff(d(32)),
+            d(60),
+            "doubling 32s would be 64s, capped at the 60s max"
+        );
+        assert_eq!(
+            next_backoff(DISCOVERY_RETRY_MAX),
+            DISCOVERY_RETRY_MAX,
+            "already at the cap stays at the cap (never grows unbounded)"
+        );
+    }
+
+    #[test]
+    fn op_registry_from_layers_op_keys_onto_immutable_base() {
+        // A discovery rebuild is `base` (local keys) + freshly discovered op keys.
+        // The local base key must survive and the op key must be added — this is
+        // the registry side of `(c) background discovery 完了後に registry が
+        // 更新される`, at the deterministic unit level.
+        let mut base = PublicKeyRegistry::new();
+        base.register_from_pem("LOCAL_KEY", ED25519_PEM).unwrap();
+        let keys = vec![discovered("itemAAA", ED25519_PUB_2, "Op Key")];
+
+        let (registry, n) = op_registry_from(
+            &base,
+            "sock",
+            Some("/path/to/cache-warden"),
+            &op_source(),
+            &keys,
+        );
+
+        assert_eq!(n, 1, "one op key layered on");
+        assert_eq!(registry.len(), 2, "local base key + op key both present");
+        assert_eq!(
+            base.len(),
+            1,
+            "the base is immutable — a rebuild never mutates it"
+        );
+        // The local key is still resolvable.
+        assert!(
+            registry.lookup(&openssh_blob(ED25519_PUB)).is_some(),
+            "the local base key survives the rebuild"
+        );
+        // The op key resolves with a lazy Op source (private PEM fetched at sign).
+        let op = registry
+            .lookup(&openssh_blob(ED25519_PUB_2))
+            .expect("op key present after rebuild");
+        assert!(
+            matches!(op.source, KeySource::Op { .. }),
+            "a discovered op key carries a lazy Op source"
+        );
+    }
+
+    #[test]
+    fn op_registry_from_rebuild_replaces_op_keys_but_keeps_base() {
+        // A second discovery that no longer returns the previous op key rebuilds
+        // to base-only (the stale op key is gone), while the local base key
+        // persists across both rebuilds because the base is never re-read from the
+        // core. This is the "hot-update replaces, does not accumulate" property.
+        let mut base = PublicKeyRegistry::new();
+        base.register_from_pem("LOCAL_KEY", ED25519_PEM).unwrap();
+
+        let first = vec![discovered("itemAAA", ED25519_PUB_2, "First")];
+        let (r1, _) = op_registry_from(&base, "sock", Some("/exe"), &op_source(), &first);
+        assert_eq!(r1.len(), 2, "first rebuild: local + one op key");
+
+        // A later discovery returns no op keys at all → rebuild is base-only.
+        let (r2, n2) = op_registry_from(&base, "sock", Some("/exe"), &op_source(), &[]);
+        assert_eq!(n2, 0, "no op keys in the second discovery");
+        assert_eq!(
+            r2.len(),
+            1,
+            "only the local base key remains (op key dropped)"
+        );
+        assert!(
+            r2.lookup(&openssh_blob(ED25519_PUB)).is_some(),
+            "the local base key persists across rebuilds"
+        );
+    }
+
+    #[test]
+    fn op_registry_from_without_exe_adds_no_op_keys() {
+        // With no resolvable own-binary path, op keys cannot be re-fetched at sign
+        // time, so none are registered (fail-closed) — only the local base
+        // survives. Mirrors `spawn_listeners`' exe-unknown branch.
+        let mut base = PublicKeyRegistry::new();
+        base.register_from_pem("LOCAL_KEY", ED25519_PEM).unwrap();
+        let keys = vec![discovered("itemAAA", ED25519_PUB_2, "Op")];
+
+        let (registry, n) = op_registry_from(&base, "sock", None, &op_source(), &keys);
+
+        assert_eq!(n, 0, "no exe → no op keys layered");
+        assert_eq!(registry.len(), 1, "only the local base key");
     }
 }

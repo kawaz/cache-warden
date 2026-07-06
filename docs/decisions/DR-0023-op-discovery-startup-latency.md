@@ -1,7 +1,7 @@
 # DR-0023: 起動時 op discovery のブロッキングを解消 (blocking pool 化 + lazy refresh)
 
-- Status: Accepted (Phase 1) / Proposed (Phase 2) (2026-06-14)
-- Related: DR-0018 (型付き source、prefetch / `force_eager`) / DR-0021 (signal / shutdown、startup 中シグナル取りこぼし防止の前提) / DR-0008 (単一 daemon、tokio runtime) / 関連 issue `docs/issue/2026-06-14-ssh-agent-provider-architecture.md` (Provider 再設計の動機)
+- Status: Accepted (Phase 1 2026-06-14; Phase 2 2026-07-06)
+- Related: DR-0018 (型付き source、prefetch / `force_eager`) / DR-0021 (signal / shutdown、startup 中シグナル取りこぼし防止の前提) / DR-0008 (単一 daemon、tokio runtime) / DR-0026 (discovery 失敗時 disk-cache fallback。Phase 2 の registry seed はこの cache→`DiscoveredKey` 変換を再利用) / DR-0022 (per-key fetch backoff。Phase 2 の task-level retry backoff とは別レイヤ) / 関連 issue `docs/issue/2026-06-14-ssh-agent-provider-architecture.md` (Provider 再設計の動機)
 
 ## Context
 
@@ -50,14 +50,62 @@ DR-0018 では「公開鍵 index は常駐、秘密鍵は lazy」を方針とし
   - watchdog (DR-0021) が 5 秒後に `_exit(0)` するので bounded-exit は保証 (watchdog の存在意義がここで活きる)
   - = blocking pool に乗せても abort 不能性は変わらないが、**main runtime の応答性 (= shutdown 信号の認識)** は回復する
 
-### Phase 2: `discover_keys` 自体を lazy + background refresh に (将来、別 DR 化候補)
+### Phase 2: listener 即時 bind + disk-cache seed + background discovery (採択、2026-07-06)
 
-- 起動時の eager discovery を廃止し、最初の SIGN_REQUEST まで discovery を遅延 (= cold path はそこで負担)
-- 並行で background refresh task が定期的に op discovery を回し、warm cache を維持
-- warm 状態では SIGN_REQUEST の overhead は zero
-- DR-0018 の `force_eager` (= authsock keys は startup eager) は **公開鍵 index** のみ eager に整理 (= 秘密鍵 lazy と分離)
-- `docs/issue/2026-06-14-ssh-agent-provider-architecture.md` の Provider 再設計と整合する構造 (Provider 抽象化と一体で実装すれば自然)
-- Phase 2 単独実装は **Provider 再設計と被るので、Provider 再設計が動くまで保留** (= 二重作業を避ける)
+P1 (= `spawn_listeners` が discovery 完了を await するため、op hang 時に listener
+起動が最大 30s 遅延、最悪 launchd context では永久に bind されない) を解消する。
+
+**当初の Phase 2 案 (= 初回 SIGN_REQUEST まで discovery を遅延) は採らない**。
+「socket ready なのに鍵が空」問題 (案 A の弱点) を避けつつ、DR-0026 で
+**disk-cache から public key を復元する変換が既に存在**するので、それを起動時 seed
+に転用する方が筋が良い (= 二重作業を避ける、Provider 再設計を待たずに独立実装可能)。
+
+採択した構造:
+
+1. **listener 即時 bind**: `run()` は discovery 完了を待たず `spawn_listeners` する。
+   初期 registry は disk cache からの seed (`seed_all_sources_from_cache` →
+   `seed_from_cache` = DR-0026 `fallback_from_cache` と**同一変換・同一境界規則**
+   = provenance / vault / item filter)。cold first-start は seed 空で bind (= それでも
+   「listener 不在」より改善)。**公開鍵 index の常駐手段が「同期 op ブロック」から
+   「disk-cache seed」に変わっただけ**で、秘密鍵 lazy fetch (DR-0018 / DR-0014) は不変。
+2. **background discovery (source 単位 apply)**: 起動後に `op_discovery_refresh` task が
+   blocking pool で `discover_all_sources` を回し、live enumerate に成功した source を
+   **その source ごとに即 hot-swap** する (`SourceDiscovery.fresh` = live 成功した source
+   名の集合)。既存 `spawn_github_refresh` と同じ「blocking pool 上で外部 CLI を回して
+   共有状態を更新」パターンに揃えた。**全 source 一括 (`all_fresh`) ではなく source 単位**
+   なのは、恒久的に到達不能な source (未 sign-in の別アカウント等) が 1 つでもあると、
+   健全な source の live key が永久に適用されず (cold cache では 0 key serving)、retry
+   loop も終わらない all-or-nothing 退行を避けるため。apply は blocking pool 上で行う
+   (`apply_discovery` は store lock + registry write を取り、並行 sign が `op item get`
+   / TouchID 中に store lock を保持しうる = async worker を塞いではならない、DR-0008)。
+3. **registry 共有可変化**: `SocketState.registry` を `Arc<RwLock<PublicKeyRegistry>>`
+   に。hot path (REQUEST_IDENTITIES / SIGN) は read guard を短命に取り、refresh は
+   write guard で swap のみ。rebuild は **immutable な local base (config `keys` の
+   公開鍵) を clone + fresh op keys** で組む (= local key は core を再読しないので TTL
+   失効で消えない)。**lock 順序**: `local_sign` は registry read guard を **鍵解決だけに
+   限定** (blob → KV key を clone したら drop、その後の auth gate / op fetch には持ち込ま
+   ない) = queue した `apply_discovery` の write guard が新規 reader を塞がない (std
+   `RwLock` は writer 優先で、read を長く持つと待機 writer が後続 read を止める)。
+   `apply_discovery` は store lock (def 登録) と registry write を**同時に持たない**ので
+   inversion もしない。
+4. **失敗時 retry (source 単位 task-level backoff)**: 未解決 source が残る間は
+   task-level exponential backoff (2s→…→60s cap) で retry。**各 source は解決した瞬間に
+   apply され、以降その source は再 discovery しない** (= 解決済み source の `op item list`
+   を無駄に再実行せず、biometric session を無用に温め続けない)。**全 target source が live
+   になったら loop 終了**、以降は既存 lazy fetch 経路に委ねる (= 解決済み source の周期的
+   自動再 discovery は新設しない、投機的 config option も足さない)。DR-0022 の per-key
+   fetch backoff とは別レイヤ。全 wait (discovery / apply / backoff) は shutdown channel と
+   select 可能 (= Phase 1 の応答性を踏襲、discovery hang 中でも SIGTERM 即応)。
+5. **multi-source cache 永続化 (clobber 回避)**: `discover_all_sources` は各 source の
+   fresh cache を per-source `save()` で書くのではなく、disk cache を 1 度 load して
+   **merge (`merge_source_cache`: 当該 source の旧 entry を provenance + vault/item 境界で
+   置換、他 source の entry は温存) → 末尾で 1 度 save**。per-source save は共有
+   `op_map.json` を最後の source の鍵だけに全置換 clobber し、Phase 2 が seed 元にする
+   disk cache から兄弟 source の鍵を消してしまうため。single-source では従来 save と同一結果。
+6. **shutdown 応答性**: seed bind + background 化で startup が op に律速されなくなった
+   ため、`run()` は discovery で `ShutdownDuringStartup` を返さなくなった (= startup
+   block 自体が無い)。background task は `handles` に積んで shutdown で await する
+   (github refresh task と同じ扱い)。
 
 ## Alternatives Considered
 
@@ -149,16 +197,17 @@ let _tasks = listeners_result.map_err(...)?;
 - 完了時に `cache-warden: discovery completed in <duration> (<n> sources, <m> keys)` を 1 行
 - = startup hang の可視化 (kawaz が「何で待っているか」がログから即わかる)
 
-## Open Questions (Phase 2 用)
+## Resolved Questions
 
-- **Q1**: Phase 2 (`discover_keys` を lazy + background refresh) は **Provider 再設計と一体化** で進めるべきか、独立して先行するか
-  - Provider 再設計 (`docs/issue/2026-06-14-ssh-agent-provider-architecture.md`) は idea 段階、DR 化前
-  - Phase 1 で応答性問題は十分緩和されるので、Phase 2 は Provider 再設計の DR 化を待つ判断
-- **Q2**: `register_definitions` の eager preload (= `[kv.*].preload = true` で起動時 fetch する KV エントリ) も同じ blocking pool 化を本 DR で扱うか
-  - **本 DR で同時対応**: 同じ「sync op CLI を startup で叩く」構造、一緒に直すのが筋
-- **Q3**: blocking pool に乗せた task が `Command::output()` でハングした場合、`spawn_blocking` の handle を `abort` しても std::process は止まらない (= macOS の prctl 系がない、子プロセス kill が別途必要)
-  - 本 DR では handle abort は試みず、watchdog (DR-0021) に bounded-exit を委ねる
-  - 子プロセス kill を入れるなら `tokio::process::Command` への移行が筋良い (= Phase 2 で検討)
+- **Q1** (Phase 2 は Provider 再設計と一体か独立か): **独立して先行**で解決。DR-0026 の
+  cache→`DiscoveredKey` 変換を seed に転用でき、Provider 再設計 (idea 段階) を待つ必要が
+  なかった。Provider 再設計が入る際は seed / background 経路をその抽象に載せ替えればよい。
+- **Q2** (`register_definitions` eager preload も blocking pool 化するか): Phase 1 で
+  **同時対応済み**。
+- **Q3** (`spawn_blocking` の op がハングしたら handle abort では止まらない): Phase 2 でも
+  同じ判断。background discovery task は shutdown で select 抜けするが、`spawn_blocking`
+  上の `op` 子プロセスは detach したまま残り、process exit で刈られる (watchdog / OS)。
+  子プロセス kill が要るなら `tokio::process::Command` 移行が筋 (= 将来の別作業)。
 
 ## Related
 

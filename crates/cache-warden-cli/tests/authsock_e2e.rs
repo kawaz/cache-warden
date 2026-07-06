@@ -81,6 +81,26 @@ fn ssh_add_list(socket: &Path) -> (bool, String) {
     (out.status.success(), s)
 }
 
+/// Poll `ssh-add -l` until its combined output contains `needle` (or `timeout`
+/// elapses), returning the last listing seen.
+///
+/// DR-0023 Phase 2 binds the agent socket **before** op discovery runs, so a
+/// discovered op key appears asynchronously once the background discovery
+/// completes. Tests that assert an op key enumerates therefore wait for eventual
+/// enumeration rather than assuming it is present on the first list. (A local
+/// `keys` PEM is resident at bind time and needs no polling — this helper is for
+/// the op-`source` discovery path.)
+fn wait_for_ssh_add_contains(socket: &Path, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (_ok, listing) = ssh_add_list(socket);
+        if listing.contains(needle) || Instant::now() >= deadline {
+            return listing;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 // ---- minimal SSH agent wire helpers (no dependency on the crate internals) ----
 
 fn put_string(buf: &mut Vec<u8>, bytes: &[u8]) {
@@ -842,6 +862,12 @@ fn op_source_config(sock_path: &Path, soft_ttl: &str, hard_ttl: &str, auth_false
 /// The whole op path: discovery enumerates the 1Password key (fake `op`), it
 /// shows in `ssh-add -l`, and the first SIGN_REQUEST lazily fetches the private
 /// key via `op item get` and produces a verifiable signature.
+///
+/// Also covers DR-0023 Phase 2 case `(c) background discovery 完了後に registry
+/// が更新される`: the cache starts empty, so the socket binds with zero op keys
+/// and the key only appears **after** the background discovery runs — which is
+/// exactly what the `wait_for_ssh_add_contains` poll below observes (an
+/// immediate list would show nothing).
 #[test]
 fn op_source_discovers_key_and_signs_lazily() {
     let dir = tempfile::tempdir().unwrap();
@@ -880,11 +906,12 @@ fn op_source_discovers_key_and_signs_lazily() {
     wait_for_socket(&agent_sock);
 
     // (1) The discovered op key shows in ssh-add -l with its item title comment.
-    let (ok, listing) = ssh_add_list(&agent_sock);
-    assert!(ok, "ssh-add -l failed: {listing}");
+    //     DR-0023 Phase 2: the socket binds before discovery runs, so the key
+    //     enumerates once the background discovery completes — poll for it.
+    let listing = wait_for_ssh_add_contains(&agent_sock, "e2e op key", Duration::from_secs(10));
     assert!(
         listing.contains("e2e op key"),
-        "op key should enumerate with its title comment, got: {listing}"
+        "op key should enumerate with its title comment once discovery completes, got: {listing}"
     );
 
     // (2) First SIGN_REQUEST lazily fetches the private key (op item get) and
@@ -948,11 +975,11 @@ fn op_source_sign_with_denied_auth_is_failure() {
 
     // The key still enumerates (public discovery is auth-free). Its comment is
     // the op item *title* ("e2e op key"), not the ssh-keygen file comment.
-    let (ok, listing) = ssh_add_list(&agent_sock);
-    assert!(ok, "ssh-add -l failed: {listing}");
+    // DR-0023 Phase 2: enumeration is populated by background discovery — poll.
+    let listing = wait_for_ssh_add_contains(&agent_sock, "e2e op key", Duration::from_secs(10));
     assert!(
         listing.contains("e2e op key"),
-        "op key should enumerate before the denied sign, got: {listing}"
+        "op key should enumerate before the denied sign once discovery completes, got: {listing}"
     );
 
     // ...but the lazy load's re-auth is denied, so the sign fails cleanly.
@@ -1138,4 +1165,338 @@ fn disallowed_process_is_refused_and_hides_keys() {
         "a disallowed caller must not be able to sign"
     );
     assert!(sign_payload.is_empty(), "FAILURE must carry no detail");
+}
+
+// ---- DR-0023 Phase 2: listener binds before discovery + disk-cache seed ----
+
+/// Write a fake `op` CLI that **hangs** on every call (`sleep`), emulating a
+/// launchd-context daemon whose biometric authorization never reaches the GUI
+/// session — `op item list` never returns and is eventually wall-clock-killed by
+/// the daemon's op timeout. Used to prove the agent socket still binds and serves
+/// the disk-cache seed while discovery is stuck (DR-0023 Phase 2, P1 fix).
+fn write_hanging_op(bin_dir: &Path) {
+    let op_path = bin_dir.join("op");
+    // 300s ≫ the daemon's op wall-clock cap and the test's own timeouts, so the
+    // op child is provably still running while the socket serves the seed.
+    std::fs::write(&op_path, "#!/bin/sh\nsleep 300\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&op_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Pre-seed the op public-key disk cache (`$XDG_CACHE_HOME/cache-warden/op_map.json`)
+/// with one provenance-stamped key, as a prior successful discovery would have
+/// left it. `provenance.account = null` marks it as discovered under the op CLI
+/// **default** account (a *known* provenance, DR-0026) — so a default-account
+/// source (no `op_account`) can seed from it. `pub_line` must be a real OpenSSH
+/// public key (the registry parses it at bind time).
+fn write_op_cache(
+    cache_home: &Path,
+    item_id: &str,
+    fingerprint: &str,
+    pub_line: &str,
+    title: &str,
+) {
+    let dir = cache_home.join("cache-warden");
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = serde_json::json!({
+        "version": 1,
+        "keys": [{
+            "item_id": item_id,
+            "fingerprint": fingerprint,
+            "public_key": pub_line,
+            "title": title,
+            "vault": "Private",
+            "provenance": { "account": null }
+        }]
+    });
+    std::fs::write(
+        dir.join("op_map.json"),
+        serde_json::to_string_pretty(&json).unwrap(),
+    )
+    .unwrap();
+}
+
+/// DR-0023 Phase 2 cases `(a)` + `(b)`: with a fake `op` that hangs on `item
+/// list`, the agent socket still **binds immediately** and enumerates the key
+/// recovered from the **disk-cache seed** — no `op` call is needed for the public
+/// half. Before Phase 2 the listener was not bound until discovery returned, so a
+/// hung `op` left the socket absent entirely (the P1 dogfood-critical symptom of
+/// issue 2026-06-13). This test binds despite the hang and lists the seeded key.
+#[test]
+fn op_listener_binds_and_serves_cache_seed_while_op_hangs() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cache = dir.path().join("cache"); // isolated XDG_CACHE_HOME
+
+    // A real key whose public half is pre-seeded into the disk cache.
+    let key_path = dir.path().join("seed_key");
+    let pub_line = ssh_keygen_ed25519(&key_path, "seed-op-key");
+    let fp = ssh_fingerprint(&key_path.with_extension("pub"));
+    write_op_cache(&cache, "seeditem1", &fp, &pub_line, "seeded op key");
+
+    // A fake op that never returns for `item list` (background discovery stays
+    // stuck): the socket must still come up from the seed.
+    write_hanging_op(&bin);
+
+    let agent_sock = dir.path().join("agent.sock");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        op_source_config(&agent_sock, "1h", "24h", false),
+    )
+    .unwrap();
+
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_os = std::ffi::OsString::from(bin.as_os_str());
+    path_os.push(":");
+    path_os.push(&inherited);
+
+    let (_daemon, _control) = spawn_daemon_with_env(
+        dir.path(),
+        &config_path,
+        &[
+            ("PATH", path_os.as_os_str()),
+            ("XDG_CACHE_HOME", cache.as_os_str()),
+        ],
+    );
+
+    // (a) The socket is reachable quickly even though op is hung — bind now
+    //     precedes discovery. `wait_for_socket` panics if it never binds in 10s
+    //     (on pre-Phase-2 code it would not bind until the op timeout).
+    wait_for_socket(&agent_sock);
+
+    // (b) The seeded key enumerates from the disk cache with no live op call.
+    let (ok, listing) = ssh_add_list(&agent_sock);
+    assert!(
+        ok,
+        "ssh-add -l should list the disk-cache-seeded key while op hangs, got: {listing}"
+    );
+    assert!(
+        listing.contains("seeded op key"),
+        "the seeded key must enumerate from the cache before discovery completes, got: {listing}"
+    );
+}
+
+/// DR-0023 Phase 2 case `(d)`: while background op discovery is stuck on a hung
+/// `op`, a SIGTERM still shuts the daemon down promptly. The socket bound from
+/// the seed, and the background discovery is select-able with the shutdown
+/// channel, so the stop signal is honoured at once — far inside `op`'s wall-clock
+/// timeout (and inside the daemon's shutdown watchdog window).
+#[test]
+fn op_discovery_hang_still_shuts_down_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cache = dir.path().join("cache");
+
+    let key_path = dir.path().join("seed_key");
+    let pub_line = ssh_keygen_ed25519(&key_path, "seed-op-key");
+    let fp = ssh_fingerprint(&key_path.with_extension("pub"));
+    write_op_cache(&cache, "seeditem1", &fp, &pub_line, "seeded op key");
+    write_hanging_op(&bin);
+
+    let agent_sock = dir.path().join("agent.sock");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        op_source_config(&agent_sock, "1h", "24h", false),
+    )
+    .unwrap();
+
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_os = std::ffi::OsString::from(bin.as_os_str());
+    path_os.push(":");
+    path_os.push(&inherited);
+
+    let (mut daemon, control) = spawn_daemon_with_env(
+        dir.path(),
+        &config_path,
+        &[
+            ("PATH", path_os.as_os_str()),
+            ("XDG_CACHE_HOME", cache.as_os_str()),
+        ],
+    );
+    // The socket binds despite the hung op (Phase 2); now stop the daemon.
+    wait_for_socket(&agent_sock);
+
+    let pid = daemon.child.id();
+    let t0 = Instant::now();
+    // SAFETY: kill(2) with a real pid + SIGTERM; no memory is touched.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+
+    // The daemon must exit well within op's 300s hang. A generous 8s budget
+    // covers a loaded CI runner while still proving we do not wait on op.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match daemon.child.try_wait().expect("wait daemon") {
+            Some(_status) => break,
+            None => {
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon did not exit within 8s of SIGTERM despite a hung op discovery \
+                     (shutdown responsiveness regressed)"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "SIGTERM-to-exit took {elapsed:?} with a hung op (expected sub-second graceful shutdown)"
+    );
+    // A graceful (not SIGKILL) shutdown removes the control socket file.
+    assert!(
+        !control.exists(),
+        "graceful shutdown must remove the control socket even with a hung op discovery"
+    );
+}
+
+// ---- DR-0023 Phase 2: per-source background apply (multi-source) ----
+
+/// Write a fake `op` that serves the `up` account's single SSH key but makes the
+/// `down` account's `op item list` fail (exit 1) on every call — emulating a
+/// second 1Password account that is not signed in / permanently unreachable. The
+/// daemon passes `--account <acct>` on every call, so the script branches on it.
+fn write_two_account_fake_op(
+    bin_dir: &Path,
+    up_account: &str,
+    down_account: &str,
+    item_id: &str,
+    fingerprint: &str,
+    pub_line: &str,
+) {
+    let op_path = bin_dir.join("op");
+    let script = format!(
+        r#"#!/bin/sh
+# fake op CLI: `{up_account}` is signed in, `{down_account}` is not.
+args="$*"
+case "$args" in
+  *"{down_account}"*)
+    echo "fake op: account {down_account} is not signed in" >&2
+    exit 1
+    ;;
+esac
+case "$args" in
+  *"item list"*)
+    cat <<JSON
+[
+  {{"id":"{item_id}","title":"source A key","vault":{{"id":"v1","name":"Private"}},
+   "category":"SSH_KEY","additional_information":"{fingerprint}"}}
+]
+JSON
+    ;;
+  *"item get"*"public_key"*)
+    printf '{{"id":"public_key","type":"STRING","value":"%s"}}' "{pub_line}"
+    ;;
+  *)
+    echo "fake op: unhandled args: $args" >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+    std::fs::write(&op_path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&op_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// DR-0023 Phase 2 per-source apply: with **two** op sources — one signed in
+/// (`up`), one permanently unreachable (`down`) — the healthy source's key still
+/// enumerates via background discovery. This is the regression the old
+/// all-or-nothing `all_fresh` gate caused: because the `down` source's `op item
+/// list` never succeeds, the whole registry swap was withheld and the `up`
+/// source's socket served ZERO keys forever (on a cold cache). The fix applies
+/// each source the moment it enumerates live, so `up` is served while `down` is
+/// retried in the background.
+#[test]
+fn healthy_op_source_serves_while_sibling_source_permanently_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cache = dir.path().join("cache"); // isolated, cold XDG_CACHE_HOME
+
+    // The healthy source's key.
+    let key_path = dir.path().join("up_key");
+    let pub_line = ssh_keygen_ed25519(&key_path, "source-a-key");
+    let fp = ssh_fingerprint(&key_path.with_extension("pub"));
+
+    write_two_account_fake_op(&bin, "acct-up", "acct-down", "upitem1", &fp, &pub_line);
+
+    let sock_up = dir.path().join("agent_up.sock");
+    let sock_down = dir.path().join("agent_down.sock");
+    let config_path = dir.path().join("config.toml");
+    let config = format!(
+        "[authsock.sources.up]\n\
+         kind = \"op\"\n\
+         op_account = \"acct-up\"\n\
+         soft-ttl = \"1h\"\n\
+         hard-ttl = \"24h\"\n\n\
+         [authsock.sources.down]\n\
+         kind = \"op\"\n\
+         op_account = \"acct-down\"\n\
+         soft-ttl = \"1h\"\n\
+         hard-ttl = \"24h\"\n\n\
+         [authsock.sockets.up]\n\
+         path = \"{}\"\n\
+         source = \"up\"\n\n\
+         [authsock.sockets.down]\n\
+         path = \"{}\"\n\
+         source = \"down\"\n",
+        sock_up.display(),
+        sock_down.display(),
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut path_os = std::ffi::OsString::from(bin.as_os_str());
+    path_os.push(":");
+    path_os.push(&inherited);
+
+    let (_daemon, control) = spawn_daemon_with_env(
+        dir.path(),
+        &config_path,
+        &[
+            ("PATH", path_os.as_os_str()),
+            ("XDG_CACHE_HOME", cache.as_os_str()),
+        ],
+    );
+
+    // Both sockets bind immediately (Phase 2), even though the `down` source's op
+    // never succeeds.
+    wait_for_socket(&sock_up);
+    wait_for_socket(&sock_down);
+
+    // The healthy source's key enumerates via per-source background apply — this
+    // is the assertion that fails under the old all-or-nothing gate (the `down`
+    // source would hold `up` hostage and this socket would list nothing).
+    let listing = wait_for_ssh_add_contains(&sock_up, "source A key", Duration::from_secs(10));
+    assert!(
+        listing.contains("source A key"),
+        "the signed-in source's key must enumerate even while a sibling source is \
+         permanently down, got: {listing}"
+    );
+
+    // The permanently-down source serves nothing (cold cache, no live discovery).
+    // `ssh-add -l` exits non-zero on an empty agent ("The agent has no
+    // identities"), which is the clean empty answer — the socket is bound (the
+    // connection succeeded) and simply lists no key, and never the up source's.
+    let (_ok, down_listing) = ssh_add_list(&sock_down);
+    assert!(
+        !down_listing.contains("source A key"),
+        "the down source must not serve the up source's key: {down_listing}"
+    );
+
+    // The daemon is healthy (control socket live) despite the background retry loop
+    // still running for the down source.
+    assert!(control.exists(), "control socket stays bound");
 }

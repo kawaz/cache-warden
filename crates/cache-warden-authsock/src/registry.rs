@@ -68,7 +68,11 @@ pub struct RegisteredKey {
 /// Lookups during SIGN_REQUEST are by the exact key blob the client sends, so
 /// the map is keyed on the raw blob bytes. Insertion order is irrelevant;
 /// `BTreeMap` keeps enumeration deterministic for stable `ssh-add -l` output.
-#[derive(Debug, Default)]
+///
+/// `Clone` supports the DR-0023 Phase 2 background-discovery refresh: the
+/// immutable base (local `keys`) is cloned and the freshly discovered op keys
+/// are layered on top, then the result is swapped into the live registry.
+#[derive(Debug, Default, Clone)]
 pub struct PublicKeyRegistry {
     by_blob: BTreeMap<Vec<u8>, RegisteredKey>,
 }

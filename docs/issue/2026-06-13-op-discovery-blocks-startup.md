@@ -107,3 +107,34 @@ DR-0022 backoff 検証のため fg daemon (= terminal 経由起動、UI session 
   DR-0019 register フローでの session type 調整 (要実機検証)
 
 P1 が残るため issue は open 継続。
+
+## 2026-07-06 P1 解消 (DR-0023 Phase 2: listener 先行 bind + background discovery)
+
+P1 (= `spawn_listeners` が discovery await 後のため op hang 時に listener 起動が
+最大 30s 遅延、最悪 launchd context では永久に bind されない) を解消した:
+
+- **`run()` は discovery を待たず listener を即 bind**。初期 registry は disk cache
+  からの seed (`authsock::seed_all_sources_from_cache` → `seed_from_cache`、= P2 で
+  入れた `fallback_from_cache` と同一変換・同一境界規則)。cold first-start は seed 空
+  で bind (= それでも「listener 不在」より改善)。
+- **background discovery** (`authsock::op_discovery_refresh`) が blocking pool で
+  discovery を回し、**source 単位**で live 成功したものから各 socket の registry を
+  hot-swap (1 source の恒久失敗が健全な source の適用を塞がない)。registry は
+  `Arc<RwLock<PublicKeyRegistry>>` 化し、immutable local base + fresh op keys で
+  rebuild。disk cache への保存も source 単位 merge (`merge_source_cache`、兄弟
+  source の entry を clobber しない)。
+- **失敗時 retry** は task-level exponential backoff (2s→…→60s cap)、source 単位で
+  初回成功まで retry・解決済み source は再 discovery しない (= launchd の永久 hang
+  でも tight loop にならず seed serving 継続)。全 wait は shutdown channel と select
+  可能 (discovery hang 中でも SIGTERM 即応)。
+- 実装: `server.rs::run` / `authsock.rs` (`seed_all_sources_from_cache` /
+  `spawn_listeners` (→ `ListenerSet` / `DiscoveryTarget`) / `op_discovery_refresh` /
+  `apply_discovery` / `op_registry_from` / `next_backoff`)。判断記録は DR-0023 Phase 2。
+- テスト: e2e `op_listener_binds_and_serves_cache_seed_while_op_hangs` (hang op でも
+  bind + seed 列挙) / `op_discovery_hang_still_shuts_down_promptly` (hang 中 SIGTERM
+  即応)、unit `op_registry_from_*` / `next_backoff_*` / `seed_from_cache_*`。
+
+**P3 (launchd context の biometric 到達不能) は残存**。これはコード外の構造制約で、
+lazy 化しても初回 sign の op fetch は同条件 (= ssh-agent-provider-architecture か
+DR-0019 register フローの session type 調整が本筋、要実機検証)。P3 が残るため issue は
+open 継続。
