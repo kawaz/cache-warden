@@ -241,12 +241,34 @@ pub fn validate_cli_key(key: &str, verb: &str) -> Result<(), String> {
 /// The `authsock` namespace holds adapter-internal op keys the daemon composes
 /// itself; a user's `kv set` / `kv define` into it is refused here so the error
 /// is friendly and early (the daemon's wire handler is the backstop that also
-/// catches a raw request). Only write verbs are gated — read/lifecycle verbs
-/// (`get` / `del` / `pin` / `unpin`) are out of this bouncer's scope.
+/// catches a raw request). This gates only the write verbs; the read verb `get`
+/// has its own confidentiality gate ([`reject_reserved_read_namespace`]). The
+/// lifecycle verbs (`del` / `pin` / `unpin`) stay ungated — they reveal no value,
+/// and `del` in particular is allowed so a rotation can drop a stale op key.
 pub fn reject_reserved_write_namespace(ns: &str, verb: &str) -> Result<(), String> {
     if crate::namespace::is_reserved_namespace(ns) {
         return Err(format!(
             "`kv {verb}` cannot target the reserved namespace {ns:?} (DR-0018); \
+             it holds daemon-internal keys"
+        ));
+    }
+    Ok(())
+}
+
+/// Reject `kv get` targeting a reserved namespace (DR-0018 §4.5, confidentiality
+/// axis).
+///
+/// Symmetric to [`reject_reserved_write_namespace`]: the `authsock` namespace
+/// holds op private-key PEM (`authsock/op_*`) served only over the SSH agent
+/// protocol for SIGN, so revealing it via `kv get` is refused. Reported as an
+/// explicit error (not existence-hiding) to match the write bouncer's shape, and
+/// early/friendly at the CLI with the daemon's wire gate as the backstop. `del` /
+/// `pin` / `unpin` are out of scope (they reveal no value; `del` stays allowed
+/// for rotation).
+pub fn reject_reserved_read_namespace(ns: &str) -> Result<(), String> {
+    if crate::namespace::is_reserved_namespace(ns) {
+        return Err(format!(
+            "`kv get` cannot target the reserved namespace {ns:?} (DR-0018); \
              it holds daemon-internal keys"
         ));
     }
@@ -756,6 +778,11 @@ pub fn parse_kv_single_key(verb: &str, args: &[String], ns: &str) -> Result<Requ
         return Err(format!("kv {verb} requires exactly one KEY"));
     }
     validate_cli_key(positional[0], verb)?;
+    // `get` is confidentiality-gated on the reserved namespace (DR-0018 §4.5);
+    // `unpin` is a lifecycle verb that reveals no value, so it is not gated.
+    if verb == "get" {
+        reject_reserved_read_namespace(ns)?;
+    }
     let key = crate::namespace::compose(ns, positional[0]);
     match verb {
         "get" => Ok(Request::KvGet {
@@ -1202,6 +1229,41 @@ mod tests {
         // The bouncer is reservation-specific: an ordinary namespace still works.
         assert!(parse_kv_set(&s(&["K", "v"]), "default", false, no_stdin).is_ok());
         assert!(parse_kv_define(&s(&["K", "--source", "op://v/i/f"]), "projA").is_ok());
+    }
+
+    #[test]
+    fn kv_get_from_reserved_authsock_namespace_is_rejected() {
+        // Confidentiality symmetry (DR-0018 §4.5): `--namespace authsock` on `get`
+        // is refused at the CLI with a steer, before any request is built — the op
+        // private-key PEM is never requested over the wire.
+        let err = parse_kv_single_key("get", &s(&["K"]), "authsock").unwrap_err();
+        assert!(err.contains("reserved"), "must name the reservation: {err}");
+        assert!(err.contains("authsock"), "must name the namespace: {err}");
+    }
+
+    #[test]
+    fn kv_get_from_ordinary_namespace_is_fine() {
+        // Reservation-specific: an ordinary namespace still resolves a get request.
+        assert!(parse_kv_single_key("get", &s(&["K"]), "default").is_ok());
+    }
+
+    #[test]
+    fn kv_del_from_reserved_authsock_namespace_is_allowed() {
+        // Availability/rotation axis, distinct from confidentiality: `del` is not
+        // gated on the reserved namespace, so a rotation can drop a stale op key.
+        // The request is built normally.
+        let req = parse_kv_del(&s(&["K"]), "authsock").unwrap();
+        match req {
+            Request::KvDel { key, .. } => assert_eq!(key, "authsock/K"),
+            other => panic!("expected KvDel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_unpin_from_reserved_authsock_namespace_is_not_gated() {
+        // `unpin` is a lifecycle verb that reveals no value, so it shares the
+        // read-gate exemption with `del`: it resolves normally on the reserved ns.
+        assert!(parse_kv_single_key("unpin", &s(&["K"]), "authsock").is_ok());
     }
 
     #[test]

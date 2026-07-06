@@ -263,6 +263,30 @@ fn reject_reserved_namespace_write(key: &str) -> Result<(), Response> {
     }
 }
 
+/// Reject a `kv.get` targeting a reserved namespace (DR-0018 §4.5, confidentiality
+/// axis).
+///
+/// Symmetric to [`reject_reserved_namespace_write`]: the `authsock` namespace
+/// holds op private-key PEM (`authsock/op_*`) the daemon composes itself and
+/// serves only over the SSH agent protocol for SIGN. No legitimate wire path
+/// reveals that PEM, so an external `kv.get` into the reserved namespace is
+/// refused with the same explicit `BadRequest` as writes — interface symmetry
+/// over existence-hiding, since the write bouncer already names the reservation.
+///
+/// Splits on the raw first `/` (not [`crate::namespace::split_composed`]) so the
+/// namespace is caught even if the KEY segment is not a valid identifier: unlike
+/// the write path, `kv.get` has no prior [`validate_protocol_key`] gate, so an
+/// arbitrary caller-supplied key must be classified by its namespace alone.
+fn reject_reserved_namespace_read(key: &str) -> Result<(), Response> {
+    match key.split_once('/') {
+        Some((ns, _)) if crate::namespace::is_reserved_namespace(ns) => Err(Response::error(
+            ErrorKind::BadRequest,
+            format!("namespace {ns:?} is reserved and cannot be read (DR-0018)"),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn handle_set<A, R, C>(
     store: &mut Store,
     ctx: &HandlerCtx<'_, A, R, C>,
@@ -396,6 +420,14 @@ where
     R: SourceRunner,
     C: Clock,
 {
+    // Reserved-namespace confidentiality gate (DR-0018 §4.5), applied *first* —
+    // before the process-access gate and the retrieval chain — so a reserved key
+    // is refused without ever running its source (no op private-key fetch, no
+    // PEM). Symmetric to the write bouncer in `handle_set` / `handle_define`.
+    if let Err(resp) = reject_reserved_namespace_read(&key) {
+        return resp;
+    }
+
     // Key-level process-access gate (DR-0012 key layer). Applied *before* the
     // retrieval chain so a denied requester never triggers the source command or
     // a re-auth prompt. A key with no policy entry is unrestricted (the common
@@ -984,6 +1016,13 @@ mod tests {
         }
     }
 
+    fn err_msg(resp: &Response) -> String {
+        match resp {
+            Response::Err(e) => e.error.message.clone(),
+            Response::Ok(_) => panic!("expected error, got ok"),
+        }
+    }
+
     #[test]
     fn ping_returns_pong() {
         let clock = FakeClock::new();
@@ -1243,6 +1282,195 @@ mod tests {
         };
         assert!(handle_request(&mut store, &c, req).is_ok());
         assert!(store.has_value("default/authsock"));
+    }
+
+    #[test]
+    fn wire_get_into_reserved_authsock_namespace_is_bad_request() {
+        // Confidentiality symmetry to the write bouncer (DR-0018 §4.5): the
+        // `authsock` namespace holds op private-key PEM the daemon composes and
+        // serves only over the SSH agent SIGN path. Even a value already resident
+        // there (seeded directly here, as the daemon's own op composition does)
+        // must never be revealed over a wire `kv.get`. The refusal is an explicit
+        // BadRequest matching the write bouncer's shape (interface symmetry over
+        // existence-hiding), and it names the reservation so the caller sees why.
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        let ttl = Ttl::new(
+            Some(Duration::from_secs(SOFT)),
+            Some(Duration::from_secs(HARD)),
+        )
+        .unwrap();
+        store
+            .set(
+                "authsock/op_itemABC",
+                ValueSource::Static,
+                SecretBytes::new(b"PEM".to_vec()),
+                ttl,
+                &cap,
+                &clock,
+            )
+            .unwrap();
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "authsock/op_itemABC".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+        let msg = err_msg(&resp);
+        assert!(msg.contains("reserved"), "must name the reservation: {msg}");
+        assert!(msg.contains("authsock"), "must name the namespace: {msg}");
+    }
+
+    #[test]
+    fn wire_get_reserved_namespace_does_not_run_the_source() {
+        // The gate sits *before* the retrieval chain, so a definition-backed
+        // reserved key is refused without ever running its source command — the op
+        // private-key fetch (and thus the PEM) never happens. Proven by the
+        // runner's run count staying at zero. The definition is registered
+        // directly (the daemon's internal path), bypassing the write bouncer a
+        // wire `kv.define` would hit.
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"PEM");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        let ttl = Ttl::new(None, None).unwrap();
+        store
+            .define(
+                "authsock/op_itemABC",
+                ValueSource::command(vec!["echo".into(), "PEM".into()]),
+                ttl,
+            )
+            .unwrap();
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "authsock/op_itemABC".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+        assert_eq!(runner.runs(), 0, "reserved get must not run the source");
+    }
+
+    #[test]
+    fn wire_get_non_reserved_namespace_still_reads() {
+        // Namespace-specific: the reserved *word* as an ordinary KEY is fine.
+        // `default/authsock` = namespace `default`, key `authsock` — reads as
+        // usual, confirming the gate keys off the namespace, not the substring.
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        let ttl = Ttl::new(
+            Some(Duration::from_secs(SOFT)),
+            Some(Duration::from_secs(HARD)),
+        )
+        .unwrap();
+        store
+            .set(
+                "default/authsock",
+                ValueSource::Static,
+                SecretBytes::new(b"ok".to_vec()),
+                ttl,
+                &cap,
+                &clock,
+            )
+            .unwrap();
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "default/authsock".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(get_value(&resp), b"ok");
+    }
+
+    #[test]
+    fn wire_del_into_reserved_authsock_namespace_still_works() {
+        // Availability/rotation axis — distinct from confidentiality. `kv del` is
+        // *not* gated on the reserved namespace: dropping a resident op key is how
+        // a rotation clears the stale entry, and del reveals no value. A seeded
+        // reserved value is removed successfully. This is the deliberate asymmetry
+        // with the read/write bouncers (get/set/define blocked, del allowed).
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        let ttl = Ttl::new(
+            Some(Duration::from_secs(SOFT)),
+            Some(Duration::from_secs(HARD)),
+        )
+        .unwrap();
+        store
+            .set(
+                "authsock/op_itemABC",
+                ValueSource::Static,
+                SecretBytes::new(b"PEM".to_vec()),
+                ttl,
+                &cap,
+                &clock,
+            )
+            .unwrap();
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvDel {
+                key: "authsock/op_itemABC".into(),
+                with_define: false,
+            },
+        );
+        assert!(resp.is_ok(), "del on reserved ns must succeed (rotation)");
+        assert!(
+            !store.has_value("authsock/op_itemABC"),
+            "reserved value must be removed by del"
+        );
+    }
+
+    #[test]
+    fn wire_list_still_names_reserved_keys() {
+        // `kv.list` is value-free (key names + metadata only, DR-0022 §3), so it is
+        // *not* gated: a reserved key's existence is already discoverable and no
+        // secret leaks. Behavior is unchanged — the reserved key name still appears
+        // in the listing.
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        let ttl = Ttl::new(
+            Some(Duration::from_secs(SOFT)),
+            Some(Duration::from_secs(HARD)),
+        )
+        .unwrap();
+        store
+            .set(
+                "authsock/op_itemABC",
+                ValueSource::Static,
+                SecretBytes::new(b"PEM".to_vec()),
+                ttl,
+                &cap,
+                &clock,
+            )
+            .unwrap();
+        let resp = handle_request(&mut store, &c, Request::KvList);
+        let keys = match &resp {
+            Response::Ok(ok) => match &ok.payload {
+                OkPayload::List { keys, .. } => keys.clone(),
+                other => panic!("expected list payload, got {other:?}"),
+            },
+            Response::Err(e) => panic!("expected list ok, got error: {e:?}"),
+        };
+        assert!(
+            keys.iter().any(|k| k == "authsock/op_itemABC"),
+            "list must still name the reserved key (value-free): {keys:?}"
+        );
     }
 
     #[test]
