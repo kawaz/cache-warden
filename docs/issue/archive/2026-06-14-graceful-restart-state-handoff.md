@@ -1,6 +1,6 @@
 ---
 title: "graceful restart: kv + endpoint fd を引き継いで新バイナリへ（アイデア記録）"
-status: wip
+status: resolved
 category: idea
 created: 2026-06-14T10:08:58+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-07-09T17:40:05+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-09T23:48:02+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0029","implemented","done:Phase 1 実装完了 (bundle1=yrsmsvkk, bundle1-fixup=rmtyxzqx, bundle2=zlwxovoo)","issue/2026-07-09-graceful-restart-phase2-brew-upgrade-integration","issue/2026-07-09-graceful-restart-phase3-listener-fd-inheritance","issue/2026-07-09-graceful-restart-holder-panic-regression-guard"]
 blocked_by:
 origin:
 ---
