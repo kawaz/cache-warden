@@ -1,11 +1,11 @@
 ---
 title: macos-process-inspect crate 切り出し
-status: open
+status: wip
 category: design
 created: 2026-06-22T21:15:48+09:00
 last_read: 2026-07-10T02:38:45+09:00
 open_entered: 2026-06-22T21:15:48+09:00
-wip_entered:
+wip_entered: 2026-07-10T02:41:07+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
