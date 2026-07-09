@@ -105,13 +105,102 @@ on-success-release:
     git -C "$(brew --repository)/Library/Taps/kawaz/homebrew-tap" pull --ff-only
     brew upgrade --cask kawaz/tap/cache-warden
     cache-warden --version
-    # daemon は in-memory に secret を保持するため自動再起動しない (再起動 = cache
-    # クリア = 全鍵 re-auth)。有効化はユーザの明示判断に委ね、案内だけ出す:
-    @echo ""
-    @echo "[note] バイナリを upgrade しました。常駐 daemon が居る場合は旧版のまま稼働中です。"
-    @echo "[note] daemon は in-memory に secret を保持するため自動再起動しません (再起動すると cache が消え再認証が必要)。"
-    @echo "[note] 新バージョンを有効化するなら手動で再起動してください: cache-warden daemon register (idempotent / bootout+bootstrap で再起動)。"
-    @echo "[note] 稼働状態の確認: cache-warden daemon status"
+    just daemon-graceful-restart
+
+# brew upgrade 後に常駐 daemon を in-place で新バイナリへ切り替える (graceful
+# restart)。bin / socket / expected_path は隔離テスト用に位置引数で上書き可能
+# (例: `just daemon-graceful-restart ./target/release/cache-warden
+# /tmp/test.sock ./target/release/cache-warden`)。socket が空なら
+# デフォルトソケットを使う (= `--socket` を付けない)。
+daemon-graceful-restart bin="cache-warden" socket="" expected_path="/Applications/CacheWarden.app/Contents/MacOS/cache-warden":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    bin="{{bin}}"
+    socket="{{socket}}"
+    expected_path="{{expected_path}}"
+
+    # socket 指定は関数で吸収する (空配列 + `set -u` は bash 3.2 でエラーに
+    # なるため、配列展開ではなく分岐で `--socket` を付ける)。CLI の第 1 引数は
+    # コマンド名固定で、`--socket` は残り引数のどこにあっても拾われるので末尾に付ける。
+    cw() {
+        if [ -n "$socket" ]; then
+            "$bin" "$@" --socket "$socket"
+        else
+            "$bin" "$@"
+        fi
+    }
+
+    # 1. daemon 生存確認: ping が失敗するなら daemon は稼働していない
+    #    (= 次回起動時に新しいバイナリが使われるので何もしなくてよい)
+    if ! cw ping >/dev/null 2>&1; then
+        echo "[note] daemon は稼働していないため再起動は不要。次回起動時に新しいバイナリが使われます。"
+        exit 0
+    fi
+
+    # 2. restart 前の状態取得 (pid / version / entries 件数)
+    status_before="$(cw status)"
+    pid_before="$(echo "$status_before" | sed -nE 's/^daemon: .* \(pid ([0-9]+)\)$/\1/p')"
+    version_before="$(echo "$status_before" | sed -nE 's/^daemon: [^ ]+ ([^ ]+) \(pid [0-9]+\)$/\1/p')"
+    entries_before="$(echo "$status_before" | grep -c '^  ' || true)"
+
+    if [ -z "$pid_before" ]; then
+        echo "[warn] daemon status から pid を取得できませんでした。手動確認してください: cache-warden daemon status"
+        exit 0
+    fi
+
+    # 3. バイナリパス一致判定
+    #    lsof の txt (= 実行イメージ) から絶対パスを取る。ps -o comm= は
+    #    argv[0] や短縮名を返すことがあり不確実なため lsof 経路にする。
+    #    `-F n` のフィールド出力なら空白を含むパスでも壊れない (awk の
+    #    $NF 抽出はパス中の空白で切れる)。最初の txt = 実行バイナリ本体。
+    actual_path="$(lsof -a -p "$pid_before" -d txt -F n 2>/dev/null | sed -n 's/^n//p' | head -1)"
+    if [ "$actual_path" != "$expected_path" ]; then
+        echo "[warn] daemon は想定外のバイナリ (${actual_path:-不明}) で稼働中。graceful restart しても brew で更新したバイナリには切り替わらないためスキップします。手動確認してください。"
+        exit 0
+    fi
+
+    # 4. restart 実行 (拒否 = 旧バージョン daemon が稼働継続、fallback は手動介入)
+    if ! cw daemon restart --graceful; then
+        echo "[warn] graceful restart が拒否されました: 旧バージョンの daemon が稼働継続しています。手動で再起動してください: cache-warden daemon register"
+        exit 0
+    fi
+
+    # 5. 復帰待ち: in-place exec の完了は外部プロセスの状態遷移なので polling でしか
+    #    観測できない。0.2 秒間隔・最大 10 秒の bounded poll。
+    ready=0
+    for _ in $(seq 1 50); do
+        if cw ping >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
+        sleep 0.2
+    done
+    if [ "$ready" -ne 1 ]; then
+        echo "[error] daemon が復帰しません。状態確認: cache-warden daemon status"
+        exit 1
+    fi
+
+    # 6. restart 後の検証
+    status_after="$(cw status)"
+    pid_after="$(echo "$status_after" | sed -nE 's/^daemon: .* \(pid ([0-9]+)\)$/\1/p')"
+    version_after="$(echo "$status_after" | sed -nE 's/^daemon: [^ ]+ ([^ ]+) \(pid [0-9]+\)$/\1/p')"
+    entries_after="$(echo "$status_after" | grep -c '^  ' || true)"
+
+    if [ -z "$pid_after" ]; then
+        echo "[warn] restart 後の daemon status から pid を取得できず、状態保持を検証できませんでした。手動確認してください: cache-warden daemon status"
+        exit 0
+    fi
+
+    if [ "$pid_after" = "$pid_before" ]; then
+        echo "[note] graceful restart 完了: pid ${pid_after} 維持, ${version_before} -> ${version_after}, entries ${entries_before} -> ${entries_after} 件保持"
+    else
+        echo "[warn] pid が変わりました (cold start 退化, ${pid_before} -> ${pid_after})。in-memory cache は失われ再認証が必要です。"
+    fi
+
+    if [ "$entries_after" -lt "$entries_before" ]; then
+        echo "[warn] entries 件数が減りました (${entries_before} -> ${entries_after})。手動確認してください: cache-warden status"
+    fi
 
 # ---------- utility ----------
 
