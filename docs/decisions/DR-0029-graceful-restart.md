@@ -65,7 +65,7 @@ launchd 管理下の daemon (PID=P, 旧バイナリ)
   │                             3. 自分の socketpair end 以外の fd を全 close
   │                                (belt-and-suspenders; ② で listener は閉鎖済)
   │                             以降は write / read / explicit_bzero / _exit のみ
-  │ ⑥ exec 対象を検証 (§3) して execve(自 plist の ProgramArguments[0])
+  │ ⑥ exec 対象を検証 (§3: 起動時記録の自パス固定 + 署名の自己一致) → execve
   ▼
 launchd 管理下の daemon (PID=P のまま, 新バイナリ)
   │ ⑦ 継承 fd (env `CACHE_WARDEN_HANDOFF_FD` で番号通知) から state を受領 (§2)
@@ -157,13 +157,24 @@ COMMIT  = 1 frame (new → holder、全受領 + bind 完了後)
 
 ### 3. exec 対象の検証 (詰めどころ a の一部、§2-3 の macOS 適合)
 
-- exec するパスは **plist に焼いた ProgramArguments[0]** (= stable-which の
-  durable 判定を通ったパス、DR-0019 §2.5)。cwd 相対や PATH 探索はしない
+- **exec するパスは「起動時に記録した自身の実行パス (current_exe)」に固定**する。
+  plist の再読みや PATH 探索はしない — 「稼働中バイナリと同一パス」を検証項目
+  ではなく構造で保証する (brew upgrade はパス据え置きで実体を入れ替えるため、
+  同一パスの exec が新バイナリを正しく拾う。plist 改変で別パスへ誘導される
+  経路も同時に塞がる)。パスが消えている場合は中止
+- **署名は自己一致検証**: 候補バイナリの codesign identity (TeamID + signing
+  identifier) が**実行中の自分自身のものと一致**することを要求する。期待値の
+  ハードコードや設定より強く、「署名済み upgrade を信頼するなら後継も信頼」
+  (issue §2 の trust 整理) をそのまま機械化した形。判定は fail-closed:
+  - 自分が署名済み → 候補も同一 identity 必須。不一致 / 未署名は中止
+  - 自分が未署名 (dev build) → identity 比較は不能。owner (自 uid) +
+    非 world-writable + 同一パスのみ確認し、**警告を出して続行** (DR-0019 §2.5
+    の「開発をブロックしない」と同じ倒し方。dev 経路のリスクは開発者自身に
+    閉じる)
 - macOS に fexecve は無いため「open した fd を検証してそのまま exec」は不可。
-  代替: execve 前に codesign 検証 (TeamID 一致) + owner/perms 確認 → execve。
-  TOCTOU は残るが、**macOS はカーネルが exec 時に codesign を再強制**するため
-  bounded (issue §2-3 の許容判断のまま)。Linux は owner/perms (+将来 hash pin)
-  で代替
+  検証 → execve の TOCTOU は残るが、**macOS はカーネルが exec 時に codesign を
+  再強制**するため bounded (issue §2-3 の許容判断のまま)。Linux は codesign が
+  無いため owner/perms + 同一パス (+将来 hash pin) で代替
 - 検証失敗時は handoff を中止して現行プロセスが serve 継続 (listener close 前に
   検証を行う順序にすれば完全無害。実装では ① 直後 = ② の前に検証する)
 
