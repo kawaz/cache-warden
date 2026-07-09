@@ -30,6 +30,9 @@
   バイナリパスを確認した上で `daemon restart --graceful` を自動実行し、pid 同一 + entries
   保持を検証して報告。失敗系は手動介入案内に退化。— justfile `daemon-graceful-restart`
   recipe、issue archive `2026-07-09-graceful-restart-phase2-brew-upgrade-integration`
+- **holder 非 panic 規律の regression 保護**: holder 3 関数に clippy deny
+  (panic / unwrap_used / expect_used / indexing_slicing) を適用、既存 CI の
+  clippy gate に乗せた。— issue archive `2026-07-09-graceful-restart-holder-panic-regression-guard`
 
 ## 短期 (= 残作業・近い着手候補)
 
@@ -37,9 +40,6 @@
   v0.17.0 実装済み
 - **op discovery の起動ブロック解消** (P3 = launchd context の biometric 到達不能のみ残存):
   `docs/issue/2026-06-13-op-discovery-blocks-startup.md`
-- **holder 非 panic 規律の regression 保護** (bundle 2 review LOW の follow-up): panic=abort 副作用
-  過大で revert、代替として clippy attribute 単位の deny を検討。
-  `docs/issue/2026-07-09-graceful-restart-holder-panic-regression-guard.md`
 - **鍵形式の残ギャップ**: RSA PKCS#1 / FIDO sk-* / 証明書 (需要次第)。ECDSA は実装済み
 
 ## 中期 (= 構想中)
