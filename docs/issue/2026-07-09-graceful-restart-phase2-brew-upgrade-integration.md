@@ -3,7 +3,7 @@ title: graceful restart Phase 2: brew upgrade 完了時の自動 restart --grace
 status: idea
 category: design
 created: 2026-07-09T23:44:04+09:00
-last_read:
+last_read: 2026-07-10T01:37:54+09:00
 open_entered:
 wip_entered:
 blocked_entered:
