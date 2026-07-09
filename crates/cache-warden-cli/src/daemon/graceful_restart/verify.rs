@@ -26,7 +26,10 @@ pub(crate) enum VerifyError {
     ParentOthersWritable(PathBuf),
     /// The re-open immediately before `execve` (DR-0029 §3 step 3) resolved
     /// to a different (dev, ino) than the file already verified — the
-    /// narrowed TOCTOU window caught a swap.
+    /// narrowed TOCTOU window caught a swap. Only [`reconfirm_identity`]
+    /// constructs this, and its sole caller is the macOS-only
+    /// `handoff::execute`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     IdentityChangedSinceVerification,
     /// macOS codesign self-consistency check failed (see
     /// [`super::codesign`]).
@@ -72,7 +75,11 @@ pub(crate) struct VerifiedExe {
     /// verification and exec.
     #[allow(dead_code)]
     pub(crate) file: File,
+    /// Read only by [`reconfirm_identity`], whose sole caller is the
+    /// macOS-only `handoff::execute` (hence dead on other targets).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) dev: u64,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) ino: u64,
 }
 
@@ -179,6 +186,7 @@ fn warn_on_writable_ancestor_chain(path: &Path) {
 /// neither `fexecve` nor `execveat(AT_EMPTY_PATH)` to close it completely
 /// (see the research doc's §4.1 vs. macOS gap; this is the "縮小 (narrow)"
 /// mitigation DR-0029 §3 settles for, not full closure).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn reconfirm_identity(path: &Path, expected: &VerifiedExe) -> Result<(), VerifyError> {
     let meta = std::fs::metadata(path).map_err(VerifyError::Stat)?;
     if meta.dev() != expected.dev || meta.ino() != expected.ino {

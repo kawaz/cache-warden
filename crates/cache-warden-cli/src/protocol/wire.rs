@@ -728,7 +728,10 @@ impl Response {
 
     /// Construct an accepted `daemon.restart_graceful` acknowledgement
     /// (DR-0029). See [`Request::RestartGraceful`]'s doc for why a client
-    /// should not wait on a second reply after this one.
+    /// should not wait on a second reply after this one. Constructed only
+    /// on the macOS-only accept path of `graceful_restart::handle_request`
+    /// (hence dead on other targets).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn restarting_ack() -> Self {
         Response::Ok(OkResponse {
             ok: true,
