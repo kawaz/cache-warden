@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use stable_which::{Candidate, PathTag, ScoringPolicy, resolve_stable_path};
+use stable_which::{Candidate, ScoringPolicy, resolve_stable_path};
 
 use crate::commands::service;
 use crate::config::Config;
@@ -181,18 +181,6 @@ pub fn parse_unregister_args(args: &[String]) -> Result<UnregisterArgs, String> 
     Ok(out)
 }
 
-/// Whether a `stable-which` resolution settled on a *non-stable* path (DR-0019
-/// §2.5): the best candidate is still a dev build output (`target/release`) or an
-/// ephemeral/temp location, i.e. no stable PATH symlink points at this binary.
-///
-/// Pure (operates on the candidate's tags) so the warn branch is unit-testable
-/// without a filesystem. A `true` result means `register` should warn but still
-/// proceed with the dev path (DR-0019 §2.5: do not block development).
-fn is_unstable_resolution(tags: &[PathTag]) -> bool {
-    tags.iter()
-        .any(|t| matches!(t, PathTag::BuildOutput | PathTag::Ephemeral))
-}
-
 /// The outcome of resolving the binary path to bake into the service definition
 /// (DR-0019 §2.5): the program path plus the enclosing `.app` bundle (macOS TCC
 /// layer) if any, and a human-facing warning when the path is unstable.
@@ -238,20 +226,24 @@ fn resolve_program_exe(
 
     let candidate: Candidate = resolve_stable_path(&current_exe, ScoringPolicy::SameBinary)
         .map_err(|e| format!("cannot resolve a stable binary path: {e}"))?;
-    let warning = if is_unstable_resolution(&candidate.tags) {
-        Some(format!(
-            "cache-warden: warning: no stable install path found for the daemon binary; \
-             baking the development path {} into the service (it will break on `cargo clean` \
-             / rebuild). Install via Homebrew or pass `--executable PATH` for a stable path \
-             (DR-0019).",
-            candidate.path.display()
-        ))
-    } else {
+    // Durable-to-pin judgement is delegated to stable-which 0.4 (`is_stable()`):
+    // dev build outputs, ephemeral/temp locations, versioned installs
+    // (`Cellar/<ver>` etc.), and unrecognized locations all count as non-durable.
+    // Warn but still proceed with the path (DR-0019 §2.5: do not block development).
+    let warning = if candidate.is_stable() {
         None
+    } else {
+        Some(format!(
+            "cache-warden: warning: no durable install path found for the daemon binary; \
+             baking {} into the service (a dev build, versioned install, or unrecognized \
+             location — it can break on rebuild or upgrade). Install via Homebrew or pass \
+             `--executable PATH` for a durable path (DR-0019).",
+            candidate.path().display()
+        ))
     };
     let (program, app_bundle) = with_app_layer(
-        &candidate.path,
-        candidate.path.to_string_lossy().into_owned(),
+        candidate.path(),
+        candidate.path().to_string_lossy().into_owned(),
     );
     Ok(ResolvedExe {
         program,
@@ -651,33 +643,6 @@ mod tests {
     #[test]
     fn register_args_executable_requires_value() {
         assert!(parse_register_args(&s(&["--executable"])).is_err());
-    }
-
-    // ---- unstable-resolution warning branch (DR-0019 §2.5) ----
-
-    #[test]
-    fn unstable_resolution_flags_build_output_and_ephemeral() {
-        // A dev build output / ephemeral path → unstable → warn.
-        assert!(is_unstable_resolution(&[
-            PathTag::Input,
-            PathTag::BuildOutput
-        ]));
-        assert!(is_unstable_resolution(&[PathTag::Ephemeral]));
-    }
-
-    #[test]
-    fn unstable_resolution_clears_for_stable_path() {
-        // A stable PATH symlink that is the same binary → no warning.
-        assert!(!is_unstable_resolution(&[
-            PathTag::InPathEnv(0),
-            PathTag::SameCanonical
-        ]));
-        // ManagedBy / Shim are "warning-ish" for stability but still a real
-        // install path, not a dev artifact → no warn branch here.
-        assert!(!is_unstable_resolution(&[PathTag::ManagedBy(
-            "mise".into()
-        )]));
-        assert!(!is_unstable_resolution(&[PathTag::Shim]));
     }
 
     // ---- --executable: bundle id wiring via build_definition (DR-0019 §2.5) ----

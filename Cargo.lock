@@ -1013,9 +1013,9 @@ dependencies = [
 
 [[package]]
 name = "stable-which"
-version = "0.3.3"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a21e7a8f52fa6787ee51c4d1409f4076971ddc6053d58cb23e13ebc237eb234b"
+checksum = "d9ca79cf530827154e5710370b7788da9b855d6e42de1775d6074f8eb6996d07"
 
 [[package]]
 name = "subtle"
