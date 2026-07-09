@@ -3,11 +3,11 @@
 将来検討項目のリスト。確定した予定ではなく、検討中のアイデアを集める場所。
 (DESIGN-ja.md「将来検討」「open question」節と対応。実装フェーズで issue/ に降ろす)
 
-## 現況 (2026-06 時点)
+## 現況 (2026-07 時点)
 
-**v0.20.0 出荷済み。** KV コア・control socket プロトコル・デーモン・authsock アダプタは
+**v0.24.0 出荷済み。** KV コア・control socket プロトコル・デーモン・authsock アダプタは
 実装済みで、authsock-warden との機能パリティ (DR-0004 Phase 2) を達成。dogfood
-(Phase 3 切替) で実運用検証中 — 安定再開の鍵は下記「op-refetch loop」(運用バグ) の解消。
+(Phase 3) で実運用中。
 
 完了済み (確定設計 + 実装):
 - KV コア (TTL soft/hard 2 分離・プロセス認証・mlock/zeroize) — DR-0003/0005/0007/0011
@@ -16,19 +16,17 @@
 - config / 再認証コマンド / dry-run / inject / OTP / namespace / 型付き source-auth — DR-0010/0013/0015/0016/0017/0018
 - authsock アダプタ (SSH agent protocol / 鍵フィルタ / allowed_processes 2 層 / 1Password 署名 / ECDSA 含む 3 鍵種) — DR-0004/0012、port-plan
 - daemon サービス登録 + macOS 署名/notarization/.app — DR-0019/0020 (release.yml + service.rs)
+- op-refetch loop の解消 (SIGN 起因 regenerate の完遂キャッシュ + fetch 失敗 backoff) — DR-0022
+- FDA チェック&誘導フロー (macos-tcc crate + register 統合) — issue archive `2026-06-14-fda-check-flow-port`
+- 予約 NS (authsock) の kv.get/set 拒否 (read/write bouncer) — DR-0018 §4.5 / DR-0027
+- stable-which 0.4 移行 (durable-to-pin 判定を crate 側に委譲) — DR-0019 §2.5
 
 ## 短期 (= 残作業・近い着手候補)
 
-- **op-refetch loop の解消** (dogfood 再開の主リスク): SIGN 起因の regenerate (op fetch) が
-  クライアント切断でも完遂・キャッシュするように。詳細は issue archive `2026-06-14-op-refetch-loop` 参照
-- **stable-which 0.4.0 移行** (F): 現状 0.3 + 自前 `is_unstable_resolution` 判定 (versioned-managed
-  を見落とす潜在バグ)。0.4.0 の `is_stable()`/`tags()` 経由に書き換えで同時に埋まる — DR-0019、journal 参照
 - **prefetch 本体** (DR-0018 未着手): `kv prefetch ...` / 起動時 prefetch。型付きスキーマ自体は
-  v0.17.0 実装済み。authsock NS 正規化 (内部鍵 `__authsock_op:*` → 予約 NS `authsock/op_*` +
-  reserved NS bouncer) は DR-0027 で実装済み。`authsock` NS の `kv.get` 拒否 (DR-0018 §4.5) は残タスク
-- **op discovery の起動ブロック解消**: `docs/issue/2026-06-13-op-discovery-blocks-startup.md`
-- **FDA チェック&誘導フローの移植** (authsock-warden で解決済み、cache 未対応): op 実行時の TCC
-  ダイアログを Full Disk Access ON で恒久解消する register 統合フロー。`docs/issue/2026-06-14-fda-check-flow-port.md`
+  v0.17.0 実装済み
+- **op discovery の起動ブロック解消** (P3 = launchd context の biometric 到達不能のみ残存):
+  `docs/issue/2026-06-13-op-discovery-blocks-startup.md`
 - **鍵形式の残ギャップ**: RSA PKCS#1 / FIDO sk-* / 証明書 (需要次第)。ECDSA は実装済み
 
 ## 中期 (= 構想中)
