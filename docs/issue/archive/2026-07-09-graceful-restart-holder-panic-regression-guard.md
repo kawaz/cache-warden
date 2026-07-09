@@ -1,6 +1,6 @@
 ---
 title: graceful restart holder の非 panic 規律の regression 保護 (panic=abort follow-up)
-status: idea
+status: resolved
 category: design
 created: 2026-07-09T23:44:04+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-10T02:37:10+09:00
 discard_reason:    # 1-line JSON array string[] 例: ["discarded","環境が変わった"]
 pending_reason:    # 1-line JSON array string[] 例: ["pending","v2 待ち"]
-close_reason:      # close 時に update が記録。1-line JSON array string[] 例: ["dr/DR-0007","implemented"]
+close_reason: ["implemented","案 A を実装 (commit xwnpwvxn): holder_child_main / holder_send_and_wait_commit / holder_explicit_bzero に clippy::panic / unwrap_used / expect_used / indexing_slicing の deny 属性を付与。unwrap 混入で clippy が error になることを実機確認 (陽性)、既存コードは通過 (陰性)。indexing_slicing の不要検知は発生せず (holder は raw pointer 操作のみで添え字アクセスなし)。callee 内 panic は検知不能のため holder 関数は leaf-level (libc + core のみ) に保つ規約をコードコメントに明記。案 B/C への格上げは false-negative が問題になった時に再検討。"]
 blocked_by:
 origin: DR-0029 bundle 2 adversarial review LOW への follow-up
 ---
