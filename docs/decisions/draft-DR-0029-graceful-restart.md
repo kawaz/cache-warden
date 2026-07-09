@@ -140,7 +140,17 @@ COMMIT  = 1 frame (new → holder、全受領 + bind 完了後)
   serde_json でも可 — どちらも mlock buffer 内で安全性同等、**実装時に選ぶ**)
 - 1 entry = `key (NS/KEY)` + `secret bytes` + `Ttl 状態 (loaded_at/extended_at を
   wall clock 絶対時刻で運び、受領側で monotonic 基準へ再アンカー)` + `pin 状態` +
-  `FailureRecord (backoff)` + `ValueMeta` + `Definition (ValueSource)`
+  `FailureRecord (backoff)` + `ValueMeta` + `Definition (ValueSource)` +
+  **per-entry アクセス制約 record** (下記)
+- **per-entry アクセス制約は引き継ぎ必須**: 「set 実行元プロセスの子孫のみ get 可」
+  のような set 時に記録される制約 (現行の process policy 状態、将来の
+  kv-get-peer-identity-guard record) はエントリに付随する動的状態であり、落とすと
+  fail-closed なら該当エントリが誰からも読めずキャッシュとして死に、fail-open なら
+  機密性の約束が restart で silently 解除される — どちらも不可。identity record
+  (PID + proc_uniqueid 等) は daemon restart がクライアントを殺さない以上
+  restart 後も有効な参照なので、record をバイト列のまま直列化して運び、新プロセス
+  で同一に評価する。config 由来の `kv_process_policies` は config 再読込で再構築
+  されるため運ばない (動的 record と静的 config の線引き)
 - 対象は **kv 全エントリ** (op:// / static / command 由来を問わない。issue の
   「source 種別で絞れるという当初観察は誤り」の結論に従う)。公開鍵 registry は
   非秘密なので運ばず新側で再構築。upstream proxy は状態を持たず対象外
@@ -258,8 +268,10 @@ handoff socket へ接続して状態を請求。issue §2-1 が「新が要求�
 - Q1: 直列化形式の最終選定 (postcard vs 長さプレフィックス JSON)。エントリ数
   実測 (dogfood は現状 10 数鍵) では性能差は誤差の見込み → 依存を増やさない側に
   倒すのが有力
-- Q2: `Capability` トークン (DR-0024) はプロセス内 opaque なので運ばず新側で
-  再発行、で問題ないか (adapter が旧 cap を握り続ける経路が無いことの確認)
+- Q2: `Capability` トークン (DR-0024) は**アダプタのロールトークン**であって
+  エントリに紐付かないため、運ばず新側で再発行する (adapter が旧 cap を握り
+  続ける経路が無いことの実装時確認のみ)。per-entry のアクセス制約 record とは
+  別物で、後者は §2 の通り引き継ぎ必須
 - Q3: macOS の fork における mlock 継承の実機確認 (設計は「継承されない」前提で
   無条件再適用なので、結果がどちらでも設計は変わらない — 確認は findings 記録用)
 - Q4 (旧 Q3): 環境変数 `CACHE_WARDEN_HANDOFF_FD` が launchd の
