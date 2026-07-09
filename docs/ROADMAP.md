@@ -26,6 +26,10 @@
   記録 + 親 dir チェーン警告 + codesign 自己一致検証。失敗経路は cold start に退化 (現状の
   非 graceful restart と等価)。config 優先ロジックを import に対称適用済み。
   — DR-0029、bundle 1 `yrsmsvkk` + `rmtyxzqx`、bundle 2 `zlwxovoo`
+- **graceful restart Phase 2** (brew upgrade 連携): `on-success-release` が daemon の稼働
+  バイナリパスを確認した上で `daemon restart --graceful` を自動実行し、pid 同一 + entries
+  保持を検証して報告。失敗系は手動介入案内に退化。— justfile `daemon-graceful-restart`
+  recipe、issue archive `2026-07-09-graceful-restart-phase2-brew-upgrade-integration`
 
 ## 短期 (= 残作業・近い着手候補)
 
@@ -33,9 +37,6 @@
   v0.17.0 実装済み
 - **op discovery の起動ブロック解消** (P3 = launchd context の biometric 到達不能のみ残存):
   `docs/issue/2026-06-13-op-discovery-blocks-startup.md`
-- **graceful restart Phase 2** (brew upgrade 連携): 手動 restart --graceful を `on-success-release`
-  経由で自動化。dogfood 体験直結の次段。
-  `docs/issue/2026-07-09-graceful-restart-phase2-brew-upgrade-integration.md`
 - **holder 非 panic 規律の regression 保護** (bundle 2 review LOW の follow-up): panic=abort 副作用
   過大で revert、代替として clippy attribute 単位の deny を検討。
   `docs/issue/2026-07-09-graceful-restart-holder-panic-regression-guard.md`
