@@ -1,10 +1,10 @@
 ---
 title: cache-warden 独自 TouchID 認証 dialog 実装
-status: blocked
+status: open
 category: design
 created: 2026-06-22T21:20:33+09:00
 last_read:
-open_entered: 2026-06-22T21:20:33+09:00
+open_entered: 2026-07-10T03:10:45+09:00
 wip_entered:
 blocked_entered: 2026-07-04T09:33:55+09:00
 pending_entered:
@@ -13,7 +13,7 @@ resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by: [2026-06-22-crate-macos-process-inspect]
+blocked_by: []
 origin: 自リポ TODO
 ---
 
@@ -62,7 +62,7 @@ cache-warden 独自の TouchID 認証 dialog を実装し、**要求元プロセ
 
 ## 関連
 
-- blocked_by: 2026-06-22-crate-macos-process-inspect (= peer info 取得基盤が前提)
+- 前提だった 2026-06-22-crate-macos-process-inspect は resolved (crate land 済み)、unblock
 - 関連: 2026-06-22-kv-get-peer-identity-guard (= guard 評価結果も dialog に表示)
 - 関連: DR-0022 fetch failure backoff (= op CLI 経由 fetch の現状経路、本機能は cw 独自経路に置換していく方向性)
 - 元発想: 2026-06-22 セッション、kawaz の「1Password の dialog は白紙委任で頭おかしい」発言
