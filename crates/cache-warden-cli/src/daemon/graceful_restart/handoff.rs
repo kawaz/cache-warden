@@ -324,7 +324,19 @@ pub(crate) fn execute(_prepared: PreparedHandoff) {
 /// here immediately, as part of the close-everything-else sweep below (fd
 /// hygiene inside the child must not depend on what the parent concurrently
 /// does with its own copy).
+// The holder child must never unwind: a panic between `fork` and `_exit`
+// would run non-async-signal-safe unwind/Drop code inside the forked child.
+// These lints turn the "async-signal-safe code only" discipline (enforced by
+// review) into a compile-time gate for the most common panic sources. They
+// cannot catch panics inside callees — keep the holder functions leaf-level
+// (libc + core only) so the annotated bodies are the whole surface.
 #[cfg(target_os = "macos")]
+#[deny(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
 fn holder_child_main(buf_ptr: *const u8, buf_len: usize, holder_fd: RawFd, new_fd: RawFd) -> ! {
     // DR-0029 bundle 2 review MEDIUM-1: close every fd except our own end of
     // the socketpair, as the very first action after fork — before
@@ -427,6 +439,12 @@ fn holder_child_main(buf_ptr: *const u8, buf_len: usize, holder_fd: RawFd, new_f
 /// error or EOF (the new process aborted or never came up), `3` on a
 /// send/receive timeout (`SO_SNDTIMEO`/`SO_RCVTIMEO`, set in `prepare`).
 #[cfg(target_os = "macos")]
+#[deny(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
 fn holder_send_and_wait_commit(buf_ptr: *const u8, buf_len: usize, fd: RawFd) -> i32 {
     let mut sent = 0usize;
     while sent < buf_len {
@@ -492,6 +510,12 @@ fn holder_send_and_wait_commit(buf_ptr: *const u8, buf_len: usize, fd: RawFd) ->
 /// call site was judged not worth a new FFI surface for this bundle — noted
 /// as a simplification in the delegation's final report.
 #[cfg(target_os = "macos")]
+#[deny(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
 fn holder_explicit_bzero(ptr: *mut u8, len: usize) {
     // SAFETY: `ptr`/`len` describe the same buffer this child has been
     // reading from throughout, exclusively owned by this child at this
