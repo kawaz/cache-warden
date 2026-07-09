@@ -171,10 +171,26 @@ COMMIT  = 1 frame (new → holder、全受領 + bind 完了後)
     非 world-writable + 同一パスのみ確認し、**警告を出して続行** (DR-0019 §2.5
     の「開発をブロックしない」と同じ倒し方。dev 経路のリスクは開発者自身に
     閉じる)
-- macOS に fexecve は無いため「open した fd を検証してそのまま exec」は不可。
-  検証 → execve の TOCTOU は残るが、**macOS はカーネルが exec 時に codesign を
-  再強制**するため bounded (issue §2-3 の許容判断のまま)。Linux は codesign が
-  無いため owner/perms + 同一パス (+将来 hash pin) で代替
+- **TOCTOU の縮小 (macOS)**: カーネルの exec 時 codesign 再強制は**完全性**
+  (改竄バイナリは動かない) しか守らず、**identity の期待一致** (検証した
+  バイナリと exec されるバイナリが同一実体か) は守らない — 検証と exec の隙間に
+  「別の正規署名済みバイナリ」を差し替えられると素通しになる。macOS には
+  fexecve が無く完全には閉じられないため、以下で窓を縮める
+  (research `2026-07-09-graceful-restart-binary-verification-plan.md` §4.1 の
+  fd 固定方針の macOS 適合):
+  1. fd を O_RDONLY で開き、**fd に対して** fstat (owner = 自 uid /
+     group・others 書込不可) + `(st_dev, st_ino)` を記録
+  2. codesign 自己一致検証 (パス経由だが、直後の 3 で実体一致を確認)
+  3. **exec 直前に同パスを再 open し `(st_dev, st_ino)` の一致を確認** →
+     即 execve (残る窓は fstat→execve の数命令に縮む)
+  4. **親ディレクトリチェーンが others 書込不可**であることを確認
+     (/Applications 配下で差し替えを実際に防いでいるのはこれ。書込可能な
+     チェーン上にある場合は警告)
+- Linux (将来): fexecve / `execveat(AT_EMPTY_PATH)` で「検証した fd を
+  そのまま exec」でき TOCTOU を完全に閉じられる。identity は codesign が
+  無いため末尾追記署名 + 埋め込み公開鍵 (L1) で自前定義する — 設計正本は
+  research `2026-07-09-graceful-restart-binary-verification-plan.md` (L1/L2)、
+  本 DR のスコープ外として issue 管理
 - 検証失敗時は handoff を中止して現行プロセスが serve 継続 (listener close 前に
   検証を行う順序にすれば完全無害。実装では ① 直後 = ② の前に検証する)
 
@@ -287,6 +303,11 @@ handoff socket へ接続して状態を請求。issue §2-1 が「新が要求�
   無条件再適用なので、結果がどちらでも設計は変わらない — 確認は findings 記録用)
 - Q4 (旧 Q3): 環境変数 `CACHE_WARDEN_HANDOFF_FD` が launchd の
   EnvironmentVariables と衝突しないことの確認のみ
+- Q5: **downgrade 防止** — 脆弱な旧バージョンのバイナリへの graceful restart を
+  許すか。macOS では候補の CFBundleVersion (or 埋め込み version) と自 version の
+  比較で実現できる。方針候補: 同 version 可 / 旧 version は警告 or `--force`
+  必須。research プラン §7 (vcode) の mac 適合。MVP では未実装でも、**検証順序に
+  version 比較の挿入点を確保**しておく
 
 ## 実装フェーズ (目安)
 
