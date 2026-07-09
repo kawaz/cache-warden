@@ -1,6 +1,6 @@
 ---
 title: macos-process-inspect crate 切り出し
-status: wip
+status: resolved
 category: design
 created: 2026-06-22T21:15:48+09:00
 last_read: 2026-07-10T02:38:45+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-07-10T02:41:07+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-10T03:09:09+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented: 受け入れ条件5項目を達成 (commit xolwruyq)。crates/macos-process-inspect を workspace member 追加、ancestry API (cycle guard / wrap-safe)、LOCAL_PEERPID/LOCAL_PEEREPID/LOCAL_PEERTOKEN の socket peer 特定、proc_uniqueid (private flavor 17、失敗は Unavailable 退化)、非 macOS shim。FFI は SDK ヘッダ+XNU ソース+C 実測で裏取り、macOS で 23/23 テスト green、Linux cross の clippy -D warnings green (Linux 上の cargo test は次回 push の CI で確認)。想定 API スコープのうち codesign 検証/env/argv/TCC/.app bundle 検出は未実装 (blocked 2 件の実装時に必要になった段階で追加)。既存 core process.rs / cli peer.rs との重複解消は docs/issue/2026-07-10-migrate-to-macos-process-inspect-crate.md で追跡"]
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -61,8 +61,8 @@ veecore/permission-flow には `suggested_host_app_path` (= 親プロセス遡�
 
 ## 受け入れ条件
 
-- [ ] `crates/macos-process-inspect/` として workspace member 追加
-- [ ] PID + 祖先チェーン遡上 API 実装
-- [ ] UNIX socket peer 特定 (`LOCAL_PEERPID` / `LOCAL_PEERTOKEN`) 実装
-- [ ] macOS unique process identifier (proc_uniqueid) 取得 実装
-- [ ] non-macOS no-op shim で cargo test がパスする
+- [x] `crates/macos-process-inspect/` として workspace member 追加
+- [x] PID + 祖先チェーン遡上 API 実装
+- [x] UNIX socket peer 特定 (`LOCAL_PEERPID` / `LOCAL_PEERTOKEN`) 実装
+- [x] macOS unique process identifier (proc_uniqueid) 取得 実装
+- [x] non-macOS no-op shim で cargo test がパスする

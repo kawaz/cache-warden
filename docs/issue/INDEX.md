@@ -10,7 +10,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-07-09 | design | idea | [graceful-restart-phase3-listener-fd-inheritance](./2026-07-09-graceful-restart-phase3-listener-fd-inheritance.md) | DR-0029 Phase 1 の re-bind 方式を SCM_RIGHTS の listener fd 継承にして断ゼロ化する (任意、着手条件あり)。 |
 | 2026-07-06 | bug | open | [daemon-register-help-output-oneshot](./2026-07-06-daemon-register-help-output-oneshot.md) | v0.22.3 daemon 稼働中に v0.23.0 で `daemon register` 実行、末尾に top-level help が出力され旧 daemon… |
 | 2026-07-10 | design | open | [migrate-to-macos-process-inspect-crate](./2026-07-10-migrate-to-macos-process-inspect-crate.md) | 既存 process inspect 実装の macos-process-inspect crate への移行 (重複解消) |
-| 2026-06-22 | design | wip | [crate-macos-process-inspect](./2026-06-22-crate-macos-process-inspect.md) | macOS で **socket 対抗プロセスや任意 pid の出自を多面的に inspect** する Rust crate を切り出す。Pure Rust… |
 | 2026-06-13 | bug | open | [op-discovery-blocks-startup](./2026-06-13-op-discovery-blocks-startup.md) | `[authsock.sockets.*].keys` を持つ config で起動すると、`run()` の |
 | 2026-06-22 | design | blocked | [custom-touchid-dialog](./2026-06-22-custom-touchid-dialog.md) | cache-warden 独自の TouchID 認証 dialog を実装し、**要求元プロセスの透明性**を 1Password 既定の dialog よ… |
 | 2026-06-22 | design | blocked | [kv-get-peer-identity-guard](./2026-06-22-kv-get-peer-identity-guard.md) | cache-warden の `kv set` 時に **peer-identity constraint** を declarative に付与し、`kv … |
