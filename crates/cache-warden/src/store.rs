@@ -16,7 +16,10 @@ use zeroize::Zeroizing;
 
 use crate::auth::{AuthContext, AuthError, AuthOperation, Authenticator};
 use crate::capability::{CapError, Capability};
-use crate::clock::{Clock, Monotonic, epoch_ms_to_monotonic, monotonic_to_epoch_ms};
+use crate::clock::{
+    Clock, Monotonic, epoch_ms_to_monotonic, epoch_ms_to_monotonic_for_failure,
+    epoch_ms_to_monotonic_ttl_basis, monotonic_to_epoch_ms,
+};
 use crate::definition::{DefineError, Definition};
 use crate::entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl};
 use crate::key::{InvalidKey, validate_key_syntax};
@@ -1065,11 +1068,19 @@ impl Store {
     /// Rejects the whole snapshot up front if its format version is not one
     /// this build understands ([`ImportError::UnsupportedVersion`]) — no
     /// entries are installed in that case. A malformed individual entry (an
-    /// invalid TTL, or a definition claiming a non-command source — both only
-    /// reachable via corrupted or maliciously crafted snapshot bytes, never
-    /// via [`Store::export_snapshot`]'s own output) aborts the whole import
-    /// with the corresponding [`ImportError`] rather than installing a
-    /// partial store.
+    /// invalid TTL, a reconstructed `extended_at` preceding `loaded_at`, a
+    /// definition claiming a non-command source, a key that fails the
+    /// composed-key syntax check, or a key repeated across entries — all
+    /// only reachable via corrupted or maliciously crafted snapshot bytes,
+    /// never via [`Store::export_snapshot`]'s own output) aborts the whole
+    /// import with the corresponding [`ImportError`] rather than installing a
+    /// partial store. "Aborts the whole import" is enforced by construction,
+    /// not by manual rollback: every early return happens before the
+    /// function returns `bundle`, so on any `Err` path `bundle` (and whatever
+    /// entries were installed into it so far) is simply dropped here —
+    /// zeroizing any [`SecretBytes`] already inserted via
+    /// [`crate::secret::SecretBytes`]'s zeroize-on-drop guarantee, same as
+    /// any other discarded `Store`.
     pub fn import_snapshot(
         builder: StoreBuilder,
         snapshot: StoreSnapshot,
@@ -1085,7 +1096,26 @@ impl Store {
         let mut bundle = builder.build();
         let now_mono = clock.now();
         let now_wall_ms = snapshot::wall_now_epoch_ms();
-        let to_monotonic = |epoch_ms: u64| epoch_ms_to_monotonic(now_mono, now_wall_ms, epoch_ms);
+        // Three specialized reconstructions, not one shared closure (DR-0029
+        // review HIGH-1 / HIGH-2): a TTL basis (loaded_at/extended_at) and a
+        // failure-backoff's failed_at each need their own conservative
+        // clamp direction when the wall clock regressed or the importing
+        // clock lacks headroom — see the doc on each `clock` function for
+        // why. `pin_deadline` alone uses the general conversion: a pin
+        // deadline is legitimately ahead of "now" (that is the entire point
+        // of a pin), so it must not be clamped like a TTL basis would be.
+        let to_ttl_basis =
+            |epoch_ms: u64| epoch_ms_to_monotonic_ttl_basis(now_mono, now_wall_ms, epoch_ms);
+        let to_pin_deadline =
+            |epoch_ms: u64| epoch_ms_to_monotonic(now_mono, now_wall_ms, epoch_ms);
+        let to_failed_at =
+            |epoch_ms: u64| epoch_ms_to_monotonic_for_failure(now_mono, now_wall_ms, epoch_ms);
+
+        // DR-0029 review LOW-3: a key repeated across `SnapshotEntry`s is
+        // only reachable via corrupted/crafted bytes (`Store::export_snapshot`
+        // de-duplicates by construction) — reject outright rather than let
+        // the later entry silently win.
+        let mut seen_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
         for entry in snapshot.into_entries() {
             let SnapshotEntry {
@@ -1095,14 +1125,29 @@ impl Store {
                 failure,
             } = entry;
 
+            // DR-0029 review HIGH-5: `Store::set` / `Store::define` always
+            // validate key syntax (DR-0017 §1.5); import must not be a way to
+            // smuggle a syntactically invalid key past that gate.
+            validate_key_syntax(&key).map_err(|_| ImportError::InvalidKey { key: key.clone() })?;
+            if !seen_keys.insert(key.clone()) {
+                return Err(ImportError::DuplicateKey { key });
+            }
+
             if let Some(mut v) = value {
                 let soft = v.soft_ttl_ms.map(std::time::Duration::from_millis);
                 let hard = v.hard_ttl_ms.map(std::time::Duration::from_millis);
                 let ttl = Ttl::new(soft, hard)
                     .map_err(|_| ImportError::MalformedTtl { key: key.clone() })?;
-                let loaded_at = to_monotonic(v.loaded_at_epoch_ms);
-                let extended_at = to_monotonic(v.extended_at_epoch_ms);
-                let pin_deadline = v.pin_deadline_epoch_ms.map(to_monotonic);
+                let loaded_at = to_ttl_basis(v.loaded_at_epoch_ms);
+                let extended_at = to_ttl_basis(v.extended_at_epoch_ms);
+                // DR-0029 review MEDIUM-2: CacheEntry::from_parts does not
+                // itself check extended_at >= loaded_at (its signature is
+                // unchanged; the invariant is enforced here, at the one
+                // caller that reconstructs both from untrusted wire data).
+                if extended_at < loaded_at {
+                    return Err(ImportError::MalformedTtl { key: key.clone() });
+                }
+                let pin_deadline = v.pin_deadline_epoch_ms.map(to_pin_deadline);
                 // Move the plaintext into `SecretBytes` without copying: the
                 // Zeroizing<Vec<u8>> buffer is swapped for an empty Vec via
                 // `mem::take` (through Zeroizing's DerefMut<Target=Vec<u8>>),
@@ -1137,7 +1182,7 @@ impl Store {
             }
 
             if let Some(f) = failure {
-                let failed_at = to_monotonic(f.failed_at_epoch_ms);
+                let failed_at = to_failed_at(f.failed_at_epoch_ms);
                 bundle.store.failure_backoffs.insert(
                     key.clone(),
                     FailureRecord {
@@ -3727,6 +3772,150 @@ mod tests {
 
             let err = StoreSnapshot::from_bytes(&bytes).unwrap_err();
             assert!(matches!(err, ImportError::Truncated));
+        }
+
+        // ---- DR-0029 review: HIGH-5 (key syntax), LOW-3 (duplicate key) ----
+
+        #[test]
+        fn import_rejects_invalid_key_syntax() {
+            // Only reachable via corrupted/crafted snapshot bytes: Store::set
+            // / Store::define already reject a `-`-containing key (DR-0017
+            // §1.5) before export could ever see it.
+            let clock = FakeClock::new();
+            let snap = StoreSnapshot::new(vec![SnapshotEntry {
+                key: "bad-key".to_string(),
+                value: Some(SnapshotValue {
+                    source: SnapshotSource::Static,
+                    secret: Zeroizing::new(b"v".to_vec()),
+                    soft_ttl_ms: None,
+                    hard_ttl_ms: None,
+                    loaded_at_epoch_ms: 0,
+                    extended_at_epoch_ms: 0,
+                    pin_deadline_epoch_ms: None,
+                }),
+                definition: None,
+                failure: None,
+            }]);
+
+            // `StoreBundle` does not derive `Debug`, so `unwrap_err()` (which
+            // needs `T: Debug` for its panic message) is not usable here.
+            let err = match Store::import_snapshot(Store::builder(), snap, &clock) {
+                Err(e) => e,
+                Ok(_) => panic!("expected import_snapshot to reject this snapshot"),
+            };
+            assert!(matches!(err, ImportError::InvalidKey { key } if key == "bad-key"));
+        }
+
+        #[test]
+        fn import_rejects_a_duplicate_key_across_entries() {
+            // Only reachable via corrupted/crafted bytes: Store::export_snapshot
+            // de-duplicates keys by construction (it iterates a sorted+deduped
+            // key union). Import must reject outright rather than let the
+            // later entry silently win over the earlier one.
+            let clock = FakeClock::new();
+            let make_entry = |secret: &str| SnapshotEntry {
+                key: "DUP".to_string(),
+                value: Some(SnapshotValue {
+                    source: SnapshotSource::Static,
+                    secret: Zeroizing::new(secret.as_bytes().to_vec()),
+                    soft_ttl_ms: None,
+                    hard_ttl_ms: None,
+                    loaded_at_epoch_ms: 0,
+                    extended_at_epoch_ms: 0,
+                    pin_deadline_epoch_ms: None,
+                }),
+                definition: None,
+                failure: None,
+            };
+            let snap = StoreSnapshot::new(vec![make_entry("first"), make_entry("second")]);
+
+            // `StoreBundle` does not derive `Debug`, so `unwrap_err()` (which
+            // needs `T: Debug` for its panic message) is not usable here.
+            let err = match Store::import_snapshot(Store::builder(), snap, &clock) {
+                Err(e) => e,
+                Ok(_) => panic!("expected import_snapshot to reject this snapshot"),
+            };
+            assert!(matches!(err, ImportError::DuplicateKey { key } if key == "DUP"));
+        }
+
+        // ---- DR-0029 review MEDIUM-2: extended_at >= loaded_at invariant ----
+
+        #[test]
+        fn import_rejects_extended_at_preceding_loaded_at() {
+            // Only reachable via corrupted/crafted bytes: CacheEntry::extend
+            // only ever moves extended_at forward from loaded_at, so a
+            // snapshot honestly produced by Store::export_snapshot always has
+            // extended_at >= loaded_at. CacheEntry::from_parts does not
+            // itself check this (its signature is unchanged); import_snapshot
+            // is the one caller that reconstructs both from untrusted wire
+            // data, so it is the one responsible for catching the violation.
+            let clock = FakeClock::starting_at(Monotonic::from_offset(Duration::from_secs(1_000)));
+            let now_wall_ms = crate::snapshot::wall_now_epoch_ms();
+            let snap = StoreSnapshot::new(vec![SnapshotEntry {
+                key: "BACKWARDS".to_string(),
+                value: Some(SnapshotValue {
+                    source: SnapshotSource::Static,
+                    secret: Zeroizing::new(b"v".to_vec()),
+                    soft_ttl_ms: None,
+                    hard_ttl_ms: None,
+                    loaded_at_epoch_ms: now_wall_ms - 5_000, // 5s before "now"
+                    extended_at_epoch_ms: now_wall_ms - 10_000, // earlier than loaded_at: malformed
+                    pin_deadline_epoch_ms: None,
+                }),
+                definition: None,
+                failure: None,
+            }]);
+
+            // `StoreBundle` does not derive `Debug`, so `unwrap_err()` (which
+            // needs `T: Debug` for its panic message) is not usable here.
+            let err = match Store::import_snapshot(Store::builder(), snap, &clock) {
+                Err(e) => e,
+                Ok(_) => panic!("expected import_snapshot to reject this snapshot"),
+            };
+            assert!(matches!(err, ImportError::MalformedTtl { key } if key == "BACKWARDS"));
+        }
+
+        // ---- DR-0029 review HIGH-2: failed_at re-anchor under insufficient headroom ----
+
+        #[test]
+        fn import_preserves_full_backoff_window_when_importing_clock_lacks_headroom() {
+            // Store-level regression: a failure record whose true age (per the
+            // wall-clock delta baked into failed_at_epoch_ms) exceeds the
+            // importing clock's own monotonic headroom must route through
+            // epoch_ms_to_monotonic_for_failure and anchor to "now" (the full
+            // retry_after window still applies), not clamp to Monotonic::ZERO.
+            // A ZERO clamp would make the record look `clock`'s-own-uptime
+            // older than it is — here, 90s older — which would read the 60s
+            // backoff as already-expired the instant it is checked, silently
+            // dropping the DR-0022 TouchID-storm suppression a graceful
+            // restart is supposed to preserve.
+            let clock = FakeClock::starting_at(Monotonic::from_offset(Duration::from_secs(90)));
+            let now_wall_ms = crate::snapshot::wall_now_epoch_ms();
+            // True age (relative to now_wall_ms) is 9999s — far more than the
+            // importing clock's 90s of headroom, so reconstruction hits the
+            // insufficient-headroom path.
+            let failed_at_epoch_ms = now_wall_ms - 9_999_000;
+            let snap = StoreSnapshot::new(vec![SnapshotEntry {
+                key: "WILLFAIL".to_string(),
+                value: None,
+                definition: None,
+                failure: Some(SnapshotFailure {
+                    failed_at_epoch_ms,
+                    retry_after_ms: 60_000, // 60s, well under the 90s of headroom
+                }),
+            }]);
+
+            let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
+            let s2 = bundle.store;
+
+            assert_eq!(
+                s2.failure_backoff_remaining("WILLFAIL", &clock),
+                Some(Duration::from_secs(60)),
+                "insufficient headroom must anchor failed_at to now (full 60s \
+                 remaining), not clamp to Monotonic::ZERO (which would read as \
+                 already-expired: 90s since the importing clock's own start \
+                 already exceeds the 60s retry_after)"
+            );
         }
     }
 }

@@ -33,6 +33,27 @@
 //! being consumed (by `to_bytes` or `import_snapshot`), rather than lingering
 //! in an unprotected `Vec<u8>`. None of the snapshot types derive `Debug` —
 //! deriving it would print `secret`'s raw bytes, defeating the point.
+//!
+//! [`StoreSnapshot::to_bytes`]'s wire buffer (and the per-entry JSON payload
+//! it is built from) is likewise `Zeroizing<Vec<u8>>`: the serialized bytes
+//! interleave secret plaintext with non-secret framing in one allocation, so
+//! the whole buffer is zeroized on drop rather than trying to zero only the
+//! secret sub-ranges. [`StoreSnapshot::from_bytes`] takes a borrowed `&[u8]`
+//! and cannot zeroize it itself — the caller is expected to hold that buffer
+//! in a `Zeroizing<Vec<u8>>` (or equivalent) for its whole lifetime.
+//!
+//! # Wire format compatibility (DR-0029 §2)
+//!
+//! Compatibility is one-directional: a newer build can read an older
+//! snapshot ([`FORMAT_VERSION`] within `[MIN_SUPPORTED_VERSION,
+//! FORMAT_VERSION]`, checked by [`StoreSnapshot::is_supported_version`] /
+//! `StoreSnapshot::from_bytes`), never the reverse. `format_version` bumps
+//! are **additive only** — a new field on [`SnapshotEntry`] /
+//! [`SnapshotValue`] / [`SnapshotDefinition`] / [`SnapshotFailure`], added
+//! with `#[serde(default)]` so an older snapshot missing it still
+//! deserializes. A breaking change (removing or repurposing a field) must
+//! never reuse an existing `format_version`; it requires a new wire format
+//! (a different [`MAGIC`]) instead of stretching this one.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -43,15 +64,43 @@ use zeroize::Zeroizing;
 
 use crate::source::ValueSource;
 
-/// Wire format version (DR-0029 §2 header). Bumped on any incompatible change
-/// to the per-entry payload shape; `StoreSnapshot::from_bytes` /
-/// `Store::import_snapshot` reject anything else rather than guess.
+/// Wire format version (DR-0029 §2 header). Bumped on any **additive** change
+/// to the per-entry payload shape (a new field, added with
+/// `#[serde(default)]`). `StoreSnapshot::from_bytes` / `Store::import_snapshot`
+/// accept any version in `[MIN_SUPPORTED_VERSION, FORMAT_VERSION]` (see the
+/// module doc's "Wire format compatibility" section) and reject anything
+/// outside that range rather than guess.
 pub(crate) const FORMAT_VERSION: u32 = 1;
+
+/// The oldest `format_version` this build still knows how to read. Only
+/// moves forward if a future format change is *breaking* (at which point the
+/// old range becomes permanently unreadable and gets a new [`MAGIC`] instead
+/// of a bumped [`FORMAT_VERSION`] — see the module doc).
+pub(crate) const MIN_SUPPORTED_VERSION: u32 = 1;
+
+/// Whether `v` falls within the inclusive `[MIN_SUPPORTED_VERSION,
+/// FORMAT_VERSION]` range this build accepts. Shared by
+/// [`StoreSnapshot::is_supported_version`] and `StoreSnapshot::from_bytes`
+/// (which must check it before a [`StoreSnapshot`] even exists to call the
+/// method on).
+fn version_is_supported(v: u32) -> bool {
+    (MIN_SUPPORTED_VERSION..=FORMAT_VERSION).contains(&v)
+}
 
 /// 8-byte magic prefix identifying a cache-warden handoff snapshot stream.
 /// Not a security boundary (the DR-0029 channel is a private socketpair) —
 /// just a cheap "is this even the right kind of stream" sanity check.
 const MAGIC: [u8; 8] = *b"CWSNAP01";
+
+/// Upper bound on `entry_count` used to size the initial `Vec::with_capacity`
+/// allocation in [`StoreSnapshot::from_bytes`]. `entry_count` is attacker-
+/// controlled (read straight off the wire before any per-entry frame is
+/// validated), so capacity is clamped to this rather than trusting it
+/// directly — a corrupted/crafted count of e.g. `u32::MAX` would otherwise
+/// force an oversized allocation before the truncation check on the frames
+/// themselves ever runs. The real entry count (bounded by how many frames
+/// actually parse) is unaffected; this only bounds the *pre-allocation* size.
+const MAX_SANE_ENTRIES: u32 = 65_536;
 
 /// The origin of a snapshotted value or definition, mirroring
 /// [`crate::ValueSource`] for (de)serialization. A plain mirror rather than
@@ -97,10 +146,19 @@ pub(crate) struct SnapshotValue {
     /// The one legitimate plaintext copy (see the module doc); zeroizes on
     /// drop if this snapshot is discarded before being consumed.
     pub(crate) secret: Zeroizing<Vec<u8>>,
+    // `#[serde(default)]` on every Option/BTreeMap field below is the
+    // additive-compat template (see the module doc's "Wire format
+    // compatibility" section): a *future* new field on this struct should
+    // follow the same pattern so a bundle-2-or-later build can still
+    // deserialize a snapshot produced by this (older) build, which never
+    // wrote that field at all.
+    #[serde(default)]
     pub(crate) soft_ttl_ms: Option<u64>,
+    #[serde(default)]
     pub(crate) hard_ttl_ms: Option<u64>,
     pub(crate) loaded_at_epoch_ms: u64,
     pub(crate) extended_at_epoch_ms: u64,
+    #[serde(default)]
     pub(crate) pin_deadline_epoch_ms: Option<u64>,
 }
 
@@ -110,11 +168,19 @@ pub(crate) struct SnapshotValue {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct SnapshotDefinition {
     pub(crate) source: SnapshotSource,
+    // See the `#[serde(default)]` note on `SnapshotValue` — same additive-
+    // compat template applies here.
+    #[serde(default)]
     pub(crate) soft_ttl_ms: Option<u64>,
+    #[serde(default)]
     pub(crate) hard_ttl_ms: Option<u64>,
+    #[serde(default)]
     pub(crate) value_meta_type: Option<String>,
+    #[serde(default)]
     pub(crate) value_meta_params: BTreeMap<String, String>,
+    #[serde(default)]
     pub(crate) source_meta_kind: Option<String>,
+    #[serde(default)]
     pub(crate) source_meta_fields: BTreeMap<String, String>,
 }
 
@@ -133,8 +199,13 @@ pub(crate) struct SnapshotFailure {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct SnapshotEntry {
     pub(crate) key: String,
+    // See the `#[serde(default)]` note on `SnapshotValue` — same additive-
+    // compat template applies here.
+    #[serde(default)]
     pub(crate) value: Option<SnapshotValue>,
+    #[serde(default)]
     pub(crate) definition: Option<SnapshotDefinition>,
+    #[serde(default)]
     pub(crate) failure: Option<SnapshotFailure>,
 }
 
@@ -173,10 +244,11 @@ impl StoreSnapshot {
     }
 
     /// Whether this snapshot's format version is one this build of the crate
-    /// understands. `Store::import_snapshot` checks this before touching
-    /// `entries` at all.
+    /// understands (`[MIN_SUPPORTED_VERSION, FORMAT_VERSION]`, see the module
+    /// doc). `Store::import_snapshot` checks this before touching `entries` at
+    /// all.
     pub(crate) fn is_supported_version(&self) -> bool {
-        self.format_version == FORMAT_VERSION
+        version_is_supported(self.format_version)
     }
 
     pub(crate) fn format_version(&self) -> u32 {
@@ -204,7 +276,7 @@ impl StoreSnapshot {
     /// `magic(8B) + format_version(u32, big-endian) + entry_count(u32,
     /// big-endian)`, followed by `entry_count` frames of
     /// `len(u32, big-endian) + serde_json(SnapshotEntry)`.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ExportError> {
+    pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, ExportError> {
         let entry_count: u32 =
             self.entries
                 .len()
@@ -213,13 +285,22 @@ impl StoreSnapshot {
                     count: self.entries.len(),
                 })?;
 
-        let mut out = Vec::new();
+        // Zeroizing: the wire buffer interleaves secret plaintext (each
+        // entry's serde_json payload may embed `SnapshotValue::secret`) with
+        // non-secret framing in one allocation, so the whole buffer is
+        // zeroized on drop rather than trying to zero only the secret
+        // sub-ranges (see the module doc's "Secret hygiene" section).
+        let mut out = Zeroizing::new(Vec::new());
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&self.format_version.to_be_bytes());
         out.extend_from_slice(&entry_count.to_be_bytes());
 
         for entry in &self.entries {
-            let payload = serde_json::to_vec(entry).map_err(ExportError::Serialize)?;
+            // The intermediate serialized payload also carries plaintext
+            // (before it is copied into `out`), so it gets the same
+            // Zeroizing treatment rather than existing as a bare `Vec<u8>`.
+            let payload =
+                Zeroizing::new(serde_json::to_vec(entry).map_err(ExportError::Serialize)?);
             let len: u32 = payload
                 .len()
                 .try_into()
@@ -242,6 +323,13 @@ impl StoreSnapshot {
     /// return an [`ImportError`] rather than panicking — DR-0029's fail-safe
     /// requirement is that a corrupted handoff degrades to cold start, never
     /// a crash.
+    ///
+    /// `bytes` is a plain borrowed slice: this function has no way to zeroize
+    /// it itself. The caller is expected to hold the underlying buffer in a
+    /// `Zeroizing<Vec<u8>>` (or equivalent) for as long as it is alive, same
+    /// as the buffer [`StoreSnapshot::to_bytes`] hands back (see the module
+    /// doc's "Secret hygiene" section) — this function only protects the
+    /// [`SnapshotEntry`] values it produces, not the wire bytes it read from.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ImportError> {
         let mut cursor = bytes;
 
@@ -256,7 +344,7 @@ impl StoreSnapshot {
                 .try_into()
                 .expect("exactly 4 bytes"),
         );
-        if format_version != FORMAT_VERSION {
+        if !version_is_supported(format_version) {
             return Err(ImportError::UnsupportedVersion {
                 got: format_version,
                 supported: FORMAT_VERSION,
@@ -270,7 +358,12 @@ impl StoreSnapshot {
                 .expect("exactly 4 bytes"),
         );
 
-        let mut entries = Vec::with_capacity(entry_count as usize);
+        // `entry_count` is attacker-controlled and read before any frame is
+        // validated; clamp the *pre-allocation* size rather than trusting it
+        // directly (see `MAX_SANE_ENTRIES`'s doc). The loop below still reads
+        // exactly `entry_count` frames — this only bounds how much memory is
+        // reserved up front.
+        let mut entries = Vec::with_capacity(entry_count.min(MAX_SANE_ENTRIES) as usize);
         for _ in 0..entry_count {
             let len_bytes = take(&mut cursor, 4).ok_or(ImportError::Truncated)?;
             let len = u32::from_be_bytes(len_bytes.try_into().expect("exactly 4 bytes")) as usize;
@@ -385,9 +478,12 @@ pub enum ImportError {
         supported: u32,
     },
     /// A key's TTL (soft/hard) failed [`crate::Ttl`]'s `soft <= hard`
-    /// invariant on reconstruction — only reachable via corrupted or
+    /// invariant on reconstruction, **or** its reconstructed `extended_at`
+    /// preceded its `loaded_at` — both only reachable via corrupted or
     /// maliciously crafted snapshot bytes (a snapshot honestly produced by
-    /// `Store::export_snapshot` always carries an already-valid `Ttl`).
+    /// `Store::export_snapshot` always carries an already-valid `Ttl` and
+    /// `extended_at >= loaded_at`, since `CacheEntry::extend` only ever moves
+    /// `extended_at` forward from `loaded_at`).
     MalformedTtl {
         /// The offending key.
         key: String,
@@ -400,7 +496,29 @@ pub enum ImportError {
         /// The offending key.
         key: String,
     },
-    /// `serde_json` failed to deserialize an entry payload.
+    /// A key failed the composed-key syntax check (DR-0017 §1.5,
+    /// [`crate::key::validate_key_syntax`]) on import — only reachable via
+    /// corrupted or maliciously crafted snapshot bytes (`Store::set` /
+    /// `Store::define` already reject an invalid key before it could ever
+    /// reach `Store::export_snapshot`).
+    InvalidKey {
+        /// The offending key.
+        key: String,
+    },
+    /// The same key appeared more than once among the snapshot's entries —
+    /// only reachable via corrupted or maliciously crafted snapshot bytes
+    /// (`Store::export_snapshot` de-duplicates keys by construction). Import
+    /// is rejected outright rather than silently letting the later entry win,
+    /// so a crafted snapshot cannot smuggle in an ambiguous overwrite.
+    DuplicateKey {
+        /// The offending key.
+        key: String,
+    },
+    /// `serde_json` failed to deserialize an entry payload. The `Display`
+    /// text deliberately does not include the `serde_json` error detail
+    /// (which can echo fragments of the malformed payload); callers that need
+    /// it for diagnostics should consult [`std::error::Error::source`], not
+    /// log the `Display` output.
     Deserialize(serde_json::Error),
 }
 
@@ -414,12 +532,26 @@ impl std::fmt::Display for ImportError {
                 "unsupported snapshot format version {got} (this build supports {supported})"
             ),
             ImportError::MalformedTtl { key } => {
-                write!(f, "entry {key:?} carries an invalid TTL (soft > hard)")
+                write!(
+                    f,
+                    "entry {key:?} carries an invalid TTL (soft > hard, or extended_at < loaded_at)"
+                )
             }
             ImportError::MalformedDefinition { key } => {
                 write!(f, "entry {key:?}'s definition carries a non-command source")
             }
-            ImportError::Deserialize(e) => write!(f, "failed to deserialize snapshot entry: {e}"),
+            ImportError::InvalidKey { key } => {
+                write!(f, "entry {key:?} is not a syntactically valid store key")
+            }
+            ImportError::DuplicateKey { key } => {
+                write!(f, "entry {key:?} appears more than once in the snapshot")
+            }
+            ImportError::Deserialize(_) => {
+                write!(
+                    f,
+                    "failed to deserialize snapshot entry (malformed payload)"
+                )
+            }
         }
     }
 }

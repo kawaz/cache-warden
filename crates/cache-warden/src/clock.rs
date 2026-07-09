@@ -91,11 +91,24 @@ pub(crate) fn monotonic_to_epoch_ms(
 ) -> u64 {
     if point >= now_mono {
         let ahead = point.saturating_duration_since(now_mono);
-        now_wall_epoch_ms.saturating_add(ahead.as_millis() as u64)
+        now_wall_epoch_ms.saturating_add(millis_saturating_u64(ahead))
     } else {
         let behind = now_mono.saturating_duration_since(point);
-        now_wall_epoch_ms.saturating_sub(behind.as_millis() as u64)
+        now_wall_epoch_ms.saturating_sub(millis_saturating_u64(behind))
     }
+}
+
+/// Saturating `Duration` -> millisecond-`u64` conversion.
+///
+/// `Duration::as_millis` returns `u128`, which can in principle exceed
+/// `u64::MAX`; a bare `as u64` cast would silently truncate rather than
+/// saturate in that case (DR-0029 review, LOW-2). Every call site here feeds
+/// a difference between two [`Monotonic`] points or wall-clock instants, so
+/// in practice this only ever saturates for absurdly large (multi-hundred-
+/// million-year) gaps — but saturating is still the correct degrade-safely
+/// choice over a silent wraparound.
+fn millis_saturating_u64(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The inverse of [`monotonic_to_epoch_ms`]: reconstruct a `Monotonic` point
@@ -128,6 +141,80 @@ pub(crate) fn epoch_ms_to_monotonic(
     } else {
         let behind_ms = now_wall_epoch_ms - epoch_ms;
         now_mono.saturating_sub(Duration::from_millis(behind_ms))
+    }
+}
+
+/// [`epoch_ms_to_monotonic`] specialized for a **TTL basis** timestamp
+/// (`loaded_at` / `extended_at`): clamps to `now_mono` instead of
+/// reconstructing a point ahead of it (DR-0029 review, HIGH-1).
+///
+/// A TTL basis is, by construction, never in the future at export time
+/// (`CacheEntry::loaded_at` / `extended_at` are always `<= now_mono` when
+/// `Store::export_snapshot` reads them). So if this reconstruction sees
+/// `epoch_ms > now_wall_epoch_ms` — i.e. the timestamp *appears* to lie ahead
+/// of the importing process's current wall clock — the only way that can
+/// happen honestly is if the wall clock **regressed** between export and
+/// import (an NTP correction, a manual clock change). [`epoch_ms_to_monotonic`]
+/// would otherwise reconstruct a `Monotonic` point ahead of `now_mono`, and
+/// [`Monotonic::saturating_duration_since`] against such a point returns
+/// [`Duration::ZERO`] for as long as real time has not yet caught up to it —
+/// silently defeating the hard-TTL guarantee (DR-0011) for that entire span,
+/// which could be arbitrarily long.
+///
+/// Clamping to `now_mono` is the conservative fix: it resets the reconstructed
+/// entry's TTL countdown to its maximum (as if the value were just loaded),
+/// rather than letting it look like it will never age. The entry still
+/// expires on schedule from the moment of import, just not at its "true"
+/// pre-restart age.
+pub(crate) fn epoch_ms_to_monotonic_ttl_basis(
+    now_mono: Monotonic,
+    now_wall_epoch_ms: u64,
+    epoch_ms: u64,
+) -> Monotonic {
+    if epoch_ms > now_wall_epoch_ms {
+        return now_mono;
+    }
+    epoch_ms_to_monotonic(now_mono, now_wall_epoch_ms, epoch_ms)
+}
+
+/// [`epoch_ms_to_monotonic`] specialized for [`crate::store::FailureRecord`]'s
+/// `failed_at` (DR-0029 review, HIGH-2).
+///
+/// The general function's "insufficient headroom" case (see this function's
+/// sibling doc above and [`epoch_ms_to_monotonic`]'s own headroom caveat)
+/// saturates at [`Monotonic::ZERO`] when the importing clock's own timeline
+/// does not reach back far enough to place an old timestamp. For a TTL basis
+/// that is a safe (if imprecise) "looks newer than it is" degrade. For a
+/// failure-backoff record it is the **opposite direction of danger**: a
+/// `failed_at` clamped to `ZERO` makes
+/// [`Monotonic::saturating_duration_since`] against it return a huge elapsed
+/// time, which reads as "the backoff window expired ages ago" —
+/// instantaneously lifting the DR-0022 fetch-failure backoff a restart was
+/// supposed to preserve (defeating the TouchID-storm suppression DR-0029
+/// exists for).
+///
+/// This function anchors the insufficient-headroom case to `now_mono`
+/// instead: it conservatively treats the failure as if it *just* happened,
+/// so the *full* `retry_after` window still applies after import rather than
+/// being erased.
+pub(crate) fn epoch_ms_to_monotonic_for_failure(
+    now_mono: Monotonic,
+    now_wall_epoch_ms: u64,
+    epoch_ms: u64,
+) -> Monotonic {
+    if epoch_ms >= now_wall_epoch_ms {
+        let ahead_ms = epoch_ms - now_wall_epoch_ms;
+        now_mono.saturating_add(Duration::from_millis(ahead_ms))
+    } else {
+        let behind = Duration::from_millis(now_wall_epoch_ms - epoch_ms);
+        if behind > now_mono.offset() {
+            // Insufficient headroom: reconstructing this point would
+            // saturate at Monotonic::ZERO, which would read as "ancient" and
+            // erase the backoff instead of preserving it.
+            now_mono
+        } else {
+            now_mono.saturating_sub(behind)
+        }
     }
 }
 
@@ -416,6 +503,141 @@ mod tests {
             reconstructed,
             Monotonic::ZERO,
             "insufficient headroom clamps rather than underflows"
+        );
+    }
+
+    // ---- epoch_ms_to_monotonic_ttl_basis (DR-0029 review HIGH-1) ----
+
+    #[test]
+    fn epoch_ms_to_monotonic_clamps_future_wall_clock_to_now() {
+        // Simulates a wall-clock regression between export and import (e.g.
+        // an NTP correction): the exporting process wrote loaded_at as an
+        // epoch_ms computed against its own (pre-regression) wall clock,
+        // which now reads *ahead* of the importing process's (post-
+        // regression) wall clock. The plain epoch_ms_to_monotonic would
+        // reconstruct a Monotonic point ahead of now_mono, which — per
+        // HIGH-1 — makes saturating_duration_since return ZERO for a long
+        // stretch, defeating the hard TTL. The _ttl_basis variant must
+        // instead clamp to now_mono.
+        let now_mono = Monotonic::from_offset(Duration::from_secs(1_000));
+        let now_wall_ms = 100_000u64; // post-regression wall clock
+        let epoch_ms_from_the_future = 150_000u64; // > now_wall_ms: appears ahead
+
+        let reconstructed =
+            epoch_ms_to_monotonic_ttl_basis(now_mono, now_wall_ms, epoch_ms_from_the_future);
+
+        assert_eq!(
+            reconstructed, now_mono,
+            "a TTL basis that appears to be from the future must clamp to now, \
+             never reconstruct a point ahead of now_mono"
+        );
+    }
+
+    #[test]
+    fn epoch_ms_to_monotonic_ttl_basis_matches_the_general_function_when_not_ahead() {
+        // Ordinary case (no clock regression): behaves identically to the
+        // general function for a timestamp genuinely in the past.
+        let now_mono = Monotonic::from_offset(Duration::from_secs(1_000));
+        let now_wall_ms = 100_000u64;
+        let past_epoch_ms = 70_000u64;
+
+        assert_eq!(
+            epoch_ms_to_monotonic_ttl_basis(now_mono, now_wall_ms, past_epoch_ms),
+            epoch_ms_to_monotonic(now_mono, now_wall_ms, past_epoch_ms)
+        );
+    }
+
+    #[test]
+    fn epoch_ms_to_monotonic_ttl_basis_preserves_order_when_only_one_side_is_ahead() {
+        // If loaded_at_epoch_ms and extended_at_epoch_ms straddle the
+        // apparent-future threshold (loaded_at not ahead, extended_at ahead),
+        // independent per-field clamping must still preserve the
+        // extended_at >= loaded_at invariant: the non-clamped (past) value
+        // reconstructs to some point <= now_mono, and the clamped value is
+        // exactly now_mono, so ordering holds without extra reconciliation
+        // logic.
+        let now_mono = Monotonic::from_offset(Duration::from_secs(1_000));
+        let now_wall_ms = 100_000u64;
+        let loaded_at_epoch_ms = 90_000u64; // not ahead: normal reconstruction
+        let extended_at_epoch_ms = 150_000u64; // ahead: clamps to now_mono
+
+        let loaded_at = epoch_ms_to_monotonic_ttl_basis(now_mono, now_wall_ms, loaded_at_epoch_ms);
+        let extended_at =
+            epoch_ms_to_monotonic_ttl_basis(now_mono, now_wall_ms, extended_at_epoch_ms);
+
+        assert!(
+            extended_at >= loaded_at,
+            "extended_at must never reconstruct before loaded_at"
+        );
+        assert_eq!(extended_at, now_mono);
+    }
+
+    // ---- epoch_ms_to_monotonic_for_failure (DR-0029 review HIGH-2) ----
+
+    #[test]
+    fn failure_reanchor_preserves_backoff_when_headroom_insufficient() {
+        // Mirrors epoch_ms_to_monotonic_saturates_when_importing_clock_has_no_headroom
+        // above, but for the failure-record specialization: instead of
+        // clamping to Monotonic::ZERO (which would make the backoff look
+        // ancient and instantly lapse), insufficient headroom must anchor
+        // failed_at to now_mono, so the full retry_after window still
+        // applies from the moment of import.
+        let old_now_mono = Monotonic::from_offset(Duration::from_secs(10_000));
+        let old_now_wall_ms = 1_700_000_000_000u64;
+        // Failed 1 second after the old process's own clock epoch — deep in
+        // its history relative to its own numbering.
+        let failed_at_point = old_now_mono.saturating_sub(Duration::from_secs(9_999));
+        let failed_at_epoch_ms =
+            monotonic_to_epoch_ms(old_now_mono, old_now_wall_ms, failed_at_point);
+
+        // The importing clock just started (offset ~0) with no headroom.
+        let new_now_mono = Monotonic::from_offset(Duration::from_millis(5));
+        let new_now_wall_ms = old_now_wall_ms;
+
+        let reconstructed =
+            epoch_ms_to_monotonic_for_failure(new_now_mono, new_now_wall_ms, failed_at_epoch_ms);
+
+        assert_eq!(
+            reconstructed, new_now_mono,
+            "insufficient headroom must anchor failed_at to now, not to ZERO \
+             (ZERO would read as an ancient failure and instantly lift the backoff)"
+        );
+
+        // Concretely: with failed_at == now_mono, the full retry_after must
+        // still be outstanding immediately after import.
+        let retry_after = Duration::from_secs(60);
+        let elapsed = new_now_mono.saturating_duration_since(reconstructed);
+        assert!(
+            elapsed < retry_after,
+            "backoff must not have already lapsed right after import"
+        );
+    }
+
+    #[test]
+    fn failure_reanchor_matches_the_general_function_with_sufficient_headroom() {
+        // With enough headroom, behaves identically to the general function.
+        let now_mono = Monotonic::from_offset(Duration::from_secs(50_000));
+        let now_wall_ms = 1_700_000_000_000u64;
+        let epoch_ms = now_wall_ms - 5_000; // 5s in the past, comfortably within headroom
+
+        assert_eq!(
+            epoch_ms_to_monotonic_for_failure(now_mono, now_wall_ms, epoch_ms),
+            epoch_ms_to_monotonic(now_mono, now_wall_ms, epoch_ms)
+        );
+    }
+
+    #[test]
+    fn failure_reanchor_clamps_apparent_future_failed_at_like_the_general_function() {
+        // A failed_at that appears ahead of wall-now behaves the same as the
+        // general function's "ahead" branch (this specialization only changes
+        // the insufficient-headroom "behind" case, not the "ahead" case).
+        let now_mono = Monotonic::from_offset(Duration::from_secs(1_000));
+        let now_wall_ms = 100_000u64;
+        let future_epoch_ms = 105_000u64;
+
+        assert_eq!(
+            epoch_ms_to_monotonic_for_failure(now_mono, now_wall_ms, future_epoch_ms),
+            epoch_ms_to_monotonic(now_mono, now_wall_ms, future_epoch_ms)
         );
     }
 }
