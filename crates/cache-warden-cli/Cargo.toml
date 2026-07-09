@@ -35,6 +35,21 @@ sha2 = "0.10"
 # the running binary to a stable PATH symlink (not a dev/Cellar/ephemeral path)
 # baked into the service definition. Runtime-dependency-free (DR-0002).
 stable-which = "0.5"
+# Secret-hygiene buffer for the graceful-restart handoff (DR-0029 §2/§5): the
+# same zeroize-on-drop guarantee `cache_warden::StoreSnapshot::to_bytes`
+# already returns to its caller, re-used here for the receiving side's own
+# accumulation buffer and the parent's socketpair send buffer.
+zeroize = "1"
+
+# Graceful restart (DR-0029 §3): macOS codesign self-consistency check for the
+# exec target. Confined to macOS via target-specific deps so a Linux build
+# pulls none of this (the Linux path is `unimplemented!` for now; see
+# `daemon::graceful_restart::codesign`).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

@@ -947,6 +947,26 @@ impl Store {
         Ok(had_value || had_def)
     }
 
+    /// Remove only `key`'s definition, leaving any resident value entry and
+    /// failure-backoff record untouched.
+    ///
+    /// Unlike [`Store::delete_with_definition`] (which forgets the key
+    /// entirely, value included), this exists for callers that must replace
+    /// *how* a key regenerates without disturbing value continuity — e.g.
+    /// DR-0029 bundle 2's graceful-restart startup reconciliation, which
+    /// clears an import-origin definition so the current config's
+    /// `define_with_meta` can win cleanly, while the cached secret carried
+    /// over by the handoff keeps serving until it naturally expires.
+    ///
+    /// Not cap-gated (DR-0024): like [`Store::define`]/[`Store::define_with_meta`],
+    /// a definition is value-free metadata.
+    ///
+    /// Returns `true` if a definition was present and removed, `false` if
+    /// `key` had none.
+    pub fn undefine(&mut self, key: &str) -> bool {
+        self.definitions.remove(key).is_some()
+    }
+
     // ---- graceful-restart snapshot (DR-0029 §2, Phase 1 / bundle 1) ----
 
     /// Serialize this store's full state into a [`StoreSnapshot`] for

@@ -245,6 +245,38 @@ impl SystemClock {
             base: Instant::now(),
         }
     }
+
+    /// Create a clock whose `Monotonic` numbering already starts `offset`
+    /// ahead of zero, instead of at the moment of construction (DR-0029
+    /// bundle 2 MEDIUM-6).
+    ///
+    /// [`epoch_ms_to_monotonic`]'s headroom caveat means a freshly
+    /// constructed [`SystemClock::new()`] cannot represent a snapshot
+    /// timestamp older than its own (near-zero) uptime without saturating —
+    /// which the TTL-basis/failure specializations degrade *safely*
+    /// (they never expose extra lifetime), but a hard-TTL entry imported via
+    /// graceful restart would still be treated as freshly loaded, extending
+    /// its true residency past the config's intended maximum age. Backdating
+    /// this clock's own epoch by `offset` before the graceful-restart
+    /// receive path ever calls [`crate::store::Store::import_snapshot`]
+    /// closes that gap for any entry loaded up to `offset` before the
+    /// restart. `offset` has no effect on ordinary (non-import) TTL math:
+    /// every other [`Clock`] consumer only ever compares two readings from
+    /// this same instance (see the module doc — only differences are
+    /// meaningful), so a constant added to both sides of a difference
+    /// cancels out.
+    ///
+    /// Falls back to [`SystemClock::new`]'s behaviour (no headroom) if
+    /// `offset` cannot be represented (the process/system has not been up
+    /// long enough for `Instant` to subtract it) — the same safe-degrade
+    /// posture as every other graceful-restart failure path.
+    pub fn with_epoch_offset(offset: Duration) -> Self {
+        Self {
+            base: Instant::now()
+                .checked_sub(offset)
+                .unwrap_or_else(Instant::now),
+        }
+    }
 }
 
 impl Default for SystemClock {
@@ -350,6 +382,43 @@ mod tests {
         let t1 = c.now();
         let t2 = c.now();
         assert!(t2 >= t1);
+    }
+
+    // ---- SystemClock::with_epoch_offset (DR-0029 bundle 2 MEDIUM-6) ----
+
+    #[test]
+    fn with_epoch_offset_starts_with_the_requested_headroom() {
+        // Constructing with a 600s offset must read back at (very close to)
+        // 600s immediately — the whole point being that an importer can
+        // represent a snapshot timestamp up to `offset` in the past without
+        // saturating at Monotonic::ZERO.
+        let c = SystemClock::with_epoch_offset(Duration::from_secs(600));
+        let reading = c.now().offset();
+        assert!(
+            reading >= Duration::from_secs(599),
+            "expected ~600s of headroom immediately after construction, got {reading:?}"
+        );
+        // Loose upper bound: the read-back call itself takes negligible time.
+        assert!(
+            reading < Duration::from_secs(601),
+            "unexpectedly large offset: {reading:?}"
+        );
+    }
+
+    #[test]
+    fn with_epoch_offset_remains_monotonic_nondecreasing() {
+        let c = SystemClock::with_epoch_offset(Duration::from_secs(60));
+        let t1 = c.now();
+        let t2 = c.now();
+        assert!(t2 >= t1);
+    }
+
+    #[test]
+    fn with_epoch_offset_zero_matches_new() {
+        // A zero offset degrades to plain `new()` behaviour: starts at
+        // (near) zero, not backdated.
+        let c = SystemClock::with_epoch_offset(Duration::ZERO);
+        assert!(c.now().offset() < Duration::from_secs(1));
     }
 
     #[test]

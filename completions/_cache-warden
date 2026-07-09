@@ -103,6 +103,7 @@ _cache-warden() {
             'register:Install the launchd/systemd user service (--print to preview)'
             'unregister:Stop and remove the installed service'
             'status:Show service registration / running state'
+            'restart:Restart in place with no cache re-fetch storm (DR-0029)'
           )
           _arguments -C \
             "$socket_opt" \
@@ -131,6 +132,11 @@ _cache-warden() {
                 status)
                   _arguments \
                     '--label[Service label to query (default: per-OS default)]:label' \
+                    '--help[Show this help message]'
+                  ;;
+                restart)
+                  _arguments \
+                    '--graceful[Required for now: no-storm restart via serialize + verify + exec (DR-0029)]' \
                     '--help[Show this help message]'
                   ;;
               esac

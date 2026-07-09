@@ -123,6 +123,16 @@ where
                 Response::error(ErrorKind::Internal, "capability mismatch")
             }
         },
+        // DR-0029: `server::run_request` always intercepts this variant
+        // itself (dispatching to `graceful_restart::handle_request`, which
+        // needs `Shared` — not available here) before this function is ever
+        // called with it. This arm exists only so the match stays exhaustive
+        // against a future new `Request` variant being added without a
+        // matching update here; it is not expected to execute in practice.
+        Request::RestartGraceful => Response::error(
+            ErrorKind::Internal,
+            "restart_graceful must be dispatched by run_request",
+        ),
     }
 }
 

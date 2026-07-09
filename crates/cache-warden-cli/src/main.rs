@@ -67,6 +67,13 @@ fn render_response(resp: Response) -> Result<(), String> {
                 OkPayload::GetVerified { state, .. } => {
                     println!("verified ({state}); no value (dry-run)");
                 }
+                // DR-0029: dispatched specially by `dispatch_daemon`'s
+                // `restart` leaf (it also handles the no-reply / socket-close
+                // outcome that a *successful* graceful restart produces);
+                // surfaced defensively if it ever reaches here.
+                OkPayload::Restarting { .. } => {
+                    println!("restart accepted");
+                }
                 OkPayload::Status {
                     pid,
                     version,
@@ -106,6 +113,7 @@ fn error_kind_str(kind: &protocol::wire::ErrorKind) -> &'static str {
         HardExpired => "hard expired",
         UpstreamFailed => "upstream failed",
         Internal => "internal error",
+        RestartAborted => "restart aborted",
     }
 }
 
@@ -302,6 +310,21 @@ fn dispatch_daemon(
                 help::daemon_status,
             )?;
             commands::daemon_cmd::status(parsed).map_err(CliError::Message)
+        }
+        "restart" => {
+            if help::wants_help(tail) {
+                println!("{}", help::daemon_restart().render());
+                return Ok(());
+            }
+            let parsed = or_usage(
+                commands::daemon_cmd::parse_restart_args(tail),
+                help::daemon_restart,
+            )?;
+            if parsed.graceful {
+                commands::daemon_cmd::restart_graceful(&socket).map_err(CliError::Message)
+            } else {
+                unreachable!("parse_restart_args rejects a non-graceful restart")
+            }
         }
         other => Err(CliError::Message(format!(
             "unknown daemon subcommand: {other} (try `{NAME} daemon --help`)"

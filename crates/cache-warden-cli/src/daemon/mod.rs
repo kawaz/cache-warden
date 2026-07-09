@@ -16,8 +16,13 @@
 //!   crash cannot leak in-memory secrets to disk (5a) and refuse debugger
 //!   attachment so a live inspector cannot read them (5b, opt-out via
 //!   `[daemon].allow-debug-attach`); design §3 judgement 5.
+//! - [`graceful_restart`]: DR-0029 Phase 1 — serialize the kv store, verify
+//!   this process's own binary, and hand the state to a freshly exec'd copy
+//!   of itself over a private socketpair (no re-fetch storm across a
+//!   restart). `server::run` is the only caller.
 
 pub mod authsock;
+mod graceful_restart;
 pub mod handler;
 pub mod hardening;
 pub mod otp_adapter;

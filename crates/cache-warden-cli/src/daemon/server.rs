@@ -47,6 +47,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
+use super::graceful_restart;
 use super::handler::{self, HandlerCtx};
 use super::peer::peer_pid;
 use crate::config::{Config, KvDefinition};
@@ -167,6 +168,92 @@ pub(crate) struct Shared {
     /// `kv.get` gate, and the authsock listener shares the same `Shared` so a
     /// SIGN_REQUEST resolving a KV key consults the same table.
     pub(crate) kv_process_policies: std::collections::BTreeMap<String, Vec<String>>,
+    /// This process's own exec path, resolved once at startup (DR-0029 §3):
+    /// graceful restart always execs *this exact path*, never re-resolving
+    /// `current_exe()` at restart time (which would let a `plist`/PATH change
+    /// after startup silently redirect the handoff — DR-0029 §3's rationale).
+    /// Empty when `current_exe()` failed at startup (rare); graceful restart
+    /// then always fails its own verification step, leaving the daemon
+    /// otherwise fully functional.
+    ///
+    /// Only read from `graceful_restart::handle_request`'s
+    /// `#[cfg(target_os = "macos")]` branch, hence genuinely unread on every
+    /// other target (found while cross-checking this bundle's HIGH-4
+    /// non-macOS regression test against `.github/workflows/ci.yml`'s
+    /// `ubuntu-latest` runner's `cargo clippy --workspace -- -D warnings` —
+    /// a pre-existing issue independent of that test).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) exe_path: PathBuf,
+    /// This process's own argv (`std::env::args()`, index 0 included),
+    /// captured once at startup and re-used verbatim (minus argv[0], which
+    /// [`graceful_restart`] replaces with [`Self::exe_path`] itself) when
+    /// re-exec'ing for a graceful restart ("argv 継承", DR-0029 §1 step ⑥).
+    /// See [`Self::exe_path`]'s doc for why this is macOS-only in practice.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) argv: Vec<String>,
+    /// Coordinates a graceful restart (DR-0029) between the connection
+    /// handler that receives `daemon.restart_graceful` and this module's
+    /// [`run`] loop, which owns the actual fork/exec.
+    pub(crate) restart: graceful_restart::RestartCoordinator,
+    /// Tracks in-flight connections so a graceful restart can drain them
+    /// (bounded wait, DR-0029 §4) before its accept loop stops and its
+    /// listeners close. Not consulted by the normal SIGINT/SIGTERM shutdown
+    /// path, which does not drain (pre-existing behaviour, unchanged).
+    pub(crate) active_connections: ConnectionTracker,
+}
+
+/// A bounded-wait connection counter (DR-0029 §4's drain step).
+///
+/// Incremented when [`serve`] accepts a connection, decremented when
+/// [`handle_connection`] returns. [`ConnectionTracker::wait_drained`] resolves
+/// as soon as the count reaches zero, or after `deadline` elapses, whichever
+/// is first — the design's "現行の全クライアントは per-request 接続 ...
+/// deadline 超過分は切断してよい" (DR-0029 §4).
+pub(crate) struct ConnectionTracker {
+    count: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl ConnectionTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            count: std::sync::atomic::AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn inc(&self) {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn dec(&self) {
+        // `fetch_sub` returns the *previous* value; `1` means the count just
+        // reached zero, so wake anyone waiting in `wait_drained`.
+        if self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Wait for the count to reach zero, or for `deadline` to elapse —
+    /// whichever comes first. Never panics or errors: a timed-out drain is
+    /// an accepted outcome (DR-0029 §4), not a failure.
+    async fn wait_drained(&self, deadline: std::time::Duration) {
+        let drained = async {
+            loop {
+                if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return;
+                }
+                self.notify.notified().await;
+            }
+        };
+        let _ = tokio::time::timeout(deadline, drained).await;
+    }
+}
+
+impl Default for ConnectionTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Where and what to persist for online definitions (DR-0014 §4).
@@ -205,9 +292,25 @@ impl Shared {
             socket_path: String::new(),
             pid: std::process::id(),
             kv_process_policies: std::collections::BTreeMap::new(),
+            exe_path: PathBuf::new(),
+            argv: Vec::new(),
+            restart: graceful_restart::RestartCoordinator::new(),
+            active_connections: ConnectionTracker::new(),
         }
     }
 }
+
+/// Headroom given to the graceful-restart receiving process's `Monotonic`
+/// clock (DR-0029 bundle 2 review MEDIUM-6, see the `clock` construction in
+/// [`run`]). Chosen generously (a full day) rather than matching some
+/// expected restart cadence: the only cost of a larger value is the
+/// (essentially free) `Instant` subtraction itself, while too small a value
+/// re-opens the exact security gap this constant exists to close for any
+/// entry whose TTL/age exceeds it. Falls back to zero headroom
+/// (`SystemClock::new()`-equivalent) if the process/system has not been up
+/// long enough to represent it — see [`SystemClock::with_epoch_offset`]'s doc.
+const GRACEFUL_RESTART_CLOCK_HEADROOM: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Run the daemon in the foreground until SIGINT / SIGTERM, using `config`.
 ///
@@ -257,21 +360,94 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         );
     }
 
+    // DR-0029 bundle 2 review MEDIUM-5: call `try_receive` (which, as a side
+    // effect, also spawns the state-holder reaper —
+    // `receive::reap_holder_in_background` — the moment it sees the handoff
+    // env var) *before* `bind_control_socket` can fail and return early via
+    // `?` below. Previously a bind failure (e.g. another process already
+    // holds the path) skipped `try_receive` entirely on a real
+    // graceful-restart handoff, leaving the old process's state-holder child
+    // unreaped by this process (its kernel parent, post-`execve`) until this
+    // process's own eventual exit. Calling it first guarantees the reaper
+    // always starts as soon as this process has taken the handoff fd,
+    // independent of whether the rest of startup goes on to succeed.
+    //
+    // `try_receive` reads and parses the snapshot (bounded by its own 60s
+    // timeout); any failure — no env var, a malformed stream, a timeout —
+    // falls back to `None` here, and the daemon proceeds exactly as a normal
+    // cold start (empty store) from this point on.
+    let incoming = graceful_restart::receive::try_receive();
+
     // Bind the control socket early so clients can connect (and answer `ping`)
     // while `preload = true` entries are running (DR-0023 Phase 1).
     let listener = bind_control_socket(&socket_path)?;
 
     let runner = CommandRunner::new();
-    let clock = SystemClock::new();
 
-    // Build `Shared` with an empty Store and an empty `persist` OnceLock.
-    // The persist slot is filled from within the blocking startup task after
-    // definitions are registered (DR-0023 Phase 1): OnceLock allows a single
-    // interior write after the Arc has been handed to the serve loop, without
-    // needing a Mutex or rebuilding the whole Shared struct.
-    let bundle = StoreBuilder::new()
-        .failure_backoff(config.fetch_failure_backoff())
-        .build();
+    // DR-0029 bundle 2 review MEDIUM-6: a plain `SystemClock::new()` anchors
+    // its `Monotonic` numbering to *this* construction, i.e. ~zero headroom.
+    // `Store::import_snapshot`'s reconstruction clamps safely when headroom
+    // runs out (see `epoch_ms_to_monotonic`'s doc), but "safely" here means an
+    // old entry is treated as freshly loaded — extending a hard-TTL secret's
+    // true residency past the config's intended maximum age. `incoming` above
+    // already tells us whether this is a real handoff (not just whether the
+    // env var was *present* — an already-consumed one), so the extra
+    // headroom applies exactly when there is a snapshot to import.
+    let clock = if incoming.is_some() {
+        SystemClock::with_epoch_offset(GRACEFUL_RESTART_CLOCK_HEADROOM)
+    } else {
+        SystemClock::new()
+    };
+
+    // DR-0029 §3: this process's own exec path, resolved once here and never
+    // re-derived at restart time (a later `current_exe()` call could be
+    // fooled by a changed cwd / a `plist` pointed elsewhere in the meantime —
+    // DR-0029 §3's rationale for pinning it to the startup value). Empty on
+    // failure (rare); graceful restart's own verification step then always
+    // rejects, everything else about the daemon is unaffected.
+    let exe_path = std::env::current_exe().unwrap_or_else(|e| {
+        eprintln!(
+            "cache-warden: warning: cannot resolve this process's own exec path ({e}); \
+             `daemon restart --graceful` will be unavailable"
+        );
+        PathBuf::new()
+    });
+    let argv: Vec<String> = std::env::args().collect();
+
+    let cold_bundle = || {
+        StoreBuilder::new()
+            .failure_backoff(config.fetch_failure_backoff())
+            .build()
+    };
+    let (handoff_stream, bundle) = match incoming {
+        Some(graceful_restart::receive::IncomingHandoff { stream, snapshot }) => {
+            match Store::import_snapshot(
+                StoreBuilder::new().failure_backoff(config.fetch_failure_backoff()),
+                snapshot,
+                &clock,
+            ) {
+                Ok(bundle) => (Some(stream), bundle),
+                Err(e) => {
+                    eprintln!(
+                        "cache-warden: warning: graceful-restart handoff snapshot was rejected \
+                         ({e}); falling back to a cold start"
+                    );
+                    // `stream` drops here (closes our end) — the ABORT
+                    // signal the old process's state-holder is waiting on
+                    // (DR-0029 §5).
+                    (None, cold_bundle())
+                }
+            }
+        }
+        None => (None, cold_bundle()),
+    };
+
+    // Build `Shared` with the (possibly graceful-restart-imported) Store and
+    // an empty `persist` OnceLock. The persist slot is filled from within the
+    // blocking startup task after definitions are registered (DR-0023
+    // Phase 1): OnceLock allows a single interior write after the Arc has
+    // been handed to the serve loop, without needing a Mutex or rebuilding
+    // the whole Shared struct.
     let otp_adapter = crate::daemon::otp_adapter::OtpAdapter::new(bundle.otp_cap);
     let shared = Arc::new(Shared {
         store: Mutex::new(bundle.store),
@@ -285,6 +461,10 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         socket_path: socket_path.display().to_string(),
         pid: std::process::id(),
         kv_process_policies: config.kv_process_policies(),
+        exe_path,
+        argv,
+        restart: graceful_restart::RestartCoordinator::new(),
+        active_connections: ConnectionTracker::new(),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -350,12 +530,29 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
             .store
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // DR-0029 bundle 2: whatever already has a value at this point came
+        // from a graceful-restart handoff import (run just before `Shared`
+        // was built, below) — empty on every other startup. Computed fresh
+        // here rather than threaded through from the import step so a cold
+        // start (the overwhelmingly common case) pays nothing beyond an
+        // empty-store scan.
+        let already_loaded: std::collections::HashSet<String> = store
+            .list_filtered(|r| r.entry().is_some())
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        // DR-0029 bundle 2 review CRITICAL fix: see `clear_config_owned_definitions`'s
+        // doc. A no-op on a cold start (nothing is defined yet at this point).
+        clear_config_owned_definitions(&mut store, &config_names_for_persist);
+
         register_definitions(
             &mut store,
             &runner_for_task,
             &shared_for_startup.clock,
             &config_defs_for_task,
             &authsock_keys_for_task,
+            &already_loaded,
             &shared_for_startup.control_cap,
         );
 
@@ -365,7 +562,20 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
             let path = crate::defs::definitions_state_path();
             match crate::defs::load_definitions(&path) {
                 Ok(persisted) => {
+                    // DR-0029 bundle 2 review HIGH-1 fix: see
+                    // `purge_stale_import_definitions`'s doc. Computed
+                    // *before* `restore_persisted_definitions` consumes
+                    // `persisted` below.
+                    let persisted_names: std::collections::HashSet<String> = persisted
+                        .iter()
+                        .map(|d| d.full_key(crate::namespace::DEFAULT_NAMESPACE))
+                        .collect();
                     restore_persisted_definitions(&mut store, persisted, &config_names_for_persist);
+                    purge_stale_import_definitions(
+                        &mut store,
+                        &config_names_for_persist,
+                        &persisted_names,
+                    );
                 }
                 Err(e) => {
                     eprintln!("cache-warden: {e}; ignoring persisted definitions");
@@ -430,6 +640,15 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         t0.elapsed().as_secs_f64()
     );
 
+    // DR-0029 §5: if this startup imported a graceful-restart handoff, this
+    // process is now fully up (definitions registered, control socket
+    // bound) — send the two-phase-commit `COMMIT` frame so the old
+    // process's state-holder zeroizes its buffer and exits cleanly instead
+    // of waiting out its 60s timeout.
+    if let Some(stream) = handoff_stream {
+        graceful_restart::receive::send_commit(stream);
+    }
+
     // Start one SSH agent listener per `[authsock.sockets.*]` (port Iteration 1).
     // Each binds its own socket (same 0600 / stale-recovery / double-start guard
     // as the control socket) and shares this process's Store / auth / runner /
@@ -492,11 +711,36 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
     }
     let authsock_handles = handles;
 
+    // Race the normal SIGINT/SIGTERM path against a `daemon.restart_graceful`
+    // request that has already been verified and prepared (DR-0029 bundle
+    // 2). Both converge on the exact same cleanup below (drain, stop
+    // accepting, close + unlink every listener) — reusing the existing
+    // shutdown path *is* DR-0029 §1's "accept 停止 → drain → close +
+    // unlink" step, not a second implementation of it. Only the very last
+    // action (return `Ok(())` vs. fork/exec) differs.
     #[cfg(unix)]
-    wait_for_shutdown(shutdown_notify).await;
+    let restart_requested = tokio::select! {
+        _ = wait_for_shutdown(shutdown_notify) => false,
+        _ = shared.restart.wait() => true,
+    };
     #[cfg(not(unix))]
-    wait_for_shutdown().await;
+    let restart_requested = {
+        wait_for_shutdown().await;
+        // Graceful restart's control-socket handler rejects every request on
+        // this platform before it could ever call `shared.restart`'s signal
+        // (see `graceful_restart::handle_request`'s non-macOS guard), so this
+        // is always the outcome here.
+        false
+    };
     let _ = shutdown_tx.send(true);
+    // DR-0029 §4: only the restart path drains — the pre-existing
+    // SIGINT/SIGTERM shutdown behaviour (no drain wait) is unchanged.
+    if restart_requested {
+        shared
+            .active_connections
+            .wait_drained(RESTART_DRAIN_DEADLINE)
+            .await;
+    }
     let _ = server.await;
     for (path, handle) in authsock_handles {
         let _ = handle.await;
@@ -506,6 +750,17 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
 
     // Clean up the control socket file (best effort).
     let _ = std::fs::remove_file(&socket_path);
+
+    if restart_requested {
+        // Every listener is now closed and unlinked (DR-0029 §1's fd-hygiene
+        // requirement) — only now is it safe to fork the state-holder and
+        // `execve` this process. Does not return on success; if it does
+        // return, the fork/exec sequence itself failed at the very last
+        // moment and there is nothing left to recover (the listeners are
+        // already gone) — fall through to the normal clean-shutdown return
+        // below and rely on the service manager to cold-restart this process.
+        graceful_restart::execute_after_shutdown(&shared);
+    }
     Ok(())
 }
 
@@ -521,12 +776,21 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
 /// failed eager run is a single secret-free stderr warning and leaves the
 /// definition in place (the value regenerates on the next `get`). The daemon must
 /// come up even if an upstream secret source is temporarily down.
+///
+/// `already_loaded` (DR-0029 bundle 2) is the set of composed keys that
+/// already carry a value — populated from a graceful-restart handoff import
+/// that ran just before this call, empty on every other startup (cold start,
+/// or a handoff that failed and fell back to cold). A `preload` / force-eager
+/// entry whose key is already in this set skips its eager run: the value
+/// just arrived intact from the old process, so re-running the source here
+/// would be exactly the re-fetch storm graceful restart exists to avoid.
 fn register_definitions<R, C>(
     store: &mut Store,
     runner: &R,
     clock: &C,
     entries: &[KvDefinition],
     force_eager: &std::collections::HashSet<String>,
+    already_loaded: &std::collections::HashSet<String>,
     cap: &Capability,
 ) where
     R: SourceRunner,
@@ -589,7 +853,8 @@ fn register_definitions<R, C>(
         // type (otp) stays on the definition registered just above (DR-0016).
         // `force_eager` holds composed keys (authsock `keys` are normalized at
         // config validation), so the comparison is composed-to-composed.
-        if entry.preload || force_eager.contains(&full_key) {
+        if (entry.preload || force_eager.contains(&full_key)) && !already_loaded.contains(&full_key)
+        {
             // Run the lowered execution primitive (argv + cwd/env; DR-0018 §1).
             let argv = source.command_argv().unwrap_or(&[]).to_vec();
             let cwd = source.command_cwd().map(|p| p.to_path_buf());
@@ -657,6 +922,81 @@ fn restore_persisted_definitions(
     }
 }
 
+/// Clear any existing definition for every key in `config_names` (DR-0029
+/// bundle 2 review CRITICAL fix), so `register_definitions`'s upcoming
+/// `define_with_meta` call always inserts cleanly instead of ever hitting
+/// `DefineError::Conflict`.
+///
+/// A graceful-restart handoff import can leave the store already carrying a
+/// definition for a config-defined key (imported wholesale from the old
+/// process's live registry, before this function or `register_definitions`
+/// ever runs). `define_with_meta`'s idempotency is an *exact-match* rule
+/// (DR-0014 §1): if that imported definition differs from the config's
+/// current one at all (e.g. its TTL or argv changed since the old process
+/// started), `register_definitions` would hit `Conflict` and skip
+/// re-registering it — silently leaving the *stale* imported definition in
+/// place, so a config edit would never take effect across a graceful
+/// restart. Clearing it first (via [`Store::undefine`], which touches only
+/// the definition — never the cached *value* or its failure-backoff record)
+/// makes the config always win, exactly as it would on a cold start: the
+/// cached value keeps serving uninterrupted, and the next regeneration
+/// (`get_or_regenerate`) picks up the new TTL/argv from the
+/// freshly-registered definition.
+///
+/// A no-op on a cold start (nothing is defined yet when this runs).
+fn clear_config_owned_definitions(
+    store: &mut Store,
+    config_names: &std::collections::HashSet<String>,
+) {
+    for full_key in config_names {
+        store.undefine(full_key);
+    }
+}
+
+/// Remove any definition the store still carries that is neither a current
+/// config definition nor a genuinely persisted online one (DR-0029 bundle 2
+/// review HIGH-1 fix), returning the removed keys (for logging/testing).
+///
+/// A graceful-restart handoff import can leave the store carrying a
+/// definition for a key the *old* process's config used to define but the
+/// *current* config no longer does — an orphan that is neither a config
+/// definition (excluded from [`online_definitions`]'s filter) nor ever
+/// actually persisted as online. Left alone, such an orphan would still be
+/// swept into `write_online_definitions`'s next write as if it *were*
+/// genuinely online — resurrecting itself on every subsequent restart. Call
+/// this only once `register_definitions` and `restore_persisted_definitions`
+/// have both already run, so `expected` names (config ∪ the state file's own
+/// persisted names, computed by the caller *before* the latter call
+/// consumes its `persisted` argument) reflect every definition that is
+/// supposed to still be there.
+///
+/// Every `kv.define` / `kv.del --with-define` synchronously rewrites the
+/// state file (`persist_if_enabled`), so `persisted_names` is always in sync
+/// as of the last successful mutation — the only reliable way to tell an
+/// orphan apart from a genuinely online definition that just happens to also
+/// ride along in the handoff snapshot. Callers gate this to the
+/// `persist_enabled` branch only: without persistence there is no such
+/// trustworthy record, and a lingering in-memory-only orphan is harmless (it
+/// is never written to disk).
+fn purge_stale_import_definitions(
+    store: &mut Store,
+    config_names: &std::collections::HashSet<String>,
+    persisted_names: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let expected: std::collections::HashSet<&String> =
+        config_names.iter().chain(persisted_names).collect();
+    let stale: Vec<String> = store
+        .list_filtered(|r| r.definition().is_some())
+        .into_iter()
+        .map(String::from)
+        .filter(|k| !expected.contains(k))
+        .collect();
+    for key in &stale {
+        store.undefine(key);
+    }
+    stale
+}
+
 /// The store's **online** definition registry: every definition minus the names
 /// the config defines (DR-0014 §4).
 ///
@@ -720,11 +1060,13 @@ async fn serve(
                 match accepted {
                     Ok((stream, _addr)) => {
                         let shared = Arc::clone(&shared);
+                        shared.active_connections.inc();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, shared).await {
+                            if let Err(e) = handle_connection(stream, Arc::clone(&shared)).await {
                                 // Connection-level I/O errors are non-fatal.
                                 eprintln!("cache-warden: connection error: {e}");
                             }
+                            shared.active_connections.dec();
                         });
                     }
                     Err(e) => {
@@ -796,6 +1138,13 @@ fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Respons
     // even while the startup blocking task holds the store lock (DR-0023 Phase 1).
     if matches!(req, Request::Ping) {
         return Response::pong();
+    }
+    // `daemon.restart_graceful` (DR-0029) is handled entirely by
+    // `graceful_restart`, which takes the store lock itself only for the
+    // brief snapshot-export step — it never goes through the generic
+    // `handler::handle_request` dispatch below.
+    if matches!(req, Request::RestartGraceful) {
+        return graceful_restart::handle_request(shared);
     }
 
     // Resolve requester ancestry from the peer pid (best effort).
@@ -869,6 +1218,12 @@ const SHUTDOWN_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 /// promptly and well within a service manager's own SIGTERM→SIGKILL window.
 #[cfg(unix)]
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a graceful restart waits for in-flight connections to finish
+/// before its accept loop stops and its listeners close (DR-0029 §4). A
+/// connection still open past this deadline is simply cut when this process
+/// later `execve`s — accepted, not treated as a failure.
+const RESTART_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Build a `sigset_t` containing the [`SHUTDOWN_SIGNALS`].
 #[cfg(unix)]
@@ -1081,6 +1436,10 @@ mod tests {
             socket_path: "/tmp/test.sock".into(),
             pid: std::process::id(),
             kv_process_policies: std::collections::BTreeMap::new(),
+            exe_path: PathBuf::new(),
+            argv: Vec::new(),
+            restart: graceful_restart::RestartCoordinator::new(),
+            active_connections: ConnectionTracker::new(),
         })
     }
 
@@ -1120,6 +1479,25 @@ mod tests {
         match resp {
             Response::Err(e) => assert_eq!(e.error.kind, ErrorKind::BadRequest),
             _ => panic!("expected error"),
+        }
+    }
+
+    // ---- daemon.restart_graceful dispatch (DR-0029 bundle 2) ----
+
+    #[test]
+    fn restart_graceful_without_a_resolvable_exe_path_is_aborted() {
+        // The `shared()` test helper leaves `exe_path` empty (no real daemon
+        // binary behind this test `Shared`) — the request must be cleanly
+        // rejected rather than attempt anything, on every platform. On
+        // macOS this exercises `verify_exec_target`'s own rejection (fails at
+        // `File::open("")`, before ever reaching the codesign check); on
+        // every other platform `graceful_restart::handle_request`'s
+        // early guard rejects it before touching the store at all.
+        let s = shared();
+        let resp = run_request(&s, None, Request::RestartGraceful);
+        match resp {
+            Response::Err(e) => assert_eq!(e.error.kind, ErrorKind::RestartAborted),
+            other => panic!("expected RestartAborted, got {other:?}"),
         }
     }
 
@@ -1163,6 +1541,13 @@ mod tests {
         std::collections::HashSet::new()
     }
 
+    /// An empty `already_loaded` set (no graceful-restart handoff in play) —
+    /// every pre-existing `register_definitions` test exercises the cold-start
+    /// shape, where this is always empty (DR-0029 bundle 2).
+    fn none_already_loaded() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     #[test]
     fn definition_without_preload_is_lazy_no_value_yet() {
         // Default (preload = false): the definition is registered but the
@@ -1186,7 +1571,15 @@ mod tests {
             preload: false,
             meta: Default::default(),
         }];
-        register_definitions(&mut store, &runner, &clock, &entries, &no_eager(), &cap);
+        register_definitions(
+            &mut store,
+            &runner,
+            &clock,
+            &entries,
+            &no_eager(),
+            &none_already_loaded(),
+            &cap,
+        );
         assert!(store.is_defined("default/TOK"), "definition registered");
         assert!(
             !store.has_value("default/TOK"),
@@ -1217,7 +1610,15 @@ mod tests {
             preload: true,
             meta: Default::default(),
         }];
-        register_definitions(&mut store, &runner, &clock, &entries, &no_eager(), &cap);
+        register_definitions(
+            &mut store,
+            &runner,
+            &clock,
+            &entries,
+            &no_eager(),
+            &none_already_loaded(),
+            &cap,
+        );
         let secret = store
             .get("default/TOK", &cap, &clock)
             .ok()
@@ -1269,7 +1670,15 @@ mod tests {
         ];
         let eager: std::collections::HashSet<String> =
             ["default/AGENT_KEY".to_string()].into_iter().collect();
-        register_definitions(&mut store, &runner, &clock, &entries, &eager, &cap);
+        register_definitions(
+            &mut store,
+            &runner,
+            &clock,
+            &entries,
+            &eager,
+            &none_already_loaded(),
+            &cap,
+        );
         // …but the authsock reference forces it resident.
         store
             .get("default/AGENT_KEY", &cap, &clock)
@@ -1330,7 +1739,15 @@ mod tests {
                 meta: Default::default(),
             },
         ];
-        register_definitions(&mut store, &runner, &clock, &entries, &no_eager(), &cap);
+        register_definitions(
+            &mut store,
+            &runner,
+            &clock,
+            &entries,
+            &no_eager(),
+            &none_already_loaded(),
+            &cap,
+        );
         // BAD's eager run failed, but its definition survives for regeneration.
         assert!(
             store.is_defined("default/BAD"),
@@ -1378,12 +1795,144 @@ mod tests {
         }];
         let eager: std::collections::HashSet<String> =
             ["default/AGENT_KEY".to_string()].into_iter().collect();
-        register_definitions(&mut store, &runner, &clock, &entries, &eager, &cap);
+        register_definitions(
+            &mut store,
+            &runner,
+            &clock,
+            &entries,
+            &eager,
+            &none_already_loaded(),
+            &cap,
+        );
         assert!(store.is_defined("default/AGENT_KEY"), "definition survives");
         assert!(
             !store.has_value("default/AGENT_KEY"),
             "no value after failed run"
         );
+    }
+
+    // ---- already_loaded (DR-0029 bundle 2: skip eager re-fetch on graceful restart) ----
+
+    #[test]
+    fn already_loaded_key_skips_eager_rerun_even_when_preload_is_true() {
+        // Simulates a key that arrived with a value via a graceful-restart
+        // handoff import (DR-0029 bundle 2), seeded directly via `store.set`
+        // here rather than through a real import for test isolation.
+        // `preload = true` must NOT re-run the source for it — doing so would
+        // be exactly the re-fetch storm graceful restart exists to avoid.
+        use cache_warden::FakeClock;
+        let runner = CommandRunner::new();
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let entries = vec![KvDefinition {
+            name: "TOK".into(),
+            namespace: None,
+            source: crate::protocol::wire::SourceSpecWire::Command {
+                command: crate::protocol::wire::CommandSpecWire {
+                    argv: vec!["printf".into(), "re-fetched-value".into()],
+                    cwd: None,
+                    env: Default::default(),
+                },
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            preload: true,
+            meta: Default::default(),
+        }];
+        store
+            .set(
+                "default/TOK".to_string(),
+                cache_warden::ValueSource::Static,
+                b"imported-value".to_vec().into(),
+                cache_warden::Ttl::never(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+        let already_loaded: std::collections::HashSet<String> =
+            ["default/TOK".to_string()].into_iter().collect();
+
+        register_definitions(
+            &mut store,
+            &runner,
+            &clock,
+            &entries,
+            &no_eager(),
+            &already_loaded,
+            &cap,
+        );
+
+        store
+            .get("default/TOK", &cap, &clock)
+            .ok()
+            .flatten()
+            .unwrap()
+            .with_exposed(|b| {
+                assert_eq!(
+                    b, b"imported-value",
+                    "already-loaded preload key must not be re-fetched"
+                )
+            });
+    }
+
+    #[test]
+    fn already_loaded_key_skips_eager_rerun_for_force_eager_too() {
+        // Same contract as the `preload` case above, but via the
+        // authsock-referenced force-eager path.
+        use cache_warden::FakeClock;
+        let runner = CommandRunner::new();
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let entries = vec![KvDefinition {
+            name: "AGENT_KEY".into(),
+            namespace: None,
+            source: crate::protocol::wire::SourceSpecWire::Command {
+                command: crate::protocol::wire::CommandSpecWire {
+                    argv: vec!["printf".into(), "re-fetched-pem".into()],
+                    cwd: None,
+                    env: Default::default(),
+                },
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            preload: false,
+            meta: Default::default(),
+        }];
+        store
+            .set(
+                "default/AGENT_KEY".to_string(),
+                cache_warden::ValueSource::Static,
+                b"imported-pem".to_vec().into(),
+                cache_warden::Ttl::never(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+        let eager: std::collections::HashSet<String> =
+            ["default/AGENT_KEY".to_string()].into_iter().collect();
+        let already_loaded = eager.clone();
+
+        register_definitions(
+            &mut store,
+            &runner,
+            &clock,
+            &entries,
+            &eager,
+            &already_loaded,
+            &cap,
+        );
+
+        store
+            .get("default/AGENT_KEY", &cap, &clock)
+            .ok()
+            .flatten()
+            .unwrap()
+            .with_exposed(|b| {
+                assert_eq!(
+                    b, b"imported-pem",
+                    "already-loaded force-eager key must not be re-fetched"
+                )
+            });
     }
 
     // ---- restore_persisted_definitions (config-priority merge; DR-0014 §4) ----
@@ -1442,6 +1991,7 @@ mod tests {
             &clock,
             &[pdef("DB", &["config-cmd"], None, None)],
             &no_eager(),
+            &none_already_loaded(),
             &_cap,
         );
         let config_names: std::collections::HashSet<String> =
@@ -1458,6 +2008,172 @@ mod tests {
             &["config-cmd".to_string()],
             "config definition wins the merge"
         );
+    }
+
+    // ---- clear_config_owned_definitions / purge_stale_import_definitions
+    //      (DR-0029 bundle 2 review CRITICAL / HIGH-1 fixes) ----
+    //
+    // Symmetric to `restore_drops_persisted_key_that_config_already_defines`
+    // above (config wins over a *persisted-file*-origin definition): these
+    // cover config winning over an *import-origin* (graceful-restart
+    // handoff) definition instead, the scenario `restore_persisted_definitions`
+    // never had to handle because a persisted-file restore never carries a
+    // co-resident value entry the way a handoff import does.
+
+    #[test]
+    fn clear_config_owned_definitions_lets_a_changed_config_definition_win_over_import() {
+        // Simulate what a graceful-restart handoff import leaves behind:
+        // a definition for `OLD` with the *old* argv/TTL, plus its cached
+        // value already resident (imported wholesale, before either
+        // `clear_config_owned_definitions` or `register_definitions` runs).
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let clock = cache_warden::FakeClock::new();
+        store
+            .define_with_meta(
+                "default/OLD",
+                cmd_src(&["old-cmd"]).lower(),
+                Ttl::new(None, Some(std::time::Duration::from_secs(3600))).unwrap(),
+                cache_warden::ValueMeta::new(),
+                cache_warden::SourceMeta::new(),
+            )
+            .unwrap();
+        store
+            .set(
+                "default/OLD",
+                cmd_src(&["old-cmd"]).lower(),
+                cache_warden::SecretBytes::new(b"cached-value".to_vec()),
+                Ttl::new(None, Some(std::time::Duration::from_secs(3600))).unwrap(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+
+        let config_names: std::collections::HashSet<String> =
+            ["default/OLD".to_string()].into_iter().collect();
+        clear_config_owned_definitions(&mut store, &config_names);
+
+        // The definition is gone (cleared)...
+        assert!(
+            !store.is_defined("default/OLD"),
+            "clear_config_owned_definitions must remove the import-origin definition"
+        );
+        // ...but the cached *value* must survive untouched.
+        store
+            .get("default/OLD", &cap, &clock)
+            .ok()
+            .flatten()
+            .expect("value must still be present")
+            .with_exposed(|b| assert_eq!(b, b"cached-value", "cached value must be undisturbed"));
+
+        // register_definitions (the CRITICAL fix's actual caller) can now
+        // insert the *new* config definition cleanly — no Conflict, even
+        // though its argv differs from what was just cleared.
+        let runner = CommandRunner::new();
+        register_definitions(
+            &mut store,
+            &runner,
+            &clock,
+            &[pdef("OLD", &["new-cmd"], None, Some(10))],
+            &no_eager(),
+            &none_already_loaded(),
+            &cap,
+        );
+        let d = store.definition_of("default/OLD").unwrap();
+        assert_eq!(
+            d.source().command_argv().unwrap(),
+            &["new-cmd".to_string()],
+            "the new config definition must win over the cleared import-origin one"
+        );
+        // The cached value is still untouched by register_definitions too
+        // (it only registers definitions; it does not touch existing values
+        // for keys not in `already_loaded`... this key already has a value,
+        // but register_definitions never overwrites an existing value on a
+        // non-eager entry).
+        store
+            .get("default/OLD", &cap, &clock)
+            .ok()
+            .flatten()
+            .expect("value must still be present after register_definitions")
+            .with_exposed(|b| assert_eq!(b, b"cached-value"));
+    }
+
+    #[test]
+    fn purge_stale_import_definitions_removes_orphaned_config_removed_key_but_keeps_persisted_online_one()
+     {
+        // Two import-origin definitions land in the store (as a handoff
+        // import would leave them): `REMOVED_FROM_CONFIG` (used to be a
+        // config key in the *old* process, no longer is) and `STILL_ONLINE`
+        // (a genuinely online definition, created via `kv.define` at
+        // runtime, unrelated to any config).
+        let (mut store, _cap) = cache_warden::test_helpers::store_with_cap();
+        store
+            .define_with_meta(
+                "default/REMOVED_FROM_CONFIG",
+                cmd_src(&["stale-cmd"]).lower(),
+                Ttl::new(None, None).unwrap(),
+                cache_warden::ValueMeta::new(),
+                cache_warden::SourceMeta::new(),
+            )
+            .unwrap();
+        store
+            .define_with_meta(
+                "default/STILL_ONLINE",
+                cmd_src(&["online-cmd"]).lower(),
+                Ttl::new(None, None).unwrap(),
+                cache_warden::ValueMeta::new(),
+                cache_warden::SourceMeta::new(),
+            )
+            .unwrap();
+
+        // The *current* config no longer mentions either key (both look
+        // identical to the reconciliation logic at this point); only the
+        // state file's own persisted names distinguish them.
+        let config_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let persisted_names: std::collections::HashSet<String> =
+            ["default/STILL_ONLINE".to_string()].into_iter().collect();
+
+        let stale = purge_stale_import_definitions(&mut store, &config_names, &persisted_names);
+
+        assert_eq!(
+            stale,
+            vec!["default/REMOVED_FROM_CONFIG".to_string()],
+            "only the orphaned (config-removed, never-persisted) key must be purged"
+        );
+        assert!(
+            !store.is_defined("default/REMOVED_FROM_CONFIG"),
+            "the orphaned definition must actually be gone"
+        );
+        assert!(
+            store.is_defined("default/STILL_ONLINE"),
+            "a genuinely persisted online definition must survive the purge"
+        );
+    }
+
+    #[test]
+    fn purge_stale_import_definitions_keeps_current_config_keys() {
+        let (mut store, _cap) = cache_warden::test_helpers::store_with_cap();
+        store
+            .define_with_meta(
+                "default/STILL_CONFIGURED",
+                cmd_src(&["cmd"]).lower(),
+                Ttl::new(None, None).unwrap(),
+                cache_warden::ValueMeta::new(),
+                cache_warden::SourceMeta::new(),
+            )
+            .unwrap();
+        let config_names: std::collections::HashSet<String> =
+            ["default/STILL_CONFIGURED".to_string()]
+                .into_iter()
+                .collect();
+        let persisted_names = std::collections::HashSet::new();
+
+        let stale = purge_stale_import_definitions(&mut store, &config_names, &persisted_names);
+
+        assert!(
+            stale.is_empty(),
+            "a current config key must never be purged"
+        );
+        assert!(store.is_defined("default/STILL_CONFIGURED"));
     }
 
     #[test]

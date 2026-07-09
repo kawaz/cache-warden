@@ -288,6 +288,10 @@ pub fn daemon() -> HelpSpec {
                 name: "status",
                 desc: "Show service registration / running state",
             },
+            Row {
+                name: "restart --graceful",
+                desc: "Restart in place with no cache re-fetch storm (DR-0029)",
+            },
         ],
         options: &[],
         detail: "\
@@ -405,6 +409,28 @@ Reports whether the service definition is installed, whether the service manager
 reports it running, its pid, and the definition file path — a one-screen table,
 the same shape on macOS and Linux. This is distinct from the top-level
 `cache-warden status`, which lists cache entries.",
+        show_global: true,
+    }
+}
+
+/// `daemon restart` leaf page (DR-0029).
+pub fn daemon_restart() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " daemon restart"),
+        summary: "Restart the daemon in place with no cache re-fetch storm.",
+        usage: concat!("cache-warden", " daemon restart --graceful"),
+        subcommands: &[],
+        options: &[Row {
+            name: "--graceful",
+            desc: "Required for now: serialize the kv cache, verify this binary, and hand \
+                   the state to a freshly exec'd copy of itself (same pid, same socket)",
+        }],
+        detail: "\
+Unlike a plain restart (which loses every cached value and re-triggers each
+source's own auth cycle — e.g. an OTP TouchID prompt per key), `--graceful`
+carries the current TTL/pin/backoff state across to the new process. Failure at
+any point before the handoff completes falls back to a normal cold start; the
+daemon is never left without listeners.",
         show_global: true,
     }
 }

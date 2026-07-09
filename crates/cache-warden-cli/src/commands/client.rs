@@ -20,6 +20,21 @@ use crate::refs::{ResolveResult, ResolvedValue, Resolver};
 /// Returns an error string (suitable for the CLI's top-level error path) if the
 /// socket cannot be reached or the exchange fails.
 pub fn round_trip(socket: &Path, req: &Request) -> Result<Response, String> {
+    match round_trip_or_close(socket, req)? {
+        Some(resp) => Ok(resp),
+        None => Err("daemon closed the connection without responding".to_string()),
+    }
+}
+
+/// Like [`round_trip`], but a connection the daemon closes *before* sending
+/// any reply is `Ok(None)` rather than an error.
+///
+/// Used by `daemon restart --graceful` (DR-0029): a graceful restart that
+/// succeeds replaces the daemon process before it can send a second reply
+/// (see [`crate::protocol::wire::Request::RestartGraceful`]'s doc), so the
+/// client normally observes exactly this outcome on success. Every other
+/// caller wants the plain error, hence [`round_trip`] stays the default.
+pub fn round_trip_or_close(socket: &Path, req: &Request) -> Result<Option<Response>, String> {
     let stream = UnixStream::connect(socket).map_err(|e| {
         format!(
             "cannot connect to daemon at {} ({e}). Is `cache-warden run` started?",
@@ -43,9 +58,10 @@ pub fn round_trip(socket: &Path, req: &Request) -> Result<Response, String> {
         .read_line(&mut response_line)
         .map_err(|e| format!("failed to read response: {e}"))?;
     if n == 0 {
-        return Err("daemon closed the connection without responding".to_string());
+        return Ok(None);
     }
     decode_response(response_line.trim_end())
+        .map(Some)
         .map_err(|e| format!("malformed response from daemon: {e}"))
 }
 

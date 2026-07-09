@@ -378,6 +378,25 @@ pub enum Request {
         /// The key to unpin.
         key: String,
     },
+    /// Trigger a graceful restart (DR-0029): serialize the store's full state,
+    /// verify the current binary's on-disk image, and hand the state to a
+    /// freshly exec'd copy of this same process over a private socketpair —
+    /// no re-fetch storm, same pid, same control socket path.
+    ///
+    /// No fields: the exec target is always this daemon's own
+    /// `current_exe()`, captured once at startup (DR-0029 §3) — never a path
+    /// supplied by the caller, which would reopen the very PATH-substitution
+    /// attack the verification step exists to close.
+    ///
+    /// The daemon replies [`Response::restarting_ack`] only when it accepts
+    /// the request (verification passed the point where it is safe to
+    /// proceed); from there the connection — and every other listener — is
+    /// torn down as part of the handoff, so a client normally observes the
+    /// socket close rather than a second reply. A verification failure
+    /// replies with [`ErrorKind::RestartAborted`] instead, and the current
+    /// process keeps serving untouched.
+    #[serde(rename = "daemon.restart_graceful")]
+    RestartGraceful,
 }
 
 /// The value source for a [`Request::KvSet`].
@@ -511,6 +530,12 @@ pub enum OkPayload {
         /// Whether the key existed (the pin, if any, was dropped).
         unpinned: bool,
     },
+    /// Reply to an *accepted* [`Request::RestartGraceful`] (DR-0029). See that
+    /// variant's doc for why a client should not expect a second response.
+    Restarting {
+        /// Always `true`; lets `untagged` disambiguate the reply.
+        restarting: bool,
+    },
 }
 
 /// Value-free description of a stored entry, for `status`.
@@ -590,6 +615,11 @@ pub enum ErrorKind {
     UpstreamFailed,
     /// An internal daemon error (lock poisoned, etc.).
     Internal,
+    /// A `daemon.restart_graceful` request was rejected before touching any
+    /// listener or socket (DR-0029): exec-target verification failed, a
+    /// restart is already in progress, or graceful restart is unsupported on
+    /// this platform. The current process is unaffected and keeps serving.
+    RestartAborted,
 }
 
 impl Response {
@@ -693,6 +723,16 @@ impl Response {
         Response::Ok(OkResponse {
             ok: true,
             payload: OkPayload::Unpinned { unpinned },
+        })
+    }
+
+    /// Construct an accepted `daemon.restart_graceful` acknowledgement
+    /// (DR-0029). See [`Request::RestartGraceful`]'s doc for why a client
+    /// should not wait on a second reply after this one.
+    pub fn restarting_ack() -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::Restarting { restarting: true },
         })
     }
 
@@ -1154,6 +1194,32 @@ mod tests {
         let line = serde_json::to_string(&resp).unwrap();
         assert!(line.contains(r#""ok":false"#));
         assert!(line.contains(r#""kind":"not_found""#));
+        roundtrip_response(&resp);
+    }
+
+    // ---- daemon.restart_graceful (DR-0029) ----
+
+    #[test]
+    fn restart_graceful_request_uses_dotted_cmd_tag_and_no_fields() {
+        let line = serde_json::to_string(&Request::RestartGraceful).unwrap();
+        assert_eq!(line, r#"{"cmd":"daemon.restart_graceful"}"#);
+        roundtrip_request(&Request::RestartGraceful);
+    }
+
+    #[test]
+    fn restarting_ack_response_roundtrips_and_is_ok() {
+        let resp = Response::restarting_ack();
+        assert!(resp.is_ok());
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""restarting":true"#), "{line}");
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn restart_aborted_error_kind_serializes_snake_case() {
+        let resp = Response::error(ErrorKind::RestartAborted, "exec target verification failed");
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""kind":"restart_aborted""#), "{line}");
         roundtrip_response(&resp);
     }
 }

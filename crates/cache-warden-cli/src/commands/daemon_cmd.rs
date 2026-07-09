@@ -88,6 +88,81 @@ pub fn run_foreground(args: &[String], socket: PathBuf, config: Config) -> Resul
     }
 }
 
+/// Parsed flags for `daemon restart` (DR-0029).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestartArgs {
+    /// `--graceful`: the only supported restart mode for now (DR-0029 Phase
+    /// 1). Required — see [`parse_restart_args`]'s doc for why a bare
+    /// `daemon restart` is rejected rather than silently falling back to
+    /// some other behaviour.
+    pub graceful: bool,
+}
+
+/// Parse `daemon restart` flags: `--graceful` (required for now).
+///
+/// A plain restart (kill + let the service manager respawn, or some future
+/// non-graceful in-place mode) is not implemented by this bundle — DR-0029
+/// Phase 1 only builds the `--graceful` path. Rather than silently doing
+/// nothing or picking an arbitrary default, a bare `daemon restart` is a
+/// usage error naming the flag explicitly required today.
+pub fn parse_restart_args(args: &[String]) -> Result<RestartArgs, String> {
+    let mut out = RestartArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--graceful" => {
+                out.graceful = true;
+                i += 1;
+            }
+            other => {
+                return Err(format!("unknown option for `daemon restart`: {other}"));
+            }
+        }
+    }
+    if !out.graceful {
+        return Err(
+            "`daemon restart` requires `--graceful` (the only restart mode implemented so far; \
+             see docs/decisions/DR-0029-graceful-restart.md)"
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
+/// Execute `daemon restart --graceful` (DR-0029): send
+/// `Request::RestartGraceful` over the control socket and report the
+/// outcome.
+///
+/// A graceful restart that is *accepted* replaces the daemon process before
+/// it can send a second reply (see
+/// [`crate::protocol::wire::Request::RestartGraceful`]'s doc) — the
+/// connection closing with no response is therefore treated the same as an
+/// explicit acknowledgement, not as a failure. Only an explicit error
+/// response (verification failed, unsupported platform, a restart already in
+/// progress) or a connection failure is reported as an error.
+pub fn restart_graceful(socket: &Path) -> Result<(), String> {
+    use crate::commands::client::round_trip_or_close;
+    use crate::protocol::wire::{Request, Response};
+
+    match round_trip_or_close(socket, &Request::RestartGraceful)? {
+        None => {
+            println!(
+                "graceful restart accepted; the daemon closed the connection to restart in \
+                 place (same pid, same socket) — `cache-warden ping` to confirm it is back up"
+            );
+            Ok(())
+        }
+        Some(Response::Ok(_)) => {
+            println!(
+                "graceful restart accepted; the daemon is restarting in place — \
+                 `cache-warden ping` to confirm it is back up"
+            );
+            Ok(())
+        }
+        Some(Response::Err(e)) => Err(format!("graceful restart rejected: {}", e.error.message)),
+    }
+}
+
 /// Parsed flags for `daemon register` (DR-0019 §1).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegisterArgs {
@@ -517,6 +592,26 @@ mod tests {
     fn run_foreground_rejects_positional_args() {
         let err = run_foreground(&["extra".into()], PathBuf::from("/x.sock"), cfg()).unwrap_err();
         assert!(err.contains("takes no positional arguments"));
+    }
+
+    // ---- restart flag parsing (DR-0029) ----
+
+    #[test]
+    fn restart_args_require_graceful() {
+        let err = parse_restart_args(&[]).unwrap_err();
+        assert!(err.contains("--graceful"), "{err}");
+    }
+
+    #[test]
+    fn restart_args_accept_graceful() {
+        let a = parse_restart_args(&s(&["--graceful"])).unwrap();
+        assert!(a.graceful);
+    }
+
+    #[test]
+    fn restart_args_reject_unknown_flag() {
+        assert!(parse_restart_args(&s(&["--bogus"])).is_err());
+        assert!(parse_restart_args(&s(&["--graceful", "--bogus"])).is_err());
     }
 
     // ---- register flag parsing (DR-0019 §1) ----

@@ -42,6 +42,7 @@ fn help_flag_goes_to_stdout_exit_zero_at_every_level() {
         &["daemon", "register", "--help"][..],
         &["daemon", "unregister", "--help"][..],
         &["daemon", "status", "--help"][..],
+        &["daemon", "restart", "--help"][..],
         &["kv", "--help"][..],
         &["kv", "define", "--help"][..],
         &["kv", "set", "--help"][..],
@@ -95,6 +96,8 @@ fn daemon_group_help_lists_service_subcommands() {
     assert!(out.contains("register"));
     assert!(out.contains("unregister"));
     assert!(out.contains("status"));
+    // DR-0029: restart --graceful is listed alongside them.
+    assert!(out.contains("restart"));
 }
 
 #[test]
@@ -103,6 +106,22 @@ fn daemon_register_help_carries_flags() {
     assert!(out.contains("--socket PATH"));
     assert!(out.contains("--label NAME"));
     assert!(out.contains("--print"));
+}
+
+#[test]
+fn daemon_restart_help_carries_graceful_flag() {
+    let out = stdout(&cw(&["daemon", "restart", "--help"]));
+    assert!(out.contains("--graceful"));
+}
+
+#[test]
+fn daemon_restart_without_graceful_is_a_usage_error() {
+    // DR-0029 Phase 1 only implements `--graceful`; a bare `daemon restart`
+    // must be a usage error (leaf help to stderr, exit 1), not a silent
+    // no-op or an attempt to connect to a daemon.
+    let o = cw(&["daemon", "restart"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("--graceful"), "{}", stderr(&o));
 }
 
 #[test]

@@ -10,3 +10,12 @@ resolver = "2"
 [workspace.package]
 version = "0.24.0"
 edition = "2024"
+
+# DR-0029: graceful-restart state-holder child (`holder_child_main`) must not
+# unwind (post-fork Drop code is not async-signal-safe). Cargo's panic strategy
+# is per-binary and cannot be scoped to a module, so panic=abort would also
+# strip `handle_connection`'s per-request panic recovery from every daemon
+# release build — a bad trade for dogfood availability. The holder's non-panic
+# discipline is enforced at code-review time instead; adding automated
+# regression protection (a lint pass, an audit test, or a targeted panic=abort
+# helper crate) is a follow-up.
