@@ -223,6 +223,11 @@
       <div class="desc">ssh-agent wire の message/codec、鍵レジストリ (wire blob ↔ Store キー)、その場署名 (PEM 非保持)、op discovery + disk cache、filter / process policy (fail-closed)</div>
       <div class="typechips"><code>AgentMessage</code><code>AgentCodec</code><code>RegisteredKey</code><code>KeySource</code><code>OpClient</code><code>chain_gate_passes</code></div>
     </div>
+    <div class="module">
+      <div class="name">graceful restart <span class="crate">cli::daemon::graceful_restart{,/handoff,/receive,/verify,/codesign}</span></div>
+      <div class="desc">DR-0029 Phase 1 (macOS)。RestartGraceful 受信 → Store::export_snapshot → §3 検証 (自パス固定 + fd fstat + dev/ino + 親 dir チェーン警告 + codesign 自己一致) → drain → fd 衛生 → socketpair → fork → holder 子が async-signal-safe syscall のみで送信 → parent が同一 PID exec → new プロセスは import_snapshot + config 優先 reconcile + COMMIT 返送</div>
+      <div class="typechips"><code>RestartCoordinator</code><code>PreparedHandoff</code><code>VerifiedExe</code><code>holder_child_main</code><code>reap_holder_in_background</code><code>SecCodeCopySigningInformation</code></div>
+    </div>
   </div>
 
   <div>
@@ -246,6 +251,10 @@
     <div class="actor edge-svc">
       <div class="name">launchd / systemd --user</div>
       <div class="via">plist / unit 生成 + bootstrap。TCC 永続化は .app Bundle ID (DR-0019/0020)</div>
+    </div>
+    <div class="actor edge-proc">
+      <div class="name">state-holder child (fork 済み一時プロセス)</div>
+      <div class="via">graceful restart 時に fork。async-signal-safe syscall のみで socketpair 経由 state 送信 → COMMIT 受信で zeroize + <span class="mono">_exit</span></div>
     </div>
   </div>
 </div>
@@ -327,6 +336,16 @@
   <div class="note">cache_ttl 毎に再取得、失敗時は <code>mark_failed</code> で fail-closed。</div>
 </div>
 
+<div class="bcard">
+  <div class="bcard-head"><span class="route">graceful restart: control → holder → 新プロセス (同一 PID)</span><span class="chip chip-agent">socketpair (匿名)</span><span class="chip chip-proc">fork + execve</span></div>
+  <div class="proto">RestartGraceful 受信 → §3 検証 → drain → listener close+unlink → <code>socketpair(AF_UNIX, SOCK_STREAM)</code> → fork → parent が同一 PID で execve、holder は SO_RCVTIMEO 60s で socketpair I/O。wire は magic + version + entry_count + 長さプレフィックス (StoreSnapshot、EOF 非依存)、返信は 6byte <code>b"COMMIT"</code></div>
+  <dl class="kv">
+    <dt>env</dt><dd><code>CACHE_WARDEN_HANDOFF_FD</code> (継承 fd 番号) / <code>CACHE_WARDEN_HANDOFF_HOLDER_PID</code> (waitpid reap 用)</dd>
+    <dt>型</dt><dd><code>StoreSnapshot</code> (cache_warden::snapshot、Zeroizing で運搬) / <code>PreparedHandoff</code> / holder 送信は既成 <code>Zeroizing&lt;Vec&lt;u8&gt;&gt;</code></dd>
+  </dl>
+  <div class="note">holder は fork 前に mlock した buffer を保持し、fork 直後に <code>ptrace(PT_DENY_ATTACH)</code> と <code>mlock</code> 再適用 (失敗は fail-closed で <code>_exit(4/5)</code>)。COMMIT 受信 → <code>write_volatile</code> + <code>compiler_fence</code> で zeroize → <code>_exit(0)</code>。失敗経路 (ABORT / timeout) は新プロセスの cold start に退化 = 現状の非 graceful restart と等価 (悪化しない)。</div>
+</div>
+
 <h2><span class="num">3</span>crate 構成と責務分離</h2>
 <div class="tablewrap">
 <table>
@@ -354,7 +373,7 @@
 </table>
 </div>
 
-<footer>実装コード (crates/ 全 crate) を一次資料として作成、control socket 仕様は DR-0009 で裏取り。実装変更時はこの地図も追従させること。最終更新: 2026-07-09 (v0.24.0)。</footer>
+<footer>実装コード (crates/ 全 crate) を一次資料として作成、control socket 仕様は DR-0009、graceful restart は DR-0029 で裏取り。実装変更時はこの地図も追従させること。最終更新: 2026-07-09 (v0.24.0 + DR-0029 Phase 1)。</footer>
 </main>
 </body>
 </html>

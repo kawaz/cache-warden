@@ -1,6 +1,6 @@
 # DR-0029: graceful restart — kv 秘密状態を引き継ぐ無 storm 再起動
 
-- Status: Accepted (2026-07-09 kawaz 承認。fail-safe の cold start 退化は「悪化ではない」として許容)
+- Status: Implemented — Phase 1 完了 (2026-07-09、change `zlwxovoo`。bundle 1 = `yrsmsvkk` + `rmtyxzqx`、bundle 2 = `zlwxovoo`)。Phase 2 (brew upgrade 連携) / Phase 3 (fd 継承) は後継 issue に分離
 - Date: 2026-07-09
 - 関連: issue `2026-06-14-graceful-restart-state-handoff` (動機と secure handoff 大枠合意) /
   DR-0021 (signal/shutdown、本 DR はその次段) / DR-0019 (launchd 登録) /
@@ -317,3 +317,90 @@ handoff socket へ接続して状態を請求。issue §2-1 が「新が要求�
    注入時に新プロセスが即 bind して cold start できること** (fail-safe の仕様固定)
 2. Phase 2: brew upgrade 連携 (`on-success-release` から graceful 経路を叩く)
 3. Phase 3 (任意): listening fd 継承で断ゼロ化
+
+## 実装追記 (Phase 1 完了、2026-07-09)
+
+実装で判明・確定した細部を記録 (change `zlwxovoo`)。設計骨格は §1-6 のまま、以下は
+運用・実装上の delta:
+
+### Open Questions の実装時確定
+
+- **Q1 直列化形式**: **serde_json + 4 byte 長プレフィックス**に確定。依存を増やさない
+  側に倒した (postcard 追加せず)。エントリ実測で性能差は誤差
+- **Q3 mlock 継承**: 実装は「継承されない前提で無条件再適用」で固定 (macOS 実機の
+  継承有無は結果に依存しないため findings 記録は省略)
+- **Q4 環境変数**: `CACHE_WARDEN_HANDOFF_FD` + `CACHE_WARDEN_HANDOFF_HOLDER_PID` の
+  2 変数を使用。launchd EnvironmentVariables と衝突しないことを実機で確認
+- **Q5 downgrade 防止**: MVP スコープ外のまま。挿入点は codesign 検証 (`codesign.rs`)
+  内に確保、将来 version 比較を追加可能
+
+### holder の exit code 割り当て (§5 の全経路表の実装)
+
+| 事象 | exit code |
+|---|---|
+| 正常 (COMMIT 受信 → zeroize) | 0 |
+| ABORT (new プロセスの end close → EPIPE / EOF) | 2 |
+| COMMIT timeout (SO_RCVTIMEO 60s 超過) | 3 |
+| PT_DENY_ATTACH 失敗 | 4 (fail-closed) |
+| mlock 失敗 | 5 (fail-closed) |
+
+fail-closed の 4/5 は「秘密を swap 可能 or ptrace 経路で読める状態に置かない」の
+実装保証。新プロセスは holder pid を `waitpid` で reap してログ (Q4 で規定した env)。
+
+### §3 検証の実装確定
+
+- **exec パス固定**: `Shared` に起動時 `std::env::current_exe()` を cache、restart 時
+  は cache 値を使う (plist 再読みしない = plist 改変誘導の遮断)
+- **親 dir チェーン警告 (fail-open)**: 直近 parent の owner/perms は fail-closed のまま、
+  祖父母以上のディレクトリが others-writable なら `eprintln!` 警告 + 続行
+  (`warn_on_writable_ancestor_chain`)
+- **codesign 自己一致検証**: `security-framework` crate 経由 (macOS target 依存で 4 crate
+  追加)。`SecCodeCopyGuestWithAttributes` で自 SecCode 取得 → `SecStaticCodeCheckValidity`
+  で候補の有効性 → TeamID + signing identifier の一致確認。**改竄検出はカーネル on-demand
+  code-signing 強制頼み** (発火時は execve 後 SIGKILL → cold start に退化 = 現状より
+  悪化しない)。testability のため `verify_against(self_identity, candidate)` を分離
+
+### handoff 対象の実装確定
+
+Store::export_snapshot / import_snapshot 経路で以下を運ぶ:
+- 全 entry (TTL 絶対時刻 wall clock / pin / FailureRecord / ValueMeta / Definition)
+- **per-entry アクセス制約 record**: 現行 core Store に相当フィールドが無いため今回は
+  含まれない。将来 kv-get-peer-identity-guard 実装時に `#[serde(default)]` で追加可能
+- **config 優先ロジックの対称適用**: `restore_persisted_definitions` と対称形の
+  `clear_config_owned_definitions` を server.rs に追加。config が定義するキーの import
+  由来 definition を `Store::undefine` (値と failure_backoff は残す = 連続性を保ち、次の
+  get で config の新 TTL/argv が適用される)
+- **config 削除キーの reconcile**: `purge_stale_import_definitions` を追加、
+  persist enabled 時のみ「config 名 ∪ persisted online 名」の補集合を除去
+  (削除キーが state file に汚染ループとして書き込まれるのを防ぐ)
+
+### 新プロセスの Monotonic runway
+
+`SystemClock::with_epoch_offset(24h)` を core crate に追加 (非破壊)。graceful 受信側
+で使用し、bundle 1 が引き継いだ Monotonic::ZERO クランプ課題 (headroom 不足) を解消。
+24h の値は「daemon 稼働期間の実運用上限」を想定 (10 分では config hard-ttl 長い場合に
+不足する)。
+
+### 自主発見・修正した実バグ 2 件
+
+- **holder ゾンビ化**: 誰も holder pid を waitpid していなかった → `CACHE_WARDEN_HANDOFF_HOLDER_PID`
+  env で新プロセスに pid を渡し、`reap_holder_in_background` が新プロセス起動最初に
+  reap thread を起動 (bind 失敗前に起動 = bind 失敗経路でも reap 保証)
+- **不正 fd での abort**: `UnixStream::from_raw_fd` が Rust std の io-safety hardening
+  (close(EBADF) で abort) を発火させて daemon 全体が落ちる経路 → `fcntl(F_GETFD)` で
+  fd 有効性を事前確認するガード追加
+
+### panic=abort 提案の revert
+
+bundle 2 adversarial review LOW で `[profile.release] panic = "abort"` (holder の
+compile-time 非 panic 保証) が提案されたが、**release バイナリで 1 request panic →
+daemon 全体 abort** の副作用が実運用リスクとして過大と判断して revert。holder の
+非 panic 規律は現状 code review で担保、regression 保護は後継 issue
+`2026-07-09-graceful-restart-holder-panic-regression-guard` (clippy attribute deny
+の案 A から着手予定) に分離。
+
+### 依存追加
+
+macOS 限定 target 依存として `security-framework` (3) + `security-framework-sys` (2) +
+`core-foundation` (0.10) + `core-foundation-sys` (0.8) の 4 crate。全プラットフォーム
+向けに CLI 側の zeroize 1 (bundle 1 で既に採用の型を波及)。

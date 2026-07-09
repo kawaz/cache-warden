@@ -20,6 +20,12 @@
 - FDA チェック&誘導フロー (macos-tcc crate + register 統合) — issue archive `2026-06-14-fda-check-flow-port`
 - 予約 NS (authsock) の kv.get/set 拒否 (read/write bouncer) — DR-0018 §4.5 / DR-0027
 - stable-which 0.4 移行 (durable-to-pin 判定を crate 側に委譲) — DR-0019 §2.5
+- **graceful restart Phase 1** (kv 秘密状態を保った同一 PID exec 再起動、macOS): 再起動契機
+  (brew upgrade / config 変更 / 手動) で kv キャッシュを保ったまま新バイナリへ切り替える。fork
+  + state-holder child + socketpair 二相コミット + exec 対象の自パス固定 + fd fstat + dev/ino
+  記録 + 親 dir チェーン警告 + codesign 自己一致検証。失敗経路は cold start に退化 (現状の
+  非 graceful restart と等価)。config 優先ロジックを import に対称適用済み。
+  — DR-0029、bundle 1 `yrsmsvkk` + `rmtyxzqx`、bundle 2 `zlwxovoo`
 
 ## 短期 (= 残作業・近い着手候補)
 
@@ -27,6 +33,12 @@
   v0.17.0 実装済み
 - **op discovery の起動ブロック解消** (P3 = launchd context の biometric 到達不能のみ残存):
   `docs/issue/2026-06-13-op-discovery-blocks-startup.md`
+- **graceful restart Phase 2** (brew upgrade 連携): 手動 restart --graceful を `on-success-release`
+  経由で自動化。dogfood 体験直結の次段。
+  `docs/issue/2026-07-09-graceful-restart-phase2-brew-upgrade-integration.md`
+- **holder 非 panic 規律の regression 保護** (bundle 2 review LOW の follow-up): panic=abort 副作用
+  過大で revert、代替として clippy attribute 単位の deny を検討。
+  `docs/issue/2026-07-09-graceful-restart-holder-panic-regression-guard.md`
 - **鍵形式の残ギャップ**: RSA PKCS#1 / FIDO sk-* / 証明書 (需要次第)。ECDSA は実装済み
 
 ## 中期 (= 構想中)
@@ -36,8 +48,11 @@
 - **ssh-agent Provider 再設計** (大物): authsock を「Provider 抽象 (KeySource/UpstreamAgent/
   Keyring + Composite) を合成し socket で filter 公開する toolkit」へ。discovery の upstream
   ありき解消・source-glob socket carving。`docs/issue/2026-06-14-ssh-agent-provider-architecture.md`
-- **graceful restart** (kv + endpoint fd 引き継ぎ): upgrade で op TouchID サイクルをリセットしない
-  無停止切替。`docs/issue/2026-06-14-graceful-restart-state-handoff.md`
+- **graceful restart Phase 3** (listener fd 継承で断ゼロ化、任意): 現状 Phase 1 の re-bind 経路の
+  数百 ms 断は per-request クライアントで無害と判断。「断が実運用で問題」の観測が出たら着手。
+  `docs/issue/2026-07-09-graceful-restart-phase3-listener-fd-inheritance.md`
+- **graceful restart Linux 対応**: macOS は Phase 1 で実装済、Linux は fexecve + 末尾追記署名 L1 /
+  fs-verity L2 の設計が別 issue に。`docs/issue/2026-07-09-linux-graceful-restart-fexecve-verification.md`
 - **hard-ttl の TouchID 頻度調整**: 長寿命鍵の hard-ttl 延長 / prefetch+pin warm 維持 (bug D)
 
 ## 長期 / アイデア (= 検討初期)
