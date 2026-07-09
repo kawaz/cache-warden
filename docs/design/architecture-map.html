@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cache-warden アーキテクチャ地図</title>
+<style>
+  :root {
+    --bg: #f7f8f7;
+    --surface: #ffffff;
+    --surface2: #eef1ef;
+    --ink: #1c2422;
+    --ink-dim: #5a6662;
+    --line: #d5dcd8;
+    --daemon-bg: #eaf1ee;
+    --daemon-line: #9fb8ad;
+    /* transport semantic colors */
+    --c-agent: #0f766e;   /* ssh-agent wire (unix socket) */
+    --c-ctl:   #1d4ed8;   /* control socket JSON lines */
+    --c-proc:  #b45309;   /* subprocess */
+    --c-inproc:#6b7280;   /* in-process */
+    --c-svc:   #7c3aed;   /* service manager */
+    --c-agent-bg: #e6f4f2;
+    --c-ctl-bg:   #e8eefc;
+    --c-proc-bg:  #fdf0df;
+    --c-inproc-bg:#eceef1;
+    --c-svc-bg:   #f1eafc;
+    --mono-bg: #edf0ee;
+    --warn: #b45309;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14181a;
+      --surface: #1c2225;
+      --surface2: #232b2e;
+      --ink: #e4eae7;
+      --ink-dim: #93a09b;
+      --line: #333d40;
+      --daemon-bg: #1a2523;
+      --daemon-line: #3c554c;
+      --c-agent: #2dd4bf;
+      --c-ctl:   #7ca6ff;
+      --c-proc:  #f5a742;
+      --c-inproc:#9aa4ae;
+      --c-svc:   #b58cf5;
+      --c-agent-bg: #123330;
+      --c-ctl-bg:   #1a2440;
+      --c-proc-bg:  #3a2a12;
+      --c-inproc-bg:#262c31;
+      --c-svc-bg:   #2b1f42;
+      --mono-bg: #242c2a;
+      --warn: #f5a742;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14181a; --surface: #1c2225; --surface2: #232b2e;
+    --ink: #e4eae7; --ink-dim: #93a09b; --line: #333d40;
+    --daemon-bg: #1a2523; --daemon-line: #3c554c;
+    --c-agent: #2dd4bf; --c-ctl: #7ca6ff; --c-proc: #f5a742; --c-inproc: #9aa4ae; --c-svc: #b58cf5;
+    --c-agent-bg: #123330; --c-ctl-bg: #1a2440; --c-proc-bg: #3a2a12; --c-inproc-bg: #262c31; --c-svc-bg: #2b1f42;
+    --mono-bg: #242c2a; --warn: #f5a742;
+  }
+  :root[data-theme="light"] {
+    --bg: #f7f8f7; --surface: #ffffff; --surface2: #eef1ef;
+    --ink: #1c2422; --ink-dim: #5a6662; --line: #d5dcd8;
+    --daemon-bg: #eaf1ee; --daemon-line: #9fb8ad;
+    --c-agent: #0f766e; --c-ctl: #1d4ed8; --c-proc: #b45309; --c-inproc: #6b7280; --c-svc: #7c3aed;
+    --c-agent-bg: #e6f4f2; --c-ctl-bg: #e8eefc; --c-proc-bg: #fdf0df; --c-inproc-bg: #eceef1; --c-svc-bg: #f1eafc;
+    --mono-bg: #edf0ee; --warn: #b45309;
+  }
+
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: "Avenir Next", "Helvetica Neue", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif;
+    line-height: 1.65; margin: 0; padding: 2.5rem 1.5rem 4rem;
+    font-size: 15px;
+  }
+  main { max-width: 1080px; margin: 0 auto; }
+  code, .mono {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+    font-size: 0.86em;
+  }
+  code { background: var(--mono-bg); padding: 0.08em 0.35em; border-radius: 3px; }
+
+  header { margin-bottom: 2rem; }
+  h1 { font-size: 1.7rem; font-weight: 600; margin: 0 0 0.3rem; letter-spacing: -0.01em; text-wrap: balance; }
+  .sub { color: var(--ink-dim); font-size: 0.95rem; margin: 0; }
+  h2 { font-size: 1.15rem; font-weight: 600; margin: 2.8rem 0 0.9rem; padding-bottom: 0.35rem; border-bottom: 1px solid var(--line); }
+  h2 .num { color: var(--ink-dim); font-weight: 500; margin-right: 0.5em; }
+
+  /* ---------- legend ---------- */
+  .legend { display: flex; flex-wrap: wrap; gap: 0.5rem 1.2rem; margin: 1rem 0 1.4rem; font-size: 0.85rem; }
+  .legend span { display: inline-flex; align-items: center; gap: 0.45em; color: var(--ink-dim); }
+  .swatch { width: 22px; height: 4px; border-radius: 2px; display: inline-block; }
+
+  /* ---------- diagram ---------- */
+  .diagram {
+    display: grid; grid-template-columns: 200px 1fr 230px; gap: 1rem;
+    align-items: start;
+  }
+  @media (max-width: 820px) { .diagram { grid-template-columns: 1fr; } }
+  .col-label {
+    font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--ink-dim); margin-bottom: 0.6rem; font-weight: 600;
+  }
+  .actor {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+    padding: 0.6rem 0.8rem; margin-bottom: 0.7rem;
+  }
+  .actor .name { font-weight: 600; font-size: 0.92rem; }
+  .actor .via { color: var(--ink-dim); font-size: 0.78rem; margin-top: 0.15rem; }
+  .actor.edge-agent { border-left: 3px solid var(--c-agent); }
+  .actor.edge-ctl   { border-left: 3px solid var(--c-ctl); }
+  .actor.edge-proc  { border-left: 3px solid var(--c-proc); }
+  .actor.edge-svc   { border-left: 3px solid var(--c-svc); }
+
+  .daemon-box {
+    background: var(--daemon-bg); border: 1.5px dashed var(--daemon-line); border-radius: 10px;
+    padding: 1rem 1.1rem;
+  }
+  .daemon-title { font-weight: 700; font-size: 0.95rem; margin-bottom: 0.1rem; }
+  .daemon-sub { color: var(--ink-dim); font-size: 0.78rem; margin-bottom: 0.9rem; }
+  .module {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+    padding: 0.55rem 0.75rem; margin-bottom: 0.6rem;
+  }
+  .module .name { font-weight: 600; font-size: 0.9rem; }
+  .module .crate { color: var(--ink-dim); font-size: 0.75rem; }
+  .module .desc { font-size: 0.82rem; color: var(--ink-dim); margin-top: 0.2rem; }
+  .module.core { border: 1.5px solid var(--daemon-line); background: var(--surface2); }
+  .flow { text-align: center; color: var(--c-inproc); font-size: 0.78rem; margin: 0.15rem 0 0.55rem; }
+
+  .typechips { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.4rem; }
+  .typechips code { font-size: 0.72rem; }
+
+  /* ---------- boundary cards ---------- */
+  .bcard {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    padding: 0.9rem 1.1rem; margin-bottom: 0.9rem;
+  }
+  .bcard-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; margin-bottom: 0.3rem; }
+  .bcard-head .route { font-weight: 600; font-size: 0.95rem; }
+  .chip {
+    font-size: 0.72rem; font-weight: 600; padding: 0.12em 0.6em; border-radius: 999px;
+    letter-spacing: 0.03em; white-space: nowrap;
+  }
+  .chip-agent { background: var(--c-agent-bg); color: var(--c-agent); }
+  .chip-ctl   { background: var(--c-ctl-bg);   color: var(--c-ctl); }
+  .chip-proc  { background: var(--c-proc-bg);  color: var(--c-proc); }
+  .chip-inproc{ background: var(--c-inproc-bg);color: var(--c-inproc); }
+  .chip-svc   { background: var(--c-svc-bg);   color: var(--c-svc); }
+  .bcard .proto { font-size: 0.85rem; color: var(--ink-dim); margin: 0.15rem 0 0.4rem; }
+  .bcard .note { font-size: 0.85rem; margin-top: 0.45rem; }
+  dl.kv { display: grid; grid-template-columns: 5.5em 1fr; gap: 0.15rem 0.8rem; margin: 0.4rem 0 0; font-size: 0.85rem; }
+  dl.kv dt { color: var(--ink-dim); }
+  dl.kv dd { margin: 0; }
+
+  /* ---------- crate table ---------- */
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+  th, td { text-align: left; padding: 0.5rem 0.9rem 0.5rem 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-dim); font-weight: 600; }
+
+  footer { margin-top: 3rem; color: var(--ink-dim); font-size: 0.8rem; }
+</style>
+
+</head>
+<body>
+<main>
+<header>
+  <h1>cache-warden アーキテクチャ地図</h1>
+  <p class="sub">v0.24.0 時点 · 4 crates (cache-warden / cache-warden-authsock / cache-warden-cli / macos-tcc) · 実コード読み取りベース</p>
+</header>
+
+<div class="legend">
+  <span><i class="swatch" style="background:var(--c-agent)"></i> unix socket · ssh-agent wire</span>
+  <span><i class="swatch" style="background:var(--c-ctl)"></i> unix socket · JSON Lines (control)</span>
+  <span><i class="swatch" style="background:var(--c-proc)"></i> subprocess</span>
+  <span><i class="swatch" style="background:var(--c-svc)"></i> service manager (register 時のみ)</span>
+  <span><i class="swatch" style="background:var(--c-inproc)"></i> in-process (trait / 関数呼び出し)</span>
+</div>
+
+<h2><span class="num">1</span>プロセス地図</h2>
+<div class="diagram">
+  <div>
+    <div class="col-label">クライアント</div>
+    <div class="actor edge-agent">
+      <div class="name">ssh / git / ssh-keygen</div>
+      <div class="via">SSH_AUTH_SOCK → <span class="mono">agent-*.sock.cw</span></div>
+    </div>
+    <div class="actor edge-ctl">
+      <div class="name">cache-warden CLI</div>
+      <div class="via">kv / status / ping / run / inject → <span class="mono">control.sock</span></div>
+    </div>
+    <div class="actor edge-svc">
+      <div class="name">daemon register (CLI)</div>
+      <div class="via">launchctl / systemctl を起動</div>
+    </div>
+  </div>
+
+  <div class="daemon-box">
+    <div class="daemon-title">cache-warden daemon (単一 tokio プロセス, DR-0008)</div>
+    <div class="daemon-sub">launchd (macOS) / systemd --user (Linux) が親としてライフサイクル管理。graceful shutdown は sigwait 専用スレッド</div>
+
+    <div class="module">
+      <div class="name">authsock listener <span class="crate">cli::daemon::authsock</span></div>
+      <div class="desc">[authsock.sockets.*] ごとに UnixListener。REQUEST_IDENTITIES はレジストリ + upstream 統合、SIGN_REQUEST はローカル署名 (blocking pool) or upstream 転送</div>
+      <div class="typechips"><code>SocketState</code><code>PublicKeyRegistry</code><code>FilterEvaluator</code><code>Upstream</code></div>
+    </div>
+    <div class="module">
+      <div class="name">control server → handler <span class="crate">cli::daemon::{server,handler}</span></div>
+      <div class="desc">server が唯一の I/O 層 (accept / JSON Lines / Mutex 取得)。handler は非同期・I/O なしの純関数で wire Request を Store API へ変換。OTP 導出は otp_adapter に分離 (DR-0024§8 / DR-0028)</div>
+      <div class="typechips"><code>Shared</code><code>HandlerCtx</code><code>OtpAdapter</code></div>
+    </div>
+    <div class="flow">▼ in-process · Capability トークン (control / authsock / otp の 3 ロール) を提示して呼ぶ</div>
+    <div class="module core">
+      <div class="name">core Store <span class="crate">cache-warden (core crate) · Arc&lt;Mutex&lt;Store&gt;&gt;</span></div>
+      <div class="desc">in-memory KV。二段階 TTL (Active→Soft→HardExpired)、Capability ゲート (DR-0024)、key 文法強制 (DR-0027)、Definition による遅延生成 (DR-0014)、fetch 失敗 backoff (DR-0022)。認証は Authenticator 境界、プロセス系譜は ProcessInspector (解釈は adapter 側, DR-0004)</div>
+      <div class="typechips"><code>Store</code><code>CacheEntry</code><code>Ttl</code><code>SecretBytes</code><code>Capability</code><code>Authenticator</code><code>Definition</code><code>ValueSource</code><code>SourceRunner</code></div>
+    </div>
+    <div class="module">
+      <div class="name">authsock adapter crate <span class="crate">cache-warden-authsock</span></div>
+      <div class="desc">ssh-agent wire の message/codec、鍵レジストリ (wire blob ↔ Store キー)、その場署名 (PEM 非保持)、op discovery + disk cache、filter / process policy (fail-closed)</div>
+      <div class="typechips"><code>AgentMessage</code><code>AgentCodec</code><code>RegisteredKey</code><code>KeySource</code><code>OpClient</code><code>chain_gate_passes</code></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="col-label">外部サービス</div>
+    <div class="actor edge-proc">
+      <div class="name">op CLI (1Password)</div>
+      <div class="via">item list / get · JSON · 30s timeout<br>→ 1Password.app → TouchID (coreauthd)</div>
+    </div>
+    <div class="actor edge-proc">
+      <div class="name">自バイナリ再 exec</div>
+      <div class="via"><span class="mono">__authsock-op-private-key</span> が op を叩き PEM を stdout へ</div>
+    </div>
+    <div class="actor edge-agent">
+      <div class="name">上流 ssh-agent</div>
+      <div class="via">1Password agent / system ssh-agent (リクエスト毎に接続)</div>
+    </div>
+    <div class="actor edge-proc">
+      <div class="name">GitHub</div>
+      <div class="via">curl · <span class="mono">github=&lt;user&gt;</span> filter の公開鍵取得</div>
+    </div>
+    <div class="actor edge-svc">
+      <div class="name">launchd / systemd --user</div>
+      <div class="via">plist / unit 生成 + bootstrap。TCC 永続化は .app Bundle ID (DR-0019/0020)</div>
+    </div>
+  </div>
+</div>
+
+<h2><span class="num">2</span>IO 境界カタログ (境界ごとの transport / プロトコル / 型)</h2>
+
+<div class="bcard">
+  <div class="bcard-head"><span class="route">ssh クライアント → authsock listener</span><span class="chip chip-agent">unix socket</span></div>
+  <div class="proto">ssh-agent wire protocol: 4byte BE 長プレフィックス + msg_type + payload (最大 16MB)。OpenSSH 互換</div>
+  <dl class="kv">
+    <dt>socket</dt><dd><code>~/.ssh/agent-*.sock.cw</code> 等 (<code>[authsock.sockets.*].path</code>)</dd>
+    <dt>型</dt><dd><code>AgentMessage</code> / <code>MessageType</code> (RequestIdentities=11, SignRequest=13, …) / <code>SignRequestFields</code> / <code>Identity</code>、フレーミングは <code>AgentCodec</code> (authsock::codec)</dd>
+  </dl>
+  <div class="note">SIGN_REQUEST: ローカル鍵 → blocking pool 上で Store の認証ゲートを通し署名。未知鍵 → upstream 転送。registry の読みロックは鍵解決だけに絞り認証待ち前に解放。</div>
+</div>
+
+<div class="bcard">
+  <div class="bcard-head"><span class="route">cache-warden CLI → control server</span><span class="chip chip-ctl">unix socket</span></div>
+  <div class="proto">JSON Lines v1 (DR-0009): 1 行 = 1 リクエスト / 1 レスポンス。秘密値は <code>*_b64</code> フィールドで base64</div>
+  <dl class="kv">
+    <dt>socket</dt><dd><code>$XDG_STATE_HOME/cache-warden/control.sock</code> (0600, <code>--socket</code> で上書き)</dd>
+    <dt>型</dt><dd><code>Request</code> (Ping/Status/KvSet/KvDefine/KvGet/KvDel/KvList/KvPin/KvUnpin) / <code>Response</code> (Ok/Err) / <code>OkPayload</code> / <code>ErrorKind</code> / <code>EntryInfo</code> / <code>SourceSpecWire</code> / <code>ValueMetaWire</code> (cli::protocol::wire)</dd>
+  </dl>
+  <div class="note">クライアントは同期 UnixStream で <code>round_trip()</code> 一発。daemon 側は tokio で 1 接続複数行、各リクエストを spawn_blocking で core 実行 (regenerate がブロックしうるため)。</div>
+</div>
+
+<div class="bcard">
+  <div class="bcard-head"><span class="route">server → handler → core Store</span><span class="chip chip-inproc">in-process</span></div>
+  <div class="proto">関数呼び出し (store lock 保持のまま)。wire 型 → core 型への lowering がここで起きる</div>
+  <dl class="kv">
+    <dt>渡す物</dt><dd><code>HandlerCtx</code> = auth / runner / clock / store_cap / otp_adapter / requester / kv_process_policies</dd>
+    <dt>core 型</dt><dd><code>Store</code> / <code>Capability</code> / <code>ValueSource</code> / <code>Ttl</code> / <code>SecretBytes</code> / <code>ExtendAuthOutcome</code> 等</dd>
+  </dl>
+  <div class="note">core ↔ adapter 境界の主要交点。<code>SourceSpecWire</code> / <code>ValueMetaWire</code> を <code>ValueSource</code> / <code>ValueMeta</code> へ変換してから呼ぶ。OTP は cap-gated read → <code>with_exposed</code> クロージャ内で TOTP 導出 (seed をクロージャ外へ出さない)。</div>
+</div>
+
+<div class="bcard">
+  <div class="bcard-head"><span class="route">authsock listener → core Store</span><span class="chip chip-inproc">in-process</span></div>
+  <div class="proto">Mutex&lt;Store&gt; 取得 + authsock 用 Capability 提示。control socket と同じ認証ゲートを共有</div>
+  <dl class="kv">
+    <dt>型</dt><dd><code>Store</code> / <code>dyn Authenticator</code> / <code>SourceRunner</code> / <code>Clock</code> / <code>Capability</code> (authsock_cap)</dd>
+  </dl>
+  <div class="note"><code>ensure_loaded</code> が op 由来鍵の遅延 set を行う: 初回 sign 時に <code>private_key_argv()</code> が組んだ argv を runner 経由で実行して PEM を取得・キャッシュ。</div>
+</div>
+
+<div class="bcard">
+  <div class="bcard-head"><span class="route">daemon → op CLI</span><span class="chip chip-proc">subprocess</span></div>
+  <div class="proto"><code>op item list --categories "SSH Key" --format json</code> / <code>op item get … --format json</code>。stdout JSON を serde でパース、30s timeout</div>
+  <dl class="kv">
+    <dt>型</dt><dd><code>OpClient</code> (trait) / <code>RealOpClient</code> / <code>OpKeyInfo</code> / <code>OpKeyCache</code> (disk cache, DR-0026 fallback)</dd>
+  </dl>
+  <div class="note">discovery は公開鍵側のみ。秘密鍵 PEM は op を直接呼ばず、<strong>自バイナリを <code>__authsock-op-private-key</code> で再 exec</strong> → その子が op を叩き JSON から PEM を抽出して plain stdout へ → core の <code>CommandRunner</code> が raw stdout を秘密値としてキャプチャ (op の JSON ラッピングと core の「stdout = 秘密値」契約の橋渡し)。認証は op → 1Password.app → TouchID (coreauthd) で発火。</div>
+</div>
+
+<div class="bcard">
+  <div class="bcard-head"><span class="route">authsock listener → 上流 ssh-agent</span><span class="chip chip-agent">unix socket</span></div>
+  <div class="proto">同じ ssh-agent wire (AgentCodec を再利用、上流応答も同じ framing 検査 = 信頼しない)。CONNECT 10s / REQUEST 30s</div>
+  <dl class="kv">
+    <dt>型</dt><dd><code>Upstream</code> / <code>UpstreamConnection</code> / <code>AgentMessage</code></dd>
+  </dl>
+  <div class="note">リクエスト毎に新規接続 (プーリングなし = 上流再起動に強い)。IDENTITIES は local + upstream を blob でマージし local 優先。SIGN は前回 enumeration で記録した upstream を先に試行。</div>
+</div>
+
+<div class="bcard">
+  <div class="bcard-head"><span class="route">daemon register → launchd / systemd</span><span class="chip chip-svc">subprocess (登録時のみ)</span></div>
+  <div class="proto">launchctl bootout/bootstrap/print (macOS)、systemctl --user (Linux)。plist / unit を事前生成して渡す</div>
+  <dl class="kv">
+    <dt>型</dt><dd><code>ServiceDefinition</code> / <code>ServiceStatus</code> / <code>Backend</code> (trait)</dd>
+  </dl>
+  <div class="note">ProgramArguments = <code>[exe, "daemon", "run", (--socket PATH)]</code>。exe が .app バンドル内なら AssociatedBundleIdentifiers で TCC 永続化 (DR-0019/0020)。常駐通信ではなくプロセス起動/監視契約。</div>
+</div>
+
+<div class="bcard">
+  <div class="bcard-head"><span class="route">authsock filter → GitHub</span><span class="chip chip-proc">subprocess</span></div>
+  <div class="proto">curl で HTTPS GET (<code>github=&lt;user&gt;</code> マッチャの公開鍵一覧)。blocking pool 上で実行</div>
+  <dl class="kv">
+    <dt>型</dt><dd><code>GithubFetcher</code> (trait) / <code>GithubMatcher</code></dd>
+  </dl>
+  <div class="note">cache_ttl 毎に再取得、失敗時は <code>mark_failed</code> で fail-closed。</div>
+</div>
+
+<h2><span class="num">3</span>crate 構成と責務分離</h2>
+<div class="tablewrap">
+<table>
+  <tr><th>crate</th><th>役割</th><th>境界に出る主要型</th></tr>
+  <tr>
+    <td><code>cache-warden</code> (core)</td>
+    <td>secure KV の中心。TTL 状態機械 / SecretBytes (zeroize + mlock, Clone なし) / Capability ゲート / Authenticator 境界 / ProcessInspector (系譜取得のみ、解釈しない) / Definition・ValueSource による遅延生成。adapter のメタデータは型不透明スロット (ValueMeta/SourceMeta) で持ち中身を解釈しない</td>
+    <td><code>Store</code> <code>SecretBytes</code> <code>Capability</code> <code>Authenticator</code> <code>ValueSource</code> <code>Ttl</code></td>
+  </tr>
+  <tr>
+    <td><code>cache-warden-authsock</code></td>
+    <td>ssh-agent adapter。wire message/codec、PublicKeyRegistry (blob ↔ Store キーの value-free マッピング)、ステートレス署名 (Ed25519/RSA/ECDSA、PEM 非保持)、upstream 転送、op discovery + disk cache、filter / process policy (意味解釈はここ, DR-0004)</td>
+    <td><code>AgentMessage</code> <code>AgentCodec</code> <code>RegisteredKey</code> <code>OpClient</code> <code>FilterEvaluator</code></td>
+  </tr>
+  <tr>
+    <td><code>cache-warden-cli</code></td>
+    <td>daemon ホスト (tokio server / authsock listener / handler / otp_adapter) + control socket wire 型 + CLI (手書き argv dispatch, clap なし, DR-0002) + launchd/systemd 登録 + TOML config</td>
+    <td><code>Request/Response</code> <code>HandlerCtx</code> <code>Shared</code> <code>ServiceDefinition</code> <code>Config</code></td>
+  </tr>
+  <tr>
+    <td><code>macos-tcc</code></td>
+    <td>TCC 権限 (Full Disk Access) の照会 + System Settings 誘導。non-macOS では stub。<code>internal fda-check</code> サブコマンドから利用</td>
+    <td><code>Permission</code> <code>AuthState</code> <code>WaitOutcome</code></td>
+  </tr>
+</table>
+</div>
+
+<footer>実装コード (crates/ 全 crate) を一次資料として作成、control socket 仕様は DR-0009 で裏取り。実装変更時はこの地図も追従させること。最終更新: 2026-07-09 (v0.24.0)。</footer>
+</main>
+</body>
+</html>
