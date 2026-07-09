@@ -287,7 +287,7 @@ pub fn render_systemd_unit(def: &ServiceDefinition) -> String {
 
     let mut out = String::new();
     out.push_str("[Unit]\n");
-    out.push_str("Description=cache-warden secret cache daemon (DR-0019)\n");
+    out.push_str("Description=cache-warden secret cache daemon\n");
     out.push('\n');
 
     out.push_str("[Service]\n");
@@ -384,7 +384,7 @@ pub fn backend() -> Result<Box<dyn Backend>, String> {
 pub fn backend() -> Result<Box<dyn Backend>, String> {
     Err(
         "daemon register/unregister/status: unsupported platform (only macOS \
-         launchd and Linux systemd --user are supported; DR-0019)"
+         launchd and Linux systemd --user are supported)"
             .to_string(),
     )
 }
@@ -893,7 +893,7 @@ mod tests {
         let got = render_systemd_unit(&d);
         let expected = "\
 [Unit]
-Description=cache-warden secret cache daemon (DR-0019)
+Description=cache-warden secret cache daemon
 
 [Service]
 Type=simple

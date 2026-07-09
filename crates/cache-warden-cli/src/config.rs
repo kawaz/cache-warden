@@ -708,7 +708,7 @@ pub fn build_kv_source(
     if let Some(toml::Value::Array(_)) = command {
         return Err(ConfigError::new(format!(
             "[kv.{name}]: the bare `command = [...]` array form was removed; \
-             write `source = \"command\"` with `command.argv = [...]` instead (DR-0018)"
+             write `source = \"command\"` with `command.argv = [...]` instead"
         )));
     }
 
@@ -927,7 +927,7 @@ impl AuthsockSocketConfig {
                 if crate::namespace::split_composed(k).is_none() {
                     return Err(ConfigError::new(format!(
                         "[authsock.sockets.{name}]: invalid key {k:?} in `keys`: must be \
-                         KEY or \"NS/KEY\" with segments matching [A-Za-z0-9_]+ (DR-0017)"
+                         KEY or \"NS/KEY\" with segments matching [A-Za-z0-9_]+"
                     )));
                 }
                 keys.push(k.clone());

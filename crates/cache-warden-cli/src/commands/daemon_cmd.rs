@@ -237,7 +237,7 @@ fn resolve_program_exe(
             "cache-warden: warning: no durable install path found for the daemon binary; \
              baking {} into the service (a dev build, versioned install, or unrecognized \
              location — it can break on rebuild or upgrade). Install via Homebrew or pass \
-             `--executable PATH` for a durable path (DR-0019).",
+             `--executable PATH` for a durable path.",
             candidate.path().display()
         ))
     };
@@ -462,7 +462,7 @@ pub fn register(
     if service::linger_enabled() == Some(false) {
         eprintln!(
             "cache-warden: hint: `systemd --user` services stop at logout without lingering; \
-             run `loginctl enable-linger` to keep the daemon running (DR-0019)"
+             run `loginctl enable-linger` to keep the daemon running"
         );
     }
     Ok(())

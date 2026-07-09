@@ -47,7 +47,7 @@ pub fn validate_identifier(s: &str, what: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "invalid {what} {s:?}: must be non-empty and contain only [A-Za-z0-9_] (DR-0017)"
+            "invalid {what} {s:?}: must be non-empty and contain only [A-Za-z0-9_]"
         ))
     }
 }

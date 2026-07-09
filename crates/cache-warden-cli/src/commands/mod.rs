@@ -229,7 +229,7 @@ pub fn validate_cli_key(key: &str, verb: &str) -> Result<(), String> {
     if key.contains('/') {
         return Err(format!(
             "`kv {verb}` KEY must not contain `/` (got {key:?}); \
-             select the namespace with `--namespace NS` instead (DR-0017)"
+             select the namespace with `--namespace NS` instead"
         ));
     }
     crate::namespace::validate_identifier(key, "KEY")
@@ -248,7 +248,7 @@ pub fn validate_cli_key(key: &str, verb: &str) -> Result<(), String> {
 pub fn reject_reserved_write_namespace(ns: &str, verb: &str) -> Result<(), String> {
     if crate::namespace::is_reserved_namespace(ns) {
         return Err(format!(
-            "`kv {verb}` cannot target the reserved namespace {ns:?} (DR-0018); \
+            "`kv {verb}` cannot target the reserved namespace {ns:?}; \
              it holds daemon-internal keys"
         ));
     }
@@ -268,7 +268,7 @@ pub fn reject_reserved_write_namespace(ns: &str, verb: &str) -> Result<(), Strin
 pub fn reject_reserved_read_namespace(ns: &str) -> Result<(), String> {
     if crate::namespace::is_reserved_namespace(ns) {
         return Err(format!(
-            "`kv get` cannot target the reserved namespace {ns:?} (DR-0018); \
+            "`kv get` cannot target the reserved namespace {ns:?}; \
              it holds daemon-internal keys"
         ));
     }

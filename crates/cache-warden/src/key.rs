@@ -47,7 +47,7 @@ impl std::fmt::Display for InvalidKey {
         write!(
             f,
             "invalid key {:?}: must be one or two [A-Za-z0-9_]+ segments joined by `/` \
-             (KEY or NS/KEY) (DR-0017)",
+             (KEY or NS/KEY)",
             self.key
         )
     }

@@ -241,7 +241,7 @@ fn validate_protocol_key(key: &str) -> Result<(), Response> {
             ErrorKind::BadRequest,
             format!(
                 "invalid key {key:?}: must be NS/KEY with both segments matching \
-                 [A-Za-z0-9_]+ (DR-0017)"
+                 [A-Za-z0-9_]+"
             ),
         ))
     }
@@ -257,7 +257,7 @@ fn reject_reserved_namespace_write(key: &str) -> Result<(), Response> {
     match crate::namespace::split_composed(key) {
         Some((ns, _)) if crate::namespace::is_reserved_namespace(ns) => Err(Response::error(
             ErrorKind::BadRequest,
-            format!("namespace {ns:?} is reserved and cannot be written to (DR-0018)"),
+            format!("namespace {ns:?} is reserved and cannot be written to"),
         )),
         _ => Ok(()),
     }
@@ -281,7 +281,7 @@ fn reject_reserved_namespace_read(key: &str) -> Result<(), Response> {
     match key.split_once('/') {
         Some((ns, _)) if crate::namespace::is_reserved_namespace(ns) => Err(Response::error(
             ErrorKind::BadRequest,
-            format!("namespace {ns:?} is reserved and cannot be read (DR-0018)"),
+            format!("namespace {ns:?} is reserved and cannot be read"),
         )),
         _ => Ok(()),
     }
