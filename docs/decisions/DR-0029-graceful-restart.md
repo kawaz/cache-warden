@@ -1,6 +1,6 @@
 # DR-0029: graceful restart — kv 秘密状態を引き継ぐ無 storm 再起動
 
-- Status: Draft v2 (codex adversarial review 反映済み、kawaz レビュー待ち)
+- Status: Accepted (2026-07-09 kawaz 承認。fail-safe の cold start 退化は「悪化ではない」として許容)
 - Date: 2026-07-09
 - 関連: issue `2026-06-14-graceful-restart-state-handoff` (動機と secure handoff 大枠合意) /
   DR-0021 (signal/shutdown、本 DR はその次段) / DR-0019 (launchd 登録) /
