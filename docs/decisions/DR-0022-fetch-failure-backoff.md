@@ -37,7 +37,7 @@ v1 改訂版に対する Codex re-review で以下が追加指摘され v2 で�
 
 ## Context
 
-dogfood Phase 3 (cache-warden が日常 SSH の本番) 中、離席タイミングで TouchID が約 20 連発する現象を観測した (journal `docs/journal/2026-06-13-handoff-ecdsa-dogfood-stablewhich.md` §A、issue `docs/issue/2026-06-14-op-refetch-loop.md`)。
+dogfood Phase 3 (cache-warden が日常 SSH の本番) 中、離席タイミングで TouchID が約 20 連発する現象を観測した (issue `docs/issue/archive/2026-06-14-op-refetch-loop.md`)。
 
 コード調査 (2026-06-14) で根本原因が確定:
 
@@ -264,7 +264,6 @@ fetch-failure-backoff = "5s"  # default 5s; "0s" で機能無効化
 - `crates/cache-warden/src/store.rs` の `Store` 構造体 (新 `failure_backoffs` フィールド追加対象)
 - `crates/cache-warden-cli/src/commands/op_private_key.rs:57` — 既存の失敗時 stderr 診断 (整合確認)
 - `crates/cache-warden-cli/src/daemon/authsock.rs:488` — 別経路の `authsock connection error` ログ (混同しないため記録、op-refetch loop 旧仮説の混同元)
-- journal `docs/journal/2026-06-13-handoff-ecdsa-dogfood-stablewhich.md` §A — 現象発見の起点
 - issue `docs/issue/2026-06-14-op-refetch-loop.md` — 本 DR が解の本体
 - issue `docs/issue/2026-06-14-touchid-blocks-blocking-pool.md` — 副次問題、本 DR の範囲外
 - DR-0011 (TTL 2 分離) — 分類比較対象 (TTL/pin と本 DR の retry policy は別カテゴリ)

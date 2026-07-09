@@ -68,7 +68,7 @@ Opus サブエージェント委譲による実装、を 1 日で 4 周回した
 - 体制: メイン Fable（設計・監査・統合）+ Opus サブエージェント（実装、TDD、commit しない）。
   監査で毎回 1〜2 件の実質的指摘が出た（トップレベル help の極性不統一 / authsock footgun /
   status 型表示の落ち）ので、**監査工程は省略しない**こと
-- 残タスク（handoff journal 由来、未着手）: パリティ実機検証（Phase 2、kawaz 同席要）/
+- 残タスク（未着手）: パリティ実機検証（Phase 2、kawaz 同席要）/
   key 層 allowed_processes 🟡 / op agent socket 高速路 🟡 / ビルトイン TouchID 🔴 /
   anti-debug (b)(c) 🔴 / privsep 🔴 / 他ベンダ KeySource（`--source` scheme テーブルが受け皿）
 - 新規の将来候補: 参照のインライン define（opt-in、DR-0014 §5）/ zsh 補完（CLI 面が安定した今が頃合い）
@@ -76,5 +76,4 @@ Opus サブエージェント委譲による実装、を 1 日で 4 周回した
 ## 関連
 
 - [DR-0013](../decisions/DR-0013-secret-reference-injection.md) / [DR-0014](../decisions/DR-0014-kv-definition-model.md) / [DR-0015](../decisions/DR-0015-dry-run-verification-mode.md) / [DR-0016](../decisions/DR-0016-otp-value-type.md)
-- [2026-06-11-authsock-port-and-fable-handoff.md](./2026-06-11-authsock-port-and-fable-handoff.md) — 前セッションからの引き継ぎ元
 - [DESIGN-ja.md](../DESIGN-ja.md) — 全変更を反映済み

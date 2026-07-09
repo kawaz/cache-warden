@@ -24,7 +24,7 @@ dogfood Phase 3 (cache-warden が日常 SSH の本番) 中に TouchID が連発�
 
 ### 0.1 daemon 稼働確認
 
-dogfood Phase 3 の現在の稼働状態は以下のとおり (journal `2026-06-13-handoff` §現在の稼働状態 参照):
+dogfood Phase 3 の現在の稼働状態は以下のとおり:
 
 - launchd ラベル: `com.github.kawaz.cache-warden`
 - `.cw` socket: `~/.ssh/agent-kawaz.sock.cw` / `agent-emerada.sock.cw` / `agent-syun.sock.cw`
@@ -569,6 +569,5 @@ daemon upgrade が必要な場合は `cache-warden daemon register` で plist �
 
 - [issue: op-refetch-loop](../issue/2026-06-14-op-refetch-loop.md) — 本 runbook の対象問題
 - [DR-0022: fetch 失敗時 backoff](../decisions/DR-0022-fetch-failure-backoff.md) — 修正方針
-- [journal §A: 元観測記録](../journal/2026-06-13-handoff-ecdsa-dogfood-stablewhich.md) — TouchID 20 連発の発見起点
 - [journal: parity-phase2](../journal/2026-06-12-parity-phase2.md) — ssh 隔離テクニック (`-F /dev/null` / `-o IdentityAgent`) の元記録
 - [runbook: parity-verification](./parity-verification.md) — Phase 3 切替手順 (構造参考)

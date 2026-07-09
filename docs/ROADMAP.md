@@ -20,7 +20,7 @@
 ## 短期 (= 残作業・近い着手候補)
 
 - **op-refetch loop の解消** (dogfood 再開の主リスク): SIGN 起因の regenerate (op fetch) が
-  クライアント切断でも完遂・キャッシュするように。`docs/journal/2026-06-13-handoff-ecdsa-dogfood-stablewhich.md` bug A 参照
+  クライアント切断でも完遂・キャッシュするように。詳細は issue archive `2026-06-14-op-refetch-loop` 参照
 - **stable-which 0.4.0 移行** (F): 現状 0.3 + 自前 `is_unstable_resolution` 判定 (versioned-managed
   を見落とす潜在バグ)。0.4.0 の `is_stable()`/`tags()` 経由に書き換えで同時に埋まる — DR-0019、journal 参照
 - **prefetch 本体** (DR-0018 未着手): `kv prefetch ...` / 起動時 prefetch。型付きスキーマ自体は

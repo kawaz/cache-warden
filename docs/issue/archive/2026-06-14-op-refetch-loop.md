@@ -10,7 +10,6 @@ close_reason:
 
 - status: **resolved** (2026-06-22)
 - 発見: 2026-06-13 (Phase 3 dogfood 切替直後、離席中に観測)
-- 元記録: `docs/journal/2026-06-13-handoff-ecdsa-dogfood-stablewhich.md` §A (本 issue で独立昇格)
 - 関連: DR-0018 (型付き source、prefetch で起動時 warm 化することで二次的に緩和し得る) / [2026-06-13-op-discovery-blocks-startup.md](./2026-06-13-op-discovery-blocks-startup.md) (起動時 op 同期ブロック、同じ op fetch 経路)
 - last_read: 2026-06-22T17:14:30+09:00
 
@@ -105,7 +104,6 @@ C / E は独立に効き、両方やる価値あり。D は副次。
 
 ## 関連
 
-- journal `2026-06-13-handoff-ecdsa-dogfood-stablewhich.md` §A — 元記録
 - [2026-06-13-op-discovery-blocks-startup.md](./2026-06-13-op-discovery-blocks-startup.md) — 同じ op fetch 経路の別 issue
 - DR-0018 — prefetch / typed source (起動時 warm 化が二次的に緩和)
 - DR-0011 — TTL 2 分離 (hard-ttl 失効が本 issue の再 fetch 起点になり得る、G と連動)

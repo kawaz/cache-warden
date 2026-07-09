@@ -76,4 +76,3 @@
 - [docs/findings/2026-06-14-op-cli-failure-categorization.md](../findings/2026-06-14-op-cli-failure-categorization.md)
 - [docs/design/lazy-load-op-key-unification-plan.md](../design/lazy-load-op-key-unification-plan.md) (= A-3a 計画書)
 - [docs/runbooks/op-refetch-loop-live-diagnosis.md](../runbooks/op-refetch-loop-live-diagnosis.md)
-- 前 journal: [2026-06-13-handoff-ecdsa-dogfood-stablewhich.md](./2026-06-13-handoff-ecdsa-dogfood-stablewhich.md)
