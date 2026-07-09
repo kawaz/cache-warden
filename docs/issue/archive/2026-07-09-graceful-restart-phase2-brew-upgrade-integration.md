@@ -1,6 +1,6 @@
 ---
 title: graceful restart Phase 2: brew upgrade 完了時の自動 restart --graceful 呼び出し
-status: wip
+status: resolved
 category: design
 created: 2026-07-09T23:44:04+09:00
 last_read: 2026-07-10T01:37:54+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-07-10T01:38:46+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-10T02:27:50+09:00
 discard_reason:    # 1-line JSON array string[] 例: ["discarded","環境が変わった"]
 pending_reason:    # 1-line JSON array string[] 例: ["pending","v2 待ち"]
-close_reason:      # close 時に update が記録。1-line JSON array string[] 例: ["dr/DR-0007","implemented"]
+close_reason: ["implemented","justfile: daemon-graceful-restart recipe + on-success-release 自動呼出 (commit xrszuvqm)","隔離daemonで正常系/daemon不在/パス不一致の3case実機検証済み","実運用初回発火は次リリースのbrew upgrade時"]
 blocked_by:
 origin: DR-0029 Phase 1 完了に伴う後続作業
 ---
