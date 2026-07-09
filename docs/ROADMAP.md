@@ -33,6 +33,12 @@
 - **holder 非 panic 規律の regression 保護**: holder 3 関数に clippy deny
   (panic / unwrap_used / expect_used / indexing_slicing) を適用、既存 CI の
   clippy gate に乗せた。— issue archive `2026-07-09-graceful-restart-holder-panic-regression-guard`
+- **macos-process-inspect crate 新設**: pid facts / ancestry / proc_uniqueid /
+  socket peer credentials (LOCAL_PEERPID/PEEREPID/PEERTOKEN) を提供する自己完結
+  crate (libc のみ依存、将来別 repo 化前提)。custom-touchid-dialog と
+  kv-get-peer-identity-guard の 2 件を unblock。既存 process.rs / peer.rs との
+  重複解消は issue `2026-07-10-migrate-to-macos-process-inspect-crate` で追跡。
+  — issue archive `2026-06-22-crate-macos-process-inspect`
 
 ## 短期 (= 残作業・近い着手候補)
 
