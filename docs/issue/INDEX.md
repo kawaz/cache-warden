@@ -4,7 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
-| 2026-06-14 | idea | idea | [graceful-restart-state-handoff](./2026-06-14-graceful-restart-state-handoff.md) | **そもそも kv を維持したい根本理由 = op の TouchID サイクルに引き戻されたくない**。 |
+| 2026-06-14 | idea | wip | [graceful-restart-state-handoff](./2026-06-14-graceful-restart-state-handoff.md) | **そもそも kv を維持したい根本理由 = op の TouchID サイクルに引き戻されたくない**。 |
 | 2026-06-14 | idea | idea | [ssh-agent-provider-architecture](./2026-06-14-ssh-agent-provider-architecture.md) | 現状の authsock アダプタは **「中継役（relay）」前提**の名残: |
 | 2026-06-14 | bug | idea | [touchid-blocks-blocking-pool](./2026-06-14-touchid-blocks-blocking-pool.md) | SIGN_REQUEST 処理は `spawn_blocking` で blocking pool に乗せ、その中で **`store` の `std::sy… |
 | 2026-07-06 | bug | open | [daemon-register-help-output-oneshot](./2026-07-06-daemon-register-help-output-oneshot.md) | v0.22.3 daemon 稼働中に v0.23.0 で `daemon register` 実行、末尾に top-level help が出力され旧 daemon… |

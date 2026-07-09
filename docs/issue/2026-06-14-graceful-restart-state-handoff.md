@@ -1,11 +1,11 @@
 ---
 title: "graceful restart: kv + endpoint fd を引き継いで新バイナリへ（アイデア記録）"
-status: idea
+status: wip
 category: idea
 created: 2026-06-14T10:08:58+09:00
 last_read:
 open_entered:
-wip_entered:
+wip_entered: 2026-07-09T17:40:05+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
