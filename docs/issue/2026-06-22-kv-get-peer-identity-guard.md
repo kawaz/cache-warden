@@ -1,10 +1,10 @@
 ---
 title: kv get peer-identity guard
-status: blocked
+status: open
 category: design
 created: 2026-06-22T21:18:58+09:00
 last_read:
-open_entered: 2026-06-22T21:18:58+09:00
+open_entered: 2026-07-10T03:11:57+09:00
 wip_entered:
 blocked_entered: 2026-07-04T09:33:55+09:00
 pending_entered:
@@ -13,7 +13,7 @@ resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by: [2026-06-22-crate-macos-process-inspect]
+blocked_by: []
 origin: 自リポ TODO
 ---
 
