@@ -71,6 +71,7 @@ mod key;
 mod meta;
 mod process;
 mod secret;
+mod snapshot;
 mod source;
 mod store;
 #[cfg(any(test, feature = "test-support"))]
@@ -89,6 +90,7 @@ pub use key::{InvalidKey, validate_key_syntax};
 pub use meta::{SourceMeta, ValueMeta};
 pub use process::{FakeInspector, InspectError, ProcessInfo, ProcessInspector, SystemInspector};
 pub use secret::SecretBytes;
+pub use snapshot::{ExportError, ImportError, StoreSnapshot};
 pub use source::{CommandRunner, RunError, SourceRunner, TrailingNewline, ValueSource};
 pub use store::{
     ExtendAuthOutcome, ExtendOutcome, FailureRecord, ItemRef, PinAuthOutcome, RegenerateDefOutcome,

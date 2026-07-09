@@ -12,15 +12,21 @@
 
 use std::collections::BTreeMap;
 
+use zeroize::Zeroizing;
+
 use crate::auth::{AuthContext, AuthError, AuthOperation, Authenticator};
 use crate::capability::{CapError, Capability};
-use crate::clock::{Clock, Monotonic};
+use crate::clock::{Clock, Monotonic, epoch_ms_to_monotonic, monotonic_to_epoch_ms};
 use crate::definition::{DefineError, Definition};
 use crate::entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl};
 use crate::key::{InvalidKey, validate_key_syntax};
 use crate::meta::{SourceMeta, ValueMeta};
 use crate::process::ProcessInfo;
 use crate::secret::SecretBytes;
+use crate::snapshot::{
+    self, ExportError, ImportError, SnapshotDefinition, SnapshotEntry, SnapshotFailure,
+    SnapshotSource, SnapshotValue, StoreSnapshot,
+};
 use crate::source::{RunError, SourceRunner, ValueSource};
 
 /// Build an [`AuthContext`] for `key`/`op`, attaching `requester` if present.
@@ -936,6 +942,213 @@ impl Store {
         // DR-0022: failure backoff lifetime = definition lifetime.
         self.failure_backoffs.remove(key);
         Ok(had_value || had_def)
+    }
+
+    // ---- graceful-restart snapshot (DR-0029 §2, Phase 1 / bundle 1) ----
+
+    /// Serialize this store's full state into a [`StoreSnapshot`] for
+    /// graceful-restart handoff to a fresh process.
+    ///
+    /// Only keys carrying *something* meaningful are included: a key whose
+    /// value is logically hard-expired (a "husk" not yet physically
+    /// zeroized — see [`CacheEntry::peek_value`]'s doc) contributes no value
+    /// entry, and a key with no value, no definition, and no failure record
+    /// at all is skipped entirely.
+    ///
+    /// `cap` is checked first (DR-0024): an unauthorized caller learns
+    /// nothing about the store's contents. `clock` supplies "now" for the
+    /// [`crate::clock::monotonic_to_epoch_ms`] wall-clock re-anchoring of
+    /// every timestamp; the wall-clock side of that conversion reads the real
+    /// [`std::time::SystemTime`] directly (this is a one-shot operation, not
+    /// a per-tick TTL check, so — unlike every other `Store` method — there
+    /// is no injectable wall-clock parameter; see the `snapshot` module doc
+    /// for why the *pure* conversion functions this builds on stay
+    /// independently testable regardless).
+    ///
+    /// Capability tokens (DR-0024) are adapter-role tokens, not tied to any
+    /// entry (DR-0029 Q2), so none travel in the snapshot; the receiving
+    /// process re-issues its own via [`Store::import_snapshot`]'s `builder`.
+    pub fn export_snapshot(
+        &self,
+        cap: &Capability,
+        clock: &impl Clock,
+    ) -> Result<StoreSnapshot, ExportError> {
+        self.check_cap(cap).map_err(|_| ExportError::CapMismatch)?;
+
+        let now_mono = clock.now();
+        let now_wall_ms = snapshot::wall_now_epoch_ms();
+        let to_epoch_ms = |point: Monotonic| monotonic_to_epoch_ms(now_mono, now_wall_ms, point);
+
+        let mut keys: Vec<&String> = self
+            .entries
+            .keys()
+            .chain(self.definitions.keys())
+            .chain(self.failure_backoffs.keys())
+            .collect();
+        keys.sort();
+        keys.dedup();
+
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = self.entries.get(key).and_then(|entry| {
+                // A logically hard-expired entry must never be exported as if
+                // it were live plaintext, even if this method (which only
+                // borrows `&self`) has not yet triggered the physical zeroize.
+                if entry.state(clock) == EntryState::HardExpired {
+                    return None;
+                }
+                let secret = entry.peek_value()?;
+                Some(SnapshotValue {
+                    source: SnapshotSource::from_value_source(entry.source()),
+                    secret: Zeroizing::new(secret.with_exposed(|b| b.to_vec())),
+                    soft_ttl_ms: entry.ttl().soft().map(|d| d.as_millis() as u64),
+                    hard_ttl_ms: entry.ttl().hard().map(|d| d.as_millis() as u64),
+                    loaded_at_epoch_ms: to_epoch_ms(entry.loaded_at()),
+                    extended_at_epoch_ms: to_epoch_ms(entry.extended_at()),
+                    pin_deadline_epoch_ms: entry.pin_deadline().map(to_epoch_ms),
+                })
+            });
+
+            let definition = self.definitions.get(key).map(|def| {
+                let (value_meta_type, value_meta_params) = def.meta().clone().into_parts();
+                let (source_meta_kind, source_meta_fields) = def.source_meta().clone().into_parts();
+                SnapshotDefinition {
+                    source: SnapshotSource::from_value_source(def.source()),
+                    soft_ttl_ms: def.ttl().soft().map(|d| d.as_millis() as u64),
+                    hard_ttl_ms: def.ttl().hard().map(|d| d.as_millis() as u64),
+                    value_meta_type,
+                    value_meta_params,
+                    source_meta_kind,
+                    source_meta_fields,
+                }
+            });
+
+            let failure = self
+                .failure_backoffs
+                .get(key)
+                .map(|record| SnapshotFailure {
+                    failed_at_epoch_ms: to_epoch_ms(record.failed_at),
+                    retry_after_ms: record.retry_after.as_millis() as u64,
+                });
+
+            if value.is_none() && definition.is_none() && failure.is_none() {
+                // Nothing meaningful survives for this key (e.g. a stale
+                // hard-expired husk with no definition and no failure record).
+                continue;
+            }
+
+            out.push(SnapshotEntry {
+                key: key.clone(),
+                value,
+                definition,
+                failure,
+            });
+        }
+
+        Ok(StoreSnapshot::new(out))
+    }
+
+    /// Rebuild a store from a [`StoreSnapshot`]: the graceful-restart
+    /// counterpart of [`Store::export_snapshot`], run by the freshly exec'd
+    /// process.
+    ///
+    /// `builder` supplies the *new* process's own settings (e.g. the
+    /// configured failure-backoff duration) and issues fresh [`Capability`]
+    /// tokens. `clock` anchors the wall-clock-to-`Monotonic` re-anchoring for
+    /// every timestamp the snapshot carries — see
+    /// [`crate::clock::epoch_ms_to_monotonic`]'s doc for the headroom this
+    /// clock needs to provide for old entries to reconstruct their correct
+    /// relative age (a bundle-2 / fork-exec-integration concern; this method
+    /// cannot fix an under-provisioned clock, only degrade safely if given
+    /// one).
+    ///
+    /// Rejects the whole snapshot up front if its format version is not one
+    /// this build understands ([`ImportError::UnsupportedVersion`]) — no
+    /// entries are installed in that case. A malformed individual entry (an
+    /// invalid TTL, or a definition claiming a non-command source — both only
+    /// reachable via corrupted or maliciously crafted snapshot bytes, never
+    /// via [`Store::export_snapshot`]'s own output) aborts the whole import
+    /// with the corresponding [`ImportError`] rather than installing a
+    /// partial store.
+    pub fn import_snapshot(
+        builder: StoreBuilder,
+        snapshot: StoreSnapshot,
+        clock: &impl Clock,
+    ) -> Result<StoreBundle, ImportError> {
+        if !snapshot.is_supported_version() {
+            return Err(ImportError::UnsupportedVersion {
+                got: snapshot.format_version(),
+                supported: crate::snapshot::FORMAT_VERSION,
+            });
+        }
+
+        let mut bundle = builder.build();
+        let now_mono = clock.now();
+        let now_wall_ms = snapshot::wall_now_epoch_ms();
+        let to_monotonic = |epoch_ms: u64| epoch_ms_to_monotonic(now_mono, now_wall_ms, epoch_ms);
+
+        for entry in snapshot.into_entries() {
+            let SnapshotEntry {
+                key,
+                value,
+                definition,
+                failure,
+            } = entry;
+
+            if let Some(mut v) = value {
+                let soft = v.soft_ttl_ms.map(std::time::Duration::from_millis);
+                let hard = v.hard_ttl_ms.map(std::time::Duration::from_millis);
+                let ttl = Ttl::new(soft, hard)
+                    .map_err(|_| ImportError::MalformedTtl { key: key.clone() })?;
+                let loaded_at = to_monotonic(v.loaded_at_epoch_ms);
+                let extended_at = to_monotonic(v.extended_at_epoch_ms);
+                let pin_deadline = v.pin_deadline_epoch_ms.map(to_monotonic);
+                // Move the plaintext into `SecretBytes` without copying: the
+                // Zeroizing<Vec<u8>> buffer is swapped for an empty Vec via
+                // `mem::take` (through Zeroizing's DerefMut<Target=Vec<u8>>),
+                // so the same allocation changes owner from `v.secret` to
+                // `secret_bytes` rather than existing as two live copies —
+                // the DR-0028 "no owned copy" pattern applied to import.
+                let raw = std::mem::take(&mut *v.secret);
+                let secret_bytes = SecretBytes::new(raw);
+                let cache_entry = CacheEntry::from_parts(
+                    v.source.into_value_source(),
+                    ttl,
+                    secret_bytes,
+                    loaded_at,
+                    extended_at,
+                    pin_deadline,
+                );
+                bundle.store.entries.insert(key.clone(), cache_entry);
+            }
+
+            if let Some(d) = definition {
+                let soft = d.soft_ttl_ms.map(std::time::Duration::from_millis);
+                let hard = d.hard_ttl_ms.map(std::time::Duration::from_millis);
+                let ttl = Ttl::new(soft, hard)
+                    .map_err(|_| ImportError::MalformedTtl { key: key.clone() })?;
+                let value_meta = ValueMeta::from_parts(d.value_meta_type, d.value_meta_params);
+                let source_meta = SourceMeta::from_parts(d.source_meta_kind, d.source_meta_fields);
+                let def = Definition::new(d.source.into_value_source(), ttl)
+                    .map_err(|_| ImportError::MalformedDefinition { key: key.clone() })?
+                    .with_meta(value_meta)
+                    .with_source_meta(source_meta);
+                bundle.store.definitions.insert(key.clone(), def);
+            }
+
+            if let Some(f) = failure {
+                let failed_at = to_monotonic(f.failed_at_epoch_ms);
+                bundle.store.failure_backoffs.insert(
+                    key.clone(),
+                    FailureRecord {
+                        failed_at,
+                        retry_after: std::time::Duration::from_millis(f.retry_after_ms),
+                    },
+                );
+            }
+        }
+
+        Ok(bundle)
     }
 }
 
@@ -3166,5 +3379,354 @@ mod tests {
         // "shared" appears in both entries and definitions, must be deduped.
         // Order: sorted alphabetically.
         assert_eq!(result, vec!["a", "shared", "z"]);
+    }
+
+    // ---- DR-0029 §2 graceful-restart snapshot (export_snapshot / import_snapshot) ----
+
+    mod snapshot_tests {
+        use super::*;
+
+        /// Build a store exercising the three DR-0029-mandated snapshot shapes
+        /// in one go: a plain static value ("STATIC"), a definition whose
+        /// value was lazily regenerated via a mock command
+        /// ("DEFINED", `CountingRunner`), and a key that is *both* pinned
+        /// *and* carries an active fetch-failure backoff record ("PINNED").
+        ///
+        /// The pin+backoff combination on one key needs a specific sequence,
+        /// since the two are individually exclusive with the states each
+        /// other's setup passes through:
+        /// [`Store::pin_authenticated`] refuses a hard-expired entry, and
+        /// [`Store::regenerate`] only records a backoff for a *hard-expired*
+        /// command-source entry that fails to regenerate. So: give "PINNED" a
+        /// command-source value, hard-expire it, fail a `regenerate` (records
+        /// the backoff, leaves the entry hard-expired with no value), then
+        /// `set` a fresh value (this does **not** clear `failure_backoffs` —
+        /// DR-0022 — so the record survives) and only *then* pin it.
+        ///
+        /// Returns the store, its control capability, and the clock driving
+        /// it (so the caller can advance time further before exporting).
+        fn three_shape_store() -> (Store, Capability, FakeClock) {
+            let clock = FakeClock::new();
+            let (mut s, cap) =
+                crate::test_helpers::store_with_cap_and_backoff(Duration::from_secs(60));
+            // STATIC and DEFINED use a TTL that never hard-expires: shape 3's
+            // setup below deliberately advances the shared clock past the
+            // short `ttl()` hard window (to hard-expire "PINNED" for its own
+            // regenerate-failure flow), which would otherwise also destroy
+            // STATIC/DEFINED's values before export — an artifact of sharing
+            // one clock across all three shapes, not something this test is
+            // trying to exercise.
+            let durable_ttl = Ttl::never();
+
+            // Shape 1: a plain static value.
+            s.set(
+                "STATIC",
+                ValueSource::Static,
+                SecretBytes::from("static-secret"),
+                durable_ttl,
+                &cap,
+                &clock,
+            )
+            .unwrap();
+
+            // Shape 2: a definition, lazily produced via a mock command runner
+            // (DR-0014 get_or_regenerate path), so both `entries` and
+            // `definitions` carry this key.
+            s.define(
+                "DEFINED",
+                ValueSource::command(["op".into(), "read".into()]),
+                durable_ttl,
+            )
+            .unwrap();
+            let runner = CountingRunner::new(b"regenerated-secret");
+            s.get_or_regenerate("DEFINED", &runner, &AllowAll, None, &cap, &clock)
+                .unwrap();
+            assert_eq!(runner.runs(), 1, "test setup: DEFINED must be produced");
+
+            // Shape 3: pinned + an active backoff record on the same key.
+            s.set(
+                "PINNED",
+                ValueSource::command(["will-fail".into()]),
+                SecretBytes::from("v0"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            clock.advance(HARD); // hard-expire it
+            let err = s
+                .regenerate("PINNED", &FailingRunner, &AllowAll, None, &cap, &clock)
+                .unwrap_err();
+            assert_eq!(err, RegenerateOutcome::RunFailed(RunError::EmptyOutput));
+            assert!(
+                s.failure_backoff_remaining("PINNED", &clock).is_some(),
+                "test setup: the failed regenerate must record a backoff"
+            );
+            // Re-set a fresh value (does not clear failure_backoffs, DR-0022),
+            // then pin it — now possible since the entry is Active again.
+            s.set(
+                "PINNED",
+                ValueSource::command(["will-fail".into()]),
+                SecretBytes::from("pinned-secret"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            s.pin_authenticated(
+                "PINNED",
+                clock.now().saturating_add(Duration::from_secs(10_000)),
+                &AllowAll,
+                None,
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            assert!(
+                s.failure_backoff_remaining("PINNED", &clock).is_some(),
+                "test setup: backoff record must survive the re-set + pin"
+            );
+
+            (s, cap, clock)
+        }
+
+        #[test]
+        fn roundtrip_preserves_values_definitions_and_meta_across_all_three_shapes() {
+            let (s, cap, clock) = three_shape_store();
+            let expected_pin_deadline = s.pin_deadline_of("PINNED");
+            assert!(
+                expected_pin_deadline.is_some(),
+                "test setup: PINNED must be pinned"
+            );
+            let expected_backoff_remaining = s.failure_backoff_remaining("PINNED", &clock);
+
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            assert_eq!(snap.len(), 3, "STATIC, DEFINED, PINNED");
+
+            // Import into a brand-new store, using the *same* clock instance
+            // (simulating no elapsed time) so this test isolates data-fidelity
+            // from the separate time-re-anchoring concern (covered below and
+            // in clock.rs).
+            let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
+            let mut s2 = bundle.store;
+            let cap2 = bundle.control_cap;
+
+            // Shape 1: static value, byte-for-byte via with_exposed (DR-0028).
+            let v = s2.get("STATIC", &cap2, &clock).unwrap().unwrap();
+            v.with_exposed(|b| assert_eq!(b, b"static-secret"));
+            assert_eq!(s2.source_of("STATIC"), Some(&ValueSource::Static));
+
+            // Shape 2: definition + its produced value both survive, and the
+            // definition is still regenerable (command source preserved).
+            let v = s2.get("DEFINED", &cap2, &clock).unwrap().unwrap();
+            v.with_exposed(|b| assert_eq!(b, b"regenerated-secret"));
+            assert_eq!(
+                s2.definition_of("DEFINED").map(Definition::source),
+                Some(&ValueSource::command(["op".into(), "read".into()]))
+            );
+
+            // Shape 3: pin deadline and the active backoff record both survive.
+            // Same clock instance for export and import (see the comment
+            // above), so the reconstructed values must match *exactly*, not
+            // just approximately.
+            let v = s2.get("PINNED", &cap2, &clock).unwrap().unwrap();
+            v.with_exposed(|b| assert_eq!(b, b"pinned-secret"));
+            assert_eq!(s2.pin_deadline_of("PINNED"), expected_pin_deadline);
+            assert_eq!(
+                s2.failure_backoff_remaining("PINNED", &clock),
+                expected_backoff_remaining,
+                "PINNED's failure backoff record must survive the round trip"
+            );
+            // PINNED was built via set()/regenerate() directly (not
+            // define()/get_or_regenerate()), so it legitimately has no
+            // definition — this shape's distinguishing feature is pin +
+            // backoff, not a definition.
+            assert_eq!(s2.definition_of("PINNED"), None);
+        }
+
+        #[test]
+        fn roundtrip_preserves_value_meta_and_source_meta() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.define_with_meta(
+                "OTP",
+                ValueSource::command(["op".into(), "read".into()]),
+                ttl(),
+                ValueMeta::with_type("otp", [("digits".to_string(), "6".to_string())]),
+                SourceMeta::with_kind("op", [("uri".to_string(), "op://v/i/f".to_string())]),
+            )
+            .unwrap();
+            let runner = CountingRunner::new(b"123456");
+            s.get_or_regenerate("OTP", &runner, &AllowAll, None, &cap, &clock)
+                .unwrap();
+
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
+            let s2 = bundle.store;
+
+            let def = s2.definition_of("OTP").unwrap();
+            assert_eq!(def.meta().type_label(), Some("otp"));
+            assert_eq!(def.meta().param("digits"), Some("6"));
+            assert_eq!(def.source_meta().kind(), Some("op"));
+            assert_eq!(def.source_meta().field("uri"), Some("op://v/i/f"));
+        }
+
+        #[test]
+        fn export_skips_a_key_with_no_value_definition_or_failure() {
+            // delete() removes only the value; with no definition and no
+            // failure record either, the key contributes nothing to export
+            // once fully gone.
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.set(
+                "GONE",
+                ValueSource::Static,
+                SecretBytes::from("v"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            s.delete("GONE", &cap).unwrap();
+
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            assert!(snap.is_empty());
+        }
+
+        #[test]
+        fn export_skips_a_logically_hard_expired_value_even_if_not_yet_zeroized() {
+            // export_snapshot only borrows &self, so it cannot trigger the
+            // zeroize side effect itself — but it must still refuse to
+            // export plaintext that is logically destroyed.
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.set(
+                "EXPIRED",
+                ValueSource::Static,
+                SecretBytes::from("v"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            clock.advance(HARD);
+            // No get()/state_of() call here: the physical zeroize has not run.
+
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            assert!(
+                snap.is_empty(),
+                "a logically hard-expired value must not be exported"
+            );
+        }
+
+        #[test]
+        fn export_rejects_a_capability_mismatch_before_reading_anything() {
+            let clock = FakeClock::new();
+            let (s, _cap) = crate::test_helpers::store_with_cap();
+            let (_other_store, other_cap) = crate::test_helpers::store_with_cap();
+            assert!(matches!(
+                s.export_snapshot(&other_cap, &clock),
+                Err(ExportError::CapMismatch)
+            ));
+        }
+
+        #[test]
+        fn time_reanchor_preserves_relative_load_order_across_a_process_boundary() {
+            // Two independent clocks stand in for two processes: the "old"
+            // clock the entries were loaded against, and a "new" clock (with
+            // enough headroom — see epoch_ms_to_monotonic's doc) the importer
+            // uses. loaded_at ordering between two keys must survive even
+            // though the two clocks' Monotonic numbering is unrelated.
+            let old_clock =
+                FakeClock::starting_at(Monotonic::from_offset(Duration::from_secs(50_000)));
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            // A long (2h) hard TTL and no soft TTL, so the 1h gap between the
+            // two loads below neither hard-expires OLDER before export nor
+            // lets soft-expiry (a separate concern) interfere with the get()
+            // assertions — this test is purely about hard-TTL ordering
+            // surviving the process-boundary re-anchor.
+            let long_ttl = Ttl::new(None, Some(Duration::from_secs(7_200))).unwrap();
+            s.set(
+                "OLDER",
+                ValueSource::Static,
+                SecretBytes::from("older-secret"),
+                long_ttl,
+                &cap,
+                &old_clock,
+            )
+            .unwrap();
+            old_clock.advance(Duration::from_secs(3600)); // 1h passes
+            s.set(
+                "NEWER",
+                ValueSource::Static,
+                SecretBytes::from("newer-secret"),
+                long_ttl,
+                &cap,
+                &old_clock,
+            )
+            .unwrap();
+
+            let snap = s.export_snapshot(&cap, &old_clock).unwrap();
+
+            // The "new" process's clock: unrelated zero point, but started
+            // with a full day of headroom in its own numbering.
+            let new_clock =
+                FakeClock::starting_at(Monotonic::from_offset(Duration::from_secs(86_400)));
+            let bundle = Store::import_snapshot(Store::builder(), snap, &new_clock).unwrap();
+            let mut s2 = bundle.store;
+            let cap2 = bundle.control_cap;
+
+            // Both values are still Active immediately after import (neither
+            // TTL window has elapsed in the *new* process's frame) ...
+            assert!(s2.get("OLDER", &cap2, &new_clock).unwrap().is_some());
+            assert!(s2.get("NEWER", &cap2, &new_clock).unwrap().is_some());
+            // ... but OLDER, having been loaded 1h before NEWER, hits its hard
+            // TTL (2h from its own load) first: advancing by the remaining
+            // 1h (2h hard - the 1h already "elapsed" during export, per the
+            // re-anchored ages) must destroy OLDER while NEWER (loaded an
+            // hour later, so only 1h into its own 2h window) survives.
+            new_clock.advance(Duration::from_secs(3_600));
+            assert!(
+                s2.get("OLDER", &cap2, &new_clock).unwrap().is_none(),
+                "OLDER must have hard-expired first"
+            );
+            assert!(
+                s2.get("NEWER", &cap2, &new_clock).unwrap().is_some(),
+                "NEWER, loaded an hour after OLDER, must still be alive"
+            );
+        }
+
+        #[test]
+        fn import_rejects_an_unsupported_format_version() {
+            let (s, cap, clock) = three_shape_store();
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            let mut bytes = snap.to_bytes().unwrap();
+            // format_version occupies the 4 bytes right after the 8-byte magic.
+            bytes[8..12].copy_from_slice(&999u32.to_be_bytes());
+
+            // Realistic pipeline: a corrupted wire snapshot is caught by
+            // `from_bytes` before `import_snapshot` ever runs.
+            let err = StoreSnapshot::from_bytes(&bytes).unwrap_err();
+            assert!(matches!(
+                err,
+                ImportError::UnsupportedVersion {
+                    got: 999,
+                    supported: _
+                }
+            ));
+        }
+
+        #[test]
+        fn import_rejects_a_corrupted_length_prefix_without_panicking() {
+            let (s, cap, clock) = three_shape_store();
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            let mut bytes = snap.to_bytes().unwrap();
+            // The first entry's length prefix is the 4 bytes right after the
+            // 12-byte header (magic + version + entry_count).
+            bytes[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+
+            let err = StoreSnapshot::from_bytes(&bytes).unwrap_err();
+            assert!(matches!(err, ImportError::Truncated));
+        }
     }
 }

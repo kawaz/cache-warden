@@ -332,6 +332,67 @@ impl CacheEntry {
         self.source.is_regenerable()
     }
 
+    /// The instant this value was loaded — the basis for its **hard** TTL
+    /// window (see the module-level "Two timing bases" note).
+    ///
+    /// Crate-internal: [`crate::Store::export_snapshot`] (DR-0029) reads this
+    /// to carry the value's absolute lifetime basis across a graceful restart.
+    pub(crate) fn loaded_at(&self) -> Monotonic {
+        self.loaded_at
+    }
+
+    /// The instant the **soft** window last restarted (see the module-level
+    /// "Two timing bases" note). Same caller as [`CacheEntry::loaded_at`].
+    pub(crate) fn extended_at(&self) -> Monotonic {
+        self.extended_at
+    }
+
+    /// Borrow the live secret with **no** TTL evaluation and **no** zeroize
+    /// side effect — a raw peek.
+    ///
+    /// Unlike [`CacheEntry::get`] (which gates on Active and applies the
+    /// hard-expiry zeroize), this returns `Some` whenever a value is
+    /// physically present (Active *or* SoftExpired) and `None` once
+    /// hard-expired (destroyed) or never set. Crate-internal:
+    /// [`crate::Store::export_snapshot`] (DR-0029) calls this only *after*
+    /// independently confirming (via [`CacheEntry::state`]) that the entry is
+    /// not logically hard-expired, so a stale-but-not-yet-physically-zeroized
+    /// husk is never exported as if it were live plaintext.
+    pub(crate) fn peek_value(&self) -> Option<&SecretBytes> {
+        self.value.as_ref()
+    }
+
+    /// Reconstruct an entry with explicit lifecycle timestamps (DR-0029
+    /// handoff import), instead of [`CacheEntry::new`]'s "loaded right now"
+    /// semantics.
+    ///
+    /// `hard_expired` starts `false`: a snapshot only ever carries a value
+    /// that [`crate::Store::export_snapshot`] confirmed was *not* logically
+    /// hard-expired at export time (see [`CacheEntry::peek_value`]'s doc), so
+    /// there is no sticky "already destroyed" flag to carry over. Whether the
+    /// reconstructed entry reads as Active, SoftExpired, or (if the handoff
+    /// itself took long enough) HardExpired is decided the same way as any
+    /// other entry: by the next [`CacheEntry::state`] / [`CacheEntry::evaluate`]
+    /// call against the importing process's own clock.
+    pub(crate) fn from_parts(
+        source: ValueSource,
+        ttl: Ttl,
+        value: SecretBytes,
+        loaded_at: Monotonic,
+        extended_at: Monotonic,
+        pin_deadline: Option<Monotonic>,
+    ) -> Self {
+        Self {
+            source,
+            ttl,
+            value: Some(value),
+            loaded_at,
+            extended_at,
+            pin_deadline,
+            hard_expired: false,
+        }
+    }
+
     /// Force the entry into the HardExpired state, zeroizing the value now.
     pub fn force_hard_expire(&mut self) {
         self.zeroize_value();
@@ -804,5 +865,83 @@ mod tests {
             &clock,
         );
         assert!(e.is_regenerable());
+    }
+
+    // ---- DR-0029 snapshot accessors: loaded_at / extended_at / peek_value / from_parts ----
+
+    #[test]
+    fn loaded_at_and_extended_at_start_equal_and_track_extend() {
+        let clock = FakeClock::new();
+        let mut e = active_entry(&clock);
+        assert_eq!(e.loaded_at(), Monotonic::ZERO);
+        assert_eq!(e.extended_at(), Monotonic::ZERO);
+        clock.advance(Duration::from_secs(5));
+        e.extend(&clock).unwrap();
+        // extend moves only extended_at; loaded_at (the hard-TTL basis) is fixed.
+        assert_eq!(e.loaded_at(), Monotonic::ZERO);
+        assert_eq!(
+            e.extended_at(),
+            Monotonic::from_offset(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn peek_value_sees_active_and_soft_expired_but_not_hard_expired() {
+        let clock = FakeClock::new();
+        let mut e = active_entry(&clock);
+        assert_eq!(e.peek_value().unwrap().expose_secret(), b"v");
+        clock.advance(SOFT);
+        assert_eq!(
+            e.peek_value().unwrap().expose_secret(),
+            b"v",
+            "soft-expired: value is still physically present"
+        );
+        clock.advance(HARD - SOFT);
+        e.evaluate(&clock); // trigger the zeroize side effect
+        assert!(
+            e.peek_value().is_none(),
+            "hard-expired: value has been zeroized"
+        );
+    }
+
+    #[test]
+    fn from_parts_reconstructs_explicit_timestamps_not_now() {
+        // Unlike CacheEntry::new (loaded_at = extended_at = now), from_parts lets
+        // a caller (DR-0029 snapshot import) place both bases anywhere on the
+        // clock's timeline — the mechanism state re-anchoring relies on.
+        let clock = FakeClock::starting_at(Monotonic::from_offset(Duration::from_secs(1_000)));
+        let loaded_at = Monotonic::from_offset(Duration::from_secs(900));
+        let extended_at = Monotonic::from_offset(Duration::from_secs(950));
+        let e = CacheEntry::from_parts(
+            ValueSource::Static,
+            ttl(),
+            SecretBytes::from("v"),
+            loaded_at,
+            extended_at,
+            None,
+        );
+        assert_eq!(e.loaded_at(), loaded_at);
+        assert_eq!(e.extended_at(), extended_at);
+        // now=1000: 100s since extended_at (>= SOFT=10) => SoftExpired; and
+        // 100s since loaded_at (< HARD=30... wait HARD=30 < 100) => actually
+        // hard fires first when both windows are already exceeded.
+        assert_eq!(e.state(&clock), EntryState::HardExpired);
+    }
+
+    #[test]
+    fn from_parts_can_reconstruct_a_still_active_entry() {
+        let clock = FakeClock::starting_at(Monotonic::from_offset(Duration::from_secs(100)));
+        // Loaded 2s ago, still well within both soft (10s) and hard (30s) windows.
+        let loaded_at = Monotonic::from_offset(Duration::from_secs(98));
+        let e = CacheEntry::from_parts(
+            ValueSource::Static,
+            ttl(),
+            SecretBytes::from("v"),
+            loaded_at,
+            loaded_at,
+            None,
+        );
+        assert_eq!(e.state(&clock), EntryState::Active);
+        assert_eq!(e.peek_value().unwrap().expose_secret(), b"v");
     }
 }

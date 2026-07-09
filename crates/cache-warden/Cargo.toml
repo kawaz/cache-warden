@@ -10,7 +10,10 @@ readme = "../../README.md"
 [dependencies]
 # Reliable secret zeroization. See docs/decisions/DR-0005-core-security-dependencies.md
 # for why this is an intentional exception to the "std only" dependency goal (DR-0002).
-zeroize = "1"
+# The "serde" feature adds `Zeroizing<Z>: Serialize + Deserialize` (gated by zeroize's
+# own optional serde dependency), used by the DR-0029 snapshot's secret field so it
+# self-zeroizes if a `StoreSnapshot` is dropped before being consumed.
+zeroize = { version = "1", features = ["serde"] }
 # Process inspection (pid -> exe path / parent pid / start time) via OS APIs.
 # macOS: proc_pidpath / proc_pidinfo; Linux: sysconf(_SC_CLK_TCK) for the /proc starttime unit.
 # See docs/decisions/DR-0006-process-inspection-dependencies.md for the rationale and the
@@ -25,6 +28,14 @@ tracing = "0.1"
 # Called once at startup to seed the per-process random offset; cost is negligible.
 # Same category as zeroize (DR-0005) and libc (DR-0006): intentional minimal dependency exception.
 getrandom = "0.2"
+# Snapshot (de)serialization for graceful-restart handoff (DR-0029 §2, entry
+# framing format). Both crates already live in this workspace (cache-warden-cli
+# and cache-warden-authsock already depend on them for their own wire formats),
+# so this reuses an existing dependency rather than adding a new one to the
+# workspace's dependency graph. `postcard` (the DR's other candidate) was
+# rejected specifically to avoid that new addition (DR-0029 Q1).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [features]
 test-support = []

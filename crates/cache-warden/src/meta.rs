@@ -79,6 +79,21 @@ impl ValueMeta {
     pub fn is_empty(&self) -> bool {
         self.type_label.is_none() && self.params.is_empty()
     }
+
+    /// Reconstruct a slot from its exact internal parts (DR-0029 snapshot
+    /// import): unlike [`ValueMeta::with_type`] (which always sets a `Some`
+    /// label), this accepts an `Option<String>` directly so a round-tripped
+    /// slot is bit-for-bit identical to the one [`ValueMeta::into_parts`]
+    /// extracted, rather than only equivalent-when-typed.
+    pub(crate) fn from_parts(type_label: Option<String>, params: BTreeMap<String, String>) -> Self {
+        Self { type_label, params }
+    }
+
+    /// Decompose into `(type_label, params)`, the inverse of
+    /// [`ValueMeta::from_parts`] (DR-0029 snapshot export).
+    pub(crate) fn into_parts(self) -> (Option<String>, BTreeMap<String, String>) {
+        (self.type_label, self.params)
+    }
 }
 
 /// An opaque, core-uninterpreted slot for a definition's **typed source origin**
@@ -157,6 +172,18 @@ impl SourceMeta {
     /// Whether this slot carries no kind and no fields (the default).
     pub fn is_empty(&self) -> bool {
         self.kind.is_none() && self.fields.is_empty()
+    }
+
+    /// Reconstruct a slot from its exact internal parts (DR-0029 snapshot
+    /// import) — the [`SourceMeta`] counterpart of [`ValueMeta::from_parts`].
+    pub(crate) fn from_parts(kind: Option<String>, fields: BTreeMap<String, String>) -> Self {
+        Self { kind, fields }
+    }
+
+    /// Decompose into `(kind, fields)`, the inverse of [`SourceMeta::from_parts`]
+    /// (DR-0029 snapshot export).
+    pub(crate) fn into_parts(self) -> (Option<String>, BTreeMap<String, String>) {
+        (self.kind, self.fields)
     }
 }
 
@@ -257,6 +284,33 @@ mod tests {
         );
         let keys: Vec<&str> = m.fields().map(|(k, _)| k).collect();
         assert_eq!(keys, vec!["argv", "cwd", "env"]);
+    }
+
+    // ---- from_parts / into_parts round trip (DR-0029 snapshot import/export) ----
+
+    #[test]
+    fn value_meta_from_parts_into_parts_round_trips_typed() {
+        let original = ValueMeta::with_type("otp", [("digits".to_string(), "6".to_string())]);
+        let (label, params) = original.clone().into_parts();
+        let rebuilt = ValueMeta::from_parts(label, params);
+        assert_eq!(rebuilt, original);
+    }
+
+    #[test]
+    fn value_meta_from_parts_into_parts_round_trips_empty() {
+        let original = ValueMeta::new();
+        let (label, params) = original.clone().into_parts();
+        let rebuilt = ValueMeta::from_parts(label, params);
+        assert_eq!(rebuilt, original);
+        assert!(rebuilt.is_empty());
+    }
+
+    #[test]
+    fn source_meta_from_parts_into_parts_round_trips() {
+        let original = SourceMeta::with_kind("op", [("uri".to_string(), "op://v/i/f".to_string())]);
+        let (kind, fields) = original.clone().into_parts();
+        let rebuilt = SourceMeta::from_parts(kind, fields);
+        assert_eq!(rebuilt, original);
     }
 
     #[test]
