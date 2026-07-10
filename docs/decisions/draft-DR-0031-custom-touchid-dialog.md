@@ -83,10 +83,39 @@ bundle 実機観察 (2026-07-10、`ls` / `otool -L` / `codesign -d`、read-only)
 - Rust binding: **`objc2-local-authentication-embedded-ui` crate が既存**
   (v0.3.2, 2025-10-04 公開, docs.rs 100%対応, Zlib/Apache/MIT)。madsmtm/objc2 の一部。
   cache-warden の依存は現状 objc2 系ゼロなので新規追加になる
-- SwiftUI 統合: LAAuthenticationView は NSView subclass、SwiftUI から使うには
-  `NSViewRepresentable` ラッパーが必要 (公式のネイティブ SwiftUI View 版なし)。
-  ただし `_LocalAuthentication_SwiftUI.framework` (`_` prefix、内部用の匂い) が
-  同じ場所に存在するのを実機観察、SwiftUI 版が存在する可能性 — 未確認
+- SwiftUI 統合: `_LocalAuthentication_SwiftUI.framework` の中身を la-swiftui-recon で
+  実機ヘッダ + Xcode SDK swiftinterface 確認した結果、**SwiftUI ネイティブ View
+  `LocalAuthenticationView` (public struct、macOS 13.0+/Ventura) が存在**。macCatalyst
+  以外の macOS 専用、内部で `import LocalAuthenticationEmbeddedUI` して AppKit の
+  LAAuthenticationView を wrap している構造 (推定):
+
+  ```swift
+  // .swiftinterface verbatim (抜粋)
+  @available(macOS 13.0, *)
+  public struct LocalAuthenticationView<Label> : View where Label : View {
+    public init(context: LAContext, @ViewBuilder label: () -> Label)
+    public init(_ titleKey: LocalizedStringKey, context: LAContext) where Label == Text
+    public init(reason: Text, context: LAContext? = nil,
+                result: @escaping (Result<Void, Error>) -> Void,
+                @ViewBuilder label: () -> Label)
+    // ...
+  }
+  ```
+
+  ただし customization surface は title/reason/context/result callback のみで、
+  1P dialog のようなリッチ UI (呼び出し元アイコン + 詳細 tap 展開等) を作るには
+  自前で作り込みが残る (SwiftUI 側の宣言的レイアウトに乗せられる分は楽になる)
+- **1P の完成度が高い理由の仮説 (推測)**: `_LocalAuthentication_SwiftUI.tbd` に
+  swiftinterface に露出していない private シンボル `SheetConfiguration` (callerName /
+  callerIconPath / authenticationTitle / authenticationMessage / authenticationHint /
+  submitButtonTitle / fallbackButtonTitle 等の豊富な customization フィールド) +
+  `View.authenticationSheet(isPresented:configuration:onCompletion:)` modifier が存在
+  (la-swiftui-recon で確認)。1P dialog の完成度 (呼び出し元アイコン + カスタム文言 +
+  Vault 展開等) は SheetConfiguration の各フィールドと一致度が高く、**1P はこの
+  private API を使っている可能性が高い** (App Store 提出しないので Developer ID +
+  notarize で通す前提)。**cache-warden は private API 不採用** — 将来 OS 更新で
+  無警告 break のリスクが実運用として過大。public API の範囲で実装する結果、
+  1P より控えめな dialog になる可能性を許容する
 - notarize / entitlement: 明示的な追加 entitlement 要求は公式 doc に見当たらず、
   1Password.app が Developer ID notarize で通っている実例が最有力の状況証拠。
   cache-warden 自身での通過は未検証 (Phase 1 land 前に必ず実機確認)
@@ -96,8 +125,8 @@ bundle 実機観察 (2026-07-10、`ls` / `otool -L` / `codesign -d`、read-only)
 公式に目的が一致する framework がある以上、private API に走る動機は薄い)。
 
 参考: `docs/research/2026-07-10-touchid-dialog-ui-options.md` (先行研究) と、
-本 DR 執筆に伴い実施した 3 本の recon (`1p-bundle-recon` + `lacontext-inline-recon` +
-`laeui-recon`)。
+本 DR 執筆に伴い実施した 4 本の recon (`1p-bundle-recon` + `lacontext-inline-recon` +
+`laeui-recon` + `la-swiftui-recon`)。
 
 この方式は cache-warden の要件 (requester 情報の透明性、対象 kv entry の明示、
 DR-0030 の guard 評価結果の可視化) と設計目標が一致する。本 DR は 1Password 方式に
@@ -137,10 +166,12 @@ DR-0030 の guard 評価結果の可視化) と設計目標が一致する。本
 
 ### 2. helper 実装言語 — Rust 統一と Swift 併存の 2 案 (判断保留)
 
-laeui-recon で `objc2-local-authentication-embedded-ui` crate (v0.3.2, madsmtm/objc2
-生態系) の存在が判明した。当初 draft が想定した「LAEmbeddedUI 用 objc2 crate が無く
-raw msg_send で NSView を模倣」は前提が崩れ、**Rust 統一の実装距離が想定より短い**
-可能性が高い。以下の 2 案を併記し kawaz レビューで確定する。
+recon 4 本の結果を統合すると、helper 実装言語には 3 通りの現実的な選択肢がある:
+
+- **案 A**: Rust + objc2 系 (LAAuthenticationView を直接叩く、macOS 12+ 対応)
+- **案 B1**: Swift + SwiftUI native (LocalAuthenticationView を使う、macOS 13+ 必要)
+- **案 B2**: Swift + AppKit ラップ (LAAuthenticationView を NSViewRepresentable で
+  wrap、macOS 12+ 対応)
 
 **案 A: Rust 統一 (helper も Rust + objc2 系)**:
 
@@ -179,45 +210,75 @@ Cons:
 - SwiftUI の宣言的 layout システムより手続き的 (add subview 呼ぶ形式)、将来 dialog を
   凝るときの修正距離が SwiftUI より長い
 
-**案 B: Swift + SwiftUI (helper のみ Swift、daemon は Rust)**:
+**案 B1: Swift + SwiftUI native (`LocalAuthenticationView` 使用、macOS 13+)**:
 
 実装距離見積:
-- SwiftUI `ApproverDialog` View (LAAuthenticationView は `NSViewRepresentable` ラッパー
-  を書く必要): 200〜300 行
-- LAContext.evaluatePolicy の Swift async/await 統合: 30〜50 行
+- SwiftUI `ApproverDialog` View (`LocalAuthenticationView` が直接 View、
+  NSViewRepresentable ラッパー不要): 200〜300 行 (la-swiftui-recon 所感: 「SwiftUI
+  ネイティブ利用でも AppKit ラップ相当分の 100 行程度しか削減されない、customization
+  surface が制限的で結局自前作り込みが残る」)
+- LAContext.evaluatePolicy 相当は `LocalAuthenticationView` が内部で扱う: 統合コード 30〜50 行
 - IPC (SwiftNIO or Foundation.URLSession の unix socket、peer_pid 取得): 100〜200 行
-- **合計目安: 350〜550 行**
+- **合計目安: 330〜550 行**
 
 Pros:
-- SwiftUI の宣言的 layout で見た目調整コストが低い、Vault 展開・詳細トグル・
-  アニメーションが将来必要になった時に強い
-- Apple 公式 sample (WWDC22 session 10108 の LAContext / LARight demo) を近い形で流用可能
-- LAAuthenticationView の SwiftUI 統合パターンが明確 (`NSViewRepresentable` は Apple 標準
-  ラッパー)
+- SwiftUI ネイティブで LocalAuthenticationView を宣言的に配置可能
+- Apple 公式 sample (WWDC22 session 10108 系) 流用が最短
+- SwiftUI の宣言的 layout で将来の見た目調整コストが低い
 
 Cons:
+- **macOS 13.0 (Ventura) 最小要件**: LocalAuthenticationView が Ventura 以降。
+  cache-warden のこれまでの実質下限 (Monterey) から 1 バージョン上げる判断
 - build system 追加 (xcodebuild + Swift Package Manager)、release.yml と .app packaging
   変更 (DR-0020 の署名・notarize 手順に nested Swift bundle のステップ追加)
-- helper のロジック (chain 表示、peer exit 検知、IPC) が daemon 側と言語分離するため
-  型共有が失われる (JSON wire schema を明示、下 §4)
-- cache-warden プロジェクト初の Swift 依存 — 「Rust オンリー」の設計原則を helper に
-  限って緩める判断
-- helper 内部のロジック (peer polling、IPC 状態機械) を Swift で書く負担、Rust の型安全
-  を helper 内部で失う
+- helper のロジックが daemon 側と言語分離、型共有が失われる (JSON wire schema)
+- Swift 依存導入 — 「Rust オンリー」の設計原則を helper に限って緩める判断
+- customization surface が制限的 (title/reason/context/result callback のみ)。1P 風の
+  リッチ UI (呼び出し元アイコン等) を実現するには結局 SwiftUI 側で自前 View 構築が必要
+
+**案 B2: Swift + AppKit ラップ (`LAAuthenticationView` を NSViewRepresentable で wrap、macOS 12+)**:
+
+実装距離見積:
+- NSViewRepresentable ラッパー (LAAuthenticationView 用): 30〜50 行
+- SwiftUI `ApproverDialog` View: 200〜300 行
+- LAContext.evaluatePolicy の Swift async/await 統合: 30〜50 行
+- IPC: 100〜200 行
+- **合計目安: 360〜600 行**
+
+Pros:
+- macOS 12 (Monterey) 対応維持 (案 A と同じ下限)
+- SwiftUI の宣言的 layout の利益は得られる
+- 案 B1 と同じ SwiftUI + LAContext の統合パターン
+
+Cons:
+- 案 B1 と同じ build system 追加 + Swift 依存導入コスト
+- NSViewRepresentable の追加実装 (SwiftUI native 版なら不要だった 30-50 行)
+- Apple 公式 sample は SwiftUI native 版が多く、AppKit ラップの参考は少ない
 
 **両案共通の設計**:
 「§1 の 2 プロセス構成」「§4 の JSON IPC」「§5 の dialog 情報階層」「§7 peer exit」
 「§8 二重 dialog 防止」「§9 fallback」「§10 graceful restart 整合」は言語非依存で成立。
 言語選択が変わっても daemon 側は無傷、helper 内部のみ切替可能。
 
+**実装距離の総括**:
+
+| 案 | 実装距離見積 | macOS 下限 | build system 変更 |
+|---|---|---|---|
+| A: Rust 統一 (objc2 系) | 550-850 行 | 12.0 Monterey | 最小 (Cargo に crate 追加のみ) |
+| B1: Swift + SwiftUI native | 330-550 行 | 13.0 Ventura | 大 (xcodebuild + SwiftPM) |
+| B2: Swift + AppKit ラップ | 360-600 行 | 12.0 Monterey | 大 (xcodebuild + SwiftPM) |
+
+実装距離差は当初想定の 1/3-1/5 ではなく **1.3-1.6 倍程度**に収束 (la-swiftui-recon で
+Swift native の短縮効果が限定的と判明したため)。
+
 **現時点の推奨 (kawaz レビューに委ねる、Open Question 4)**:
-- **案 A 推奨** (Rust 統一): laeui-recon で objc2 crate 実在が確認された今、実装距離差
-  (350-550 行 vs 550-850 行) は 1.5-2 倍程度で、「言語統一」「build system 単純さ」
-  「wire schema 共有」の利益が build system 変更コストを上回る。cache-warden の
-  「Rust オンリー」の設計原則は helper のためだけに崩したくない
-- 案 B に倒す条件: 実装 PoC で LAAuthenticationView の Rust ラップに大きな詰まり
-  (SDK 変更で obj2 crate が追随できない、NSApplication runloop に予想外の落とし穴等)
-  が判明した場合、Phase 1 の land 速度優先で案 B に切替
+- **案 A 推奨** (Rust 統一): 実装距離差が 1.3-1.6 倍に留まる今、「言語統一」「build system
+  単純さ」「wire schema 共有」「Rust オンリー原則」の利益が build system 変更コストを
+  上回る。cache-warden の下限も Monterey を維持できる
+- 案 B1 に倒す条件: SwiftUI 宣言的 UI で将来の見た目大幅リッチ化が予定される、
+  かつ macOS 13+ に下限を上げる合意が取れる
+- 案 B2 に倒す条件: Swift 依存を受け入れつつ Monterey 下限を維持したい (案 B1 の
+  Ventura 要件を避けたい)
 
 ### 3. helper のライフサイクル
 
@@ -364,12 +425,11 @@ fn evaluate(ctx: &LAContext, request: &ApproveRequest) {
 }
 ```
 
-**v1 (Phase 1) の実装スケッチ (§2 案 B: Swift + SwiftUI)**:
+**v1 (Phase 1) の実装スケッチ (§2 案 B1: Swift + SwiftUI native)**:
 
 ```swift
-// SwiftUI
+// SwiftUI, macOS 13+
 struct ApproverDialog: View {
-    @State var context = LAContext()
     let request: ApproveRequest
     let onOutcome: (ApproveOutcome) -> Void
 
@@ -377,10 +437,52 @@ struct ApproverDialog: View {
         VStack {
             RequesterHeader(request: request)          // icon → check → cw icon
             SummaryLine(request: request)              // "Allow ... to read <key>"
-            if let guardEval = request.guardEval {
-                VerifiedChip(matched: guardEval.matchedConstraints)
+            if let g = request.guardEval {
+                VerifiedChip(matched: g.matchedConstraints)
             }
-            LAAuthenticationViewRepresentable(context: context)  // NSViewRepresentable
+            // public LocalAuthenticationView (macOS 13+)
+            LocalAuthenticationView(
+                reason: Text("Authenticate to access \(request.key)"),
+                context: LAContext(),
+                result: { r in
+                    switch r {
+                    case .success:      onOutcome(.approved)
+                    case .failure(let e): onOutcome(.biometricFailed(e))
+                    }
+                },
+                label: { Text("Touch ID") }
+            )
+            Button("Cancel") { onOutcome(.cancelled) }
+        }
+    }
+}
+```
+
+**v1 (Phase 1) の実装スケッチ (§2 案 B2: Swift + AppKit ラップ)**:
+
+```swift
+// SwiftUI + NSViewRepresentable, macOS 12+
+struct LAAuthViewRepresentable: NSViewRepresentable {
+    let context: LAContext
+    func makeNSView(context: Context) -> LAAuthenticationView {
+        LAAuthenticationView(context: self.context, controlSize: .large)
+    }
+    func updateNSView(_ nsView: LAAuthenticationView, context: Context) {}
+}
+
+struct ApproverDialog: View {
+    @State var context = LAContext()
+    let request: ApproveRequest
+    let onOutcome: (ApproveOutcome) -> Void
+
+    var body: some View {
+        VStack {
+            RequesterHeader(request: request)
+            SummaryLine(request: request)
+            if let g = request.guardEval {
+                VerifiedChip(matched: g.matchedConstraints)
+            }
+            LAAuthViewRepresentable(context: context)
             HStack {
                 Button("Cancel") { onOutcome(.cancelled) }
                 Spacer()
@@ -415,10 +517,15 @@ Mode A と Mode B の切替は helper 内部で完結し、daemon 側の IPC sch
 影響しない。Phase 1 の PoC で Mode A が動けば land、動かなければ Mode B で先行 land し
 Mode A は Phase 3 に回す。
 
-**macOS 下限バージョン**: 本 DR で cache-warden の最小要件を **macOS 12 Monterey** に
-明示する (LAAuthenticationView が Monterey 以降の API のため)。既存の cache-warden は
-特定の deployment target を指定しておらず、CI runner の `macos-latest` は既に
-Sonoma/Sequoia。Monterey 未満は元々サポート対象外だったが本 DR で公式にする。
+**macOS 下限バージョン**: 実装言語選択 (Open Q4) と連動して以下の 2 択:
+
+- 案 A (Rust + LAAuthenticationView) or 案 B2 (Swift + AppKit ラップ): **macOS 12 Monterey**
+  最小要件 (LAAuthenticationView が Monterey 以降)
+- 案 B1 (Swift + SwiftUI native LocalAuthenticationView): **macOS 13 Ventura** 最小要件
+
+CI runner の `macos-latest` は既に Sonoma/Sequoia。cache-warden は特定の deployment
+target を指定していないが、実質的には Monterey 以降で動いている。本 DR で公式化する
+バージョンは実装言語選択の結果で確定 (Open Q3)。
 
 `LARight` / `LARightStore` (新しい高レベル API、macOS 13.0+) の採用は Phase 3+ で再検討:
 cache-warden の「kv entry の secret access permission」の抽象と semantic 的に近く、
@@ -525,18 +632,18 @@ daemon が graceful restart (同一 PID exec + state-holder child) するとき:
 ## 実装 phase 分割
 
 - **Phase 1 (最小 land)**:
-  - `CacheWardenApprover.app` bundle 骨格 (macOS 12 Monterey+、実装言語は §2 の
-    案 A/B のいずれか、Open Q4 で確定)
+  - `CacheWardenApprover.app` bundle 骨格 (macOS 下限は Open Q3/Q4 で確定)
   - IPC socket + JSON schema、daemon 側 `approver.rs`
   - dialog サマリ表示のみ (詳細展開は無し)
   - guard がある entry のみ dialog 発火 (DR-0030 と同時 land 前提)
   - TouchID 統合は Mode A (LAAuthenticationView 埋め込み) を目標。実装 PoC で
     標準シートが別途出るなど問題があれば Mode B (標準シート許容) に fallback
   - fallback は「helper 不在 → guard 付き entry を fail-closed」のみ
-  - build system (案 A / Rust 統一): 既存 Cargo workspace に helper crate 追加のみ、
-    release.yml 変更は helper の nested `.app` を .app packaging 手順に含めるだけ
-  - build system (案 B / Swift 併存): xcodebuild + Swift Package を release.yml に統合、
-    DR-0020 の codesign / notarize フローを拡張して nested Swift `.app` を含める
+  - build system は Open Q4 の言語選択で分岐:
+    - 案 A (Rust 統一): 既存 Cargo workspace に helper crate 追加のみ、release.yml
+      変更は helper の nested `.app` を .app packaging 手順に含めるだけ
+    - 案 B1 / B2 (Swift + SwiftUI): xcodebuild + Swift Package を release.yml に統合、
+      DR-0020 の codesign / notarize フローを拡張して nested Swift `.app` を含める
 
 - **Phase 2**:
   - dialog 詳細展開 (ancestry chain / guard 詳細)
@@ -559,18 +666,23 @@ daemon が graceful restart (同一 PID exec + state-holder child) するとき:
 2. **helper ライフサイクル**: (b) daemon spawn を提案。ただし kawaz が「daemon 死亡時も
    dialog を残したい」ケース (常駐 daemon が graceful restart 中でも dialog は生かす)
    を優先するなら (a) LaunchAgent 別登録に切替
-3. **macOS 下限を Monterey に明示するか**: LAAuthenticationView が macOS 12 Monterey
-   以降のため、本 DR は最小要件を **macOS 12 Monterey** と規定。cache-warden は既に
-   特定の deployment target を明示しておらず、実質 Monterey 以降で動いているが、
-   公式に「Monterey 未満は非サポート」と `Cargo.toml` / release.yml / README に書く
-   判断。draft は明示提案。当初 Ventura と示した情報は laeui-recon 実機ヘッダで修正
-4. **helper 実装言語 (案 A: Rust 統一 vs 案 B: Swift + SwiftUI)**: §2 で 2 案を比較、
-   実装距離見積は 550-850 行 (Rust) vs 350-550 行 (Swift) と近接。案 A 推奨だが
-   最終判断は kawaz レビュー。判断基準の提示:
+3. **macOS 下限バージョン**: Open Q4 の実装言語選択と連動:
+   - 案 A (Rust + objc2) or 案 B2 (Swift + AppKit ラップ) → **macOS 12 Monterey**
+   - 案 B1 (Swift + SwiftUI native) → **macOS 13 Ventura**
+
+   cache-warden の実質下限は既に Monterey (macos-latest = Sonoma/Sequoia)。本 DR で
+   公式化するときの選択次第で 1 バージョン上げるか維持するか。draft は Monterey 維持を
+   推奨 (現行ユーザに影響しない、案 A/B2 との組み合わせなら追加コストなし)
+4. **helper 実装言語 (3 案から選択)**: §2 で 3 案を比較、実装距離見積 550-850 行 (A) vs
+   330-550 行 (B1) vs 360-600 行 (B2) と 1.3-1.6 倍差に収束。draft は案 A 推奨だが
+   最終判断は kawaz レビュー。判断軸:
    - 「Rust オンリー」の設計原則を helper のためだけに崩したくない → 案 A
    - build system の単純さ (release.yml 変更最小、cross-compile 経路無変更) → 案 A
-   - SwiftUI の宣言的 layout + Apple 公式サンプル流用の速度優先 → 案 B
-   - 「dialog を Vault 展開・詳細トグル・アニメーション」で将来大幅変更を予定 → 案 B
+   - macOS 下限を Monterey に維持したい → 案 A or 案 B2
+   - SwiftUI の宣言的 layout + Apple 公式サンプル流用の速度優先 → 案 B1
+   - Ventura 下限を許容し「dialog を Vault 展開・詳細トグル・アニメーション」で将来
+     大幅変更を予定 → 案 B1
+   - Swift 依存を受け入れつつ Monterey 下限を維持したい → 案 B2
 5. **`[auth].command` を dialog 化するかの scope**: Phase 2 で CommandAuthenticator を
    dialog に置き換えると、既存の外部コマンド運用 (osascript / 独自 GUI) を持つユーザは
    移行が必要。draft は「共存を維持、config で dialog / command を選択」を提案 (両立
