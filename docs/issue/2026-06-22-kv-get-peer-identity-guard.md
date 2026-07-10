@@ -1,11 +1,11 @@
 ---
 title: kv get peer-identity guard
-status: open
+status: wip
 category: design
 created: 2026-06-22T21:18:58+09:00
 last_read:
 open_entered: 2026-07-10T03:11:57+09:00
-wip_entered:
+wip_entered: 2026-07-10T09:59:04+09:00
 blocked_entered: 2026-07-04T09:33:55+09:00
 pending_entered:
 discarded_entered:
@@ -61,6 +61,16 @@ default_require_same_user = true
 - 評価エラー時の挙動: 拒否 (= 安全側) を default、verbose mode で reason 提示
 - DR-0022 既存の `[auth].command` (CommandAuthenticator) との関係: 同居 / 統合 / 置換のどれか
 - 不可逆性: 弱い識別 (cmdline) と強い識別 (codesign) をユーザに明示する UX
+
+## 進捗
+
+設計フェーズ着手: `docs/decisions/draft-DR-0030-kv-peer-identity-guard.md` (commit `vnmzvlsv`) を執筆。codex adversarial review 実施中。kawaz レビュー待ちの Open questions 3 点を DR に明記済み:
+
+- `default_require_same_user` の既定値
+- shell リストの置き場
+- 拒否時の将来 UX
+
+実装は DR accept 後に着手する。
 
 ## 受け入れ条件
 

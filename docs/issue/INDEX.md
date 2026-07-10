@@ -12,7 +12,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-07-10 | design | open | [migrate-to-macos-process-inspect-crate](./2026-07-10-migrate-to-macos-process-inspect-crate.md) | 既存 process inspect 実装の macos-process-inspect crate への移行 (重複解消) |
 | 2026-06-13 | bug | open | [op-discovery-blocks-startup](./2026-06-13-op-discovery-blocks-startup.md) | `[authsock.sockets.*].keys` を持つ config で起動すると、`run()` の |
 | 2026-06-22 | design | open | [custom-touchid-dialog](./2026-06-22-custom-touchid-dialog.md) | cache-warden 独自の TouchID 認証 dialog を実装し、**要求元プロセスの透明性**を 1Password 既定の dialog よ… |
-| 2026-06-22 | design | open | [kv-get-peer-identity-guard](./2026-06-22-kv-get-peer-identity-guard.md) | cache-warden の `kv set` 時に **peer-identity constraint** を declarative に付与し、`kv … |
+| 2026-06-22 | design | wip | [kv-get-peer-identity-guard](./2026-06-22-kv-get-peer-identity-guard.md) | cache-warden の `kv set` 時に **peer-identity constraint** を declarative に付与し、`kv … |
 | 2026-06-15 | design | pending-sublimation | [changelog-md-adoption](./2026-06-15-changelog-md-adoption.md) | DR-0024 / DR-0025 のような minor breaking change (= pre-1.0 で minor bump、API surfac… |
 
 <!--
