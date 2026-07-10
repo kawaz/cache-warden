@@ -29,6 +29,34 @@ dialog は、実機観察により **1Password.app 本体が host する独自 U
   TouchID を触ると染色が完了し dialog が消える (標準 evaluatePolicy シートが**別に
   出ている痕跡は視認されない**)
 
+bundle 実機観察 (2026-07-10、`ls` / `otool -L` / `codesign -d`、read-only):
+
+- 主要 UI は **Electron** (`Contents/Frameworks/Electron Framework.framework`、
+  Web リソースは 38 MB の `app.asar` に閉じ込め)。1P が Electron を選んだのは**アプリ
+  全体 UI が Web ベースだから**であり、TouchID dialog 単体には Electron は必要ない
+- `Contents/Frameworks/index.node` (Rust 製ネイティブアドオン、build path から
+  `libop_core_node.dylib` を確認) と `libop_sdk_lib_core.dylib` (Rust 製 SDK) が
+  **`LocalAuthenticationEmbeddedUI.framework` を直接リンク**している
+- Electron Framework 本体は `LocalAuthentication.framework` のみリンク、`op-ssh-sign`
+  (別バイナリ、SSH 用) は LocalAuthentication 系一切リンクなし (SecKey API 経由と推定)
+- LocalAuthentication 系 entitlement は要求されていない (メイン .app の entitlements
+  で確認)
+- 稼働プロセス: メイン (pid 822、Electron) + Renderer × 2 + GPU + Network utility +
+  Login Items 2 種、helper.app の入れ子構造は Electron 由来
+
+これから読み取れる示唆 (recon 結論):
+
+- **`LocalAuthenticationEmbeddedUI.framework` が「独自 UI 内に埋め込む指紋 UI」の実装
+  経路として最有力**。1P はこれを Rust 製ライブラリから直接呼んでいる = **Rust から
+  技術的に到達可能な実証例が存在**
+- **Electron は cache-warden の設計に不要**。dialog 単体なら SwiftUI or Rust + AppKit
+  で 400x325 の floating panel を出せば足りる
+- **軽量 helper 分離パターン** (メイン UI と署名専用軽量バイナリ `op-ssh-sign` を分離)
+  は cache-warden の「daemon 本体 / dialog 専用 helper」分離設計と親和的
+
+ただし LAEmbeddedUI が公開 API か semi-private か / Rust から呼ぶ objc2 bindings が
+存在するか / notarize で通るかは追加調査中 (§6 参照)。
+
 この方式は cache-warden の要件 (requester 情報の透明性、対象 kv entry の明示、
 DR-0030 の guard 評価結果の可視化) と設計目標が一致する。本 DR は 1Password 方式に
 倣った独自 dialog を cache-warden に導入する設計を確定する。
@@ -60,19 +88,28 @@ DR-0030 の guard 評価結果の可視化) と設計目標が一致する。本
 
 - **daemon (現行 `cache-warden`)**: 変更なしを原則、helper 呼び出し口 (`daemon/approver.rs`) を
   新設。Rust のまま
-- **helper (`CacheWardenApprover`)**: **Swift + SwiftUI** で新規実装。LocalAuthentication /
-  AppKit / NSWorkspace のネイティブ体験、objc2 バインディング経由より圧倒的に短い実装距離。
-  Rust 統一を諦めるが、UI + Biometric ドメインは Apple 純正言語に倒す方が長期メンテコストが低い
+- **helper (`CacheWardenApprover`)**: 実装言語は **LAEmbeddedUI framework の公開度・
+  Rust 利用可否の判定結果次第で確定** (下 §2 と Open Question 4)。第一候補は Swift +
+  SwiftUI (LocalAuthentication / AppKit / NSWorkspace のネイティブ体験、既知の
+  Apple 公式サンプルパターンが多数)。ただし 1P bundle 観察で「Rust 製 SDK が
+  LAEmbeddedUI を直接呼ぶ」実証例が判明したため、Rust + objc2 での統一言語実装も
+  技術的には現実味を持つ
 
-### 2. helper 実装言語の選定理由 (Rust vs Swift の tradeoff 記録)
+### 2. helper 実装言語の選定 (Swift vs Rust の tradeoff、LAEmbeddedUI 判定次第で確定)
 
-Rust で通すと以下が全部自前になる:
+前提として **LAEmbeddedUI framework が公開 API か / Rust から呼ぶ objc2 bindings が
+存在するか** の判定次第で最終選択が変わる (下記の 3 シナリオ)。draft では第一候補を
+Swift としつつ、Rust 統一の余地を残す。
+
+**Rust で通す場合のコスト**:
 - NSApplication / NSWindow / SwiftUI (objc2-app-kit binding は存在するが hot path で
   頻繁に触るには摩擦が高い、[[touchid-dialog-ui-options]] research §3)
 - LAContext / evaluatePolicy の callback interop (objc2-local-authentication は動くが
   クロージャブリッジは煩雑)
 - NSWorkspace の app icon 取得
-- AXWebArea を模倣したアニメーション (角丸パネル、指紋染色トランジション)
+- 角丸パネル + 指紋染色トランジションのアニメーション
+- **LAEmbeddedUI の binding**: 現時点で objc2-* の対応 crate 有無は未確認 (recon 中)。
+  無ければ objc2 の raw msg_send マクロで手書き
 
 **Swift 選択のコスト**:
 - build system が 2 言語構成に (Cargo + xcodebuild)。release.yml と .app packaging が
@@ -83,12 +120,26 @@ Rust で通すと以下が全部自前になる:
   緩める判断。この境界は helper に限定し、core / adapter / cli には Swift を持ち込まない
 
 **Swift 選択の利益**:
-- SwiftUI で dialog デザインが 200 行程度で書ける (Rust + objc2 で書くと 800 行超)
-- LAContext との integration が公式サンプルそのまま (Apple の Framework 統合ドキュメント
-  が Swift 前提)
+- SwiftUI で dialog デザインが 200 行程度で書ける (Rust + objc2 で書くと 800 行超の見積)
+- LAContext / LAEmbeddedUI との integration が公式サンプルそのまま (Apple の Framework
+  統合ドキュメントが Swift 前提)
 - app icon 取得・NSWorkspace 系 API が言語ネイティブ
 - 将来 SwiftUI で見た目を凝りたくなった時 (Vault 展開・詳細トグル・アニメーション) の
   コストが Rust 経由の 1/3〜1/5
+
+**判断シナリオ (recon 結果次第で確定)**:
+
+- **S1: LAEmbeddedUI が公開 API + objc2 crate あり** → Rust 統一 (対 Swift 引数が
+  ほぼ消える)。build system 変更なし、DR-0020 の notarize 手順そのまま
+- **S2: LAEmbeddedUI が公開 API + objc2 crate なし (手書き必要)** → Swift 選択が
+  短距離、この case が今の第一候補
+- **S3: LAEmbeddedUI が semi-private / undocumented** → Rust でも Swift でも
+  notarize リスクは同じ。1P が Developer ID で通しているので実用上通る蓋然性が
+  高いが、DR に明示的リスクとして記録
+
+いずれのシナリオでも「§1 の 2 プロセス構成」「§4 の JSON IPC」「§5 の dialog 情報階層」
+「§7 peer exit」「§8 二重 dialog 防止」「§9 fallback」「§10 graceful restart 整合」の
+設計は言語非依存で成立する。実装言語の分岐は helper 内部の閉じた話。
 
 ### 3. helper のライフサイクル
 
@@ -189,27 +240,42 @@ issue 受け入れ条件を満たすには「シンプル表示 + 詳細展開�
 - floating panel level (`NSWindow.Level.floating`)、他の window に隠れない
 - LSUIElement=YES で Dock に helper アイコン非表示
 
-### 6. LAContext との統合 — v1 は標準シート許容、v2 で inline 検討
+### 6. LAContext と LAEmbeddedUI の統合
 
-1Password の実機観察では「独自 dialog 内で指紋アニメが完結」しているように見えるが、
-これが公開 API で実現可能かは要検証 (research 未確認事項)。
+1P bundle 観察で **`LocalAuthenticationEmbeddedUI.framework`** の存在と、1Password の
+Rust 製 SDK がこれを直接リンクしている事実が判明した。これが「独自 dialog 内で指紋
+アイコンが徐々に染色するアニメーション」の実装経路として最有力候補
+(観察された「標準シートが別に出ている痕跡がない」挙動と整合)。
 
-**v1 (本 DR の実装スコープ)**:
+**方針: LAEmbeddedUI を第一選択で使う**。公開度・利用可能性の判定は Open Question 3
+で扱うが、以下の 2 モードで実装スコープを分割する:
+
+**Mode A (LAEmbeddedUI が使える場合、v1 の第一候補)**:
+- helper が独自 dialog window を出す
+- dialog の指紋領域は LAEmbeddedUI のネイティブビュー (`LAAuthenticationView` 相当、
+  名称は要確認) を embed
+- ユーザが指紋を触ると LAEmbeddedUI 内部で TouchID 評価が完了、helper に callback
+- **標準 evaluatePolicy シートは出さない** (1P と同じ体験)
+- 見た目・遷移が 1P dialog と等価
+
+**Mode B (LAEmbeddedUI が使えない or 判定困難な場合、fallback)**:
 - helper が独自 dialog を表示
-- ユーザが `Touch ID authenticate` ボタンを押すと `LAContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, reason: <短い要約>)` を呼ぶ
+- ユーザが `Touch ID authenticate` ボタンを押すと
+  `LAContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, reason: <短い要約>)` を呼ぶ
 - 標準 evaluatePolicy シートが独自 dialog の上に一瞬出て、TouchID を触ると完了
-- 標準シートの `localizedReason` は独自 dialog と重複する情報 (短めに)。dialog 側で
-  詳細を出している前提で「Authenticate to access `key`」程度
-- 二重 UI 体験 (独自 dialog → 標準シート) は許容: 情報の可視化と TouchID の統合は
-  step-by-step で完結する
+- 標準シートの `localizedReason` は「Authenticate to access `<key>`」程度に短く
+  (詳細は既に dialog 側で出している)
+- 二重 UI 体験 (独自 dialog → 標準シート) を許容: 情報の可視化と TouchID の統合は
+  step-by-step で完結
 
-**v2 (将来、条件付き)**:
-- 1Password 方式の inline 統合 (標準シートを出さずに evaluatePolicy 完了) が公開 API で
-  可能と判明した場合に移行
-- 判断根拠 (公開 API パス / 非公開 API 依存 / private framework 使用) は当該時点で
-  別 DR にする
-- v1 と v2 の切替は user-facing に影響しない (dialog の見た目は同じ、内部の TouchID
-  呼び出し方だけ変わる)
+**v1 の land 判断**:
+- Mode A を Phase 1 の目標にし、LAEmbeddedUI recon 結果が「公開 API + notarize OK」
+  なら A を land
+- recon 結果が semi-private / 未整備なら Mode B で先行 land し、Mode A は Phase 3 に
+  回す (v1 と v2 の切替は user-facing に影響しない: dialog の見た目は同じ、内部の
+  TouchID 呼び出し方だけ変わる)
+
+Mode A / B の切替は helper 内部で完結し、daemon 側の IPC schema (§4) には影響しない。
 
 ### 7. peer exit 処理
 
@@ -287,7 +353,9 @@ daemon が graceful restart (同一 PID exec + state-holder child) するとき:
 - notarize: `CacheWarden.app` と一緒に notarize (helper が nested になるので stapler も含む)
 - entitlements: LocalAuthentication (Biometric) 使用のため
   `com.apple.developer.biometrics = true` (要確認、要件次第)。FDA は helper には不要
-  (secret を触るのは daemon 側、helper は評価しか行わない)
+  (secret を触るのは daemon 側、helper は評価しか行わない)。1P 実機観察では
+  LocalAuthentication 系 entitlement は明示されておらず、Developer ID + notarize で
+  通っている実例あり (§Context の bundle 観察)
 - `AssociatedBundleIdentifiers` (DR-0020): daemon の bundle_id と helper の bundle_id を
   互いに登録し、TCC 上「同じアプリの構成要素」として認識させる
 
@@ -310,11 +378,13 @@ daemon が graceful restart (同一 PID exec + state-holder child) するとき:
 ## 実装 phase 分割
 
 - **Phase 1 (最小 land)**:
-  - `CacheWardenApprover.app` bundle 骨格 (SwiftUI + LocalAuthentication)
+  - `CacheWardenApprover.app` bundle 骨格 (実装言語は §2 + Open Q3 で確定、
+    第一候補 Swift + SwiftUI)
   - IPC socket + JSON schema、daemon 側 approver.rs
   - dialog サマリ表示のみ (展開は無し)
   - guard がある entry のみ dialog 発火 (DR-0030 と同時 land 前提)
-  - v1 の LAContext 統合 (標準シート許容)
+  - TouchID 統合は Mode A (LAEmbeddedUI 使用) を目標、recon 判定が semi-private 等で
+    リスク大と出たら Mode B (標準シート許容) に fallback。判断は Phase 1 着手直前に確定
   - fallback は「helper 不在 → guard 付き entry を fail-closed」のみ
 
 - **Phase 2**:
@@ -324,7 +394,7 @@ daemon が graceful restart (同一 PID exec + state-holder child) するとき:
   - helper 死亡検知 + 自動 restart
 
 - **Phase 3 (条件付き)**:
-  - inline TouchID (1Password 方式) 実装 (v1 → v2 の LAContext 統合切替)
+  - Phase 1 で Mode B (標準シート) を選んだ場合、Mode A (LAEmbeddedUI inline) への移行
   - Watch 認証対応
   - dialog カスタマイズ (config 由来のテーマ / 表示項目選択)
 
@@ -336,10 +406,19 @@ daemon が graceful restart (同一 PID exec + state-holder child) するとき:
 2. **helper ライフサイクル**: (b) daemon spawn を提案。ただし kawaz が「daemon 死亡時も
    dialog を残したい」ケース (常駐 daemon が graceful restart 中でも dialog は生かす)
    を優先するなら (a) LaunchAgent 別登録に切替
-3. **v1 の LAContext 統合方式**: 標準シート許容 (実装コスト低) vs 標準シート抑制の
-   PoC を先にやってから v1 を land。draft は前者を提案 (Phase 1 の land 速度優先)
-4. **Swift 依存の導入判断**: cache-warden の設計原則「Rust 一本」を helper に限って
-   緩める判断。この境界を kawaz が受け入れるか (対抗案: Rust + objc2 で通す。実装
-   コスト 3-5 倍・保守コスト増と引き換えに言語統一)
+3. **LAEmbeddedUI 使用判定** — 現在 recon 中: (a) 公開 API + notarize OK なら
+   Mode A で v1 land (1P と等価な UX)、(b) semi-private / undocumented なら Mode B で
+   v1 land + Mode A は Phase 3 に回す (v1 land を遅らせない)。判定材料は recon 結果 +
+   1P bundle 観察の Developer ID + notarize 通過実例
+4. **helper 実装言語の最終選択** — Open Q3 と連動: (a) LAEmbeddedUI の objc2 crate が
+   ある → Rust 統一、(b) crate が無いが手書き 200 行程度で済む → Rust 統一を維持、
+   (c) 手書きが 800 行超になる or LAContext との interop が複雑 → Swift + SwiftUI。
+   Rust 統一を守るコストと Swift 導入の build system 変更コストのどちらが小さいかを
+   recon 結果で確定
+5. **`[auth].command` を dialog 化するかの scope**: Phase 2 で CommandAuthenticator を
+   dialog に置き換えると、既存の外部コマンド運用 (osascript / 独自 GUI) を持つユーザは
+   移行が必要。draft は「共存を維持、config で dialog / command を選択」を提案 (両立
+   させる) が、simplification を優先するなら「dialog を land した時点で command は
+   deprecated 予告」も選択肢
 5. **二重 dialog 防止方針**: v1 の「(i) cache HIT のみ dialog」で妥当か。「(ii) op fetch
    時にも cache-warden dialog を出して 1P dialog を後ろに隠す」設計の余地
