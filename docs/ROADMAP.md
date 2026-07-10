@@ -47,11 +47,13 @@
   declarative 宣言し、kv get 時に評価。1Password の白紙委任を段階的に置き換える
   ロードマップの基盤。DR accept 後に実装。`docs/decisions/draft-DR-0030-kv-peer-identity-guard.md`、
   issue `2026-06-22-kv-get-peer-identity-guard`
-- **custom TouchID 承認 dialog** (draft-DR-0031 レビュー待ち): 1Password 方式の独自
-  GUI helper で、requester プロセスツリー / kv entry name / guard 評価結果を可視化。
-  LAAuthenticationView (LocalAuthenticationEmbeddedUI.framework、macOS 12+ 公開 API)
-  を独自 dialog に埋め込み。実装言語は Rust 統一 / Swift+SwiftUI の 2 案を Open Question
-  として提示。DR-0030 と同時 land が理想。`docs/decisions/draft-DR-0031-custom-touchid-dialog.md`、
+- **custom TouchID 承認 dialog** (draft-DR-0031、**方向性 kawaz 裁定済み 2026-07-10**):
+  1Password 方式の独自 GUI helper で、requester プロセスツリー / kv entry name /
+  guard 評価結果を可視化。LAAuthenticationView (LocalAuthenticationEmbeddedUI.framework、
+  macOS 12+ 公開 API) を独自 dialog に埋め込み。helper app + ソケット通信 + peer
+  検証 (プロセス / TCC / 署名) 前提、Linux 対象外。実装言語 (Rust 統一 / Swift 系) は
+  Open Question のまま。DR-0030 と同時 land が理想、リモート承認 (draft-DR-0032) と
+  相補構成。`docs/decisions/draft-DR-0031-custom-touchid-dialog.md`、
   issue `2026-06-22-custom-touchid-dialog`
 - **prefetch 本体** (DR-0018 未着手): `kv prefetch ...` / 起動時 prefetch。型付きスキーマ自体は
   v0.17.0 実装済み
@@ -61,6 +63,12 @@
 
 ## 中期 (= 構想中)
 
+- **リモート承認 (静的ページ + WebRTC DataChannel + passkey)** (draft-DR-0032 議論中):
+  離席中・Linux/headless での対話的承認経路。静的承認ページ + 極小シグナリング中継
+  (p2pcf 型) + URL fragment による SDP 認証 + daemon 自身が WebAuthn RP として
+  assertion 検証。ローカル TouchID (draft-DR-0031) と相補構成 (passkey 登録は
+  ローカル TouchID 必須)。`docs/decisions/draft-DR-0032-remote-approval-web-passkey.md`、
+  research 2 本 (`2026-07-10-remote-approval-signaling` / `2026-07-10-serverless-webauthn-rp`)
 - **TouchID ビルトイン**: 自前再認証 (LocalAuthentication) で soft TTL 切れ延長に使う。
   `[auth]` の `touchid`/`push` 将来枠は DR-0018 で受け皿のみ用意済み (実装なし)。
   draft-DR-0031 の custom TouchID dialog helper が land した後、`[auth].touchid` の

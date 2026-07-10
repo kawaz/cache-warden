@@ -1,6 +1,10 @@
 # draft-DR-0031: custom TouchID 承認 dialog — 1Password 方式の独自 GUI helper
 
-- Status: Draft (kawaz レビュー待ち。codex adversarial review 予定)
+- Status: Draft — **方向性は kawaz 裁定済み (2026-07-10)**: 「TouchID はローカル本人確認
+  として UX が良いので進めて良い。helper app で UI を出し daemon とはソケット通信、
+  相手プロセス / TCC / 署名確認は基本。Linux 対応はなし」。リモート承認
+  (draft-DR-0032) と相補構成にする (例: passkey 登録時はローカル TouchID 必須)。
+  Open Q4 (helper 実装言語) は未裁定
 - Date: 2026-07-10
 - 関連: issue `2026-06-22-custom-touchid-dialog` (背景・受け入れ条件) /
   draft-DR-0030 (kv per-entry peer-identity guard、評価結果を dialog で表示する接続点) /
