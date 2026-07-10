@@ -152,9 +152,24 @@ JSON ベースのメッセージスキーマをバージョン付きで定義す
 
 - **Q1 (kawaz)**: シグナリング許容度 — 完全静的に拘るか、Cloudflare Workers 級の
   極小中継 (自前デプロイ、状態レス) まで許容か
-- **Q2 (kawaz)**: URL の配送経路 — daemon からスマホへ承認 URL をどう届けるか。
-  候補: push 通知サービス / メッセンジャー連携 / (在席時) QR 表示 / 事前ペアリング
-  した常駐ページ。安全性がここに集約されるため本 DR の要
+- **Q2 (kawaz 方向性裁定済み 2026-07-10)**: URL の配送経路 — kawaz 環境 (mac +
+  iPhone/iPad) では **Apple 純正チャネル (AirDrop / iMessage / ユニバーサル
+  クリップボード) を使う**。分析の結果、経路は用途で分かれる:
+  - **iMessage = 主経路**: 3 案で唯一の真のリモート対応 (E2E のままどこでも届く)。
+    daemon から `osascript` で Messages.app 経由の自分宛送信を自動化可能
+    (Automation TCC 初回 1 回)
+  - **ユニバーサルクリップボード = 近接時の簡易経路**: `pbcopy` 一発で最も簡単、
+    UC 同期は約 2 分失効で短寿命 URL と整合。ただし近接 + 同一 iCloud + Handoff
+    必須で離席中は不可、クリップボードは両デバイスの任意アプリから可読 (URL 単回
+    使用 + 短 TTL が前提条件)
+  - **AirDrop = 近接時の手動フォールバック**: 秘匿は硬いが近接必須 + 自動化が弱い
+    (share sheet 介在 + 受信側受諾)
+  - AirDrop/UC は近接必須のため「離席中の承認」は iMessage のみが満たす。近接時は
+    ローカル TouchID (DR-0031) が本来の経路で、UC/AirDrop は「手元の iPad で内容を
+    確認したい」等の補助用途
+  - **配送チャネルはプラガブルにする**: 上記は daemon = macOS 前提の Apple
+    エコシステム依存。Linux daemon 用は ntfy/push 系等を別チャネルとして追加できる
+    抽象にする (残 Open: Linux 既定チャネルの選定)
 - **Q3**: RP ID のドメイン選定 — `<name>.github.io` / `*.pages.dev` / 独自ドメイン。
   変更で passkey 全滅のため初日に確定が必要
 - **Q4**: Linux で登録セレモニーの「ローカル TouchID 必須」に相当する担保をどうするか
