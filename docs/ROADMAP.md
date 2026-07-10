@@ -42,6 +42,17 @@
 
 ## 短期 (= 残作業・近い着手候補)
 
+- **kv per-entry peer-identity guard** (draft-DR-0030 レビュー待ち): kv set 時に
+  peer-identity constraint (same-user / same-shell / same-ancestor / command) を
+  declarative 宣言し、kv get 時に評価。1Password の白紙委任を段階的に置き換える
+  ロードマップの基盤。DR accept 後に実装。`docs/decisions/draft-DR-0030-kv-peer-identity-guard.md`、
+  issue `2026-06-22-kv-get-peer-identity-guard`
+- **custom TouchID 承認 dialog** (draft-DR-0031 レビュー待ち): 1Password 方式の独自
+  GUI helper で、requester プロセスツリー / kv entry name / guard 評価結果を可視化。
+  LAAuthenticationView (LocalAuthenticationEmbeddedUI.framework、macOS 12+ 公開 API)
+  を独自 dialog に埋め込み。実装言語は Rust 統一 / Swift+SwiftUI の 2 案を Open Question
+  として提示。DR-0030 と同時 land が理想。`docs/decisions/draft-DR-0031-custom-touchid-dialog.md`、
+  issue `2026-06-22-custom-touchid-dialog`
 - **prefetch 本体** (DR-0018 未着手): `kv prefetch ...` / 起動時 prefetch。型付きスキーマ自体は
   v0.17.0 実装済み
 - **op discovery の起動ブロック解消** (P3 = launchd context の biometric 到達不能のみ残存):
@@ -51,7 +62,9 @@
 ## 中期 (= 構想中)
 
 - **TouchID ビルトイン**: 自前再認証 (LocalAuthentication) で soft TTL 切れ延長に使う。
-  `[auth]` の `touchid`/`push` 将来枠は DR-0018 で受け皿のみ用意済み (実装なし)
+  `[auth]` の `touchid`/`push` 将来枠は DR-0018 で受け皿のみ用意済み (実装なし)。
+  draft-DR-0031 の custom TouchID dialog helper が land した後、`[auth].touchid` の
+  dialog 経路として統合する経路が開ける
 - **ssh-agent Provider 再設計** (大物): authsock を「Provider 抽象 (KeySource/UpstreamAgent/
   Keyring + Composite) を合成し socket で filter 公開する toolkit」へ。discovery の upstream
   ありき解消・source-glob socket carving。`docs/issue/2026-06-14-ssh-agent-provider-architecture.md`
