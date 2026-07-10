@@ -119,15 +119,16 @@ kawaz 環境 (mac + iPhone/iPad) では:
 成立を確認済み。本案では通常の HTTPS 上の WebAuthn になるため、旧案の「DataChannel
 越し」という未確認領域も消える):
 
-- **RP ID = `<node>.<tailnet>.ts.net` の host 完全一致** (Q3' 確定、recon 反映):
-  PSL 上 `ts.net` は通常の 1 エントリ public suffix で、`<tailnet>.ts.net` が
-  registrable domain — host 完全一致 RP ID なら ts.net であること自体は問題に
-  ならない (先行事例: vaultwarden が ts.net 上で WebAuthn 運用実績あり)。tailnet
-  共有 RP ID (`<tailnet>.ts.net`) は検証不足のため採らず、**ノードごとに個別 RP ID**
-  (rename 時の影響最小化 + 単純さ)。**tailnet rename (自己サービスではデフォルト名 ⇔
-  ランダム名の切替のみ可) で証明書・MagicDNS 名が無効化され登録済み passkey は全滅
-  する** — 稀な操作だが再登録導線 (登録セレモニーの再実行) を運用ドキュメントに明記
-  する
+- **RP ID = 承認ページの origin ドメインの host 完全一致。ドメイン選定は経路設計と
+  一体で kawaz 裁量** (Q3'、kawaz 裁定 2026-07-10: 「ドメインも色々所有してるし
+  気にしなくて良い」): daemon は RP ID / expected origin を config で受けるだけで、
+  ドメインに依存しない。選択肢の性質だけ記録する:
+  - **自己所有ドメイン** (推奨): kawaz 管理下で安定、tailnet rename の影響を受けない
+    = 「rename で passkey 全滅」リスクが構造的に消える
+  - **`<node>.<tailnet>.ts.net`**: PSL 上問題なし (recon 確認済み、vaultwarden の
+    WebAuthn 運用実績あり) だが、tailnet rename (稀) で passkey 全滅 → 再登録が必要
+  - いずれでも **最初の登録セレモニー前に確定**が必要 (RP ID 変更 = 登録済み passkey
+    無効化、という WebAuthn 自体の制約は不変)
 - **challenge は daemon が発行**。一意 (CSPRNG)・短寿命・使用済み管理:
   - challenge は **in-memory のみ** (disk 永続化しない)。daemon 再起動で全 challenge
     無効 (graceful restart の handoff 対象にも含めない)。restart 中の承認セッション
