@@ -34,13 +34,25 @@ record は DR-0029 handoff で引き継ぎ必須)。
 set 時に 0 個以上の constraint を宣言でき、get 時に **全 constraint が成立した場合のみ**
 値を返す (AND 合成)。
 
-| constraint | 強度 | 判定材料 | 意味論 |
-|---|---|---|---|
-| `same-user` | **強** | `peer_audit_token(fd)` の euid/ruid | getter peer の euid と ruid が setter 記録値と一致 |
-| `same-ancestor=<NAME>` | **強** | `ancestry(pid)` + 実体 pin | setter の祖先チェーンから NAME に一致した**プロセス実体** (pid + start_time、macOS では unique_id も) を記録。getter の祖先チェーンに**同一実体**が居ることを要求 |
-| `command=<NAME or /PATH>` | **弱** (詐称可能) | getter chain の `ProcessInfo::path` | chain 中に該当 name / full path が居る。argv[0] 偽装で回避可能なことを doc・`--help` に明記 |
-| (phase 2) `signed-by=<ID>` | 強 | codesign identifier | crate `macos-process-inspect` への SecCode API 追加が前提 |
-| (phase 2) `env-marker` | 中 | peer env | 同 crate への KERN_PROCARGS2 追加が前提 |
+| constraint | 判定材料 | 意味論 |
+|---|---|---|
+| `same-user` | `peer_audit_token(fd)` の euid/ruid | getter peer の euid と ruid が setter 記録値と一致 |
+| `same-ancestor=<NAME>` | `ancestry(pid)` + 実体 pin | setter の祖先チェーンから NAME に一致した**プロセス実体** (pid + start_time、macOS では unique_id も) を記録。getter の祖先チェーンに**同一実体**が居ることを要求 |
+| `command=<NAME or /PATH>` | getter chain の `ProcessInfo::path` | chain 中に該当 basename / full path の実行ファイルを持つプロセスが居る |
+| (phase 2) `signed-by=<ID>` | codesign identifier | crate `macos-process-inspect` への SecCode API 追加が前提 |
+| (phase 2) `env-marker` | peer env | 同 crate への KERN_PROCARGS2 追加が前提 |
+
+### 1b. 各 constraint の脅威モデル — 何を防ぎ、何を防がないか
+
+「強/弱」の一語ラベルでは誤解を生むため (codex review 指摘)、constraint ごとに
+**防げる読み取り / 防げない読み取り**を明記する。この表は doc / `--help` にも
+同じ内容を載せる (issue 受け入れ条件の「弱い識別の明示」を全 constraint に拡張):
+
+| constraint | 防げる | 防げない (= 限界、明示必須) |
+|---|---|---|
+| `same-user` | 別 uid のプロセスからの読み取り | **同一 uid の任意のプロセス** (cache-warden の socket は元々 same-uid 前提なので、単独では「既定の防御の再宣言」に近い。他 constraint との併用が本命) |
+| `same-ancestor` 実体 pin | 別セッション・別プロセスツリーからの読み取り、pin 先 exit 後の読み取り (自然失効) | ① pin 先プロセスが **exec で別バイナリに置き換わった**場合 (pid/start_time/unique_id は exec を跨いで同一 = 「同じプロセス実体」の定義通りだが「同じプログラム」ではない)。② **同一ツリー内の任意の子孫** (同 shell から起動した無関係ツールも通る)。③ SSH/socket フォワーディング経由では **ローカル側の中継プロセス (ssh 等) しか観測できず**、リモート実体は識別不能 — 中継プロセスが pin ツリー内なら通る |
+| `command=` | カジュアルな誤用 (意図しないツールからの読み取り) | **同 basename / 同 path の別バイナリを配置・実行できる者** (実行ファイルパスの basename 判定であり argv[0] 偽装は効かないが、$HOME 配下に同名バイナリを置ける時点で回避可能)。防御ではなく「ラベル」に近い |
 
 `same-shell` は `same-ancestor` の sugar: setter 祖先のうち**最も近い shell** (組み込み
 リスト: zsh / bash / fish / sh / nu 等) を自動選択して実体 pin する。「同じ shell
@@ -50,6 +62,11 @@ set 時に 0 個以上の constraint を宣言でき、get 時に **全 constrai
 される (crate doc)、name は詐称できる。実体 pin は「その時生きていたまさにその
 プロセス」に束縛され、セッション終了とともに自然失効する (= 失効後の get は拒否、
 値は TTL まで残るが到達不能。これは仕様であり、再 set で束縛し直す)。
+
+この guard 全体の位置づけ: **同一 uid 内の誤爆・誤配線に対する区画化**であり、
+同一 uid 内の悪意あるコードに対する防御ではない (それは DR-0024 が cap の限界として
+述べたのと同じ線引き)。悪意あるローカルコードへの対抗は phase 2 の `signed-by`
+(codesign) が初めて意味を持つ。
 
 ### 2. record の配置 — core は data、評価は CLI 層
 
@@ -76,6 +93,15 @@ set 時に 0 個以上の constraint を宣言でき、get 時に **全 constrai
 guard が無ければ「constraint なし」として import。**guard 付き entry の引き継ぎは
 必須要件** (kawaz 裁定 2026-07-09: graceful restart で record を落とすと「再起動で
 認可が消える」事故になる)。
+
+**ダウングレード方向の規定** (codex review 指摘): 旧バイナリは unknown field を
+黙って捨てるため、`#[serde(default)]` のみだと「guard 付き snapshot → 旧 daemon へ
+graceful restart → guard が消えて entry が無防備で残る」というセキュリティ後退が
+起きる。これを防ぐため、**export する snapshot に guard が 1 件でも含まれる場合は
+format_version を +1 する** (guard ゼロなら現行 version のまま = 旧 daemon への
+ダウングレードも従来通り成功)。guard を使い始めたユーザに限り、ダウングレード
+restart は cold start に退化する — 「認可が黙って消える」より「秘密ごと消えて
+再認証」の方が安全側、という判断。
 
 ### 4. 評価点・順序・失敗時挙動
 
@@ -108,9 +134,12 @@ cw kv set FOO BAR --require-same-ancestor=code --require-command=git
 default-require-same-user = true   # 既定 OFF で導入 (Open Q1)
 ```
 
-- constraint は set のたびに宣言し直す (再 set = record 上書き)。「set 時固定」が
-  issue の要件で、後から緩める API は作らない (緩めたければ再 set = setter 本人の
-  権限で行う)
+- constraint は set のたびに宣言し直す。**set は record の全置換**: constraint 付き
+  set は record を上書きし、**constraint なしの set は既存 record を削除する**
+  (= 残留させない。「今回の set の宣言がすべて」という単純な意味論。うっかり
+  無宣言 set で guard が外れるリスクは `default-require-same-user` 等の config
+  既定で緩和する)。`kv del` / `undefine` は record も同時に削除し、entries に
+  無い key の record は snapshot export / import 時に prune する (orphan を作らない)
 - `kv list` / `status` の entry metadata 表示に guard の有無 + 種別を出す
   (value-free、既存 EntryInfo の拡張)
 
@@ -125,11 +154,14 @@ default-require-same-user = true   # 既定 OFF で導入 (Open Q1)
 
 ### 7. set 時の記録経路
 
-`handle_set` (および `kv define` 経由の static set) で、HandlerCtx の requester chain
+`handle_set` で、HandlerCtx の requester chain
 + 接続 fd の `peer_audit_token` から setter identity snapshot を構築し、
 `Store::set_guard(key, GuardRecord, cap)` (新 API、set と別呼び出しにせず
 `set_with_guard` に一体化するかは実装時判断) で record を固定する。
 constraint 宣言なしの set は record を作らない (現行挙動と完全互換)。
+guard を宣言できるのは v1 では `kv set` (Static 値) のみ: definition 由来
+(config `[kv.*]` / `kv define`) の entry は運用者宣言の DR-0012 `allowed_processes`
+が既にカバーしており、set-time 宣言の主体 (consumer) が存在しないため対象外。
 
 ## Security considerations
 
