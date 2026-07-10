@@ -3,7 +3,7 @@ title: ssh-agent Provider 再設計（アイデア記録）
 status: idea
 category: idea
 created: 2026-06-14T10:08:57+09:00
-last_read:
+last_read: 2026-07-10T16:19:52+09:00
 open_entered:
 wip_entered:
 blocked_entered:
