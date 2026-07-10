@@ -2,7 +2,7 @@
 
 - Status: Draft (**方式は kawaz 裁定済み 2026-07-10: Tailscale 直達で OK**。
   WebRTC + 静的ホスティング案からの転換、旧案は §Alternatives 参照。
-  Tailscale 固有詳細 (cert / RP ID / ACL) は recon 中、反映後に accept 判断)
+  Tailscale recon 反映済み — **accept 判断可能な状態**。実機検証 2 項目は PoC gate)
 - Date: 2026-07-10
 - 関連: draft-DR-0031 (custom TouchID dialog、**相補関係** = ローカル承認面) /
   draft-DR-0030 (peer-identity guard、承認ページに載せる評価結果) /
@@ -10,7 +10,9 @@
   research `docs/research/2026-07-10-remote-approval-signaling.md` (旧 WebRTC 案の
   シグナリング調査、不採用判断の根拠として保持) /
   research `docs/research/2026-07-10-serverless-webauthn-rp.md` (daemon = WebAuthn RP
-  の成立性調査、本案でも有効)
+  の成立性調査、本案でも有効) /
+  research `docs/research/2026-07-10-tailscale-approval-hosting.md` (Tailscale cert /
+  RP ID / ACL / iOS の詳細調査)
 
 ## Context
 
@@ -59,14 +61,21 @@ TouchID は 1Password 側が出す biometric であり、cache-warden がリモ�
 
 構成要素:
 
-1. **daemon 内蔵の承認 HTTP サーバ**: daemon 自身が tailnet 内 HTTPS で承認ページ
-   (最小の静的 HTML/JS、daemon バイナリに埋め込み) と承認 API を配信する。
-   証明書は `tailscale cert` (Let's Encrypt、`<node>.<tailnet>.ts.net`)。
-   `tailscale serve` (reverse proxy) vs 自前 HTTPS listener の選択は recon 反映後に
-   確定 **[Open Q9]**
+1. **daemon 内蔵の承認 HTTP サーバ = 自前 TLS listener** (Q9 確定、recon 反映):
+   daemon 自身が tailnet 内 HTTPS で承認ページ (最小の静的 HTML/JS、daemon バイナリに
+   埋め込み) と承認 API を配信する。`tailscale serve` は identity header 認可という
+   別レイヤの機構で、daemon 自身が WebAuthn RP として origin 検証する設計とは自前
+   listener が整合。証明書は `tailscale cert` / LocalAPI (`/localapi/v0/cert/`) で
+   取得 (Let's Encrypt、`<node>.<tailnet>.ts.net`、90 日有効・自動更新なし) —
+   **90 日更新スケジューラ + 無停止リロードを daemon に内蔵する** (必須設計要素)。
+   macOS の非 root launchd agent から LocalAPI を叩けるかは variant 依存で未確認 =
+   **PoC gate の実機検証項目 (a)**
 2. **到達性 = tailnet 限定**: 承認エンドポイントには tailnet 参加デバイスしか到達
-   できない。tailnet ACL で承認者デバイスにさらに限定する **[Open Q10]**。
-   **Funnel (公開露出) は使わない** — 誤有効化を guard する
+   できない。**tailnet ACL は承認者デバイスに専用 tag (例 `tag:cw-approver`) を付与
+   し、`grants`/ACL でその tag のみが承認ポートへ到達可能と制限する** (Q10 確定)。
+   **Funnel (公開露出) は使わない** — 稼働ノードに `funnel` nodeAttr を**そもそも
+   付与しない**運用で、コード側誤操作を tailnet 側でブロックする二重防御にする
+   (disable が効かないバグ報告 #15248 があるため属性非付与が確実)
 3. **WebRTC / シグナリング中継 / TURN / 静的ホスティングは全部不要** (旧案から削除)。
    NAT 越えとトランスポート暗号は Tailscale (WireGuard) が解決済み
 
@@ -110,9 +119,15 @@ kawaz 環境 (mac + iPhone/iPad) では:
 成立を確認済み。本案では通常の HTTPS 上の WebAuthn になるため、旧案の「DataChannel
 越し」という未確認領域も消える):
 
-- **RP ID = `<node>.<tailnet>.ts.net`** (詳細は recon 反映後に確定)。**tailnet 名の
-  変更・再発行で既存 passkey が全滅する**制約は旧案 (静的ページのドメイン焼き付き)
-  と同型で残る **[Open Q3']**
+- **RP ID = `<node>.<tailnet>.ts.net` の host 完全一致** (Q3' 確定、recon 反映):
+  PSL 上 `ts.net` は通常の 1 エントリ public suffix で、`<tailnet>.ts.net` が
+  registrable domain — host 完全一致 RP ID なら ts.net であること自体は問題に
+  ならない (先行事例: vaultwarden が ts.net 上で WebAuthn 運用実績あり)。tailnet
+  共有 RP ID (`<tailnet>.ts.net`) は検証不足のため採らず、**ノードごとに個別 RP ID**
+  (rename 時の影響最小化 + 単純さ)。**tailnet rename (自己サービスではデフォルト名 ⇔
+  ランダム名の切替のみ可) で証明書・MagicDNS 名が無効化され登録済み passkey は全滅
+  する** — 稀な操作だが再登録導線 (登録セレモニーの再実行) を運用ドキュメントに明記
+  する
 - **challenge は daemon が発行**。一意 (CSPRNG)・短寿命・使用済み管理:
   - challenge は **in-memory のみ** (disk 永続化しない)。daemon 再起動で全 challenge
     無効 (graceful restart の handoff 対象にも含めない)。restart 中の承認セッション
@@ -208,29 +223,29 @@ kawaz 環境 (mac + iPhone/iPad) では:
 
 ## Open Questions
 
-- **Q3'**: RP ID の確定 — `<node>.<tailnet>.ts.net` の安定性 (tailnet 名変更・再発行
-  条件、PSL 登録状況) を recon で確認中。**最初の登録セレモニー前に確定必須**、
-  PoC では本番登録を作らない
+(Q3' RP ID / Q9 serve vs 自前 listener / Q10 ACL は recon 反映で確定済み、
+Decision 節に移動)
+
 - **Q4 (Blocker for Linux)**: Linux で登録セレモニーの「ローカル TouchID 必須」に
   相当する担保。候補: ローカル console 限定の確認操作 / macOS 側登録の信頼リスト同期
 - **Q7**: passkey の失効・ローテーション運用 (登録一覧 / 削除 CLI)
 - **Q8**: リモートページに表示する guard_eval / requester chain の詳細度 (実装 DR)
-- **Q9**: `tailscale serve` (reverse proxy) vs 自前 HTTPS listener + `tailscale cert`
-  直読み。daemon の設計 (単一プロセス、DR-0008) との相性、cert 更新の自動化を含め
-  recon 反映後に確定
-- **Q10**: tailnet ACL の設計 — 承認エンドポイントへ到達できるデバイスを承認者
-  デバイスに限定する具体構成 (tags / device 単位)。cache-warden 側でも peer 情報
-  (Tailscale の identity headers 等) を検証するか
-- **Q11**: iOS の Tailscale VPN 未接続時の UX — 通知の URL を開いたが VPN off の場合
-  の誘導 (on-demand 設定の案内 / 通知文言)
+- **Q11**: iOS の Tailscale VPN 未接続時の UX — VPN off だと ts.net の **DNS 解決
+  自体が失敗**する (recon 確定)。承認者デバイスには VPN On-Demand「Always」設定を
+  推奨し、通知文言に「開けない時は Tailscale を ON」の一文を入れる。詳細誘導は
+  実装 DR で
 - 複数デバイスへの通知 fan-out は **v1 スコープ外** (単一通知固定。固定 URL なので
   他デバイスからも自発アクセスは可能)
 
 ## 実装フェーズ想定 (accept 後)
 
-1. **PoC gate**: `tailscale cert` + daemon 内蔵 HTTPS listener (または serve) で
-   iPhone 実機 (LTE、tailnet 経由) から承認ページ到達 + FaceID で WebAuthn
-   登録/認証が通ることを確認 (**仮 RP ID で行い、本番登録は作らない**)
+1. **PoC gate** (実機検証 2 項目が主目的、**仮 RP ID で行い本番登録は作らない**):
+   (a) **macOS 非 root launchd agent からの LocalAPI cert 取得** — tailscaled の
+   variant (App Store / Standalone / OSS) 依存で未確認 (tailscale/tailscale#5761)。
+   `curl --unix-socket` 相当で `/localapi/v0/cert/` を試す。
+   (b) **iOS Safari + ts.net + FaceID の WebAuthn 動作** — 一次資料が無いため実機
+   確認。iPhone 実機 (LTE、tailnet 経由) から daemon 内蔵 HTTPS listener の承認
+   ページに到達 + 登録/認証が通ること
 2. WebAuthn 登録/認証セレモニー本実装 (webauthn-rs、challenge lifecycle 仕様、
    登録のローカル TouchID 束縛 = DR-0031 helper 連携)
 3. 承認プロバイダ抽象への統合 (DR-0031 helper と同一インターフェース、同時発火
