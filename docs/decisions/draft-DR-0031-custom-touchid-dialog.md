@@ -271,14 +271,41 @@ Cons:
 実装距離差は当初想定の 1/3-1/5 ではなく **1.3-1.6 倍程度**に収束 (la-swiftui-recon で
 Swift native の短縮効果が限定的と判明したため)。
 
-**現時点の推奨 (kawaz レビューに委ねる、Open Question 4)**:
-- **案 A 推奨** (Rust 統一): 実装距離差が 1.3-1.6 倍に留まる今、「言語統一」「build system
-  単純さ」「wire schema 共有」「Rust オンリー原則」の利益が build system 変更コストを
-  上回る。cache-warden の下限も Monterey を維持できる
-- 案 B1 に倒す条件: SwiftUI 宣言的 UI で将来の見た目大幅リッチ化が予定される、
-  かつ macOS 13+ に下限を上げる合意が取れる
-- 案 B2 に倒す条件: Swift 依存を受け入れつつ Monterey 下限を維持したい (案 B1 の
-  Ventura 要件を避けたい)
+**現時点の推奨 (PoC 実施後に確定、Open Question 4)** — codex review medium-5 対応:
+
+行数見積は「短い方が実装が終わる」を保証しない。Rust 案は AppKit runloop / NSView
+hierarchy / Auto Layout / block callback / LAContext lifetime / NSWindow activation の
+trial & error コストが読みにくく、Swift 案は逆に xcodebuild/SPM/nested app 署名
+notarize/CI cache/JSON schema 二重定義の運用負担が読みにくい。draft の Rust 推奨は
+**最終判断ではなく PoC gate に置く**:
+
+**Rust PoC 合格条件** (Phase 1 land 前に満たす必要):
+1. `NSApplication` main thread run loop で NSWindow が floating panel として表示され、
+   Dock 非表示 (LSUIElement=YES) が有効
+2. LAAuthenticationView が dialog window 内に埋め込まれ表示される
+3. LAContext.evaluatePolicy が block callback 経由で完了、以下 4 経路がすべて動く:
+   `.approved` / `.cancelled` / `.peer_gone` / `.biometricFailed`
+4. helper bundle が Developer ID + notarize で **実機で** 通り、
+   `codesign --verify --deep --strict CacheWardenApprover.app` が通る
+5. daemon から spawn + fd 渡し + 双方向 peer 認証 (§Security) が動作
+
+**Swift PoC 合格条件** (Phase 1 land 前に満たす必要):
+1-5 は上と同じ。加えて:
+6. xcodebuild + SwiftPM が Cargo と共存し、release.yml の GitHub Actions runner
+   (macos-latest) で cross-target build まで通る
+7. nested Swift `.app` を含めた `.app` 全体の codesign / notarize が通る (DR-0020
+   の bottom-up sign 手順に helper が正しく含まれる)
+8. JSON wire schema (§4) を daemon (Rust serde) と helper (Swift Codable) の両側で
+   互換に保つ contract test が回る
+
+Rust PoC が (1-5) を通れば **案 A で v1 land**。通らなければ Swift PoC (1-8) が通る
+案 B1 or B2 に切替。実装距離差が 1.3-1.6 倍程度なので、Phase 1 の中で両方を並行 PoC
+することも許容 (最初に land した方を採用する形)。
+
+**判断軸 (どちらの PoC を優先するか)**:
+- 「Rust オンリー」の設計原則を helper のためだけに崩したくない → 案 A を先行
+- SwiftUI 宣言的 UI で将来の見た目大幅リッチ化が予定される、macOS 13+ 許容 → 案 B1 を先行
+- Swift 依存を受け入れつつ Monterey 下限を維持したい → 案 B2 を先行
 
 ### 3. helper のライフサイクル
 
@@ -338,9 +365,23 @@ Request:  ApproveRequest {
         },
         responsible_bundle_id: ?String, // TCC responsible process の bundle_id
     },
-    guard_eval: {                       // DR-0030 の評価結果、guard 無しなら null
-        matched_constraints: [String],  // "same-user" | "same-shell" ...
-        setter_snapshot_summary: String // "set by zsh (pid 12345) 3h ago"
+    guard_eval: {                       // DR-0030 の評価結果、guard 無しなら null (下記構造化 schema)
+        constraints: [{
+            kind: String,               // "same-user" | "same-shell" | "same-ancestor" | "command"
+            matched: bool,              // 評価結果 (dialog 通過時は必ず全 true)
+            strength: String,           // "strong" | "weak" (弱識別マークは Dialog 表示で明示)
+            display_label: String,      // "same-shell (zsh)" 等の表示用
+            risk_note: ?String,         // 弱識別の警告文 (weak の場合)
+        }],
+        setter_pinned: ?{               // 実体 pin された setter プロセス snapshot (same-ancestor 系のみ)
+            pid: u32, start_time: u64, unique_id: ?u64,
+            path: String, name: String,
+        },
+        getter_matched: ?{              // 実体 pin と一致した getter chain のプロセス
+            pid: u32, start_time: u64, unique_id: ?u64,
+            path: String, name: String,
+        },
+        evaluated_at: u64,              // Unix epoch nanoseconds
     } | null,
     timeout_secs: u32,                  // 60 デフォルト、helper 内で bounded
 }
@@ -356,6 +397,16 @@ Response: ApproveResponse {
 「呼び出し元アイコン」の解決に使う (`NSWorkspace.icon(forURL:)` で `.app` から取得)。
 `responsible_bundle_id` が取れない CLI (Ghostty から起動した curl 等) は
 requester.chain の最上位祖先 .app を helper 側で探索して fallback。
+
+**`guard_eval` を構造化する理由** (codex review medium-4 対応): 単純な文字列
+`matched_constraints: [String]` + human summary では、(a) dialog の詳細展開で
+constraint ごとの詳細 (pin された pid/start_time/unique_id 等) を表示できない、
+(b) 弱識別 (`command` 等) の警告表示ができない、(c) 将来 localization / redaction /
+audit log に流用できない。setter identity data を helper に渡すが、`setter_pinned` /
+`getter_matched` は既に **guard 通過した getter の accessible な情報範囲** で、
+DR-0030 §7 の「setter identity を get 側 error に返さない」規定は「拒否時」の話であり、
+承認時は setter/getter 両方の識別情報が dialog に必要になる (getter が「なぜこの
+セッションから承認できるか」を理解するため)。
 
 ### 5. dialog の情報階層 (2 段: サマリ + 展開)
 
@@ -500,22 +551,35 @@ struct ApproverDialog: View {
 }
 ```
 
-**Mode A / Mode B の切替 (実装 PoC で判明する落とし穴への保険)**:
+**Mode A / Mode B の切替 (実装 PoC で判明する落とし穴への保険、land 条件を分離)**:
 
 **LAAuthenticationView が標準モーダルシートを完全に代替する** ことは公式資料 verbatim
 では未確認 (AI 要約経由の推論、laeui-recon は「ヘッダ doc + 状況証拠から推論、動画未
-視聴」と明示)。もし実装 PoC で「LAAuthenticationView 使用中も別途標準シートが立ち上
-がる」ことが判明した場合の緊急退避策 (Mode B):
+視聴」と明示)。**Mode A が実機 PoC で "標準 sheet が出ない、embedded UI 内で TouchID
+完結" と確認できた場合にのみ「custom TouchID dialog」の受け入れ条件を満たしたと
+みなす** (codex review medium-3 対応):
 
-- helper が独自 dialog を表示
-- ユーザが `Touch ID authenticate` ボタンを押すと標準 evaluatePolicy を呼ぶ
-- 標準シートが dialog の上に一瞬出て、TouchID を触ると完了
-- `localizedReason` は「Authenticate to access `<key>`」程度に短く
-- 二重 UI 体験 (独自 dialog → 標準シート) を許容
+- **Mode A land 条件 (custom TouchID dialog として v1 完成)**:
+  1. LAAuthenticationView 埋め込み dialog を表示し標準 evaluatePolicy シートが**出ない**
+     ことを目視 + Accessibility Inspector で確認
+  2. TouchID タッチで embedded UI の指紋アイコンが染色 → success 遷移
+  3. Cancel / Peer gone / Biometric failed の各終了経路が dialog 内で完結
+
+- **Mode B (暫定 UX、"metadata pre-prompt + standard LA sheet")**: Mode A の PoC で
+  上記が満たせなかった場合の暫定形。「custom TouchID dialog を完全実装した」とは呼ば
+  ずに release notes / doc で "metadata pre-prompt (v1 暫定形)" と明示する:
+  - helper が独自 dialog を表示、metadata (requester chain / kv key / guard 評価結果) を
+    見せる
+  - ユーザが `Touch ID authenticate` ボタンを押すと標準 evaluatePolicy を呼ぶ
+  - 標準シートが dialog の上に一瞬出て、TouchID を触ると完了
+  - `localizedReason` は「Authenticate to access `<key>`」程度に短く
+  - 二重 UI 体験 (独自 dialog → 標準シート) を許容 = **1P と等価な UX ではない**
+    ことを明示、issue 受け入れ条件の「シンプル表示 + 詳細展開」は満たすが「dialog
+    window 内で TouchID 完結」は Phase 3 に持ち越し
 
 Mode A と Mode B の切替は helper 内部で完結し、daemon 側の IPC schema (§4) には
-影響しない。Phase 1 の PoC で Mode A が動けば land、動かなければ Mode B で先行 land し
-Mode A は Phase 3 に回す。
+影響しない。Phase 1 の PoC で Mode A が動けば custom TouchID dialog として land、
+動かなければ Mode B (metadata pre-prompt) で先行 land し Mode A は Phase 3 に回す。
 
 **macOS 下限バージョン**: 実装言語選択 (Open Q4) と連動して以下の 2 択:
 
@@ -535,12 +599,26 @@ DR-0030 の guard record を LARightStore に持たせる将来経路もあり�
 
 dialog 表示中に requester プロセスが exit した場合の意味論:
 
-- helper は dialog 表示開始時に `requester.chain[0].pid` と `start_time` を pin
-- 500ms 周期で `macos-process-inspect::inspect(pid)` を呼び、
-  `NotFound` または `start_time` 不一致 (pid 再利用) を検知したら:
-  - **TouchID 評価前**: dialog を自動で閉じ、`ApproveResponse { outcome: "peer_gone" }` を daemon に返す
-  - **TouchID 評価中 (evaluatePolicy 呼び出し済み)**: LAContext.invalidate() でキャンセル、
-    `peer_gone` を返す
+- helper は dialog 表示開始時に `requester.chain[0].pid` / `start_time` /
+  `audit_token.pid_version` / macOS `unique_id` を pin (§4 の構造化 schema による)
+- **検知方式** (v1 実装、codex review medium-7 対応):
+  - **第一選択**: `kqueue` + `EVFILT_PROC` + `NOTE_EXIT` による event-driven 検知。
+    peer exit の瞬間に即座に通知され、polling オーバヘッドがない (kqueue 登録は
+    dialog 表示開始時に 1 回、破棄は dialog 閉じ時に 1 回)。macOS の proc kqueue は
+    root 権限不要で自 uid のプロセスに使える
+  - **fallback**: kqueue で登録できないケース (稀、権限問題等) は 500ms 周期
+    `macos-process-inspect::inspect(pid)` polling に degrade
+- **検知時の UX** (codex review medium-7 対応、突然消える dialog の混乱防止):
+  - dialog window を即座に閉じず、**「Request ended (the requesting process exited)」
+    メッセージを 1.5 秒表示** してから閉じる。ユーザに「承認完了 / helper crash /
+    peer exit」の区別を付ける
+  - **TouchID 評価前**: 上記メッセージ表示後に閉じ、`ApproveResponse { outcome: "peer_gone" }` を daemon に返す
+  - **TouchID 評価中 (evaluatePolicy 呼び出し済み)**: `LAContext.invalidate()` で
+    キャンセル → メッセージ表示 → 閉じる。invalidate が embedded UI をどう閉じるかは
+    PoC 時に verify (Mode A/B いずれでも正しく動作すること)
+- **pid 再利用対策** (codex review medium-4 / medium-7 統合): 単純な `NotFound` 判定
+  だけでなく、`start_time` / `pid_version` / `unique_id` の一致検査で「同じ pid の
+  別プロセス」を偽陽性なく峻別。3 者いずれかが不一致なら peer_gone
 - daemon 側は `peer_gone` を受けたら kv get を **AuthFailed** で返す (secret を送信しない)
 
 「peer が消えたのに secret を返す」経路は作らない (issue 受け入れ条件)。
@@ -568,36 +646,76 @@ cache-warden から secret を返せるパスは 2 つ:
   dialog に切り替え可 (現行 CommandAuthenticator の外部コマンド起動を dialog に置換)
 - guard も auth.command も無い entry → dialog なし (現行の透過的 get 挙動を維持)
 
-これで「1Password 白紙委任から段階的に置き換える」ロードマップになる:
-guard を宣言した entry から順に cache-warden dialog 化 → 全 entry に guard を宣言 →
-1Password dialog を実質見なくなる。
+**「1P 白紙委任から段階的置き換え」ロードマップの現実的制約** (codex review medium-6
+対応): 単純に「全 entry に guard を宣言 → 1P dialog を実質見なくなる」ではない。
+DR-0030 v1 は guard を **kv set (Static 値) のみ** で受け付ける (definition 由来 =
+config `[kv.*]` / `kv define` は対象外)。op source を持つ entry は:
+
+1. **初回 fetch (cache MISS, cold path)**: op CLI 経由で 1P dialog が出る。この経路は
+   cache-warden dialog では置き換えられない (op が secret 送出する側)。**残る 1P dialog
+   の既知制約**として release notes / doc に明示
+2. **hard TTL 到達 → regenerate**: 同じく op fetch が発火 → 1P dialog
+3. **soft TTL 到達 → extend**: 通常は在庫値を返しつつ background で refresh、cache-warden
+   dialog は出ない (現行挙動維持)
+
+「1P dialog を実質見なくなる」を目指すなら、**別 phase として definition (op source
+含む) にも peer-identity policy を付ける DR** が必要 (DR-0030 の後継)。これは
+「definition が config で運用者宣言」の DR-0012 と、「per-entry consumer 宣言」の
+DR-0030 の合成問題であり、本 DR のスコープ外。
+
+代わりに v1 では:
+- prefetch (DR-0018) / longer hard TTL 設定で cold path 到達頻度を下げる (kawaz 運用側)
+- 1P dialog を「初回 & TTL 切れの時のみ」に許容する運用として明示、cache-warden
+  dialog は「hot path で最も頻繁に出るもの」として最適化
+- config definition + guard の統合は将来 DR で扱う (Phase 3+ の「LARight/LARightStore
+  検討」と併せて再検討)
 
 ### 9. fallback — helper 不在時の挙動
 
-helper が spawn 失敗・接続喪失・応答なしのとき:
+helper が spawn 失敗・接続喪失・応答なしのとき、**状態を 2 種に区別する**
+(codex review high-2 対応):
 
-- **guard がある entry** (DR-0030): fail-closed で `AuthFailed` (secret を送信しない、
-  ユーザには「helper 不在」を伝える)
-- **guard が無いが auth.command が定義済み**: 現行 CommandAuthenticator にフォールバック
-  (外部コマンド exit code で承認)
-- **どちらも無い**: 従来の透過 get 挙動を維持
+- **`helper_starting` (transient)**: daemon 起動直後 / graceful restart 直後 / helper
+  respawn 中の一時状態。**bounded wait** (最大 5 秒程度、実装 PoC で調整) で helper
+  ready を待ってから承認要求を処理。timeout 到達で下記 `helper_down` に格下げ
+- **`helper_down` (permanent)**: bounded wait を超えた真の helper 不在。以下の
+  fallback:
+  - **guard がある entry** (DR-0030): fail-closed で `AuthFailed` (secret を送信しない、
+    ユーザには「helper 不在」を伝える)
+  - **guard が無いが auth.command が定義済み**: 現行 CommandAuthenticator にフォールバック
+    (外部コマンド exit code で承認)
+  - **どちらも無い**: 従来の透過 get 挙動を維持
 
-`daemon status` に helper の稼働状態 (running / not-running / stale) を表示。
-`cache-warden helper restart` サブコマンド (新設) で手動再起動を提供。
+`daemon status` に helper の稼働状態 (running / starting / down) と最終 ready 時刻、
+respawn 回数を表示。`cache-warden helper restart` サブコマンド (新設) で手動再起動を
+提供。**restart 中の既存 dialog** は helper kill によって消えるため、次の kv.get 要求
+時に helper ready を待って新規 dialog を出し直す (状態が消えることを明示する短い
+transient メッセージが helper 側にあれば理想、v1 では省略可)。
 
 ### 10. graceful restart との整合 (DR-0029)
 
-daemon が graceful restart (同一 PID exec + state-holder child) するとき:
+daemon が graceful restart (同一 PID exec + state-holder child) するとき、**helper
+readiness を control socket serve 開始条件に組み込む** (codex review high-2 対応):
 
 - helper は daemon の子プロセスなので **daemon exec 前に kill** する (子プロセスは
   execve で継承されない設計と一致)
-- 新 daemon が起動 → helper を再 spawn
-- restart 中 (helper 未起動の窓) に承認要求が来たら、上記 §9 の fallback ロジック
+- 新 daemon が起動 → **helper を spawn し、双方向 peer 認証成立 (§Security) までの
+  ready 状態を確認してから control socket serve を開始する**
+- 起動シーケンスの厳密順序:
+  1. daemon 内部初期化 (kv store restore、config load)
+  2. helper spawn + fd/env 渡し (§Security の socketpair 経路)
+  3. helper `HELLO` 受領 (helper 側で双方向 peer 認証成立、dialog 表示準備完了)
+  4. control socket 開始 + authsock listener 開始
+- helper spawn 失敗時: control socket は開始する (guard 無し entry の kv.get は
+  透過的に動く必要があるため)、guard 付き entry は §9 の `helper_down` fallback
+- restart 中 (2-3 の窓) に kv.get 要求が並んでいる場合: 3 完了までは §9 の
+  `helper_starting` に該当し、bounded wait で吸収
 
 「helper を daemon exec で継承させる」案は不採用: dialog UI 状態を跨いで受け渡す
-契機がなく、fresh restart の方が状態機械が単純。
+契機がなく、fresh restart の方が状態機械が単純。restart の hot cache 保持
+(DR-0029) と helper 再起動は独立の関心事。
 
-### 11. TCC / codesign / notarize
+### 11. TCC / codesign / notarize / release 影響
 
 `CacheWardenApprover.app` は helper bundle として:
 
@@ -605,22 +723,69 @@ daemon が graceful restart (同一 PID exec + state-holder child) するとき:
 - `NSMainNibFile` 不要 (SwiftUI で `@main` 起動)
 - codesign: `CacheWarden.app` と同一 identity (Developer ID Application)
 - notarize: `CacheWarden.app` と一緒に notarize (helper が nested になるので stapler も含む)
-- entitlements: LocalAuthentication (Biometric) 使用のため
-  `com.apple.developer.biometrics = true` (要確認、要件次第)。FDA は helper には不要
-  (secret を触るのは daemon 側、helper は評価しか行わない)。1P 実機観察では
-  LocalAuthentication 系 entitlement は明示されておらず、Developer ID + notarize で
-  通っている実例あり (§Context の bundle 観察)
+- **entitlements の扱い** (codex review low-9 対応): 1P 実機観察では
+  LocalAuthentication 系 entitlement は**明示されていない**にもかかわらず Developer ID +
+  notarize で通っている実例あり (§Context の bundle 観察)。**v1 では entitlement を
+  追加しない前提で PoC → notarize を実施し、失敗した場合にのみ追加**の順序で進める
+  (誤った entitlement を hardened runtime に入れると notarize 失敗要因になる):
+  - `com.apple.developer.biometrics` の要否は PoC で verify (現時点で「必要」と主張する
+    一次資料はなし)
+  - FDA は helper には不要 (secret を触るのは daemon 側、helper は評価しか行わない)
 - `AssociatedBundleIdentifiers` (DR-0020): daemon の bundle_id と helper の bundle_id を
   互いに登録し、TCC 上「同じアプリの構成要素」として認識させる
+
+**release 影響 (macOS 下限規定に伴う運用変更、codex review low-9 対応)**:
+
+- **README / release notes**: 「macOS 12 Monterey 以降 (Open Q3 で確定) が必要」の
+  明示を追加。Homebrew Cask (`kawaz/homebrew-tap/Casks/cache-warden.rb`) の `depends_on
+  macos: ">= :monterey"` (現在未明示なら追加) 相当の宣言も要検討
+- **Homebrew の cask metadata**: `depends_on macos:` の更新 (現状の cask を確認して
+  Monterey 未満のサポート範囲を明示的にカット)
+- **Cargo target / build.rs**: macOS deployment target を `12.0` に固定
+  (現状未指定なら `build.rs` or Cargo.toml の rustflags 経由で明示)
+- **既存ユーザへの影響**: Monterey 未満のユーザが存在するかは kawaz の運用範囲で
+  未確認 (cache-warden ユーザは kawaz 個人 + dogfood レベル、実質的に問題ない見込み)。
+  Homebrew Cask の macos_requirement 更新で古い OS ユーザは自動的に upgrade 不可に
+  なるため、事実上の non-breaking change として扱える
+- **CI matrix**: 現行 `macos-latest` (Sonoma / Sequoia) のみで、Monterey での CI 実行は
+  していない。Monterey 対応の実機検証は v1 land 前の PoC で 1 回実施 (以降は
+  `macos-latest` のみで維持) — 完全な Monterey CI matrix は overkill
 
 ## Security considerations
 
 - **helper 権限**: helper は secret を触らない (dialog 表示と TouchID 評価のみ)。daemon は
   ApproveResponse の `outcome == "approved"` を受けて初めて kv 値を requester へ送信
-- **helper のなりすまし**: helper socket は 0600 same-uid、helper の bundle 内 executable
-  path を daemon が起動時に固定 pin (改竄検知は codesign 自己一致で)
-- **dialog 情報の secret 混入禁止**: dialog に載せるのは metadata のみ (key 名 / requester
-  chain / guard 評価結果)。secret 値そのものは helper に一切送信しない
+- **helper 双方向 peer 認証 (承認バイパス防止)**: helper 応答は secret 送信の最終ゲート
+  なので、「同一 uid の別プロセスが先に `approver.sock` を bind して偽 helper 化する」
+  経路を厳密に塞ぐ必要がある。単純な socket 0600 + bundle path pin では不十分:
+  - **socket 名前解決を廃止**: daemon が `socketpair(2)` (or `pipe/UNIX socket 事前 listen`)
+    を作り、fd を helper spawn 時に環境変数/argv で helper に渡す。ファイル名 socket
+    での rendez-vous を回避し、preemptive bind 攻撃を根本的に不可能にする (第一の候補)
+  - **接続後の peer 検証**: それでも名前付き socket が必要な設計にする場合、connect
+    後即座に `getsockopt(LOCAL_PEERTOKEN)` で peer audit token を取得、以下 3 点を
+    照合:
+    1. peer pid が daemon の spawn した child pid と一致
+    2. peer の `pid_version` (audit_token) と `start_time` が spawn 時に記録した値と一致
+       (pid 再利用対策)
+    3. peer の `codesign` identifier が cache-warden 同一 (bundle 内 codesign
+       identity)
+  - **helper 側の逆方向 peer 検証**: helper も `getsockopt(LOCAL_PEERTOKEN)` で
+    daemon 側 peer を検証、pid == 起動時に env var/argv で受け取った parent pid、
+    codesign identifier 一致を確認。**双方向 peer 認証**が成立してから ApproveRequest
+    受付を開始する
+  - **失敗時**: helper socket 検証失敗 = daemon は fail-closed で AuthFailed、
+    stderr / syslog に警告 (同一 uid 内攻撃の兆候)
+- **dialog 情報 (metadata) の sensitive 扱い**: dialog に載せるのは metadata のみ
+  (key 名 / requester chain / guard 評価結果)。secret 値そのものは helper に一切送信
+  しない。**加えて metadata 自体も sensitive-adjacent と扱う** (codex review low-8):
+  - helper は request/response をログしない (tracing 出力なし、`os_log` 使う場合も
+    `%{public}` にしない)
+  - crash report / diagnostic dump に載らないよう `NSApp.setActivationPolicy(.accessory)`
+    や `pref: NSCrashReporterKey.disable` 相当の設定を検討 (未確認、実装時に verify)
+  - AX / screenshot 経路の露出は macOS の Screen Recording 権限依存で cache-warden
+    側から完全遮断はできないが、AX role を `AXSensitive` 相当にできる場合は設定
+  - 将来的に「表示名 alias / redaction 設定」を config で提供する経路を残す
+    (v1 では実装しない)
 - **DR-0030 との合成順序**: guard 評価 → fail なら dialog 出さずに拒否 (dialog を出す =
   「拒否理由が setter identity 由来」と間接的に漏らすため、DR-0030 §7 の「拒否理由を
   詳細に返さない」規定と整合)
@@ -690,3 +855,27 @@ daemon が graceful restart (同一 PID exec + state-holder child) するとき:
    deprecated 予告」も選択肢
 5. **二重 dialog 防止方針**: v1 の「(i) cache HIT のみ dialog」で妥当か。「(ii) op fetch
    時にも cache-warden dialog を出して 1P dialog を後ろに隠す」設計の余地
+
+## Confirmed via codex adversarial review (2026-07-10, job task-mrebtdaf-j8x4dt)
+
+codex review で「妥当な判断」と AGREED された設計要素 (kawaz レビューでの判断負荷
+軽減用):
+
+- **2 プロセス構成 (§1)**: 既存 daemon は tokio/control/authsock 中心で、B 案不採用
+  理由 (daemon 内 AppKit runloop を避ける) と整合
+- **control socket と approver socket の分離 (§4)**: 人間操作で数秒 pending する承認
+  リクエストを control/status と同じキューに載せない判断は妥当。peer 認証と readiness
+  gate 強化を反映済み (§Security / §10)
+- **guard 拒否時に dialog を出さない (Security 節)**: DR-0030 §4/§6 の
+  「拒否は fail-closed、auth/TouchID をトリガしない」「setter identity を漏らさない」
+  と整合
+- **helper 不在時に guard 付き entry を fail-closed (§9)**: 安全側で妥当。graceful
+  restart 中の transient は bounded wait 対応済み (§9 の `helper_starting` /
+  `helper_down` 区別)
+- **`LARight` / `LARightStore` を Phase 3+ に送る判断 (Phase 分割)**: v1 要件は
+  dialog/metadata/guard 表示で、macOS 13+ API へ寄せると Monterey 下限や意味論が増える
+  ため妥当
+- **`[auth].command` を即廃止せず共存 (Open Q5)**: DR-0010 が command auth を既存の
+  正式 Authenticator として扱っており、移行猶予が必要
+- **helper に secret 値を送らない (Security 節)**: 必須で妥当。metadata の sensitive
+  扱いも強化済み (Security 節 low-8 対応)
