@@ -30,10 +30,16 @@ cache-warden/
       Cargo.toml
       src/main.rs
       src/commands/           サブコマンド群
-      src/daemon/             サーバ + authsock リスナ + hardening + ハンドラ + peer
+      src/daemon/             サーバ + authsock リスナ + hardening + ハンドラ + peer + graceful restart
       src/protocol/           control socket wire プロトコル
       src/config.rs           設定読み込み
       src/defs.rs / src/namespace.rs / 他  共通定義・名前空間・補助モジュール
+    macos-tcc/                macOS TCC (FDA 許可状態) の検査ユーティリティ lib
+      Cargo.toml
+      src/lib.rs
+    macos-process-inspect/    macOS プロセス inspect lib (pid facts / ancestry / proc_uniqueid / socket peer credentials。libc のみ依存の自己完結、将来別 repo 化想定)
+      Cargo.toml
+      src/lib.rs / src/inspect.rs / src/peer.rs
   docs/
     DESIGN-ja.md / DESIGN.md  現実装の設計 (原本 = ja、英訳 = en)
     STRUCTURE.md              本ファイル
@@ -48,13 +54,16 @@ cache-warden/
 
 ## Workspace 構成の意図
 
-3 crate 構成 (DR-0002 / 移植計画 §1.1): コア lib (`cache-warden`) / authsock アダプタ lib
-(`cache-warden-authsock`) / cli バイナリ (`cache-warden-cli`)。
+主要 3 crate (DR-0002 / 移植計画 §1.1) + macOS ユーティリティ 2 crate:
 
 - `cache-warden`: コア (セキュア KV)。依存最小 (zeroize + libc) で crates.io 配布を想定。
 - `cache-warden-authsock`: SSH agent protocol アダプタ。`ssh-key` 等の重い依存をここに隔離し
   コアの依存最小ポリシーを守る (DR-0003/0004)。当面 `publish = false`。
 - `cache-warden-cli`: Homebrew 配布想定 (`publish = false`)。両 lib を結線する単一デーモン (DR-0008)。
+- `macos-tcc`: FDA (Full Disk Access) の TCC 許可検査。daemon register の誘導フローで使用。
+- `macos-process-inspect`: プロセス出自の多面 inspect (ancestry / unique id / socket peer
+  credentials)。cache-warden 非依存の自己完結 (安定後の別 repo 化を想定)。peer-identity guard
+  (draft-DR-0030) と custom TouchID dialog の共通基盤。
 
 version は workspace root の `[workspace.package].version` が正本で、各 crate は
 `version.workspace = true` で継承する。`just bump-version` が bump-semver で一括更新する。
