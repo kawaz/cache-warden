@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/cache-warden",
+    "crates/cache-warden-approver-poc",
     "crates/cache-warden-authsock",
     "crates/cache-warden-cli",
     "crates/macos-process-inspect",
