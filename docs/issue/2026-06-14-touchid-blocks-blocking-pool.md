@@ -3,7 +3,7 @@ title: TouchID 待ち中の Mutex 保持が blocking pool を直列化する (�
 status: idea
 category: bug
 created: 2026-06-14T13:05:13+09:00
-last_read:
+last_read: 2026-07-10T10:25:13+09:00
 open_entered:
 wip_entered:
 blocked_entered:
