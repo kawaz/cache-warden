@@ -110,3 +110,38 @@ retry-loop は feasible だが、「re-run register で recover (= idempotent)�
 (`docs/decisions/DR-0019-daemon-service-registration.md`) は
 register/bootstrap/bootout の全体設計を記すが、rollback trade-off 自体は
 `service.rs` のコード comment にのみ残る (DR 未反映)。
+
+## 調査結果 (2026-07-10)
+
+コードリーディング + 実機調査を追加実施。
+
+1. **help が stdout に出る経路を main.rs 全読で洗い出し**: 6 経路を列挙した。
+   `register()` の runtime 部分 (bootout/bootstrap 等) からは help を出力する
+   経路が無いことを再確認 (= 2026-07-06 時点の調査結果と整合、runtime エラーは
+   `CliError::Message` で help なし)
+
+2. **FDA 自己再起動経路の除外**: `daemon register` 内の FDA 未許可時の
+   `open --wait-apps` → `dispatch_internal` 経路は `help::*()` 系関数を一切
+   呼ばない設計であることをコード上で確認。よってこの経路は help 出力の原因から
+   原理的に除外できる
+
+3. **バージョン間差分の反証**: v0.22.3 (commit `6a170d5`) → v0.23.0 (commit
+   `af6f750`) 間で `main.rs` / `daemon_cmd.rs` / `service.rs` の diff がゼロ
+   だった。「upgrade で挙動が変わった」仮説はこの 3 ファイルに関する限り反証
+   される (= 差分がないので argv 解釈やエラーハンドリングが変化したわけではない)
+
+4. **brew cask 定義の確認**: `kawaz/homebrew-tap` の `Casks/cache-warden.rb`
+   に `postflight` / `caveats` 等の追加フックは無く、upgrade フローが
+   `cache-warden` を副次的に追加呼び出しする経路も無いことを確認
+
+5. **実機再現確認**: `cache-warden daemon register --print` は正常終了。
+   `cache-warden daemon register --bogus` は `daemon register` leaf help
+   (= top-level help ではない) を出す。つまり「正常な argv でこのプロセス
+   自身が top-level help を出す」経路は実機上も発見できなかった
+
+6. **残る仮説**: コード内在的な原因は上記で概ね反証できたため、残るのは
+   外部要因 (= 実際に打たれた argv が認識と異なっていた、または PATH 上の
+   別バイナリが呼ばれた等)。次回再現時は `which -a cache-warden` の結果と、
+   実行時の shell history の実打鍵全文をあわせて記録する
+
+status は `open` のまま (再現待ち)。
