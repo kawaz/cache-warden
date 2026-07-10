@@ -1,7 +1,8 @@
 # draft-DR-0032: リモート承認 — 静的ページ + WebRTC DataChannel + passkey
 
-- Status: Draft (kawaz 議論中。codex 敵対的レビュー 10 findings 反映済み 2026-07-10。
-  accept 前提条件 = §前提条件 の 4 項目の確定)
+- Status: Draft (kawaz 議論中。codex レビュー 2 巡反映済み 2026-07-10 = 敵対的
+  10 findings + アーキ全体評価 10 findings。accept 前提条件 = §前提条件 の 4 項目
+  + **§Alternatives の Tailscale 対抗案への裁定**)
 - Date: 2026-07-10
 - 関連: draft-DR-0031 (custom TouchID dialog、**相補関係** = ローカル承認面) /
   draft-DR-0030 (peer-identity guard、承認 dialog/ページに載せる評価結果) /
@@ -143,6 +144,10 @@ replay 対策が challenge 管理に全面依存するため、「厳格に管�
 - challenge は発行時の DataChannel セッション (= DTLS セッション) に紐付け、別
   セッションから届いた assertion は challenge が一致しても拒否する
 - 時刻は daemon 側の単調時計で管理し、クライアント申告時刻に依存しない
+- **graceful restart との相互作用** (codex 2 巡目): restart で DataChannel は切断され
+  承認セッションは失効する (handoff しない)。進行中だった承認要求の requester へは
+  タイムアウトと同じ形 (auth 失敗) で返る — 承認セッションは常に「daemon プロセスの
+  寿命以下」の存在
 
 ### 相補設計: 承認プロバイダ抽象と登録セレモニー
 
@@ -158,6 +163,42 @@ replay 対策が challenge 管理に全面依存するため、「厳格に管�
 - ポリシー層: どの操作にどの承認レベル (local-only / remote-allowed / 両方要求) を
   要求するかを per-entry / per-operation で宣言できる形を想定 (DR-0030 の
   peer-identity constraint と同じ declarative 面に載せる)
+- **guard 拒否はリモート承認のバイパス経路にならない** (codex 2 巡目): DR-0030 の
+  peer-identity guard が拒否した要求は fail-closed で終端し、ローカル dialog を
+  出さない (DR-0031 と同一規定) のと同様、**リモート承認セッションも生成しない**。
+  リモート承認が上書きできるのは「承認を要する」状態だけで、「guard により拒否」
+  状態は上書き不能
+
+### ローカル/リモート同時発火の統合仕様 (codex 2 巡目 High、提案)
+
+1 つの承認要求に対し両プロバイダが有効な場合の挙動を定義する (単一ユーザ前提):
+
+- **並行提示 + first-response-wins**: ポリシーが両方許可する要求は、ローカル dialog
+  とリモート承認セッションを**並行に**提示してよい。最初に届いた応答 (approve /
+  deny いずれも) でセッション全体が確定し、他方は即座に取り下げる (dialog dismiss /
+  challenge 消費 + DataChannel の `result` 送信)
+- 応答の競合 (ほぼ同時の approve と deny) は **daemon 到着順で確定**。到着 2 番目は
+  「セッション確定済み」として無視し、結果だけ返す (単一ユーザなので意味的競合は
+  実運用上起きない、race の決定性だけ保証する)
+- タイムアウトは承認要求全体で 1 個 (プロバイダ別に持たない)。満了で両面とも
+  取り下げ、requester へは既存の auth 失敗と同じ形で返る
+- 二重操作 (両面で生体を押してしまう) は first-wins により 2 回目が no-op になる
+  だけで害はない
+
+### 配送チャネルの失敗系 (codex 2 巡目 High、提案)
+
+DR-0031 §9 (helper_starting/helper_down) に対応する失敗系設計を配送側にも持つ:
+
+- **送信の成否を検証する**: iMessage 送信 (`osascript`) は exit code + エラー出力を
+  捕捉し、「送信できたか」を daemon が知る。失敗分類: Messages 未サインイン /
+  Automation TCC 未許可 / 送信エラー (ネットワーク等)
+- **失敗時は黙らない**: 配送失敗した承認セッションは (a) ローカル通知
+  (Notification Center / DR-0031 helper 経由) + ログ、(b) `status` に pending 承認
+  セッションと配送結果を露出、で観測可能にする。「離席中に配送が黙って失敗し、
+  requester が無期限に待つ」を作らない — 配送失敗が確定した時点で承認要求を
+  fail-fast (Unavailable) させるか保留するかはポリシー (既定: fail-fast)
+- 配送チャネルがプラガブルである以上、この成否検証と失敗分類はチャネル抽象の
+  インターフェースに含める (チャネル実装ごとの後付けにしない)
 
 ### クロスデバイス UX
 
@@ -186,10 +227,26 @@ JSON ベースのメッセージスキーマをバージョン付きで定義す
 | 不正な passkey 登録 | 登録セレモニーにローカル TouchID 必須 (macOS。Linux は Blocked、§前提条件 3) |
 | URL 漏洩 | URL = セッション単位の短寿命・単回使用シークレット。配送経路の機密性が前提条件 (§前提条件 1)。漏洩時も passkey なしでは承認不可だが、セッション先取り (DoS) と承認内容の閲覧は許す |
 | 中継の DoS / 可用性 (codex finding 9) | 機密性・完全性は落ちない (安全側)。**可用性は別軸で評価**: macOS はローカル TouchID がフォールバックになるが、**Linux/headless ではリモート承認が唯一の対話経路になりうるため CF 障害 = 承認不能**。Linux 運用では非対話フォールバック (`[auth].command` / 承認不要ポリシー) の設計が必要 |
-| メタデータ漏洩 (codex finding 9) | CF (シグナリング) / TURN provider には「いつ承認セッションが張られたか」「双方の IP」が見える (内容は見えない)。承認頻度・時間帯という行動パターンの漏洩は許容するトレードオフとして明記。許容できない場合は自前 TURN/中継に差し替え可能な構成にする |
+| メタデータ漏洩 (codex finding 9 + 2 巡目で格上げ) | CF (シグナリング) / TURN provider には「いつ承認セッションが張られたか」に加え**双方の IP アドレス** (= 自宅とスマホの所在情報) が見える。秘密管理ツールの利用パターン + 所在の第三者可視は行動パターンより重い漏洩として扱い、**自前 coturn を推奨構成として明記**する (無料枠 TURN は PoC / 導入時の既定にとどめ、config で差し替え可能)。Q5 で既定を最終決定 |
+| iMessage 履歴への URL 残留 (codex 2 巡目) | 送信 URL は Messages 履歴 (iCloud 同期 / バックアップ) に長期残留する。ただし URL 内の値 (セッション ID / fingerprint / シークレット) は**セッション失効後は全て無価値** (単回使用 + 短寿命が担保) であり、残留 URL から過去の承認内容・秘密値は復元できない。残るのは「承認機構を使っている事実」のみ = 許容 |
 
-## Alternatives (不採用方向)
+## Alternatives (不採用方向 + 要裁定の対抗案)
 
+- **【要 kawaz 裁定】メッシュ VPN 直達 (Tailscale 等) + daemon がページを直接配信**
+  (codex 2 巡目 Medium、対称評価の不足を指摘されたため対抗案として明記):
+  Tailscale 等で daemon に直接到達し、daemon 自身が承認ページを tailnet 内 HTTPS
+  (`<node>.<tailnet>.ts.net`、Tailscale が証明書を発行) で配信、WebAuthn の RP ID も
+  同ドメインにする構成。**WebRTC + シグナリング中継 + TURN + URL fragment 認証が
+  丸ごと不要になり、実装・攻撃面が大幅に縮む**。静的ページ改ざんリスク (ホスティング
+  侵害) も消える (ページは daemon 配下)。トレードオフ: (a) Tailscale という常駐
+  依存 + coordination server への信頼 (データ面は WireGuard P2P だが)、(b) 承認者
+  デバイス全部に Tailscale 常駐が必要 (iPhone/iPad は App + VPN プロファイル)、
+  (c) RP ID が tailnet 名に焼き付く (tailnet 改名 = passkey 全滅、CF ドメインと同型
+  の制約)、(d) 「静的アセット + ブラウザだけで動く」という原案の身軽さ (相手側
+  無 install) を失う。**個人 dogfood の投資対効果では本案が優位の可能性が高い**
+  (自作 WebRTC + 自作シグナリング + DataChannel 越し WebAuthn という未確認領域を
+  回避できる)。原案 (WebRTC 方式) は「承認者側に何も install させない」ことに価値を
+  置く場合に正当化される — どちらの価値を取るか kawaz 裁定
 - **完全静的 (中継ゼロ)**: answer の返送経路が無く、手動コピペ / QR 読み合いの UX に
   退化する。不採用 (ただし kawaz の拘り度次第で再考)
 - **PAKE (CPace) による SDP 認証 (WebWormhole 方式)**: Rust/JS 両側の CPace 実装が
@@ -237,8 +294,16 @@ JSON ベースのメッセージスキーマをバージョン付きで定義す
 - **Q4 (Blocker for Linux)**: Linux で登録セレモニーの「ローカル TouchID 必須」に
   相当する担保 (§前提条件 3)。候補: ローカル console 限定の確認操作 / macOS 側
   登録の信頼リスト同期
-- **Q5**: TURN プロバイダの既定 (Open Relay 無料枠 vs 自前 coturn vs Cloudflare)
+- **Q5**: TURN プロバイダの既定 (Open Relay 無料枠 vs 自前 coturn vs Cloudflare)。
+  IP メタデータ漏洩の観点で自前 coturn 推奨に傾いている (セキュリティ整理表参照)
 - **Q7**: passkey の失効・ローテーション運用 (登録一覧 / 削除 CLI)
+- **Q8** (codex 2 巡目): リモートページに表示する guard_eval / requester chain の
+  詳細度をローカル dialog と揃えるか絞るか。リモート経路はページ改ざん・メタデータ
+  観測の攻撃面が広いため、「プロセス名のみ (フルパス・pid 省略) の要約表示」に絞る
+  選択肢を実装 DR で検討
+- 複数デバイスへの URL fan-out (単一送信 vs 全デバイス送信) は **v1 スコープ外**
+  (単一配送固定)。RP ID (Q3) の確定は実装フェーズ 2 (WebAuthn セレモニー) 開始前の
+  kawaz 裁定事項として運ぶ
 
 (旧 Q6 セッション lifecycle は「v1 = 単回使用固定、長期ペアリングは別 DR」で決定済み、
 §前提条件 4)
