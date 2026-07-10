@@ -61,15 +61,15 @@ TouchID は 1Password 側が出す biometric であり、cache-warden がリモ�
 
 構成要素:
 
-1. **daemon 内蔵の承認 HTTP サーバ = 自前 TLS listener** (Q9 確定、recon 反映):
-   daemon 自身が tailnet 内 HTTPS で承認ページ (最小の静的 HTML/JS、daemon バイナリに
-   埋め込み) と承認 API を配信する。`tailscale serve` は identity header 認可という
-   別レイヤの機構で、daemon 自身が WebAuthn RP として origin 検証する設計とは自前
-   listener が整合。証明書は `tailscale cert` / LocalAPI (`/localapi/v0/cert/`) で
-   取得 (Let's Encrypt、`<node>.<tailnet>.ts.net`、90 日有効・自動更新なし) —
-   **90 日更新スケジューラ + 無停止リロードを daemon に内蔵する** (必須設計要素)。
-   macOS の非 root launchd agent から LocalAPI を叩けるかは variant 依存で未確認 =
-   **PoC gate の実機検証項目 (a)**
+1. **daemon 内蔵の承認 HTTP サーバ — TLS 終端は daemon 責務外** (Q9、kawaz 裁定
+   2026-07-10 で確定): daemon は承認ページ (最小の静的 HTML/JS、バイナリ埋め込み) と
+   承認 API を **ローカル HTTP listener** で提供し、**TLS 終端と tailnet への経路は
+   外側 (`tailscale serve` 等) に任せる。証明書管理・更新は cache-warden の実装
+   スコープに含めない** (kawaz: 「証明書の心配はしなくて良い。serve を使うなどで
+   解決できるし経路問題は別途考えておく」)。daemon 側は RP ID / expected origin を
+   config で受け取るだけにし、TLS 終端方式の変更 (serve / 自前 cert / 別プロキシ) に
+   対して不変になる。recon が示した非 root LocalAPI cert 取得の未知数・90 日更新
+   スケジューラは**この裁定でスコープごと消滅**
 2. **到達性 = tailnet 限定**: 承認エンドポイントには tailnet 参加デバイスしか到達
    できない。**tailnet ACL は承認者デバイスに専用 tag (例 `tag:cw-approver`) を付与
    し、`grants`/ACL でその tag のみが承認ポートへ到達可能と制限する** (Q10 確定)。
@@ -230,6 +230,12 @@ Decision 節に移動)
   相当する担保。候補: ローカル console 限定の確認操作 / macOS 側登録の信頼リスト同期
 - **Q7**: passkey の失効・ローテーション運用 (登録一覧 / 削除 CLI)
 - **Q8**: リモートページに表示する guard_eval / requester chain の詳細度 (実装 DR)
+- **Q12** (TLS 外出しの派生、実装 DR): ローカル HTTP listener は同一マシンの他
+  プロセスから直叩き可能 (tailnet gate の 1 段目をバイパス)。ただし承認 action は
+  passkey assertion 必須のため、直叩きで可能なのは pending 承認情報の閲覧と DoS の
+  み。緩和候補: UDS + serve の UDS proxy 対応確認 / 127.0.0.1 bind + serve からの
+  接続だけを peer 検証 (macos-process-inspect の応用) / 表示情報の詳細度を絞る (Q8
+  と同根)。重み付けと採否は実装 DR で
 - **Q11**: iOS の Tailscale VPN 未接続時の UX — VPN off だと ts.net の **DNS 解決
   自体が失敗**する (recon 確定)。承認者デバイスには VPN On-Demand「Always」設定を
   推奨し、通知文言に「開けない時は Tailscale を ON」の一文を入れる。詳細誘導は
@@ -239,13 +245,15 @@ Decision 節に移動)
 
 ## 実装フェーズ想定 (accept 後)
 
-1. **PoC gate** (実機検証 2 項目が主目的、**仮 RP ID で行い本番登録は作らない**):
-   (a) **macOS 非 root launchd agent からの LocalAPI cert 取得** — tailscaled の
-   variant (App Store / Standalone / OSS) 依存で未確認 (tailscale/tailscale#5761)。
-   `curl --unix-socket` 相当で `/localapi/v0/cert/` を試す。
+1. **PoC gate** (**仮 RP ID で行い本番登録は作らない**):
+   (a) **ローカル HTTPS での WebAuthn 疎通** — kawaz 提案の **oreore.net**
+   (localhost 用無償証明書サービス、`*.oreore.net` → 127.0.0.1 解決 + 有効証明書
+   配布、2026-07-10 実体確認済み) を使い、daemon のローカル HTTP listener + 手元
+   TLS 終端で登録/認証セレモニー・challenge lifecycle を実ドメイン secure context
+   で先に検証する (iOS 実機・tailnet 不要でイテレーション可能)。
    (b) **iOS Safari + ts.net + FaceID の WebAuthn 動作** — 一次資料が無いため実機
-   確認。iPhone 実機 (LTE、tailnet 経由) から daemon 内蔵 HTTPS listener の承認
-   ページに到達 + 登録/認証が通ること
+   確認。iPhone 実機 (LTE、tailscale serve 経由) から承認ページに到達 + 登録/認証が
+   通ること
 2. WebAuthn 登録/認証セレモニー本実装 (webauthn-rs、challenge lifecycle 仕様、
    登録のローカル TouchID 束縛 = DR-0031 helper 連携)
 3. 承認プロバイダ抽象への統合 (DR-0031 helper と同一インターフェース、同時発火
