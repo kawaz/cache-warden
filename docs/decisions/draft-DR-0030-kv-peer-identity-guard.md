@@ -6,7 +6,7 @@
   DR-0012 (key-level process access policy、config 由来) / DR-0022 (`[auth].command` = 再認証ゲート) /
   DR-0024 (Store capability、adapter 粒度) / DR-0029 (StoreSnapshot handoff、record 引き継ぎ必須の裁定) /
   crate `macos-process-inspect` (評価素材の取得 API) /
-  issue `2026-06-22-custom-touchid-dialog` (guard 評価結果の表示先、将来)
+  draft-DR-0031 (custom TouchID dialog、guard 評価結果の表示先)
 
 ## Context
 
@@ -149,8 +149,12 @@ default-require-same-user = true   # 既定 OFF で導入 (Open Q1)
 - `[auth].command` = **authentication** (人間がこの lifecycle イベントを承認したか)
 - 合成順: guard 拒否なら auth まで到達しない (④より前)。guard 通過後の
   soft/hard expiry 時は従来通り auth が走る。CommandAuthenticator のコード変更なし。
-  将来 custom-touchid-dialog が入ったら「guard 評価結果を dialog に表示」で接続する
-  (issue 記載の関連)
+- **dialog 表示との接続 (draft-DR-0031)**: guard 通過後に cache-warden の独自 dialog
+  (`CacheWardenApprover`) が出るとき、`ApproveRequest.guard_eval` フィールドに評価済み
+  constraint 一覧と setter identity summary を載せる。dialog はこれを緑チップ
+  (「Verified: same-shell, same-user」) と展開時の詳細に表示する。**guard 拒否時は
+  dialog を出さない** (拒否理由を setter 側に間接的に漏らさないため、§7 の
+  「setter identity を get 側 error に返さない」規定と整合)
 
 ### 7. set 時の記録経路
 
