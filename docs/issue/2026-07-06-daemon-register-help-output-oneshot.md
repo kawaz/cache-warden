@@ -3,7 +3,7 @@ title: daemon register 実行時に help 出力で異常終了 (一回性、2026
 status: open
 category: bug
 created: 2026-07-06T13:19:46+09:00
-last_read:
+last_read: 2026-07-10T04:49:00+09:00
 open_entered: 2026-07-06T13:19:46+09:00
 wip_entered:
 blocked_entered:
