@@ -67,7 +67,9 @@
   離席中・Linux/headless での対話的承認経路。静的承認ページ + 極小シグナリング中継
   (p2pcf 型) + URL fragment による SDP 認証 + daemon 自身が WebAuthn RP として
   assertion 検証。ローカル TouchID (draft-DR-0031) と相補構成 (passkey 登録は
-  ローカル TouchID 必須)。`docs/decisions/draft-DR-0032-remote-approval-web-passkey.md`、
+  ローカル TouchID 必須)。**Linux 対応は登録セレモニー担保 (DR-0032 Q4) が Blocker**、
+  方式自体も WebRTC 案 vs Tailscale 直達案の裁定待ち。
+  `docs/decisions/draft-DR-0032-remote-approval-web-passkey.md`、
   research 2 本 (`2026-07-10-remote-approval-signaling` / `2026-07-10-serverless-webauthn-rp`)
 - **TouchID ビルトイン**: 自前再認証 (LocalAuthentication) で soft TTL 切れ延長に使う。
   `[auth]` の `touchid`/`push` 将来枠は DR-0018 で受け皿のみ用意済み (実装なし)。
