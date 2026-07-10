@@ -44,6 +44,14 @@ TouchID は 1Password 側が出す biometric であり、cache-warden がリモ�
 あり、cold fetch は従来どおりローカル在席が必要。prefetch + pin 運用 (外出前
 ウォームアップ、DR-0018) と組み合わせて初めて離席運用が完結する。
 
+**cold path の白紙委任の緩和オプション** (kawaz 指摘 2026-07-10「1P dialog 単体では
+requester / 目的の情報をユーザに出せない」への回答): 1Password dialog の表示内容には
+介入できないが、**cold fetch 発火の直前に cache-warden 側の情報付き事前承認ステップ**
+(自前 dialog で requester chain / entry / 操作種別を提示、生体不要の approve/cancel
+でも可) を挟むことで、直後の 1P TouchID を「直前に内容確認した要求の実行確認」に
+意味付けし直せる。1 ステップ増える操作感とのトレードオフなので per-entry の opt-in
+ポリシーとし、採否・詳細は実装 DR で (DR-0031 の dialog 実装をそのまま流用できる)。
+
 ## Decision (Draft)
 
 ### アーキテクチャ概要
