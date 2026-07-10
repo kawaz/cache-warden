@@ -63,12 +63,14 @@
 
 ## 中期 (= 構想中)
 
-- **リモート承認 (静的ページ + WebRTC DataChannel + passkey)** (draft-DR-0032 議論中):
-  離席中・Linux/headless での対話的承認経路。静的承認ページ + 極小シグナリング中継
-  (p2pcf 型) + URL fragment による SDP 認証 + daemon 自身が WebAuthn RP として
-  assertion 検証。ローカル TouchID (draft-DR-0031) と相補構成 (passkey 登録は
-  ローカル TouchID 必須)。**Linux 対応は登録セレモニー担保 (DR-0032 Q4) が Blocker**、
-  方式自体も WebRTC 案 vs Tailscale 直達案の裁定待ち。
+- **リモート承認 (Tailscale 直達 + daemon 配信承認ページ + passkey)** (draft-DR-0032、
+  **方式 kawaz 裁定済み 2026-07-10**): 離席中・Linux/headless での対話的承認経路。
+  daemon が tailnet 内 HTTPS (`tailscale cert`) で承認ページ + API を自前配信、
+  daemon 自身が WebAuthn RP として assertion 検証。gate は tailnet 到達性 + passkey
+  の 2 段 (URL は secret ではない)。通知は iMessage 主経路。ローカル TouchID
+  (draft-DR-0031) と相補構成 (passkey 登録はローカル TouchID 必須)。**Linux 対応は
+  登録セレモニー担保 (DR-0032 Q4) が Blocker**。Tailscale 固有詳細 (cert / RP ID /
+  ACL) の recon 反映後に accept 判断。
   `docs/decisions/draft-DR-0032-remote-approval-web-passkey.md`、
   research 2 本 (`2026-07-10-remote-approval-signaling` / `2026-07-10-serverless-webauthn-rp`)
 - **TouchID ビルトイン**: 自前再認証 (LocalAuthentication) で soft TTL 切れ延長に使う。

@@ -4,7 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
-| 2026-07-10 | design | idea | [remote-approval-web-passkey](./2026-07-10-remote-approval-web-passkey.md) | 静的ページ + WebRTC DataChannel + passkey によるリモート承認。daemon とピアリングし形式化メッセージで承認対象を… |
+| 2026-07-10 | design | idea | [remote-approval-web-passkey](./2026-07-10-remote-approval-web-passkey.md) | Tailscale 直達 + WebAuthn passkey によるリモート承認 (kawaz 裁定 2026-07-10 で確定)。daemon が tailnet 内 HTTPS で承認ページ… |
 | 2026-06-14 | idea | idea | [ssh-agent-provider-architecture](./2026-06-14-ssh-agent-provider-architecture.md) | 現状の authsock アダプタは **「中継役（relay）」前提**の名残: |
 | 2026-06-14 | bug | idea | [touchid-blocks-blocking-pool](./2026-06-14-touchid-blocks-blocking-pool.md) | SIGN_REQUEST 処理は `spawn_blocking` で blocking pool に乗せ、その中で **`store` の `std::sy… |
 | 2026-07-09 | design | idea | [linux-graceful-restart-fexecve-verification](./2026-07-09-linux-graceful-restart-fexecve-verification.md) | graceful restart の Linux 対応 (fexecve + 末尾追記署名 L1 / fs-verity L2)。DR-0029 は macOS 先行、L2 は当面着手しない… |
