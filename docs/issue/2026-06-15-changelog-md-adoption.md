@@ -3,7 +3,7 @@ title: CHANGELOG.md 採用検討 (= リリースノート / breaking change 履�
 status: pending-sublimation
 category: design
 created: 2026-06-15T12:00:00+09:00
-last_read:
+last_read: 2026-07-10T16:18:58+09:00
 open_entered: 2026-06-15T12:00:00+09:00
 wip_entered:
 blocked_entered:
