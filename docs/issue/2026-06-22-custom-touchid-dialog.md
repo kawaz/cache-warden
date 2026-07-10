@@ -60,6 +60,16 @@ cache-warden 独自の TouchID 認証 dialog を実装し、**要求元プロセ
 - TCC ベースの 1Password dialog と並走するか / 置換するか (= 二重 dialog 防止)
 - 詳細表示で見せる項目の取捨選択 (= プライバシー / 情報過多のバランス)
 
+## 調査結果 (2026-07-10)
+
+実現手段調査を `docs/research/2026-07-10-touchid-dialog-ui-options.md` に保存 (commit wvsslwzk)。要点:
+
+1. `LAContext.evaluatePolicy` の TouchID シートは `localizedReason` 1 行しかカスタムできない。プロセスツリー等のリッチ表示は「自前 window → その上で `evaluatePolicy`」の 2 段構成が必須
+2. 受け入れ条件を満たすのは Swift/AppKit helper を `.app` 同梱して spawn + JSON IPC する案 (C 案) のみ。ただし secretive 方式 (`localizedReason` に要約 1 行、`objc2-local-authentication` crate で Rust 完結) を中間段 (A 案) として先行実装する価値がある
+3. daemon プロセス内 AppKit 直叩き (B 案) は tokio とのメインスレッド争奪で不採用推奨
+
+TODO の「Swift / AppKit 依存の方針決定」は kawaz 判断待ち: A 先行 → C 本命の段階案を提案する。
+
 ## 関連
 
 - 前提だった 2026-06-22-crate-macos-process-inspect は resolved (crate land 済み)、unblock
