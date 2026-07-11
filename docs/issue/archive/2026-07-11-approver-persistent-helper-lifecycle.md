@@ -1,6 +1,6 @@
 ---
 title: approver helper の常駐化 (accept ループ) + IPC 残課題の Phase 1.5 統合設計
-status: open
+status: resolved
 category: design
 created: 2026-07-11T21:24:28+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-12T03:19:29+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0031", "implemented", "journal/2026-07-12-phase-1-6-block-1-persistent-helper"]
 blocked_by:
 origin: 自リポ TODO
 ---
