@@ -761,25 +761,42 @@ readiness を control socket serve 開始条件に組み込む** (codex review h
 - **helper 権限**: helper は secret を触らない (dialog 表示と TouchID 評価のみ)。daemon は
   ApproveResponse の `outcome == "approved"` を受けて初めて kv 値を requester へ送信
 - **helper 双方向 peer 認証 (承認バイパス防止)**: helper 応答は secret 送信の最終ゲート
-  なので、「同一 uid の別プロセスが先に `approver.sock` を bind して偽 helper 化する」
-  経路を厳密に塞ぐ必要がある。単純な socket 0600 + bundle path pin では不十分:
-  - **socket 名前解決を廃止**: daemon が `socketpair(2)` (or `pipe/UNIX socket 事前 listen`)
-    を作り、fd を helper spawn 時に環境変数/argv で helper に渡す。ファイル名 socket
-    での rendez-vous を回避し、preemptive bind 攻撃を根本的に不可能にする (第一の候補)
-  - **接続後の peer 検証**: それでも名前付き socket が必要な設計にする場合、connect
-    後即座に `getsockopt(LOCAL_PEERTOKEN)` で peer audit token を取得、以下 3 点を
-    照合:
-    1. peer pid が daemon の spawn した child pid と一致
-    2. peer の `pid_version` (audit_token) と `start_time` が spawn 時に記録した値と一致
-       (pid 再利用対策)
-    3. peer の `codesign` identifier が cache-warden 同一 (bundle 内 codesign
-       identity)
-  - **helper 側の逆方向 peer 検証**: helper も `getsockopt(LOCAL_PEERTOKEN)` で
-    daemon 側 peer を検証、pid == 起動時に env var/argv で受け取った parent pid、
-    codesign identifier 一致を確認。**双方向 peer 認証**が成立してから ApproveRequest
-    受付を開始する
-  - **失敗時**: helper socket 検証失敗 = daemon は fail-closed で AuthFailed、
-    stderr / syslog に警告 (同一 uid 内攻撃の兆候)
+  なので、「同一 uid の別プロセスが偽 helper / 偽 daemon として rendez-vous に割り込む」
+  経路を厳密に塞ぐ必要がある。単純な socket 0600 + bundle path pin では不十分。
+  **採用【2026-07-12 kawaz 裁定】: code signature identity の相互検証**。daemon と
+  helper が接続直後にお互いの peer プロセスの code signature を検証し、**自分と同じ
+  signing identity で署名されているか**を確認する:
+  - **検証手順 (両側対称)**: 接続 fd から `getsockopt(LOCAL_PEERTOKEN)` で peer
+    audit token を取得 → `SecCodeCopyGuestWithAttributes(kSecGuestAttributeAudit)`
+    で**生きているプロセスの** SecCode を取得 → 自分自身
+    (`SecCodeCopySelf` + `SecCodeCopySigningInformation`) の Team ID から組んだ
+    designated requirement (`anchor apple generic` + Team ID 一致 + identifier
+    prefix `com.github.kawaz.cache-warden`) を `SecCodeCheckValidity` に食わせる。
+    双方向の検証が成立してから ApproveRequest の送受信を開始する
+  - **比較の定式化**: 「署名バイト列 / CDHash の一致」ではない (daemon と helper は
+    別バイナリなので CDHash は必ず異なる)。「**同じ signing identity (Team ID) で
+    署名された cache-warden ファミリのバイナリか**」を requirement で表現する
+  - **この方式を採る理由 (spawn 時 pid/start_time 記録照合を捨てる理由)**:
+    (a) spawn 時の pid / pid_version / start_time の簿記が不要 (stateless)、
+    graceful restart (DR-0029) で spawn 時記録が失われる問題も消える。
+    (b) audit token 経由の SecCode 取得は生きた接続の peer に対する評価なので
+    pid 再利用の TOCTOU が構造的に発生しない。
+    (c) 検証条件が両側対称で、偽 helper (daemon の listener に先回り connect) と
+    偽 daemon (偽 socket に helper を誘導) の両方を同じ 1 つの検証で塞げる。
+    socketpair fd 継承 (旧第一候補) は rendez-vous 自体を消せるが、fd を受け取った
+    先のプロセスが本物かの検証は別途必要で、署名検証を入れるなら名前付き socket
+    のままで足りる (= 設計の簡素化)
+  - **前段フィルタ**: 署名検証 (SecCode 評価) の前に audit token の euid 一致を
+    確認して別 uid からの接続を安く弾く (`macos-process-inspect::peer_audit_token`)
+  - **失敗時**: 検証失敗 = daemon は fail-closed で AuthFailed、helper は
+    request を読まず exit。stderr / syslog に警告 (同一 uid 内攻撃の兆候)
+  - **dev build も実 identity で署名する【2026-07-12 kawaz 裁定】**: ad-hoc 署名は
+    identity を持たず「同じ identity か」の検証が成立しないが、ad-hoc 用の
+    フォールバック検証経路は**作らない** (検証経路の分岐は攻撃面になる)。代わりに
+    dev build も release と同じ Developer ID Application 証明書 (ローカル keychain
+    に存在) で署名する。`just approver-run` 等の dev 実行 task に codesign step を
+    組み込む。notarization は dev では不要 (Gatekeeper は quarantine されていない
+    ローカルビルドを検査しない)
 - **dialog 情報 (metadata) の sensitive 扱い**: dialog に載せるのは metadata のみ
   (key 名 / requester chain / guard 評価結果)。secret 値そのものは helper に一切送信
   しない。**加えて metadata 自体も sensitive-adjacent と扱う** (codex review low-8):
@@ -1177,6 +1194,55 @@ request_approval)。guard・handler 統合は Phase 1.5。
   (docs/issue/2026-07-11-approver-persistent-helper-lifecycle.md)
 - 双方向 peer 認証 (`LOCAL_PEERTOKEN`)、socket file の graceful shutdown 時 cleanup、
   Cancel/Approved 以外の outcome 生成 (peer_gone / helper 側 timeout) も Phase 1.5+
+
+### Phase 1.5 実装記録 (2026-07-12)
+
+§Security の「code signature identity の相互検証」(2026-07-12 裁定) を land。
+
+#### 実装の所在と定式化
+
+- **`macos-process-inspect::codesign` 新設** (policy を持たない data + 検証プリミティブ、
+  prefix は引数で受ける): `self_identity()` / `peer_identity(fd)` / `verify_peer(fd, prefix)`。
+  検証順序は cheapest-first: self 署名情報 (Team 無し = `SelfUnsigned` で fail-closed) →
+  peer audit token → euid 一致 → `SecCodeCopyGuestWithAttributes(kSecGuestAttributeAudit)` →
+  `SecCodeCheckValidity(anchor apple generic and certificate leaf[subject.OU] = "<self_team>")` →
+  Team ID 再確認 → identifier prefix
+- **identifier prefix は requirement 言語でなく Rust 側で照合**: Code Signing Requirement
+  Language の wildcard 一致はリテラル形式・エスケープ規則の一次資料が薄く、安全側に
+  倒して requirement は anchor + Team ID までとし、prefix は
+  `kSecCodeInfoIdentifier` の `starts_with` で検査
+- **FFI は security-framework 3.x を採用** (SecCode / GuestAttributes / SecRequirement を
+  カバー)。`SecCodeCopySigningInformation` + info dict key 3 symbol のみ raw FFI
+  (DR-0029 graceful_restart の codesign FFI と同型)
+- **identifier prefix の正本は `cache_warden_approver::CACHE_WARDEN_IDENTIFIER_PREFIX`**
+  (wire schema と同じ crate に置き、daemon / helper の解釈 drift を防ぐ)。実バイナリの
+  実測: daemon = `com.github.kawaz.cache-warden`、helper = `com.github.kawaz.cache-warden.approver`、
+  Team = 3QMEVK549R — prefix `com.github.kawaz.cache-warden` が両方を包含
+- **audit token 経由の SecCode 取得は生きた接続の peer に束縛される**ため、pid 再利用の
+  TOCTOU は構造的に発生しない (§Security の設計意図どおり)
+
+#### セキュリティレビュー (opus47 敵対的レビュー) 反映
+
+- **検証バイパス経路の封鎖 (H-1)**: 検証なしの accept + exchange (テスト専用) は
+  `#[cfg(test)]` + private に閉じ、production の accept 経路は `request_approval`
+  (accept → verify → exchange) のみがコンパイルされる。「bypass フラグ」を API に
+  生やさない方針を visibility で強制
+- **同一 uid DoS 耐性 (M-2)**: `accept_verified` は検証失敗した peer を EOF で落として
+  **accept を継続**する (1-shot だと impostor の先回り connect 1 発で正当 helper の
+  承認経路を潰せる)。ループは無限だが呼び出し側の exchange 全体 timeout が bound。
+  この意味論は `accept_verified_keeps_waiting_after_rejecting_a_peer` で pin
+- **helper 側 request read の bound (M-1)**: 検証通過後の request read に 30s の
+  read timeout (正当 daemon が accept 後に write せず死んだ場合の無期限 hang 防止)
+- 持ち越し (issue `2026-07-12-approver-release-hardening.md`): standalone mode の
+  release 無効化 (TouchID 疲れ攻撃面)、evaluatePolicy completion block の main-thread
+  明示 dispatch、攻撃兆候警告ログの規約統一、`kSecCSStrictValidate` 検討
+
+#### 正常系 e2e の残り
+
+`verify_peer` の正常系 (両側 Developer ID 署名) は ad-hoc な cargo test バイナリでは
+検証不能 (`#[ignore]` の手動テストに手順を記載)。実機 e2e は Phase 1.6 (guard/handler
+統合) の TouchID 実機検証とまとめて実施する。dev 実行経路は `just approver-run` が
+Developer ID 署名を組み込み済み (justfile、ad-hoc フォールバックなし)。
 
 ## Confirmed via codex adversarial review (2026-07-10, job task-mrebtdaf-j8x4dt)
 
