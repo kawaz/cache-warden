@@ -1135,6 +1135,49 @@ Phase 1.1〜1.2 では `NSRect { origin: (0, 0), size: 400x325 }` で init し�
 - `run()` = `window.center()` で位置決め → `makeKeyAndOrderFront` → observer 登録 (token を `_focus_observer` にバインド保持) → `evaluate` → `app.run()`
 - Cargo.toml: objc2-foundation に `NSNotification` / `NSOperation` / `block2` feature 追加
 
+### Phase 1.4 実装記録 (2026-07-11)
+
+IPC (unix socket + JSON Lines) を land。wire schema は §4 の draft を
+`crates/cache-warden-approver/src/wire.rs` (approver crate の lib target) に実装し、
+daemon 側 (`cache-warden-cli`) が型を共有する。socket lifecycle は
+`crates/cache-warden-cli/src/daemon/approver.rs` (bind / spawn_helper / exchange /
+request_approval)。guard・handler 統合は Phase 1.5。
+
+#### §4 draft からの確定差分
+
+- **転送方向は daemon が bind + accept、helper が connect** (§4 本文の「helper が
+  `approver.sock` をリスン」を supersede)。理由: (a) 最終形の socketpair fd 継承
+  (= channel を spawn 側が所有する形) に構造が収束する、(b) socket file の生成・
+  stale 検知・権限 (0600) の責務が daemon 側 (control.sock と同じパターン) に揃う、
+  (c) helper 起動前に rendezvous point が確実に存在し、connect 失敗 = daemon 不在
+  と単純化できる
+- **`v: u32` (protocol version, `WIRE_VERSION = 1`) を Request/Response 両方に追加**。
+  受信側は両側とも不一致を reject する (helper: dialog を出さず fail-fast exit /
+  daemon: `InvalidData`)。将来の breaking wire change を v1 意味論で半端に解釈
+  しないため
+- **`request_id` は uuid でなく opaque String** (daemon が pid + monotonic nanos 等で
+  採番。uuid crate を wire のためだけに追加しない)
+- **timeout は exchange 全体 (accept + send + recv) を bound する**。response 受信
+  だけに掛けると、connect 前に死んだ helper で `accept()` が無期限ハングする
+  (この層では timeout が daemon 唯一の liveness signal)
+
+#### helper 側の fail-fast 規約
+
+`--socket` が明示されているのに connect / request read が失敗した場合、helper は
+**dialog を出さずに exit(1)** する。standalone 表示に落とすと「承認対象を表示しない
+偽 dialog で TouchID を求め、承認しても daemon は timeout で fail-closed する」UX
+矛盾を生むため。standalone 表示 (hardcoded サマリ) は socket 指定なしの dev 単独
+起動 (`just approver-run`) 専用。
+
+#### Phase 1.4 時点の形と Phase 1.5 への持ち越し
+
+- 現実装の `request_approval` は「1 request = 1 bind + 1 spawn」の形。§3 採用案 (b)
+  の常駐 helper (daemon 起動時 1 回 spawn + accept ループで N request) への組み替えは
+  guard/handler 統合と同時に Phase 1.5 で設計する
+  (docs/issue/2026-07-11-approver-persistent-helper-lifecycle.md)
+- 双方向 peer 認証 (`LOCAL_PEERTOKEN`)、socket file の graceful shutdown 時 cleanup、
+  Cancel/Approved 以外の outcome 生成 (peer_gone / helper 側 timeout) も Phase 1.5+
+
 ## Confirmed via codex adversarial review (2026-07-10, job task-mrebtdaf-j8x4dt)
 
 codex review で「妥当な判断」と AGREED された設計要素 (kawaz レビューでの判断負荷
