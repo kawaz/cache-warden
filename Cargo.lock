@@ -95,6 +95,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cache-warden-approver"
+version = "0.25.0"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "objc2-local-authentication-embedded-ui",
+]
+
+[[package]]
 name = "cache-warden-approver-poc"
 version = "0.25.0"
 dependencies = [

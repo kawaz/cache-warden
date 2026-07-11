@@ -1,0 +1,34 @@
+[package]
+name = "cache-warden-approver"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "cache-warden の常駐 GUI helper (custom TouchID 承認 dialog)。draft-DR-0031 案 A (Rust + objc2 統一) の本実装。daemon (cache-warden) と unix socket で ApproveRequest/Response を交換し、LAAuthenticationView 埋め込みの独自 dialog で承認を取る。"
+
+[[bin]]
+name = "cache-warden-approver"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSError",
+    "NSGeometry",
+    "NSObject",
+    "NSString",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSButton",
+    "NSControl",
+    "NSResponder",
+    "NSStackView",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+] }
+objc2-local-authentication = { version = "0.3", features = ["LAContext"] }
+objc2-local-authentication-embedded-ui = { version = "0.3", features = [
+    "LAAuthenticationView",
+] }
