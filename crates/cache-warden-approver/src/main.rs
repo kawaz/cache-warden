@@ -29,15 +29,20 @@
 #[cfg(target_os = "macos")]
 mod approver {
     use block2::RcBlock;
+    use std::ptr::NonNull;
+
     use objc2::rc::Retained;
-    use objc2::runtime::Bool;
+    use objc2::runtime::{Bool, NSObjectProtocol, ProtocolObject};
     use objc2::{MainThreadMarker, MainThreadOnly, sel};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSControlSize,
-        NSFloatingWindowLevel, NSStackView, NSStackViewDistribution, NSTextField,
-        NSUserInterfaceLayoutOrientation, NSWindow, NSWindowStyleMask,
+        NSApplication, NSApplicationActivationPolicy, NSApplicationDidFinishLaunchingNotification,
+        NSBackingStoreType, NSButton, NSControlSize, NSFloatingWindowLevel, NSStackView,
+        NSStackViewDistribution, NSTextField, NSUserInterfaceLayoutOrientation, NSWindow,
+        NSWindowStyleMask,
     };
-    use objc2_foundation::{NSError, NSPoint, NSRect, NSSize, NSString};
+    use objc2_foundation::{
+        NSError, NSNotification, NSNotificationCenter, NSPoint, NSRect, NSSize, NSString,
+    };
     use objc2_local_authentication::{LAContext, LAPolicy};
     use objc2_local_authentication_embedded_ui::LAAuthenticationView;
 
@@ -170,30 +175,80 @@ mod approver {
 
     /// draft-DR-0031 §UX policy: focus 制御の default steal を実装する。
     ///
-    /// PoC ver.2 で判明した実機観察:
+    /// 実機観察 (Phase 1.1〜1.2):
     /// - `.Accessory` activation policy + `activateIgnoringOtherApps(true)` では
-    ///   フォーカスを奪えず、focus 無しでは指紋 sensor input も受け付けられない
+    ///   フォーカスを奪えず、focus 無しでは指紋 sensor input も app に配送されない
     ///   (Apple safety design 推定)
     ///
-    /// この関数は `.Regular` activation policy を前提に、fokus 奪取のための追加処理を
-    /// 順に呼ぶ:
-    /// 1. `NSApplication::activate` (macOS 14+ の新 API) と旧 `activateIgnoringOtherApps`
-    ///    (deprecated だが macOS 12 で必要) を併用
-    /// 2. `window.orderFrontRegardless()` で ordering を強制
-    /// 3. `window.makeKey()` で key window 化を明示
-    fn steal_focus(app: &NSApplication, window: &NSWindow) {
-        // 順序: orderFront → activate → makeKey で「見える → active → focused」の
-        // 状態遷移を明示。macOS のバージョン依存挙動は Phase 1.1 の実機確認で
-        // 詳細を詰める。
+    /// Phase 1.3 試験 (d): LaunchServices 経由の activation。自分の `.app`
+    /// バンドルパスに対して `/usr/bin/open` を spawn し、LaunchServices に
+    /// 「既に走っている app の再 open = activate」をさせる。
+    ///
+    /// Design rationale: ユーザ操作起点でない self-activation はプロセス内の
+    /// どの API 経路でも macOS に拒否された (実機観察、macOS 26):
+    /// - (a) `NSRunningApplication.currentApplication().activateWithOptions:` →
+    ///   戻り値 false (request 送信自体が拒否)
+    /// - (b) `NSApplication::activate()` (macOS 14+ cooperative activation) →
+    ///   frontmost の yield 無しでは不成立
+    /// - (c-1) runtime `setActivationPolicy(.Regular)` + activate → Dock Icon は
+    ///   出るが activation は不成立
+    /// - (c-2) Carbon `TransformProcessType(kProcessTransformToForegroundApplication)`
+    ///   → OSStatus 0 (成功) でも activation は不成立
+    ///
+    /// `open` は LaunchServices (システム側プロセス) が activation を実行するため、
+    /// self-activation 制限の対象外 (実機で focus 奪取成立を確認済み)。
+    ///
+    /// 発火タイミングはイベント駆動: `NSApplicationDidFinishLaunching` 通知 (= run
+    /// loop 開始 + launch 完了後) を待ってから spawn する。起動直後に spawn すると
+    /// LaunchServices 側の activation が window 表示より先に届いた場合に focus
+    /// されない競合があるため、sleep でなく通知で順序を保証する。
+    fn steal_focus(window: &NSWindow) {
         window.orderFrontRegardless();
-
-        // macOS 14+ (Sonoma) では非 deprecated な `activate` を使うが、objc2-app-kit
-        // 0.3 系の bindings では `activate` の可用性が要確認 (unsafe 相当)。
-        // Phase 1.1 は deprecated 経路の `activateIgnoringOtherApps(true)` を残す。
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(true);
-
         window.makeKeyWindow();
+
+        // current_exe = <bundle>/Contents/MacOS/cache-warden-approver → 3 つ上が
+        // .app バンドル。バンドル外 (直接バイナリ起動) では focus steal を諦める
+        // (Phase 1.2 以降 `.app` 化が正規起動経路)。
+        let bundle = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.ancestors().nth(3).map(std::path::Path::to_path_buf))
+            .filter(|p| p.extension().is_some_and(|ext| ext == "app"));
+        match bundle {
+            Some(bundle) => {
+                let spawned = std::process::Command::new("/usr/bin/open")
+                    .arg(&bundle)
+                    .spawn();
+                eprintln!(
+                    "steal_focus: open {} -> spawn = {}",
+                    bundle.display(),
+                    spawned.is_ok()
+                );
+            }
+            None => eprintln!("steal_focus: not in .app bundle, skip open-based activation"),
+        }
+    }
+
+    /// `NSApplicationDidFinishLaunching` で `steal_focus` を発火する observer を
+    /// 登録する。戻り値の observer token は `app.run()` の間 (= プロセス生存中)
+    /// 保持しておく必要がある (drop すると解除)。
+    fn register_focus_steal_on_launch(
+        window: &Retained<NSWindow>,
+    ) -> Retained<ProtocolObject<dyn NSObjectProtocol>> {
+        let window = Retained::clone(window);
+        let block = RcBlock::new(move |_notif: NonNull<NSNotification>| {
+            steal_focus(&window);
+        });
+        let center = NSNotificationCenter::defaultCenter();
+        unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSApplicationDidFinishLaunchingNotification),
+                None,
+                // queue = None: 通知を post したスレッド (= main thread) で block を
+                // 実行する。AppKit 操作 (orderFront 等) は main thread 前提。
+                None,
+                &block,
+            )
+        }
     }
 
     pub fn run() {
@@ -203,11 +258,18 @@ mod approver {
         let ctx: Retained<LAContext> = unsafe { LAContext::new() };
         let (stack, _auth_view, _cancel) = build_content(mtm, &app, &ctx);
         window.setContentView(Some(&stack));
+        // `mainScreen` は「現在キーウィンドウを持つ画面」を返す (Apple 用語の罠だが、
+        // Accessory app の起動時点では他アプリがフォーカスを持っているため、その
+        // アプリのある画面 = ユーザが直前に操作していた画面 の中央に置かれる)。
+        // マルチモニタ環境で「フォーカスを持つアプリのモニタ中央」に配置する要求
+        // (kawaz、Phase 1.3) に対応する。
+        window.center();
         window.makeKeyAndOrderFront(None);
 
-        // draft-DR-0031 §UX policy: default focus_steal = true。Phase 1.1 では
-        // config を導入せず常に steal する。Phase 1.2 で config parse + opt-out 実装。
-        steal_focus(&app, &window);
+        // draft-DR-0031 §UX policy: default focus_steal = true。現状 config を
+        // 導入せず常に steal する (config parse + opt-out は後続 Phase)。
+        // observer token は app.run() の間 drop しないよう保持する。
+        let _focus_observer = register_focus_steal_on_launch(&window);
 
         let reason = NSString::from_str("Authenticate to access secret");
         evaluate(&app, &ctx, &reason);
