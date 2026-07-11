@@ -200,3 +200,128 @@ guard を宣言できるのは v1 では `kv set` (Static 値) のみ: definitio
 3. **get 拒否時の将来 UX**: custom-touchid-dialog 実装後、「拒否の代わりに人間承認へ
    エスカレーション」経路を作るか。本 DR では作らない (拒否は静かに拒否) とし、
    dialog 側 DR で再訪
+
+## Block 2 実装記録 (2026-07-12)
+
+commit `e9f417d3` (opus47 実装 → sonnet5-low 検証 + Fable セキュリティレビュー並列 →
+修正 → 確認レビュー)。§Decision の core / snapshot / evaluator / CLI surface を実装、
+handler 統合 (§4 の評価点への挿入) と config `[kv.policy]` は次ブロックに残す。
+
+### 実装スコープ
+
+- **core** (`crates/cache-warden/src/guard.rs`): `GuardRecord { constraints:
+  Vec<GuardConstraint>, setter: GuardSetter }` を plain data として新設。
+  `GuardConstraint` は `SameUser` / `SameAncestor { declared: DeclaredAncestor,
+  pinned: PinnedProcess }` / `Command { name }` の 3 種 (§1 の v1 スコープ通り)。
+  `same-shell` は `DeclaredAncestor::SameShell` タグとして `SameAncestor` に集約し、
+  評価規則を分けない (§1 の設計通り)。`Store` に第 4 マップ `access_guards` を追加し、
+  `set_guard` / `clear_guard` / `guard_of` を新設。`del` / `undefine` / `regenerate`
+  の各経路で対応する guard を掃除する (record が entry と乖離した orphan を防ぐ)
+- **snapshot** (`crates/cache-warden/src/snapshot.rs`): `SnapshotGuard` を追加、
+  §3 のダウングレード規定通り **guard を 1 件でも含む export のみ FORMAT_VERSION を
+  +1** する動的選択 (`from_entries` が guard の有無を見て version を決める)。
+  pin の `start_time` は ms 精度で切り捨てず **μs 精度** (`start_time_us`) で記録。
+  orphan / definition-only / hard-expired の husk (値を持たない残骸 entry) が guard を
+  抱えている場合の prune もこの回で実装
+- **evaluator** (`crates/cache-warden-cli/src/daemon/guard.rs`、新設): 純関数
+  `evaluate(getter_chain, getter_audit_token, record) -> Result<GuardEvalOutput,
+  GuardDenied>` (副作用なし、daemon state に触れない。`GuardEvalOutput` は
+  DR-0031 §4 の `GuardEval` wire に詰める素材、`GuardDenied` は落ちた constraint
+  種別のみ保持し setter identity を含めない — §4 の漏洩防止規定)。制約は AND 合成、fail-closed が全経路のデフォルト
+  (評価不能 = 拒否)。実体 pin の照合は **unique_id が両側にあれば unique_id、
+  片側のみ (または unique_id 自体が取得不能) なら start_time、両方 `None` なら
+  deny** の優先順位 (§Security considerations の「pid 再利用」規定を unique_id
+  優先に強化)
+- **CLI / wire**: `--require-same-user` / `--require-same-shell` /
+  `--require-same-ancestor=<NAME>` / `--require-command=<NAME>` の 4 flags を
+  `kv set` に追加、`Request::KvSet` に `guard_constraints: Vec<GuardConstraintWire>`
+  を追加 (宣言のみを運ぶ wire 型。実体 pin と setter identity snapshot は daemon が
+  接続 peer から構築する — CLI クライアントは pin する対象を「名前」でしか言えず、
+  実際にどのプロセスが実体として pin されるかは daemon 側の観測結果)。help と
+  completion (`completions/_cache-warden`) を同期
+
+### 意図的に保留した範囲
+
+`handle_set` への `set_guard` 呼び出し統合、`handle_get` への evaluator 挿入 (§4 の
+評価順序④の前)、config `[kv.policy] default-require-same-user` (Open Q1) は本ブロック
+未着手。**Open Q1 の既定値裁定を待つため、handler 統合と config は次ブロックへ意図的に
+切り離した**。ただし「未統合のまま黙って `guard_constraints` を捨てる」ことは
+constraint 宣言が無視される unsafe な状態を作るため、`handle_set` は
+`guard_constraints` が非空の `kv set` を **`BadRequest` で明示拒否**する (`handler.rs`
+の `handle_set` 冒頭、reserved namespace gate の直後)。この分岐は統合 land 時に
+1 行 diff で消える設計 (コード内コメントに明記済み)。
+
+### 主要設計判断
+
+- **same-shell の集約**: `same-shell` を独立 constraint 種として core に持たず、
+  `SameAncestor` に `DeclaredAncestor::SameShell` タグを乗せる形に集約した。評価規則
+  (「pin された実体が getter chain に居るか」) が `same-ancestor=<NAME>` と完全に
+  同一なため、タグは表示 (`kv list` / 将来の dialog) だけの分岐点として core に持たせる
+- **core 非解釈原則の維持**: `Store::set` は guard を一切触らない。guard の
+  set/clear は CLI 層が `set_guard` / `clear_guard` を明示的に呼び分ける (DR-0004 /
+  DR-0022 backoff と同じ「core は data、判断は adapter」の分離)
+- **実体 pin の照合優先順位**: unique_id 両側あり → unique_id 一致、片側のみ →
+  start_time 一致、両方 `None` → **deny** (fail-closed。従来案の「name-only に
+  縮退」は §Security considerations の pid 再利用規定に反する縮退だったため、
+  レビューで deny に強化)
+- **unknown wire kind の扱い**: wire 上の未知 constraint kind は deserialize
+  エラーとして拒否する。silently drop すると「宣言した制約の一部が消えたまま
+  set が成功する」unsafe 方向の縮退になるため、fail-loud を選ぶ
+
+### セキュリティレビュー (Fable 全方位) と反映
+
+sonnet5-low の fresh 検証と並行して Fable によるセキュリティレビューを実施、指摘 7 件
+(HIGH 3 / MEDIUM 1 / LOW 3) を反映:
+
+- **HIGH-1 (silent no-op 窓)**: 上記「意図的に保留した範囲」の fail-closed bounce
+  として反映。統合前に guard 付き set が「宣言通り保護されている」と誤信される窓を塞ぐ
+- **HIGH-2 ((None, None) fallback が fail-closed 規定違反)**: 実体 pin 照合で
+  unique_id / start_time が両方取得不能な場合、旧実装は name-only 比較に縮退していた。
+  これは DR 本文の fail-closed 原則 (§Security considerations) に反するため deny に
+  修正
+- **HIGH-3 (snapshot ms 切り捨てで restart 後 pin 照合全滅)**: `start_time` を ms
+  精度で保存すると、restart 直後に pin 対象プロセスの実際の start_time (μs 精度)
+  との比較が丸め誤差で不一致になり得る。wire v2 を新設する本ブロックが精度を
+  上げる唯一安いタイミングだったため μs 化 (`start_time_us`) で反映
+- **MEDIUM-4 (guard lifecycle 3 点)**: (a) regenerate 経路の guard 掃除漏れ、
+  (b) export への同梱条件を `value.is_some()` に統一 (値を持たない husk の guard を
+  export に含めない)、(c) guard 実質不使用時の無意味な FORMAT_VERSION bump の抑止
+  (= §3 のダウングレード規定通り、guard ゼロなら旧 version のまま)
+- **LOW-5/6/7**: (5) `--require-same-ancestor NAME` の space 形式が後続 flag を
+  NAME として飲む → `--` 始まりの NAME を parse error に (`=NAME` inline 形式は
+  escape hatch として許容)。(6) snapshot `UnsupportedVersion` の Display を
+  `{min}..={max}` の範囲表示に。(7) 重複 constraint 宣言を parse 時に先着順
+  dedup (同 kind + 同 NAME のみ collapse)
+
+修正確認レビューで 7 件全て FIXED、`cargo test --workspace` 1210 tests green
+(unit のみ、TouchID 実機 e2e は範囲外)。
+
+### DR-0031 §4 との齟齬メモ (Block 3 で処理予定)
+
+draft-DR-0031 §4 の `ApproveRequest.guard_eval` wire schema (`strength: "strong" |
+"weak"` の 2 値ラベル、`setter_pinned` 単数フィールド) と、本ブロックで固めた
+core/evaluator の型との間に 3 点の未解決な齟齬がある:
+
+1. **strength の 2 値ラベル**: `same-user` 単独は §1b の脅威モデル表が示す通り
+   「既定防御の再宣言」に近く、2 値 (strong/weak) では単独 same-user の弱さを
+   表現しきれない。dialog 表示側の裁量に委ねるか、ラベルを増やすかは Block 3 で判断
+2. **`setter_pinned` の単数性**: 複数の `same-ancestor` 系制約を同時宣言した場合
+   (例: `--require-same-shell` + `--require-same-ancestor=code`)、pin される実体は
+   複数になり得るが、wire の `setter_pinned` は単数フィールド。現状は最初の pin
+   のみを格納する想定だが、dialog 表示の見直しが必要になる可能性がある
+3. **`start_time` の単位不一致**: wire の `ProcessChainEntry.start_time` は epoch
+   nanoseconds、core の `PinnedProcess::start_time` は `Duration`。Block 3 の
+   adapter (evaluator → dialog wire 変換層) で単位変換が必要
+
+### handler 統合時の TODO (Block 3 以降)
+
+- unguarded set (`guard_constraints` が空の set) でも既存 guard の `clear_guard` を
+  必ず呼ぶ (§5 「今回の set の宣言がすべて」の意味論を満たすため)
+- 本ブロックで追加した HIGH-1 の fail-closed bounce (`handle_set` 冒頭) を削除し、
+  `set_guard` 呼び出しに置き換える
+- evaluator の挿入位置は §4 の順序通り: reserved namespace gate → DR-0012 gate →
+  guard → `store.get`
+- guard.rs / evaluator の `#![allow(dead_code)]` を統合時に除去
+- positive ack (新 CLI + 旧 daemon の mixed-version で guard 宣言が黙って
+  無視されるのを、set 応答の `guard_applied` ack 必須化で塞ぐ) は issue
+  `2026-07-12-kv-set-guard-positive-ack` を参照
