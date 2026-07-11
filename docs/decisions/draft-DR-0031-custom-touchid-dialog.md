@@ -4,7 +4,8 @@
   として UX が良いので進めて良い。helper app で UI を出し daemon とはソケット通信、
   相手プロセス / TCC / 署名確認は基本。Linux 対応はなし」。リモート承認
   (draft-DR-0032) と相補構成にする (例: passkey 登録時はローカル TouchID 必須)。
-  Open Q4 (helper 実装言語) は未裁定
+  **Open Q4 (helper 実装言語) は 2026-07-11 実機 PoC 通過で案 A (Rust 統一) に確定**
+  (§PoC gate 実機検証結果 参照)。helper 本実装フェーズの accept 判断は kawaz 明示指示待ち
 - Date: 2026-07-10
 - 関連: issue `2026-06-22-custom-touchid-dialog` (背景・受け入れ条件) /
   draft-DR-0030 (kv per-entry peer-identity guard、評価結果を dialog で表示する接続点) /
@@ -852,6 +853,11 @@ readiness を control socket serve 開始条件に組み込む** (codex review h
    - Ventura 下限を許容し「dialog を Vault 展開・詳細トグル・アニメーション」で将来
      大幅変更を予定 → 案 B1
    - Swift 依存を受け入れつつ Monterey 下限を維持したい → 案 B2
+   - **【裁定 2026-07-11】案 A (Rust 統一) に確定**: PoC gate を実機通過
+     (§PoC gate 実機検証結果)。macOS 下限 Monterey 維持 + 「Rust オンリー」原則保持 +
+     build system 無変更の 3 拍子が揃った。ver.2 PoC (`crates/cache-warden-approver-poc`)
+     で LAAuthenticationView 埋め込み + LAContext.evaluatePolicy + Cancel/Approved
+     両経路が実機動作。案 B (Swift 系) は不採用
 5. **`[auth].command` を dialog 化するかの scope**: Phase 2 で CommandAuthenticator を
    dialog に置き換えると、既存の外部コマンド運用 (osascript / 独自 GUI) を持つユーザは
    移行が必要。draft は「共存を維持、config で dialog / command を選択」を提案 (両立
@@ -859,6 +865,78 @@ readiness を control socket serve 開始条件に組み込む** (codex review h
    deprecated 予告」も選択肢
 5. **二重 dialog 防止方針**: v1 の「(i) cache HIT のみ dialog」で妥当か。「(ii) op fetch
    時にも cache-warden dialog を出して 1P dialog を後ろに隠す」設計の余地
+
+## PoC gate 実機検証結果 (2026-07-11、案 A Rust 統一で通過)
+
+`crates/cache-warden-approver-poc` (ver.1 = build gate、ver.2 = 実機実行) で PoC
+gate を通過した。案 A (Rust + objc2 統一) が実装可能であることを実機で確定。
+
+### 検証構成 (ver.2)
+
+- crate 依存: `objc2 = 0.6` + `objc2-app-kit = 0.3` + `objc2-foundation = 0.3` +
+  `objc2-local-authentication = 0.3` + `objc2-local-authentication-embedded-ui = 0.3`
+  + `block2 = 0.6`
+- UI 構造: `NSApplication(Accessory)` + `NSWindow(400x325, Titled|Closable, Floating)`
+  + `NSStackView(Vertical, Fill)` に `NSTextField(summary label)` + `LAAuthenticationView(ctx, .Large)`
+  + `NSButton(Cancel)` を積む
+- 承認呼び出し: `LAContext.evaluatePolicy_localizedReason_reply(DeviceOwnerAuthenticationWithBiometrics, ...,
+  RcBlock<Fn(Bool, *mut NSError)>)`
+- Cancel 経路: `NSButton::buttonWithTitle_target_action` の target =
+  `NSApplication`、action = `sel!(terminate:)` に直結 (delegate class 定義不要)
+- Approved 経路: completion block 内で `outcome = Approved` を eprintln! + `app.terminate(None)`
+- build 検証: `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings`
+  / `cargo build --workspace` が fresh でグリーン
+
+### Mode A 成立の証拠 (両側完全一致)
+
+**視覚証拠 (kawaz 実機スクショ)**: cache-warden approver (PoC) タイトルの単一
+`NSWindow` 内に、summary label + `LAAuthenticationView` が描画した指紋アイコン (濃い
+赤色) + Cancel ボタンが積まれた状態。**別途 macOS 標準 evaluatePolicy シートは
+一切出現しない** = Mode A (LAAuthenticationView 内で TouchID 完結) 成立。指紋
+アイコンの色調は前セッションで観察した 1Password 本体 dialog の「徐々に赤く染色する
+アニメーション」と一致 = 1P と cache-warden PoC が同じ `LAAuthenticationView`
+描画ロジックを共有していることの強い示唆。
+
+**coreauthd 側の間接証拠**: `coreauthd` の evaluatePolicy dispatch ログが
+`uiMechanism: MechanismTouchId[N] nonUiMechanism: MechanismTouchId[N]` で、TouchId
+mechanism 自体が UI 提供 (= 標準 `MechanismUI` を経由しない) と記録される。前セッション
+で観察した 1P op fetch (Mode B 相当) は `uiMechanism: MechanismUI[N] nonUiMechanism:
+MechanismTouchId[N](par:N)` で標準 UI mechanism が親の構造。今回の PoC はこの構造を
+一切経由せず、`Interactive,Biometry` フラグ + `MechanismTouchId` 単独 = LA 側が
+「LAAuthenticationView がプロセス内にあるので標準シートを出さない」と判断した経路。
+
+### 経路別動作確認
+
+| 経路 | 実観測 |
+|---|---|
+| Cancel | Cancel button 押下 → `terminate:` セレクタ → NSApplication 終了 → LAContext invalidate → coreauthd `Code=-9 "Invalidated by client"` → PoC プロセス exit 0 |
+| Approved | 指紋センサー接触 → coreauthd `has received finger-on` → `has matched by <private>` (指紋一致の grand truth) → `has finished with { ... }` → RcBlock callback (main queue) で `outcome = Approved` を eprintln!、`app.terminate(None)` → PoC プロセス exit 0 |
+| BiometricFailed | 型レベル到達可能性のみ (`all_outcomes()` で確認)。実観測は helper 本実装フェーズで |
+| PeerGone | 型レベル到達可能性のみ。実観測は helper 本実装 (kqueue `NOTE_EXIT` 経路) で |
+
+### 実装距離への含意
+
+- draft §7 の 550-850 行見積 (案 A) に対し、PoC ver.2 は約 200 行で「UI 表示 + Cancel/
+  Approved 両経路の block callback 統合 + terminate」まで実装済み。**helper 本実装で
+  上乗せするのは IPC socketpair + peer 認証 (双方向: daemon → helper の identity 検証
+  と helper → daemon の identity 検証)、Info.plist LSUIElement、AssociatedBundleIdentifiers
+  (TCC 永続化)、codesign + notarize、summary/detail の requester icon / チップ /
+  詳細展開 UI、kqueue で peer_gone 検知**。見積の 550-850 行は現実的な範囲に収まる
+  見込み
+- objc2 crate 群の deref coercion (`Retained<T>` → `&T` → `&NSObject` → `&AnyObject`)
+  + `sel!()` macro で NSApplication 標準 selector を再利用する経路が、案 A の
+  「delegate class を Rust 側で define_class! する」パスを部分的に不要にする。helper
+  本実装でも Cancel は同じパターンが使える (delegate class は kqueue peer_gone 用
+  callback のみで済む可能性)
+
+### PoC で意図的に非スコープにした項目 (helper 本実装で追加)
+
+- IPC (socketpair + JSON wire schema、§4) と双方向 peer 認証 (§Security)
+- `Contents/Info.plist` の `LSUIElement=YES` と AssociatedBundleIdentifiers (§DR-0020 連携)
+- Developer ID codesign + notarize (release.yml 拡張)
+- Cancel button の delegate class 実装 (peer_gone / detailed cancel reason 用)
+- Requester icon (Bundle icon 抽出) と詳細展開 UI (chevron toggle、guard 評価結果の表示)
+- daemon 側 helper spawn + fd 継承 + readiness gate (§10)
 
 ## Confirmed via codex adversarial review (2026-07-10, job task-mrebtdaf-j8x4dt)
 

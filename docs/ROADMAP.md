@@ -47,13 +47,17 @@
   declarative 宣言し、kv get 時に評価。1Password の白紙委任を段階的に置き換える
   ロードマップの基盤。DR accept 後に実装。`docs/decisions/draft-DR-0030-kv-peer-identity-guard.md`、
   issue `2026-06-22-kv-get-peer-identity-guard`
-- **custom TouchID 承認 dialog** (draft-DR-0031、**方向性 kawaz 裁定済み 2026-07-10**):
-  1Password 方式の独自 GUI helper で、requester プロセスツリー / kv entry name /
-  guard 評価結果を可視化。LAAuthenticationView (LocalAuthenticationEmbeddedUI.framework、
-  macOS 12+ 公開 API) を独自 dialog に埋め込み。helper app + ソケット通信 + peer
-  検証 (プロセス / TCC / 署名) 前提、Linux 対象外。実装言語 (Rust 統一 / Swift 系) は
-  Open Question のまま。DR-0030 と同時 land が理想、リモート承認 (draft-DR-0032) と
-  相補構成。`docs/decisions/draft-DR-0031-custom-touchid-dialog.md`、
+- **custom TouchID 承認 dialog** (draft-DR-0031、**方向性 kawaz 裁定済み 2026-07-10 +
+  実装言語 Rust 統一で確定 2026-07-11**): 1Password 方式の独自 GUI helper で、
+  requester プロセスツリー / kv entry name / guard 評価結果を可視化。
+  LAAuthenticationView (LocalAuthenticationEmbeddedUI.framework、macOS 12+ 公開 API)
+  を独自 dialog に埋め込み。helper app + ソケット通信 + peer 検証 (プロセス / TCC /
+  署名) 前提、Linux 対象外。**実装言語は案 A (Rust + objc2 統一) で確定 —
+  `crates/cache-warden-approver-poc` ver.2 が実機 PoC gate 通過**
+  (Mode A 成立 = LAAuthenticationView 内で TouchID 完結、Cancel/Approved 両経路動作、
+  1P 本体と同じ描画ロジックを共有していることを視覚 + coreauthd ログで確認)。DR-0030
+  と同時 land が理想、リモート承認 (draft-DR-0032) と相補構成。helper 本実装フェーズの
+  accept 判断は kawaz 明示指示待ち。`docs/decisions/draft-DR-0031-custom-touchid-dialog.md`、
   issue `2026-06-22-custom-touchid-dialog`
 - **prefetch 本体** (DR-0018 未着手): `kv prefetch ...` / 起動時 prefetch。型付きスキーマ自体は
   v0.17.0 実装済み
