@@ -938,6 +938,91 @@ MechanismTouchId[N](par:N)` で標準 UI mechanism が親の構造。今回の P
 - Requester icon (Bundle icon 抽出) と詳細展開 UI (chevron toggle、guard 評価結果の表示)
 - daemon 側 helper spawn + fd 継承 + readiness gate (§10)
 
+### 追加観察: フォーカス無しでは TouchID input が抑制される (2026-07-11 精密試験)
+
+kawaz 精密観察試験のシーケンス:
+
+1. PoC 起動 (背景 window、`.Accessory` activation policy、`activateIgnoringOtherApps(true)`
+   でも focus は当たらず)
+2. フォーカス無しで指を sensor に置く → **無反応 (視覚アニメも認識も無し)**
+3. 指を離してから focus 着 → 無反応
+4. focus を外してもう一度指を sensor に置く → 無反応
+5. 指を離さずダイアログをクリック (focus 着の瞬間) → 通常より短い一瞬のアニメで matched
+
+coreauthd タイムスタンプ (13:14:57〜13:15:19、精密試験):
+
+```
+13:14:57.501  MechanismTouchId[14560] will start matching (pending 開始)
+13:15:08.383  will start matching (10s heartbeat)
+13:15:18.907  will start matching (10s heartbeat)
+13:15:18.926  ★ has received finger-on ← focus 着直前
+13:15:19.276  ★ has matched by <private>  (350ms 後)
+13:15:19.279  has finished with { ... }
+```
+
+**判明**: 3 回の heartbeat 期間 (~21 秒) では `has received finger-on` は一度も
+発火せず、focus 着の瞬間に初めて発火 = **フォーカス無しでは指紋 sensor input が
+app に配送されない (MechanismTouchId は pending 維持だが input 抑制)**。前回試験
+(初回 Approved) で kawaz が視認した「アニメーション無しで一瞬で閉じた」も、focus
+着タイミングと指配置タイミングの前後関係次第で通常 350ms アニメの残時間がバラける
+現象と整合。
+
+**推定機序**: Apple の safety design (背景 app が視覚 UI なしに TouchID 承認を
+取得することを禁止 = confused deputy 防止)。正確な内部メカニズムは Apple の
+internal doc がないと確定できないが、**動作結果 (「focus 無しでは事実上効かない」)
+だけで cache-warden の設計判断には十分**。§UX policy 節で受ける。
+
+## UX policy: focus 制御 (2026-07-11 追加、PoC 実機観察から)
+
+### 背景
+
+上記 §追加観察 の通り、macOS の LAAuthenticationView + LAContext.evaluatePolicy は
+**フォーカスされた window の中でしか sensor input を受け付けない**。cache-warden の
+承認 dialog がフォーカスされずに表示されるだけの状態では、ユーザがセンサーに指を
+置いても認証が進まない = 承認要求が完了できない。したがって focus 制御は「UX の
+好み」ではなく「機能成立の必要条件」に近い扱いになる。
+
+### 実装方針
+
+- **default = focus を奪う (`focus_steal = true`)**: 上記の機能上の理由が強く、
+  「承認が完了できない」を default 動作にしない
+- **opt-out = `focus_steal = false`**: 全画面プレゼン / 録画 / ライブ配信 / 集中作業中
+  など、割込みを避けたいユーザ向け。ただし opt-out 時は指紋 UI が機能しないため、
+  UI を差し替える必要がある (下記)
+- **macOS Focus mode / DND 尊重 (`respect_focus_mode = true`、default)**: OS レベルの
+  Focus 中は steal を attention に自動格下げ。ユーザが自発的に承認ページを開くまで
+  待つ
+
+### opt-out 時 (attention only) の UI 差替え
+
+focus 無しで指紋 UI をそのまま出しても機能しないため:
+
+- 指紋アイコン (LAAuthenticationView) を grayed out / 非表示にし、代わりに
+  「クリックして承認」ヒントを表示
+- ユーザがクリック → focus 着 → UI を通常状態 (LAAuthenticationView active) に遷移
+- 通常フロー (センサーに指を置く → matched → terminate) が発火
+
+### 実装で解決すべき技術課題 (PoC で顕在化)
+
+- **`.Accessory` activation policy はフォーカスを奪えない**: PoC が `activateIgnoringOtherApps(true)`
+  を呼んでも focus 着しなかった。helper 本実装では **`.regular` + `Info.plist`
+  `LSUIElement=YES`** の組合せ (Dock Icon 非表示だが focus 奪える) を使う
+- **macOS 14+ の新 `activate` API**: 旧 `activateIgnoringOtherApps` は deprecated。
+  新旧併用で下限 macOS 12 (DR-0031 §macOS 下限バージョン) 維持
+- **`window.makeKey()` の明示呼出**: `makeKeyAndOrderFront` だけでは key window 化と
+  順序制御が分離される場合がある
+
+### config schema 案 (helper 本実装 DR で確定)
+
+```toml
+[approver]
+focus_steal = true               # default; false で attention only モード
+respect_focus_mode = true        # default; OS Focus 中は steal を attention に格下げ
+```
+
+Focus mode 状態の検知 API (`NSProcessInfo.processInfo.userInterfaceLevel` /
+DND framework) は helper 本実装で調査。
+
 ## Confirmed via codex adversarial review (2026-07-10, job task-mrebtdaf-j8x4dt)
 
 codex review で「妥当な判断」と AGREED された設計要素 (kawaz レビューでの判断負荷
