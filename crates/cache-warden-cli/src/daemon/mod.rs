@@ -7,6 +7,11 @@
 //!   accepted connection, feeding the requester ancestry chain.
 //! - [`server`]: the tokio control-socket listener — bind, accept loop, per-
 //!   connection task, watch-channel shutdown, SIGINT/SIGTERM.
+//! - [`approver`]: draft-DR-0031 Phase 1.4 IPC — the daemon-side unix-socket
+//!   `serde_json` client for the `cache-warden-approver` GUI helper. Socket
+//!   lifecycle only (bind / spawn / accept / exchange with a response
+//!   timeout); not yet wired into [`handler`] / `kv.get` (Phase 1.5 guard
+//!   integration).
 //! - [`authsock`]: the SSH agent listener(s) — one per `[authsock.sockets.*]`,
 //!   speaking the SSH agent protocol over the core Store, with local KV keys and
 //!   forwarded upstream agents (port Iterations 1–2).
@@ -21,6 +26,7 @@
 //!   of itself over a private socketpair (no re-fetch storm across a
 //!   restart). `server::run` is the only caller.
 
+pub mod approver;
 pub mod authsock;
 mod graceful_restart;
 pub mod handler;

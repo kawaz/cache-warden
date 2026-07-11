@@ -104,6 +104,8 @@ dependencies = [
  "objc2-foundation",
  "objc2-local-authentication",
  "objc2-local-authentication-embedded-ui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -154,6 +156,7 @@ dependencies = [
  "base64",
  "bytes",
  "cache-warden",
+ "cache-warden-approver",
  "cache-warden-authsock",
  "core-foundation",
  "core-foundation-sys",

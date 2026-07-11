@@ -1,27 +1,36 @@
-//! `cache-warden-approver` — draft-DR-0031 の常駐 GUI helper 本実装 (Phase 1)。
+//! `cache-warden-approver` — draft-DR-0031 の常駐 GUI helper 本実装。
 //!
-//! # スコープ (Phase 1.1)
+//! # スコープ (Phase 1.4)
 //!
 //! - LAAuthenticationView 埋め込みの承認 dialog を独自 NSWindow に表示
-//! - focus 奪取 (activation policy = `.Regular` + `activate` + `makeKey` +
-//!   `orderFrontRegardless`)。draft-DR-0031 §UX policy: focus 制御 default steal
-//!   に対応
-//! - Cancel button の target/action を `NSApplication::terminate:` に直結
+//! - focus 奪取 (`.Accessory` activation policy を維持したまま `/usr/bin/open`
+//!   経由で LaunchServices に activate させる、draft-DR-0031 §UX policy)
+//! - IPC (unix socket + serde_json、draft-DR-0031 §4): `--socket <path>` (または
+//!   `CACHE_WARDEN_APPROVER_SOCKET` env) 指定時、daemon 側 (`approver.sock`) に
+//!   接続して `ApproveRequest` を 1 行 read → サマリ表示に反映 → outcome 確定時に
+//!   `ApproveResponse` を 1 行 write。socket 指定なしはスタンドアロン動作
+//!   (hardcoded サマリ) を維持する
+//! - Cancel button の target/action は `NSApplication::terminate:` に直結したまま、
+//!   `NSApplicationWillTerminateNotification` observer で「未送信なら cancelled を
+//!   送る」方式で IPC 応答を確定する (Approved/BiometricFailed が先に送信済みなら
+//!   no-op、二重送信なし)
 //! - LAContext.evaluatePolicy の completion block 内で outcome を確定して terminate
 //!
 //! # 意図的な非スコープ (後続 Phase)
 //!
-//! - IPC (unix socket + serde_json、Phase 1.2): 現状は helper 単独起動時の
-//!   スタンドアロン挙動を確認するだけ。承認対象情報 (kv key / requester chain /
-//!   guard 評価結果) は hardcoded サマリで表示
-//! - Info.plist (`LSUIElement=YES`) + `.app` バンドル化 (Phase 1.2 or Phase 1.3):
-//!   まず非バンドル + `.Regular` activation policy で Dock Icon の挙動を実機確認する
-//! - 双方向 peer 認証 (§Security、Phase 1.3): daemon → helper の identity 検証と
-//!   helper → daemon の identity 検証は IPC 実装時に組む
+//! - Info.plist (`LSUIElement=YES`) + `.app` バンドル化: `.Accessory` +
+//!   `/usr/bin/open` 経由の focus 奪取は既に実機確認済みだが、実際の `.app`
+//!   バンドル生成 + codesign/notarize は release.yml 側の作業 (Phase 3)
+//! - 双方向 peer 認証 (§Security): daemon → helper / helper → daemon の identity
+//!   検証 (`getsockopt(LOCAL_PEERTOKEN)`) は未実装。現状は socketpair 相当の
+//!   name-based socket に接続するのみ
 //! - Cancel button の Rust 側 delegate class 定義 (peer_gone / 詳細 cancel reason 用、
 //!   Phase 2)
 //! - Requester icon / チップ / 詳細展開 UI (Phase 2)
 //! - kqueue で peer_gone 検知 (Phase 2)
+//! - `timeout_secs` の helper 内タイマー実装 (wire field としては存在するが、
+//!   Phase 1.4 の timeout enforcement は daemon 側の
+//!   `tokio::time::timeout` のみ)
 //! - codesign + notarize (Phase 3、release.yml 拡張)
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -29,16 +38,20 @@
 #[cfg(target_os = "macos")]
 mod approver {
     use block2::RcBlock;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
     use std::ptr::NonNull;
+    use std::sync::{Arc, Mutex};
 
     use objc2::rc::Retained;
     use objc2::runtime::{Bool, NSObjectProtocol, ProtocolObject};
     use objc2::{MainThreadMarker, MainThreadOnly, sel};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSApplicationDidFinishLaunchingNotification,
-        NSBackingStoreType, NSButton, NSControlSize, NSFloatingWindowLevel, NSStackView,
-        NSStackViewDistribution, NSTextField, NSUserInterfaceLayoutOrientation, NSWindow,
-        NSWindowStyleMask,
+        NSApplicationWillTerminateNotification, NSBackingStoreType, NSButton, NSControlSize,
+        NSFloatingWindowLevel, NSStackView, NSStackViewDistribution, NSTextField,
+        NSUserInterfaceLayoutOrientation, NSWindow, NSWindowStyleMask,
     };
     use objc2_foundation::{
         NSError, NSNotification, NSNotificationCenter, NSPoint, NSRect, NSSize, NSString,
@@ -46,16 +59,119 @@ mod approver {
     use objc2_local_authentication::{LAContext, LAPolicy};
     use objc2_local_authentication_embedded_ui::LAAuthenticationView;
 
-    /// draft-DR-0031 §4 の `ApproveResponse.outcome`。Phase 1.1 では UI 側の 2 経路
-    /// (Approved / Cancelled) のみ block callback から到達、他は Phase 2 以降で
-    /// helper 側 kqueue / IPC タイムアウトから到達する。
-    #[derive(Debug, Clone, Copy)]
-    #[allow(dead_code)]
-    pub enum Outcome {
-        Approved,
-        Cancelled,
-        PeerGone,
-        BiometricFailed,
+    use cache_warden_approver::wire::{ApproveRequest, ApproveResponse, Outcome, WIRE_VERSION};
+
+    /// The open IPC connection to the daemon plus the pending request's id,
+    /// or `None` once the outcome has been sent.
+    ///
+    /// Wrapped in `Arc<Mutex<Option<_>>>` so the `evaluate` completion block
+    /// and the terminate-time fallback (`register_cancel_on_terminate`) can
+    /// both hold a clone and race safely: whichever fires first `take()`s the
+    /// connection and sends; the loser sees `None` and no-ops. `None` from the
+    /// start when the helper was launched standalone (no `--socket`).
+    type WireConn = Arc<Mutex<Option<(UnixStream, String)>>>;
+
+    /// Resolve the daemon IPC socket path from `--socket <path>` /
+    /// `--socket=<path>` or the `CACHE_WARDEN_APPROVER_SOCKET` env var.
+    /// `None` means standalone mode (no daemon, hardcoded summary).
+    fn resolve_socket_path() -> Option<PathBuf> {
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            if arg == "--socket" {
+                if let Some(val) = args.next() {
+                    return Some(PathBuf::from(val));
+                }
+            } else if let Some(val) = arg.strip_prefix("--socket=") {
+                return Some(PathBuf::from(val));
+            }
+        }
+        std::env::var_os("CACHE_WARDEN_APPROVER_SOCKET").map(PathBuf::from)
+    }
+
+    /// Connect to the daemon's approver socket and read the single
+    /// `ApproveRequest` line it sends immediately after accepting (§4: helper
+    /// connects, daemon binds/accepts/sends). Blocking I/O: this runs on the
+    /// main thread before any UI is built, matching the "connect + read
+    /// before `app.run()`" requirement.
+    fn connect_and_read_request(path: &Path) -> std::io::Result<(UnixStream, ApproveRequest)> {
+        let stream = UnixStream::connect(path)?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        if line.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "daemon closed the approver socket before sending a request",
+            ));
+        }
+        let req: ApproveRequest = serde_json::from_str(line.trim_end())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // version 不一致は「別世代の daemon」からの request。v1 の意味論で
+        // 半端に解釈して dialog を出すより、ここで拒否して fail-fast に落とす
+        // (daemon 側 `exchange` も response の v を対称に検証する)。
+        if req.v != WIRE_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported approver wire version {} (helper speaks {WIRE_VERSION})",
+                    req.v
+                ),
+            ));
+        }
+        Ok((stream, req))
+    }
+
+    /// The requester name shown in the dialog summary ("Allow \<name\> to read
+    /// \<key\>"): `responsible_bundle_id` when resolvable, else the basename
+    /// of the chain's leading (requester) process path.
+    fn requester_display_name(req: &ApproveRequest) -> String {
+        if let Some(bundle_id) = &req.requester.responsible_bundle_id {
+            return bundle_id.clone();
+        }
+        req.requester
+            .chain
+            .first()
+            .map(|entry| {
+                Path::new(&entry.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| entry.path.clone())
+            })
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "requester".to_string())
+    }
+
+    /// Send `outcome` over the wire connection exactly once. A `None` `wire`
+    /// (standalone mode) or an already-taken connection (outcome already
+    /// sent) is a silent no-op — see [`WireConn`]'s race-safety doc.
+    fn send_outcome(wire: &Option<WireConn>, outcome: Outcome, biometric_kind: Option<String>) {
+        let Some(wire) = wire else {
+            eprintln!("approver outcome (standalone, no IPC): {outcome:?}");
+            return;
+        };
+        let taken = wire.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some((mut stream, request_id)) = taken else {
+            return;
+        };
+        let resp = ApproveResponse {
+            v: WIRE_VERSION,
+            request_id,
+            outcome,
+            biometric_kind,
+        };
+        match serde_json::to_string(&resp) {
+            Ok(mut line) => {
+                line.push('\n');
+                if let Err(e) = stream
+                    .write_all(line.as_bytes())
+                    .and_then(|_| stream.flush())
+                {
+                    eprintln!("approver: failed to send ApproveResponse: {e}");
+                }
+            }
+            Err(e) => eprintln!("approver: failed to encode ApproveResponse: {e}"),
+        }
     }
 
     /// activation policy を `.Accessory` に固定する (Info.plist の
@@ -99,12 +215,13 @@ mod approver {
     }
 
     /// draft-DR-0031 §5 情報階層 (呼び出し元 → チェック → cw、見出し、ボタン)。
-    /// Phase 1.1 では summary label + LAAuthenticationView + Cancel button の最小 3
-    /// 要素のみ。requester icon / チップ / 詳細展開は Phase 2。
+    /// summary label + LAAuthenticationView + Cancel button の最小 3 要素のみ。
+    /// requester icon / チップ / 詳細展開は Phase 2。
     fn build_content(
         mtm: MainThreadMarker,
         app: &NSApplication,
         ctx: &LAContext,
+        summary_text: &str,
     ) -> (
         Retained<NSStackView>,
         Retained<LAAuthenticationView>,
@@ -114,12 +231,10 @@ mod approver {
         stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
         stack.setDistribution(NSStackViewDistribution::Fill);
 
-        // Phase 1.2 で ApproveRequest 由来のサマリテキストに差し替える
-        // (「Allow <requester> to read <ns/key>」テンプレ)。
-        let summary = NSTextField::labelWithString(
-            &NSString::from_str("Allow requester to read secret"),
-            mtm,
-        );
+        // "Allow <requester> to read <ns/key>" — IPC 経由 (§4) の ApproveRequest
+        // から `requester_display_name` + `key` で組み立てる。socket 指定なしの
+        // スタンドアロン起動では固定文言 (`run` 参照)。
+        let summary = NSTextField::labelWithString(&NSString::from_str(summary_text), mtm);
         stack.addArrangedSubview(&summary);
 
         // draft-DR-0031 §6 Mode A: LAAuthenticationView 埋め込み。cache-warden-approver-poc
@@ -150,18 +265,23 @@ mod approver {
         (stack, auth_view, cancel)
     }
 
-    /// LAContext.evaluatePolicy の completion block 経由で outcome を確定。Phase 1.1
-    /// では Approved / BiometricFailed の 2 経路を eprintln! で報告し、いずれも
-    /// terminate。Phase 1.2 で IPC (ApproveResponse 送信) に置換する。
-    fn evaluate(app: &Retained<NSApplication>, ctx: &LAContext, reason: &NSString) {
+    /// LAContext.evaluatePolicy の completion block 経由で outcome を確定。
+    /// Approved / BiometricFailed の 2 経路とも `send_outcome` で IPC 応答を
+    /// (socket 指定時は) 送ってから terminate する。
+    fn evaluate(
+        app: &Retained<NSApplication>,
+        ctx: &LAContext,
+        reason: &NSString,
+        wire: Option<WireConn>,
+    ) {
         let app_for_block: Retained<NSApplication> = Retained::clone(app);
         let block = RcBlock::new(move |ok: Bool, _err: *mut NSError| {
-            let outcome = if ok.as_bool() {
-                Outcome::Approved
+            let (outcome, biometric_kind) = if ok.as_bool() {
+                (Outcome::Approved, Some("TouchID".to_string()))
             } else {
-                Outcome::BiometricFailed
+                (Outcome::BiometricFailed, Some("TouchID".to_string()))
             };
-            eprintln!("approver outcome: {outcome:?}");
+            send_outcome(&wire, outcome, biometric_kind);
             app_for_block.terminate(None);
         });
         unsafe {
@@ -170,6 +290,31 @@ mod approver {
                 reason,
                 &block,
             );
+        }
+    }
+
+    /// `NSApplicationWillTerminateNotification` observer: sends
+    /// `Outcome::Cancelled` if no outcome has been sent yet (Cancel button /
+    /// window close / any other termination path). A no-op when `evaluate`'s
+    /// completion block already sent Approved/BiometricFailed and took the
+    /// connection — see [`WireConn`]'s race-safety doc. This is the "推奨"
+    /// pattern from draft-DR-0031 Phase 1.4 scope: no Rust-side delegate class
+    /// needed, `terminate:` posts `WillTerminate` synchronously before the
+    /// process actually exits.
+    fn register_cancel_on_terminate(
+        wire: Option<WireConn>,
+    ) -> Retained<ProtocolObject<dyn NSObjectProtocol>> {
+        let block = RcBlock::new(move |_notif: NonNull<NSNotification>| {
+            send_outcome(&wire, Outcome::Cancelled, None);
+        });
+        let center = NSNotificationCenter::defaultCenter();
+        unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSApplicationWillTerminateNotification),
+                None,
+                None,
+                &block,
+            )
         }
     }
 
@@ -251,18 +396,47 @@ mod approver {
         }
     }
 
+    /// standalone (socket 指定なし) 起動時の hardcoded サマリ。既存の単独動作
+    /// (`just approver-run`) を完全維持する。
+    const STANDALONE_SUMMARY: &str = "Allow requester to read secret";
+
     pub fn run() {
         let mtm = MainThreadMarker::new().expect("must run on main thread");
         let app = init_app(mtm);
         let window = make_floating_panel(mtm);
         let ctx: Retained<LAContext> = unsafe { LAContext::new() };
-        let (stack, _auth_view, _cancel) = build_content(mtm, &app, &ctx);
+
+        // IPC 接続 + ApproveRequest read は UI 構築前 (main thread、app.run() 前)
+        // に行う (draft-DR-0031 §4)。socket が明示されているのに daemon と話せない
+        // 場合は dialog を出さずに fail-fast する: standalone 表示に落とすと
+        // 「承認対象を表示しない偽 dialog で TouchID を求め、ユーザが指紋を通しても
+        // daemon 側は応答を受け取れず timeout で fail-closed する」UX 矛盾を生む。
+        // standalone 表示は socket 指定なし (dev 単独起動) 専用。
+        let (summary_text, wire): (String, Option<WireConn>) = match resolve_socket_path() {
+            Some(path) => match connect_and_read_request(&path) {
+                Ok((stream, req)) => {
+                    let summary =
+                        format!("Allow {} to read {}", requester_display_name(&req), req.key);
+                    let conn: WireConn = Arc::new(Mutex::new(Some((stream, req.request_id))));
+                    (summary, Some(conn))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "approver: IPC connect/read failed ({e}); refusing to show a dialog without a daemon connection"
+                    );
+                    std::process::exit(1);
+                }
+            },
+            None => (STANDALONE_SUMMARY.to_string(), None),
+        };
+
+        let (stack, _auth_view, _cancel) = build_content(mtm, &app, &ctx, &summary_text);
         window.setContentView(Some(&stack));
         // `mainScreen` は「現在キーウィンドウを持つ画面」を返す (Apple 用語の罠だが、
         // Accessory app の起動時点では他アプリがフォーカスを持っているため、その
         // アプリのある画面 = ユーザが直前に操作していた画面 の中央に置かれる)。
         // マルチモニタ環境で「フォーカスを持つアプリのモニタ中央」に配置する要求
-        // (kawaz、Phase 1.3) に対応する。
+        // (kawaz) に対応する。
         window.center();
         window.makeKeyAndOrderFront(None);
 
@@ -271,8 +445,13 @@ mod approver {
         // observer token は app.run() の間 drop しないよう保持する。
         let _focus_observer = register_focus_steal_on_launch(&window);
 
+        // outcome 未送信のまま terminate した場合の fallback (Cancel button /
+        // window close 等)。evaluate の completion block が先に送信済みなら
+        // no-op (WireConn の take-once 保証)。
+        let _cancel_observer = register_cancel_on_terminate(wire.clone());
+
         let reason = NSString::from_str("Authenticate to access secret");
-        evaluate(&app, &ctx, &reason);
+        evaluate(&app, &ctx, &reason, wire);
 
         app.run();
     }
