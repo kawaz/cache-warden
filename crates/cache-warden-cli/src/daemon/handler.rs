@@ -17,7 +17,8 @@ use cache_warden::{
 
 use crate::otp_type;
 use crate::protocol::wire::{
-    EntryInfo, ErrorKind, Request, Response, SetSource, SourceSpecWire, ValueMetaWire,
+    EntryInfo, ErrorKind, GuardConstraintWire, Request, Response, SetSource, SourceSpecWire,
+    ValueMetaWire,
 };
 use crate::protocol::{decode_b64, encode_b64};
 
@@ -106,7 +107,16 @@ where
             source,
             soft_ttl_secs,
             hard_ttl_secs,
-        } => handle_set(store, ctx, key, source, soft_ttl_secs, hard_ttl_secs),
+            guard_constraints,
+        } => handle_set(
+            store,
+            ctx,
+            key,
+            source,
+            soft_ttl_secs,
+            hard_ttl_secs,
+            guard_constraints,
+        ),
         Request::KvDefine {
             key,
             source,
@@ -304,6 +314,7 @@ fn handle_set<A, R, C>(
     source: SetSource,
     soft_ttl_secs: Option<u64>,
     hard_ttl_secs: Option<u64>,
+    guard_constraints: Vec<GuardConstraintWire>,
 ) -> Response
 where
     A: ?Sized,
@@ -315,6 +326,26 @@ where
     }
     if let Err(resp) = reject_reserved_namespace_write(&key) {
         return resp;
+    }
+    // Fail-closed guard bounce: this handler layer does not yet build a
+    // `GuardRecord` and call `Store::set_guard`, so any wire-declared
+    // constraints would be silently dropped and the injected value would be
+    // stored without a guard. That would let a caller pass
+    // `--require-same-user --require-same-shell` on the CLI and reasonably
+    // believe the value is guarded, when in fact it is accessible to any
+    // getter that clears the reserved-namespace and DR-0012 gates. Refuse
+    // the request outright so the failure is loud, not silent.
+    //
+    // This branch is expected to disappear when the handler integration
+    // bundle wires `set_guard` / `clear_guard` in — at that point the
+    // `guard_constraints` list will be consumed there instead of rejected
+    // here. Removing the check is the single-line diff that lands with it.
+    if !guard_constraints.is_empty() {
+        return Response::error(
+            ErrorKind::BadRequest,
+            "guard constraints are not yet enforced by this daemon; \
+             refusing to store an unguarded value",
+        );
     }
     let ttl = match Ttl::new(
         soft_ttl_secs.map(std::time::Duration::from_secs),
@@ -857,6 +888,7 @@ mod tests {
             },
             soft_ttl_secs: Some(SOFT),
             hard_ttl_secs: Some(HARD),
+            guard_constraints: Vec::new(),
         }
     }
 
@@ -1062,6 +1094,55 @@ mod tests {
         assert_eq!(get_value(&resp), b"hunter2");
     }
 
+    /// A `kv set` carrying wire-declared guard constraints must fail-closed
+    /// while this handler layer does not yet enforce them: silently accepting
+    /// the write would store the value unguarded, and the caller (who wrote
+    /// `--require-same-user` on the CLI) would reasonably believe the value
+    /// is protected. Reject with `BadRequest` so the failure is loud.
+    /// (This branch disappears when the handler integration bundle lands
+    /// `set_guard` / `clear_guard`.)
+    #[test]
+    fn set_with_wire_declared_guard_constraints_is_rejected_fail_closed() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+
+        let req = Request::KvSet {
+            key: "default/K".into(),
+            source: SetSource::Static {
+                value_b64: encode_b64(b"hunter2"),
+            },
+            soft_ttl_secs: Some(SOFT),
+            hard_ttl_secs: Some(HARD),
+            guard_constraints: vec![GuardConstraintWire::SameUser],
+        };
+        let resp = handle_request(&mut store, &c, req);
+        assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+        // The value must not have been stored — a subsequent get returns
+        // NotFound rather than serving the injected bytes.
+        let get_resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(err_kind(&get_resp), ErrorKind::NotFound);
+    }
+
+    /// The pre-existing v1 semantics (`guard_constraints` empty) still succeed:
+    /// the fail-closed bounce above must not regress unguarded sets.
+    #[test]
+    fn set_with_empty_guard_constraints_still_succeeds() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        assert!(handle_request(&mut store, &c, set_static(b"hunter2")).is_ok());
+    }
+
     fn dry_get(key: &str) -> Request {
         Request::KvGet {
             key: key.into(),
@@ -1242,6 +1323,7 @@ mod tests {
             },
             soft_ttl_secs: None,
             hard_ttl_secs: None,
+            guard_constraints: Vec::new(),
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -1289,6 +1371,7 @@ mod tests {
             },
             soft_ttl_secs: None,
             hard_ttl_secs: None,
+            guard_constraints: Vec::new(),
         };
         assert!(handle_request(&mut store, &c, req).is_ok());
         assert!(store.has_value("default/authsock"));
@@ -1498,6 +1581,7 @@ mod tests {
             },
             soft_ttl_secs: None,
             hard_ttl_secs: None,
+            guard_constraints: Vec::new(),
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -1557,6 +1641,7 @@ mod tests {
             },
             soft_ttl_secs: Some(100),
             hard_ttl_secs: Some(10),
+            guard_constraints: Vec::new(),
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -1577,6 +1662,7 @@ mod tests {
             },
             soft_ttl_secs: None,
             hard_ttl_secs: None,
+            guard_constraints: Vec::new(),
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -1725,6 +1811,7 @@ mod tests {
                     },
                     soft_ttl_secs: None,
                     hard_ttl_secs: None,
+                    guard_constraints: Vec::new(),
                 },
             );
         }

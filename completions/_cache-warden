@@ -181,11 +181,16 @@ _cache-warden() {
                   ;;
                 set)
                   # VALUE is positional (omitted = read from piped stdin).
+                  # DR-0030 --require-* flags declare per-entry access guard.
                   _arguments \
                     "$socket_opt" \
                     "$ns_opt" \
                     '--help[Show this help message]' \
                     "$ttl_opts[@]" \
+                    '--require-same-user[Only readers with matching euid/ruid may kv get]' \
+                    '--require-same-shell[Pin the closest shell ancestor of the setter]' \
+                    '*--require-same-ancestor[Pin the setter ancestor whose basename is NAME]:name' \
+                    '*--require-command[Reader chain must contain NAME (WEAK, spoofable)]:name' \
                     '1:key:_cw_keys' \
                     '2:value (omit to read stdin):'
                   ;;

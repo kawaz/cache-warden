@@ -16,7 +16,7 @@ pub mod service;
 
 use std::path::PathBuf;
 
-use crate::protocol::wire::{Request, SetSource, ValueMetaWire};
+use crate::protocol::wire::{GuardConstraintWire, Request, SetSource, ValueMetaWire};
 use crate::protocol::{decode_b64, encode_b64, parse_duration};
 use crate::totp::OtpAlgorithm;
 
@@ -303,6 +303,44 @@ pub fn parse_kv_set(
     let mut positional: Vec<String> = Vec::new();
     let mut soft_ttl_secs: Option<u64> = None;
     let mut hard_ttl_secs: Option<u64> = None;
+    // DR-0030: --require-* flags accumulate declared guard constraints. Order
+    // of appearance is preserved on the wire so the daemon's evaluator can
+    // log fail-order deterministically.
+    let mut guard_constraints: Vec<GuardConstraintWire> = Vec::new();
+
+    // Helper: consume a `--flag VAL` or `--flag=VAL` pair and return the
+    // value. Reused by every `--require-*=NAME` flag below.
+    //
+    // In the space-separated form (`--require-same-ancestor NAME`), a NAME
+    // starting with `--` is refused: it is almost certainly a forgotten
+    // argument, and swallowing the next flag as the ancestor name silently
+    // pins a nonsense constraint (chain will never contain "--soft-ttl")
+    // and drops the intended flag on the floor. The `--flag=VAL` form is
+    // exempt from that check — an inline `=--foo` was written deliberately.
+    fn take_arg_value(
+        head: &[String],
+        idx: usize,
+        inline: Option<&str>,
+        name: &str,
+    ) -> Result<(String, usize), String> {
+        match inline {
+            Some(v) => Ok((v.to_string(), 1)),
+            None => {
+                let v = head
+                    .get(idx + 1)
+                    .cloned()
+                    .ok_or_else(|| format!("{name} requires a NAME argument"))?;
+                if v.starts_with("--") {
+                    return Err(format!(
+                        "{name} NAME must not start with `--` \
+                         (looks like a forgotten argument; got {v:?}). \
+                         Use `{name}=NAME` to force an inline value if this was intentional"
+                    ));
+                }
+                Ok((v, 2))
+            }
+        }
+    }
 
     let mut i = 0;
     while i < head.len() {
@@ -365,6 +403,36 @@ pub fn parse_kv_set(
                      definitions. Register it with `kv define KEY --type otp ...` instead"
                 ));
             }
+            // DR-0030 guard flags. `--require-same-user` and
+            // `--require-same-shell` are booleans; `--require-same-ancestor` /
+            // `--require-command` take a NAME and may be repeated (each
+            // occurrence adds one constraint to the wire).
+            "--require-same-user" => {
+                guard_constraints.push(GuardConstraintWire::SameUser);
+                i += 1;
+            }
+            "--require-same-shell" => {
+                guard_constraints.push(GuardConstraintWire::SameShell);
+                i += 1;
+            }
+            s if s == "--require-same-ancestor" || s.starts_with("--require-same-ancestor=") => {
+                let inline = s.strip_prefix("--require-same-ancestor=");
+                let (name, advance) = take_arg_value(head, i, inline, "--require-same-ancestor")?;
+                if name.is_empty() {
+                    return Err("--require-same-ancestor NAME must not be empty".to_string());
+                }
+                guard_constraints.push(GuardConstraintWire::SameAncestor { name });
+                i += advance;
+            }
+            s if s == "--require-command" || s.starts_with("--require-command=") => {
+                let inline = s.strip_prefix("--require-command=");
+                let (name, advance) = take_arg_value(head, i, inline, "--require-command")?;
+                if name.is_empty() {
+                    return Err("--require-command NAME must not be empty".to_string());
+                }
+                guard_constraints.push(GuardConstraintWire::Command { name });
+                i += advance;
+            }
             s if s.starts_with("--") => {
                 return Err(format!("unknown option for `kv set`: {s}"));
             }
@@ -403,11 +471,29 @@ pub fn parse_kv_set(
         value_b64: encode_b64(&bytes),
     };
 
+    // DR-0030: same-constraint duplicates (e.g. `--require-same-user
+    // --require-same-user`, or `--require-command=git --require-command=git`)
+    // collapse to one — a repeated declaration means the same thing as one
+    // declaration, and the evaluator's AND composition treats duplicates as
+    // redundant work. Structural equality here (via `PartialEq`) matches
+    // "same kind and same NAME" for the ancestor / command families, so
+    // `same-ancestor=code` and `same-ancestor=ghostty` remain distinct
+    // constraints. Order of first appearance is preserved so the daemon's
+    // fail-order logging stays deterministic.
+    let mut seen: Vec<GuardConstraintWire> = Vec::with_capacity(guard_constraints.len());
+    for c in guard_constraints {
+        if !seen.contains(&c) {
+            seen.push(c);
+        }
+    }
+    let guard_constraints = seen;
+
     Ok(Request::KvSet {
         key: crate::namespace::compose(ns, &key),
         source,
         soft_ttl_secs,
         hard_ttl_secs,
+        guard_constraints,
     })
 }
 
@@ -972,6 +1058,166 @@ mod tests {
                 assert_eq!(decode_b64(&value_b64).unwrap(), b"pw");
             }
             _ => panic!("expected KvSet static"),
+        }
+    }
+
+    // ---- DR-0030 --require-* guard flags on `kv set` ----
+
+    /// `kv set` without any --require-* flag produces an empty guard list
+    /// (= unguarded set, wire-compatible with pre-DR-0030 daemons).
+    #[test]
+    fn kv_set_without_require_flags_has_empty_guard_list() {
+        let req = parse_kv_set(&["K".into(), "v".into()], "default", false, no_stdin).unwrap();
+        match req {
+            Request::KvSet {
+                guard_constraints, ..
+            } => assert!(guard_constraints.is_empty()),
+            _ => panic!("expected KvSet"),
+        }
+    }
+
+    /// All four --require-* forms parse into their corresponding wire
+    /// constraints, preserving order of appearance so the daemon's evaluator
+    /// can log fail-order deterministically. `=NAME` and space-separated
+    /// forms both work; repetition is allowed.
+    #[test]
+    fn kv_set_require_flags_parse_all_kinds_and_repeats() {
+        let req = parse_kv_set(
+            &s(&[
+                "--require-same-user",
+                "--require-same-shell",
+                "--require-same-ancestor=code",
+                "--require-same-ancestor",
+                "ghostty",
+                "--require-command=git",
+                "--require-command",
+                "op",
+                "K",
+                "v",
+            ]),
+            "default",
+            false,
+            no_stdin,
+        )
+        .unwrap();
+        let expected = vec![
+            GuardConstraintWire::SameUser,
+            GuardConstraintWire::SameShell,
+            GuardConstraintWire::SameAncestor {
+                name: "code".into(),
+            },
+            GuardConstraintWire::SameAncestor {
+                name: "ghostty".into(),
+            },
+            GuardConstraintWire::Command { name: "git".into() },
+            GuardConstraintWire::Command { name: "op".into() },
+        ];
+        match req {
+            Request::KvSet {
+                guard_constraints, ..
+            } => assert_eq!(guard_constraints, expected),
+            _ => panic!("expected KvSet"),
+        }
+    }
+
+    /// Empty NAME argument on `--require-same-ancestor` / `--require-command`
+    /// is rejected at parse time — an unnamed constraint would deny every
+    /// getter (chain never contains "") and looks like a user typo.
+    #[test]
+    fn kv_set_require_flag_empty_name_is_rejected() {
+        for flag in ["--require-same-ancestor=", "--require-command="] {
+            let err = parse_kv_set(&s(&[flag, "K", "v"]), "default", false, no_stdin).unwrap_err();
+            assert!(err.contains("must not be empty"), "msg: {err}");
+        }
+    }
+
+    /// Space-separated `--require-same-ancestor` / `--require-command`
+    /// followed by a `--`-prefixed token must not silently swallow the
+    /// next flag as the NAME: `cw kv set K v --require-same-ancestor
+    /// --soft-ttl 30m` would otherwise pin a constraint on the literal
+    /// name "--soft-ttl" and drop the intended TTL flag. Reject with a
+    /// steer to the `=NAME` form for the intentional edge case.
+    #[test]
+    fn kv_set_require_flag_space_form_rejects_dashed_name() {
+        for flag in ["--require-same-ancestor", "--require-command"] {
+            let err = parse_kv_set(
+                &s(&[flag, "--soft-ttl", "30m", "K", "v"]),
+                "default",
+                false,
+                no_stdin,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("must not start with `--`"),
+                "expected a `--`-prefixed NAME to be refused, got: {err}"
+            );
+        }
+        // The `=NAME` form is exempt — an inline "=--foo" was written on
+        // purpose. A leading `--` inside the inline form parses through.
+        let req = parse_kv_set(
+            &s(&["--require-command=--verbose", "K", "v"]),
+            "default",
+            false,
+            no_stdin,
+        )
+        .unwrap();
+        match req {
+            Request::KvSet {
+                guard_constraints, ..
+            } => assert_eq!(
+                guard_constraints,
+                vec![GuardConstraintWire::Command {
+                    name: "--verbose".into()
+                }]
+            ),
+            _ => panic!("expected KvSet"),
+        }
+    }
+
+    /// DR-0030: repeated declarations of the *same* constraint collapse
+    /// to one — `--require-same-user --require-same-user` means "same-user
+    /// once", same as `--require-command=git --require-command=git`. Order
+    /// of first appearance is preserved so the daemon's fail-order log
+    /// stays deterministic. Distinct NAMEs on the ancestor / command
+    /// families are **not** deduplicated (they are different constraints).
+    #[test]
+    fn kv_set_require_flag_duplicates_are_deduplicated_preserving_first_order() {
+        let req = parse_kv_set(
+            &s(&[
+                "--require-same-user",
+                "--require-same-user",
+                "--require-same-shell",
+                "--require-same-shell",
+                "--require-command=git",
+                "--require-command=git",
+                "--require-same-ancestor=code",
+                "--require-same-ancestor=code",
+                // Distinct NAMEs — must NOT collapse.
+                "--require-same-ancestor=ghostty",
+                "K",
+                "v",
+            ]),
+            "default",
+            false,
+            no_stdin,
+        )
+        .unwrap();
+        let expected = vec![
+            GuardConstraintWire::SameUser,
+            GuardConstraintWire::SameShell,
+            GuardConstraintWire::Command { name: "git".into() },
+            GuardConstraintWire::SameAncestor {
+                name: "code".into(),
+            },
+            GuardConstraintWire::SameAncestor {
+                name: "ghostty".into(),
+            },
+        ];
+        match req {
+            Request::KvSet {
+                guard_constraints, ..
+            } => assert_eq!(guard_constraints, expected),
+            _ => panic!("expected KvSet"),
         }
     }
 

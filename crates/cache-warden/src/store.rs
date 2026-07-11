@@ -22,12 +22,14 @@ use crate::clock::{
 };
 use crate::definition::{DefineError, Definition};
 use crate::entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl};
+use crate::guard::GuardRecord;
 use crate::key::{InvalidKey, validate_key_syntax};
 use crate::meta::{SourceMeta, ValueMeta};
 use crate::process::ProcessInfo;
 use crate::secret::SecretBytes;
 use crate::snapshot::{
-    self, ExportError, ImportError, SnapshotDefinition, SnapshotEntry, SnapshotFailure,
+    self, ExportError, ImportError, SnapshotConstraint, SnapshotDeclaredAncestor,
+    SnapshotDefinition, SnapshotEntry, SnapshotFailure, SnapshotGuard, SnapshotPinnedProcess,
     SnapshotSource, SnapshotValue, StoreSnapshot,
 };
 use crate::source::{RunError, SourceRunner, ValueSource};
@@ -100,6 +102,31 @@ pub struct Store {
     /// [`Store::set`] never touches this map (DR-0022 §C1): a static value
     /// injection is not the same event as a lazy-fetch success.
     failure_backoffs: BTreeMap<String, FailureRecord>,
+    /// Per-entry access guard records (DR-0030).
+    ///
+    /// Populated by [`Store::set_guard`] alongside a [`Store::set`] whose CLI
+    /// invocation declared `--require-*` constraints; cleared by
+    /// [`Store::clear_guard`] when a subsequent unguarded set replaces the
+    /// entry.
+    ///
+    /// # Lifetime — differs from [`Store::failure_backoffs`]
+    ///
+    /// `failure_backoffs` mirrors `definitions` (a fetch failure only makes
+    /// sense while a definition is present); a value-only `delete` leaves the
+    /// backoff record alive. An `access_guards` entry mirrors the **value
+    /// set instance** instead: the record is "the setter's declaration for
+    /// *this particular* injected value", and once the value is gone the
+    /// declaration is meaningless. So every path that removes the value
+    /// (value-only [`Store::delete`], [`Store::delete_with_definition`]) also
+    /// removes the guard, and [`Store::undefine`] clears it too — a definition
+    /// change is a lifecycle event the guard should not silently survive
+    /// (DR-0030 §5).
+    ///
+    /// [`Store::set`] itself deliberately does **not** touch this map: the
+    /// CLI/daemon layer decides whether a set carries new constraints (call
+    /// `set_guard`) or none (call `clear_guard`), so the core stays oblivious
+    /// to per-adapter default policy (`default-require-same-user` etc.).
+    access_guards: BTreeMap<String, GuardRecord>,
     /// How long to suppress re-fetch after a `runner.run` failure (DR-0022).
     ///
     /// Configured via [`StoreBuilder::failure_backoff`]. The default is
@@ -202,6 +229,7 @@ impl Store {
             entries: BTreeMap::new(),
             definitions: BTreeMap::new(),
             failure_backoffs: BTreeMap::new(),
+            access_guards: BTreeMap::new(),
             failure_backoff_duration,
             access_token: token,
         }
@@ -480,6 +508,15 @@ impl Store {
         // 4. Replace with a fresh Active entry (overwrite zeroizes the old one).
         // On success, clear any existing backoff record (DR-0022).
         self.failure_backoffs.remove(key);
+        // DR-0030 §5: a guard record is bound to one set instance. The new
+        // value here is a fresh set instance (the old one was hard-expired
+        // and the value we install is upstream-regenerated, not a
+        // continuation of the setter's declaration), so a stale guard from
+        // the previous instance must not silently gate reads of the new
+        // value. v1 only attaches guards via `kv set` (Static), so this
+        // branch is defensive against future definition-side guards; the
+        // cleanup is uniform across every path that replaces the value.
+        self.access_guards.remove(key);
         self.entries
             .insert(key.to_string(), CacheEntry::new(source, value, ttl, clock));
         Ok(())
@@ -565,6 +602,11 @@ impl Store {
     /// Returns `Err(CapError::KeyMismatch)` if `cap` does not match (DR-0024).
     pub fn delete(&mut self, key: &str, cap: &Capability) -> Result<bool, CapError> {
         self.check_cap(cap)?;
+        // DR-0030 §5: guard record is bound to the value set instance. Even a
+        // value-only delete (which leaves `failure_backoffs` alive because a
+        // definition is still there to regenerate through) drops the guard —
+        // the setter's declaration only ever applied to *this* injected value.
+        self.access_guards.remove(key);
         Ok(self.entries.remove(key).is_some())
     }
 
@@ -916,6 +958,14 @@ impl Store {
         // 3. Install a fresh Active entry (overwriting any destroyed husk).
         // On success, clear any existing backoff record (DR-0022).
         self.failure_backoffs.remove(key);
+        // DR-0030 §7: definition-derived entries are outside the guard's
+        // scope (the guard was declared against the setter's *set instance*,
+        // not against future upstream regeneration). Installing a fresh
+        // definition-produced value here retires the old set instance, so
+        // its guard record — if a caller of `set_guard` left one attached —
+        // must be dropped rather than left to gate reads of a value the
+        // setter never approved.
+        self.access_guards.remove(key);
         self.entries
             .insert(key.to_string(), CacheEntry::new(source, value, ttl, clock));
         Ok(())
@@ -944,6 +994,9 @@ impl Store {
         let had_def = self.definitions.remove(key).is_some();
         // DR-0022: failure backoff lifetime = definition lifetime.
         self.failure_backoffs.remove(key);
+        // DR-0030 §5: guard follows the value; forgetting the key entirely
+        // subsumes value-only delete's guard cleanup.
+        self.access_guards.remove(key);
         Ok(had_value || had_def)
     }
 
@@ -964,7 +1017,68 @@ impl Store {
     /// Returns `true` if a definition was present and removed, `false` if
     /// `key` had none.
     pub fn undefine(&mut self, key: &str) -> bool {
+        // DR-0030 §5: undefine is a lifecycle event; a guard record declared
+        // against the previous generation of this key must not silently survive
+        // a definition rebind. (v1 only attaches guards to `kv set` static
+        // entries, but the cleanup is uniform across paths so a future
+        // definition-side guard would inherit the same rule.)
+        self.access_guards.remove(key);
         self.definitions.remove(key).is_some()
+    }
+
+    // ---- per-entry access guards (DR-0030) ----
+
+    /// Attach (or replace) the [`GuardRecord`] for `key` (DR-0030 §1).
+    ///
+    /// Called by the CLI/daemon layer immediately after the matching
+    /// [`Store::set`], with the constraint list decoded from the wire and the
+    /// setter identity resolved from the connection's peer audit token. The
+    /// full replacement semantics reflect DR-0030 §5 "set is record's whole
+    /// declaration": a set with a fresh (or empty!) constraint list is
+    /// authoritative — the CLI layer decides between calling this or
+    /// [`Store::clear_guard`].
+    ///
+    /// # Why the core stays out of set()
+    ///
+    /// [`Store::set`] does not know whether the caller "meant" to guard the
+    /// entry (there is no CLI-side default policy visible to the core, e.g.
+    /// `default-require-same-user`). Making guard attachment a separate
+    /// method lets the adapter apply its policy once, then hand the core two
+    /// primitive operations (`set` + `set_guard`/`clear_guard`) with no
+    /// hidden coupling.
+    ///
+    /// Cap check (DR-0024) runs first: returns [`CapError::KeyMismatch`] if
+    /// `cap` does not match this store's token; nothing is mutated. Key
+    /// syntax is not re-checked here — a guard can only be attached to a key
+    /// that already survived `set`'s validation.
+    pub fn set_guard(
+        &mut self,
+        key: impl Into<String>,
+        record: GuardRecord,
+        cap: &Capability,
+    ) -> Result<(), CapError> {
+        self.check_cap(cap)?;
+        self.access_guards.insert(key.into(), record);
+        Ok(())
+    }
+
+    /// Drop `key`'s guard record, returning whether one was present.
+    ///
+    /// Cap check runs first (DR-0024). Called by the CLI/daemon layer when a
+    /// subsequent unguarded set replaces the previous entry.
+    pub fn clear_guard(&mut self, key: &str, cap: &Capability) -> Result<bool, CapError> {
+        self.check_cap(cap)?;
+        Ok(self.access_guards.remove(key).is_some())
+    }
+
+    /// Borrow the [`GuardRecord`] attached to `key`, or `None` if unguarded.
+    ///
+    /// Value-free read: does not touch entries / definitions / TTL. Not
+    /// cap-gated, matching `definition_of` / `source_of` — a guard record
+    /// carries no secret plaintext (the setter chain is a fact, not a
+    /// secret; DR-0030 §Security). The evaluator uses this on every `kv get`.
+    pub fn guard_of(&self, key: &str) -> Option<&GuardRecord> {
+        self.access_guards.get(key)
     }
 
     // ---- graceful-restart snapshot (DR-0029 §2, Phase 1 / bundle 1) ----
@@ -1054,7 +1168,23 @@ impl Store {
                     retry_after_ms: record.retry_after.as_millis() as u64,
                 });
 
-            if value.is_none() && definition.is_none() && failure.is_none() {
+            // DR-0030 §5: a guard record is bound to the setter's *value set
+            // instance*, not to the key's definition. Only export the guard
+            // when a live value survives this snapshot: a definition-only
+            // key has no set instance for the guard to describe (the
+            // definition's future regeneration is outside the guard's
+            // scope, DR-0030 §7), and a hard-expired husk contributes no
+            // value entry above and so must not drag a guard-only frame
+            // across the handoff — which would gratuitously force
+            // FORMAT_VERSION=2 on a downgrade path that carries no live
+            // guarded secret at all.
+            let guard = if value.is_some() {
+                self.access_guards.get(key).map(guard_record_to_snapshot)
+            } else {
+                None
+            };
+
+            if value.is_none() && definition.is_none() && failure.is_none() && guard.is_none() {
                 // Nothing meaningful survives for this key (e.g. a stale
                 // hard-expired husk with no definition and no failure record).
                 continue;
@@ -1065,10 +1195,14 @@ impl Store {
                 value,
                 definition,
                 failure,
+                guard,
             });
         }
 
-        Ok(StoreSnapshot::new(out))
+        // DR-0030 §3 ダウングレード方向: FORMAT_VERSION は snapshot.rs 側で
+        // guard の有無から動的に選択される。ここでは選択そのものを snapshot.rs
+        // に委ねる (Store から version をハードコードしない)。
+        Ok(StoreSnapshot::from_entries(out))
     }
 
     /// Rebuild a store from a [`StoreSnapshot`]: the graceful-restart
@@ -1143,6 +1277,7 @@ impl Store {
                 value,
                 definition,
                 failure,
+                guard,
             } = entry;
 
             // DR-0029 review HIGH-5: `Store::set` / `Store::define` always
@@ -1211,10 +1346,119 @@ impl Store {
                     },
                 );
             }
+
+            // DR-0030 §5: a guard record is bound to the setter's *value set
+            // instance*. Install only when a live value survived import;
+            // definition-only or empty entries are stripped even if the wire
+            // carried a guard (a maliciously crafted stream could; the
+            // honest exporter already prunes them per the symmetric check
+            // in `export_snapshot`).
+            if let Some(g) = guard
+                && bundle.store.entries.contains_key(&key)
+            {
+                bundle
+                    .store
+                    .access_guards
+                    .insert(key.clone(), snapshot_to_guard_record(g));
+            }
         }
 
         Ok(bundle)
     }
+}
+
+// ---- guard <-> snapshot converters ----
+//
+// Kept as free functions (rather than `From`/`Into` impls between the wire
+// mirror and the domain type) for the same reason `SnapshotSource` has plain
+// converters: the mirror lives in `snapshot.rs` behind a `pub(crate)` API and
+// the mapping is a one-file concern of `Store::{export,import}_snapshot`.
+
+fn guard_record_to_snapshot(record: &crate::guard::GuardRecord) -> SnapshotGuard {
+    use crate::guard::{DeclaredAncestor, GuardConstraint};
+    let constraints = record
+        .constraints
+        .iter()
+        .map(|c| match c {
+            GuardConstraint::SameUser => SnapshotConstraint::SameUser,
+            GuardConstraint::SameAncestor { declared, pinned } => {
+                let declared = match declared {
+                    DeclaredAncestor::SameShell { shell_name } => {
+                        SnapshotDeclaredAncestor::SameShell {
+                            shell_name: shell_name.clone(),
+                        }
+                    }
+                    DeclaredAncestor::Named { name } => {
+                        SnapshotDeclaredAncestor::Named { name: name.clone() }
+                    }
+                };
+                SnapshotConstraint::SameAncestor {
+                    declared,
+                    pinned: SnapshotPinnedProcess {
+                        pid: pinned.pid,
+                        // DR-0030 §Security: the entity pin is checked by
+                        // `PinnedProcess::start_time == getter.start_time`.
+                        // macOS reports process start times at µs precision;
+                        // ms truncation here would round two "same instant"
+                        // reads to different values across a snapshot
+                        // round-trip and turn every same-ancestor guard into
+                        // a fail-closed denial after restart.
+                        start_time_us: pinned.start_time.map(|d| d.as_micros() as u64),
+                        unique_id: pinned.unique_id,
+                        path: pinned.path.clone(),
+                        name: pinned.name.clone(),
+                    },
+                }
+            }
+            GuardConstraint::Command { name } => SnapshotConstraint::Command { name: name.clone() },
+        })
+        .collect();
+    SnapshotGuard {
+        constraints,
+        setter_euid: record.setter.euid,
+        setter_ruid: record.setter.ruid,
+    }
+}
+
+fn snapshot_to_guard_record(s: SnapshotGuard) -> crate::guard::GuardRecord {
+    use crate::guard::{
+        DeclaredAncestor, GuardConstraint, GuardRecord, GuardSetter, PinnedProcess,
+    };
+    let constraints = s
+        .constraints
+        .into_iter()
+        .map(|c| match c {
+            SnapshotConstraint::SameUser => GuardConstraint::SameUser,
+            SnapshotConstraint::SameAncestor { declared, pinned } => {
+                let declared = match declared {
+                    SnapshotDeclaredAncestor::SameShell { shell_name } => {
+                        DeclaredAncestor::SameShell { shell_name }
+                    }
+                    SnapshotDeclaredAncestor::Named { name } => DeclaredAncestor::Named { name },
+                };
+                GuardConstraint::SameAncestor {
+                    declared,
+                    pinned: PinnedProcess {
+                        pid: pinned.pid,
+                        // Symmetric with the exporter's `as_micros()`; see the
+                        // note there for why ms would break the entity pin.
+                        start_time: pinned.start_time_us.map(std::time::Duration::from_micros),
+                        unique_id: pinned.unique_id,
+                        path: pinned.path,
+                        name: pinned.name,
+                    },
+                }
+            }
+            SnapshotConstraint::Command { name } => GuardConstraint::Command { name },
+        })
+        .collect();
+    GuardRecord::new(
+        constraints,
+        GuardSetter {
+            euid: s.setter_euid,
+            ruid: s.setter_ruid,
+        },
+    )
 }
 
 /// Error from [`Store::set`] when it cannot inject a value.
@@ -3815,6 +4059,7 @@ mod tests {
                 }),
                 definition: None,
                 failure: None,
+                guard: None,
             }]);
 
             // `StoreBundle` does not derive `Debug`, so `unwrap_err()` (which
@@ -3846,6 +4091,7 @@ mod tests {
                 }),
                 definition: None,
                 failure: None,
+                guard: None,
             };
             let snap = StoreSnapshot::new(vec![make_entry("first"), make_entry("second")]);
 
@@ -3884,6 +4130,7 @@ mod tests {
                 }),
                 definition: None,
                 failure: None,
+                guard: None,
             }]);
 
             // `StoreBundle` does not derive `Debug`, so `unwrap_err()` (which
@@ -3923,6 +4170,7 @@ mod tests {
                     failed_at_epoch_ms,
                     retry_after_ms: 60_000, // 60s, well under the 90s of headroom
                 }),
+                guard: None,
             }]);
 
             let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
@@ -3936,6 +4184,360 @@ mod tests {
                  already-expired: 90s since the importing clock's own start \
                  already exceeds the 60s retry_after)"
             );
+        }
+    }
+
+    // ---- DR-0030 access guards ----
+    //
+    // These tests fix the shape of the fourth `Store` map (`access_guards`)
+    // and its lifecycle coupling to entries / definitions. Evaluation logic
+    // lives in `cache-warden-cli::daemon::guard` (DR-0004: core stays out of
+    // chain interpretation), so nothing here checks "does this getter chain
+    // satisfy the record" — only "does the record land / clear at the right
+    // moments".
+
+    mod access_guards {
+        use super::*;
+        use crate::guard::{
+            DeclaredAncestor, GuardConstraint, GuardRecord, GuardSetter, PinnedProcess,
+        };
+
+        fn sample_record() -> GuardRecord {
+            GuardRecord::new(
+                vec![
+                    GuardConstraint::SameUser,
+                    GuardConstraint::SameAncestor {
+                        declared: DeclaredAncestor::SameShell {
+                            shell_name: "zsh".into(),
+                        },
+                        pinned: PinnedProcess {
+                            pid: 42,
+                            start_time: Some(Duration::from_secs(1_700_000_000)),
+                            unique_id: Some(999),
+                            path: std::path::PathBuf::from("/bin/zsh"),
+                            name: "zsh".into(),
+                        },
+                    },
+                ],
+                GuardSetter {
+                    euid: 501,
+                    ruid: 501,
+                },
+            )
+        }
+
+        /// set_guard 直後に guard_of で同じ record が引ける — 第 4 マップの
+        /// 基本輪郭 (書いた通り読める、DR-0030 §2)。
+        #[test]
+        fn set_guard_then_guard_of_returns_the_record() {
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            assert_eq!(s.guard_of("default/K"), Some(&sample_record()));
+        }
+
+        /// clear_guard は既存 record を落として true を返し、無ければ false
+        /// を返す (呼び出し側の「上書き set 時に前 record を消す」パスで
+        /// 副作用有無を区別する必要があるため)。
+        #[test]
+        fn clear_guard_reports_presence() {
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            assert!(!s.clear_guard("default/K", &cap).unwrap());
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            assert!(s.clear_guard("default/K", &cap).unwrap());
+            assert_eq!(s.guard_of("default/K"), None);
+        }
+
+        /// cap mismatch は set_guard / clear_guard 両方で拒否 (DR-0024 cap
+        /// gate は mutation の統一入口)。 guard_of は value-free read なので
+        /// cap 不要 (definition_of / source_of と同型)。
+        #[test]
+        fn set_and_clear_guard_are_cap_gated_but_guard_of_is_not() {
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            let (_other_store, other_cap) = crate::test_helpers::store_with_cap();
+            assert_eq!(
+                s.set_guard("default/K", sample_record(), &other_cap),
+                Err(CapError::KeyMismatch)
+            );
+            // Store's own cap succeeds.
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            assert_eq!(
+                s.clear_guard("default/K", &other_cap),
+                Err(CapError::KeyMismatch)
+            );
+            // guard_of is cap-free.
+            assert!(s.guard_of("default/K").is_some());
+        }
+
+        /// value-only delete でも guard は落ちる (DR-0030 §5): guard は
+        /// 「その set instance への宣言」なので値が消えれば意味論を失う。
+        /// failure_backoffs との差分をここで固定 (backoff は definition
+        /// 生存に紐づくので value-only delete でも生き残る — 対称でない)。
+        #[test]
+        fn value_only_delete_removes_guard() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            cmd_entry(&mut s, "default/K", &cap, &clock);
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            s.delete("default/K", &cap).unwrap();
+            assert_eq!(s.guard_of("default/K"), None);
+        }
+
+        /// delete_with_definition も guard を落とす (value-only delete の
+        /// 上位互換)。
+        #[test]
+        fn delete_with_definition_removes_guard() {
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.define(
+                "default/K",
+                ValueSource::command(["echo".into(), "v".into()]),
+                ttl(),
+            )
+            .unwrap();
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            s.delete_with_definition("default/K", &cap).unwrap();
+            assert_eq!(s.guard_of("default/K"), None);
+        }
+
+        /// undefine も guard を落とす (definition rebind 前に旧宣言が生き
+        /// 残る事故を防ぐ、DR-0030 §5)。v1 は set のみに guard が付くので
+        /// 実運用では稀だが、対称性のために固定。
+        #[test]
+        fn undefine_removes_guard() {
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.define(
+                "default/K",
+                ValueSource::command(["echo".into(), "v".into()]),
+                ttl(),
+            )
+            .unwrap();
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            s.undefine("default/K");
+            assert_eq!(s.guard_of("default/K"), None);
+        }
+
+        /// `Store::set` 自体は guard を触らない (DR-0030 §5): CLI 層が
+        /// set_guard / clear_guard を呼び分ける前提。core が set 中に guard
+        /// を落とすと、CLI 層の「新 record を先に埋めてから set」順序が組
+        /// めなくなるため、core は明示的な API しか提供しない。
+        #[test]
+        fn store_set_does_not_touch_guard() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.set(
+                "default/K",
+                ValueSource::Static,
+                SecretBytes::from("v1"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            // Second set with the same cap: guard stays intact — the CLI
+            // layer, not `set`, is responsible for calling `clear_guard`.
+            s.set(
+                "default/K",
+                ValueSource::Static,
+                SecretBytes::from("v2"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            assert_eq!(s.guard_of("default/K"), Some(&sample_record()));
+        }
+
+        // ---- snapshot round-trip / orphan prune / version selection ----
+
+        /// guard 付き entry の export→import 往復で record が保存される
+        /// (DR-0029 handoff の必須要件、DR-0030 §3)。
+        #[test]
+        fn guard_survives_snapshot_round_trip() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.set(
+                "default/K",
+                ValueSource::Static,
+                SecretBytes::from("secret"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
+            assert_eq!(bundle.store.guard_of("default/K"), Some(&sample_record()));
+        }
+
+        /// value も definition も無い key に guard record が残っていた
+        /// (bug 由来の orphan) 場合、export/import 時に prune される
+        /// (DR-0030 §5)。live store でも guard_of 経由で見えたままだが、
+        /// snapshot handoff を横切ると自動で片付く。
+        #[test]
+        fn orphan_guard_is_pruned_at_export() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            // Insert an orphan directly (no value, no definition).
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
+            assert_eq!(bundle.store.guard_of("default/K"), None);
+        }
+
+        /// guard を含まない export は format_version を 1 (VERSION_PRE_GUARD)
+        /// に維持し、旧 daemon が読める互換を壊さない (DR-0030 §3 "ダウン
+        /// グレード方向")。
+        #[test]
+        fn guardless_export_stays_on_pre_guard_version() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.set(
+                "default/K",
+                ValueSource::Static,
+                SecretBytes::from("v"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            assert_eq!(snap.format_version(), crate::snapshot::VERSION_PRE_GUARD);
+        }
+
+        /// definition-only key に guard record が残っていた場合、export は
+        /// guard を同梱しない (DR-0030 §5: guard は set instance に紐づく)。
+        /// 旧実装は「definition があるから live」と誤判定して guard を snapshot
+        /// に載せ、無駄に FORMAT_VERSION=2 に押し上げていた。この test は
+        /// 「definition しか無い key の guard は export されない」+ 「その
+        /// 結果 export version が PRE_GUARD に留まる」の 2 段を pin する。
+        #[test]
+        fn guard_on_definition_only_key_is_not_exported() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.define(
+                "default/K",
+                ValueSource::command(["echo".into(), "v".into()]),
+                ttl(),
+            )
+            .unwrap();
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            assert_eq!(
+                snap.format_version(),
+                crate::snapshot::VERSION_PRE_GUARD,
+                "definition-only guard must not force a version bump — the guard \
+                 belongs to no live set instance and is dropped at export"
+            );
+            let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
+            assert_eq!(bundle.store.guard_of("default/K"), None);
+        }
+
+        /// hard-expired husk (value が実体としては hard-expired、まだ物理
+        /// zeroize されていない) の key に guard record が残っていた場合、
+        /// export は guard を同梱しない (§5 と同型: 現時点で live value が
+        /// 存在しないから guard は意味論を失う)。旧実装ではこの husk が
+        /// FORMAT_VERSION=2 を強制していた。
+        #[test]
+        fn guard_on_hard_expired_value_is_not_exported() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.set(
+                "default/K",
+                ValueSource::Static,
+                SecretBytes::from("v"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            // Push past the hard TTL boundary so the value is logically
+            // destroyed (husk stage): export_snapshot borrows `&self` and
+            // must not resurrect the guard for a value it is refusing to
+            // emit as SnapshotValue.
+            clock.advance(HARD + Duration::from_secs(1));
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            assert_eq!(
+                snap.format_version(),
+                crate::snapshot::VERSION_PRE_GUARD,
+                "a hard-expired husk carries no live value, so its guard \
+                 must not force FORMAT_VERSION=2"
+            );
+        }
+
+        /// regenerate は「新しい set instance の value を install する」経路
+        /// なので、旧 set instance の guard record が生き残ってはならない
+        /// (DR-0030 §5)。 旧値の hard 失効 → regenerate → 新値 install の
+        /// フローで、以前の宣言が新値の gate に流用されないことを固定する。
+        /// v1 では kv set のみに guard が付くが、この cleanup は future の
+        /// definition-side guard も守る目的で uniform に実装されている。
+        #[test]
+        fn regenerate_clears_stale_guard() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            // Command-source entry so regenerate is applicable; attach a
+            // guard directly (simulating a future definition-side guard the
+            // v1 CLI does not yet declare, but the core cleanup must cover).
+            cmd_entry(&mut s, "default/K", &cap, &clock);
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            // Age the value past hard expiry so regenerate is legal.
+            clock.advance(HARD + Duration::from_secs(1));
+            let runner = CountingRunner::new(b"fresh");
+            s.regenerate("default/K", &runner, &AllowAll, None, &cap, &clock)
+                .expect("regenerate succeeds under AllowAll");
+            assert_eq!(
+                s.guard_of("default/K"),
+                None,
+                "regenerate installs a new set instance; the previous \
+                 declaration must not silently gate the new value"
+            );
+        }
+
+        /// get_or_regenerate 経路も同型: definition から新値が install される
+        /// と、その key に残っていた guard record は落ちる (DR-0030 §7:
+        /// definition-derived entry は guard の scope 外)。
+        #[test]
+        fn get_or_regenerate_clears_stale_guard() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.define(
+                "default/K",
+                ValueSource::command(["echo".into(), "v".into()]),
+                ttl(),
+            )
+            .unwrap();
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            let runner = CountingRunner::new(b"fresh");
+            s.get_or_regenerate("default/K", &runner, &AllowAll, None, &cap, &clock)
+                .expect("lazy generate succeeds under AllowAll");
+            assert_eq!(
+                s.guard_of("default/K"),
+                None,
+                "the definition-derived install retires the setter's \
+                 declaration; the guard record must not survive"
+            );
+        }
+
+        /// guard を 1 件でも含む export は FORMAT_VERSION に上がる。旧
+        /// daemon はここで unsupported version として reject → cold start に
+        /// 退化する (DR-0030 §3: "認可が黙って消える" より安全側)。
+        #[test]
+        fn guarded_export_bumps_to_current_format_version() {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.set(
+                "default/K",
+                ValueSource::Static,
+                SecretBytes::from("v"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            s.set_guard("default/K", sample_record(), &cap).unwrap();
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            assert_eq!(snap.format_version(), crate::snapshot::FORMAT_VERSION);
         }
     }
 }

@@ -1453,6 +1453,7 @@ mod tests {
             },
             soft_ttl_secs: None,
             hard_ttl_secs: None,
+            guard_constraints: Vec::new(),
         };
         assert!(run_request(&s, None, set).is_ok());
         let resp = run_request(

@@ -307,6 +307,16 @@ pub enum Request {
         /// Hard TTL in seconds, or `None` for "never hard-expires".
         #[serde(default)]
         hard_ttl_secs: Option<u64>,
+        /// DR-0030 per-entry access guard: the caller's set-time
+        /// declaration of what a subsequent `kv.get` must satisfy to
+        /// receive the value. Empty = unguarded (the pre-DR-0030 default,
+        /// preserved by `#[serde(default)]` so old daemons/clients keep
+        /// interoperating). Only the declaration travels on the wire —
+        /// the setter's identity snapshot and the ancestor `pinned`
+        /// entity are resolved daemon-side from the connection's peer
+        /// audit token (never trust caller-supplied process identities).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        guard_constraints: Vec<GuardConstraintWire>,
     },
     /// Register a *typed source* definition for a key (DR-0014 §1 / DR-0018 §1).
     ///
@@ -397,6 +407,50 @@ pub enum Request {
     /// process keeps serving untouched.
     #[serde(rename = "daemon.restart_graceful")]
     RestartGraceful,
+}
+
+/// A single guard constraint declared by the CLI at `kv set` time (DR-0030).
+///
+/// Only the **declaration** travels here — the setter's peer identity and
+/// (for `SameAncestor`) the pinned process entity are resolved on the
+/// daemon side from the connection's peer audit token, never from
+/// client-supplied fields. That asymmetry is deliberate: a wire client
+/// cannot lie about who they are to the guard record.
+///
+/// Wire encoding: internally-tagged (`{"kind":"same-user"}`,
+/// `{"kind":"same-shell"}`, `{"kind":"same-ancestor","name":"code"}`,
+/// `{"kind":"command","name":"git"}`). Unknown `kind` values fail
+/// deserialization rather than silently degrading — a guard is a
+/// security-sensitive record and "quietly accept as no-op" is unsafe.
+///
+/// `command=` is the **weak** kind: the daemon matches by executable
+/// basename or full-path equality, and anyone with write access to a
+/// same-basename location can spoof it. The CLI `--help`, `kv list`
+/// display and the approver dialog all label it as such.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum GuardConstraintWire {
+    /// Getter must match the setter's euid/ruid.
+    SameUser,
+    /// Setter's closest shell ancestor (organic zsh/bash/fish/sh/nu, per
+    /// the daemon's built-in list; DR-0030 §1) is pinned; getter must
+    /// have that same process entity in its ancestry chain.
+    SameShell,
+    /// Setter-side ancestor whose executable basename matches `name` is
+    /// pinned; same evaluation rule as `SameShell`.
+    SameAncestor {
+        /// The ancestor basename to look up in the setter's chain (the
+        /// value written after `=` on `--require-same-ancestor=NAME`).
+        name: String,
+    },
+    /// Getter's chain must contain a process whose executable path
+    /// matches `name` either by basename or by full-path equality.
+    /// Weak — see the type doc.
+    Command {
+        /// Basename (`"git"`) or full path (`"/usr/bin/git"`) to look
+        /// for in the getter's chain.
+        name: String,
+    },
 }
 
 /// The value source for a [`Request::KvSet`].
@@ -802,6 +856,7 @@ mod tests {
             },
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
+            guard_constraints: Vec::new(),
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""cmd":"kv.set""#));
@@ -928,6 +983,67 @@ mod tests {
             }
             _ => panic!("expected KvSet"),
         }
+    }
+
+    /// DR-0030 wire compat: a pre-DR-0030 client sending a `kv.set` line with
+    /// no `guard_constraints` field must decode into an empty Vec, so old
+    /// clients keep interoperating unchanged (`#[serde(default)]`).
+    #[test]
+    fn kv_set_guard_constraints_default_to_empty_when_absent() {
+        let line = r#"{"cmd":"kv.set","key":"K","source":{"kind":"static","value_b64":"AA=="}}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        match req {
+            Request::KvSet {
+                guard_constraints, ..
+            } => assert!(guard_constraints.is_empty()),
+            _ => panic!("expected KvSet"),
+        }
+    }
+
+    /// A guarded kv.set request round-trips lossless-y through JSON with the
+    /// four constraint kinds (same-user, same-shell, same-ancestor=NAME,
+    /// command=NAME). Pins the internally-tagged wire encoding so a serde
+    /// rename would surface here.
+    #[test]
+    fn kv_set_guard_constraints_roundtrip_all_kinds() {
+        let req = Request::KvSet {
+            key: "K".into(),
+            source: SetSource::Static {
+                value_b64: "AA==".into(),
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            guard_constraints: vec![
+                GuardConstraintWire::SameUser,
+                GuardConstraintWire::SameShell,
+                GuardConstraintWire::SameAncestor {
+                    name: "code".into(),
+                },
+                GuardConstraintWire::Command { name: "git".into() },
+            ],
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        // Encoding shape (kebab-case tag, spelled kinds).
+        assert!(line.contains(r#""kind":"same-user""#), "{line}");
+        assert!(line.contains(r#""kind":"same-shell""#), "{line}");
+        assert!(
+            line.contains(r#"{"kind":"same-ancestor","name":"code"}"#),
+            "{line}"
+        );
+        assert!(
+            line.contains(r#"{"kind":"command","name":"git"}"#),
+            "{line}"
+        );
+        roundtrip_request(&req);
+    }
+
+    /// Unknown constraint `kind` is rejected at deserialize time rather than
+    /// silently degrading to "no constraint" — a guard is security-sensitive
+    /// enough that lenient parsing would be unsafe (DR-0030 §Security).
+    #[test]
+    fn kv_set_unknown_guard_kind_is_rejected() {
+        let line = r#"{"cmd":"kv.set","key":"K","source":{"kind":"static","value_b64":"AA=="},"guard_constraints":[{"kind":"same-planet"}]}"#;
+        assert!(serde_json::from_str::<Request>(line).is_err());
     }
 
     #[test]

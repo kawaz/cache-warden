@@ -29,6 +29,7 @@
 pub mod approver;
 pub mod authsock;
 mod graceful_restart;
+pub mod guard;
 pub mod handler;
 pub mod hardening;
 pub mod otp_adapter;

@@ -70,13 +70,22 @@ use crate::source::ValueSource;
 /// accept any version in `[MIN_SUPPORTED_VERSION, FORMAT_VERSION]` (see the
 /// module doc's "Wire format compatibility" section) and reject anything
 /// outside that range rather than guess.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 2;
 
 /// The oldest `format_version` this build still knows how to read. Only
 /// moves forward if a future format change is *breaking* (at which point the
 /// old range becomes permanently unreadable and gets a new [`MAGIC`] instead
 /// of a bumped [`FORMAT_VERSION`] — see the module doc).
 pub(crate) const MIN_SUPPORTED_VERSION: u32 = 1;
+
+/// Wire version that carries no per-entry access guard (DR-0030). Emitted by
+/// [`StoreSnapshot::from_entries`] when no entry carries a guard record — a
+/// current-generation build that started using guards would step up to
+/// [`FORMAT_VERSION`], and older builds (which cannot enforce guards) will
+/// then refuse to import rather than silently drop the declarations
+/// (DR-0030 §3 "ダウングレード方向"). Guard-free workloads keep producing
+/// v1 snapshots so older-build downgrade stays cold-startable.
+pub(crate) const VERSION_PRE_GUARD: u32 = 1;
 
 /// Whether `v` falls within the inclusive `[MIN_SUPPORTED_VERSION,
 /// FORMAT_VERSION]` range this build accepts. Shared by
@@ -192,10 +201,81 @@ pub(crate) struct SnapshotFailure {
     pub(crate) retry_after_ms: u64,
 }
 
-/// One key's full snapshotted state: its value, its definition, and its
-/// failure-backoff record, any combination of which may be present or absent
-/// — mirroring the three independent maps [`crate::Store`] keeps them in
-/// (DR-0014 / DR-0022).
+/// The declared kind of a `same-ancestor`-family constraint on the wire
+/// (mirror of the core's `guard::DeclaredAncestor`). Evaluation ignores
+/// which variant this is — it exists so `kv list` / the approver dialog can
+/// render `"same-shell (zsh)"` vs `"same-ancestor (code)"` without carrying
+/// a parallel display hint on every entry.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum SnapshotDeclaredAncestor {
+    /// Declared via `--require-same-shell` (sugar). Carries the pinned
+    /// shell's basename purely for display.
+    SameShell { shell_name: String },
+    /// Declared via `--require-same-ancestor=NAME`.
+    Named { name: String },
+}
+
+/// The pinned process entity carried inside a `same-ancestor`-family
+/// constraint (mirror of `guard::PinnedProcess`).
+///
+/// `start_time_us` carries the process's kernel-reported start time in
+/// **microseconds** since the system epoch — deliberately finer than the
+/// snapshot's other TTL timestamps (which live at millisecond resolution).
+/// macOS's `proc_pidbsdinfo` reports start_time at μs precision, and
+/// `PinnedProcess::start_time == PinnedProcess::start_time` is the entity
+/// pin's identity check (DR-0030 §Security): truncating to ms would round
+/// two "same instant" reads to different values across a snapshot round-trip,
+/// which would fail the equality after graceful restart and turn every
+/// same-ancestor guard into a fail-closed denial. `start_time_us` /
+/// `unique_id` are `#[serde(default)]` so a future field addition on the
+/// same wire version stays additive.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SnapshotPinnedProcess {
+    pub(crate) pid: u32,
+    #[serde(default)]
+    pub(crate) start_time_us: Option<u64>,
+    #[serde(default)]
+    pub(crate) unique_id: Option<u64>,
+    pub(crate) path: PathBuf,
+    pub(crate) name: String,
+}
+
+/// One constraint of a snapshotted [`SnapshotGuard`] (mirror of
+/// `guard::GuardConstraint`). Uses an internally-tagged serde
+/// representation so an unknown constraint kind fails deserialization
+/// rather than silently degrading to "no constraint" — safer than
+/// `#[serde(other)]` for a security-sensitive record.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum SnapshotConstraint {
+    SameUser,
+    SameAncestor {
+        declared: SnapshotDeclaredAncestor,
+        pinned: SnapshotPinnedProcess,
+    },
+    Command {
+        name: String,
+    },
+}
+
+/// A snapshotted per-entry access guard record (DR-0030). Carries the
+/// AND-composed constraint list plus a small setter identity snapshot
+/// (`euid` / `ruid`). Distinct wire types are used rather than a raw
+/// `serde(default)` on the core's [`crate::GuardRecord`] to keep the core's
+/// public API free of a wire-format concern (same pattern as
+/// [`SnapshotSource`] for [`crate::ValueSource`]).
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SnapshotGuard {
+    pub(crate) constraints: Vec<SnapshotConstraint>,
+    pub(crate) setter_euid: u32,
+    pub(crate) setter_ruid: u32,
+}
+
+/// One key's full snapshotted state: its value, its definition, its
+/// failure-backoff record, and its DR-0030 access guard, any combination of
+/// which may be present or absent — mirroring the four independent maps
+/// [`crate::Store`] keeps them in (DR-0014 / DR-0022 / DR-0030).
 #[derive(Serialize, Deserialize)]
 pub(crate) struct SnapshotEntry {
     pub(crate) key: String,
@@ -207,6 +287,12 @@ pub(crate) struct SnapshotEntry {
     pub(crate) definition: Option<SnapshotDefinition>,
     #[serde(default)]
     pub(crate) failure: Option<SnapshotFailure>,
+    /// DR-0030 guard record; present only on snapshots produced by builds
+    /// that speak wire format >= [`FORMAT_VERSION`]. `#[serde(default)]` lets
+    /// an older v1 payload (which never wrote this field) deserialize into
+    /// `None`, matching the additive-compat template.
+    #[serde(default)]
+    pub(crate) guard: Option<SnapshotGuard>,
 }
 
 /// A serialized capture of a [`crate::Store`]'s full state (DR-0029 §2),
@@ -234,11 +320,34 @@ impl std::fmt::Debug for StoreSnapshot {
 }
 
 impl StoreSnapshot {
-    /// Build a fresh (current-version) snapshot from already-collected
-    /// entries. Crate-internal: only `Store::export_snapshot` constructs one.
+    /// Build a fresh snapshot at the current [`FORMAT_VERSION`].
+    ///
+    /// Only meaningful for tests that pin the "newest version" behavior
+    /// explicitly; `Store::export_snapshot` uses [`Self::from_entries`]
+    /// instead so guard-free workloads keep emitting v1 payloads for older
+    /// builds to consume.
+    #[cfg(test)]
     pub(crate) fn new(entries: Vec<SnapshotEntry>) -> Self {
         Self {
             format_version: FORMAT_VERSION,
+            entries,
+        }
+    }
+
+    /// Build a snapshot, choosing the wire version by content (DR-0030 §3
+    /// "ダウングレード方向"): any entry with a [`SnapshotGuard`] forces
+    /// [`FORMAT_VERSION`] so an older build refuses to import (rather than
+    /// silently dropping the guard); otherwise the snapshot stays on
+    /// [`VERSION_PRE_GUARD`] to keep guard-free downgrade paths working.
+    pub(crate) fn from_entries(entries: Vec<SnapshotEntry>) -> Self {
+        let any_guarded = entries.iter().any(|e| e.guard.is_some());
+        let format_version = if any_guarded {
+            FORMAT_VERSION
+        } else {
+            VERSION_PRE_GUARD
+        };
+        Self {
+            format_version,
             entries,
         }
     }
@@ -529,7 +638,8 @@ impl std::fmt::Display for ImportError {
             ImportError::BadMagic => write!(f, "not a cache-warden snapshot stream (bad magic)"),
             ImportError::UnsupportedVersion { got, supported } => write!(
                 f,
-                "unsupported snapshot format version {got} (this build supports {supported})"
+                "unsupported snapshot format version {got} (this build supports {min}..={supported})",
+                min = MIN_SUPPORTED_VERSION,
             ),
             ImportError::MalformedTtl { key } => {
                 write!(
@@ -583,6 +693,7 @@ mod tests {
             }),
             definition: None,
             failure: None,
+            guard: None,
         }
     }
 
@@ -639,6 +750,25 @@ mod tests {
             }
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
+    }
+
+    /// UnsupportedVersion's Display must show the **inclusive range** the
+    /// build accepts (`MIN..=FORMAT`), not just the upper bound. Reporting
+    /// only the top edge misleads a user diagnosing a downgrade attempt
+    /// ("supported 2" reads as "v1 too old" when v1 is still supported); the
+    /// range makes both boundaries observable.
+    #[test]
+    fn unsupported_version_display_names_both_range_bounds() {
+        let err = ImportError::UnsupportedVersion {
+            got: 999,
+            supported: FORMAT_VERSION,
+        };
+        let msg = err.to_string();
+        let expected = format!("{MIN_SUPPORTED_VERSION}..={FORMAT_VERSION}");
+        assert!(
+            msg.contains(&expected),
+            "display should carry the inclusive range {expected:?}: {msg}"
+        );
     }
 
     #[test]
@@ -702,6 +832,142 @@ mod tests {
     fn snapshot_source_round_trips_static() {
         let s = SnapshotSource::from_value_source(&ValueSource::Static);
         assert!(matches!(s.into_value_source(), ValueSource::Static));
+    }
+
+    // ---- DR-0030 guard serde compat ----
+
+    /// A v1 (pre-DR-0030) `SnapshotEntry` payload with no `guard` key must
+    /// deserialize into `guard: None` via `#[serde(default)]` — the
+    /// additive-compat template requirement for new fields (module doc
+    /// "Wire format compatibility").
+    #[test]
+    fn snapshot_entry_without_guard_key_deserializes_to_none() {
+        // Legal v1 payload: value present, no guard field.
+        let json = r#"{
+          "key":"K",
+          "value":{
+            "source":"Static",
+            "secret":[104,105],
+            "soft_ttl_ms":10000,
+            "hard_ttl_ms":30000,
+            "loaded_at_epoch_ms":1000,
+            "extended_at_epoch_ms":1000
+          }
+        }"#;
+        let entry: SnapshotEntry = serde_json::from_str(json).expect("v1 payload deserializes");
+        assert!(entry.guard.is_none(), "missing guard key -> None");
+    }
+
+    /// A guarded entry round-trips through JSON with each constraint kind
+    /// intact. Pins the wire-tag encoding (`same-user` / `same-shell` /
+    /// `same-ancestor` / `command`) and the pinned-process shape so a serde
+    /// rename would surface here.
+    #[test]
+    fn snapshot_guard_all_constraint_kinds_roundtrip() {
+        let guard = SnapshotGuard {
+            constraints: vec![
+                SnapshotConstraint::SameUser,
+                SnapshotConstraint::SameAncestor {
+                    declared: SnapshotDeclaredAncestor::SameShell {
+                        shell_name: "zsh".into(),
+                    },
+                    pinned: SnapshotPinnedProcess {
+                        pid: 42,
+                        // Deliberately a sub-ms value (…_567 µs, i.e. not a
+                        // whole millisecond): pins the "µs precision is
+                        // preserved" invariant that a millisecond field would
+                        // silently break by round-tripping through as_millis.
+                        start_time_us: Some(1_700_000_001_234_567),
+                        unique_id: Some(999),
+                        path: PathBuf::from("/bin/zsh"),
+                        name: "zsh".into(),
+                    },
+                },
+                SnapshotConstraint::SameAncestor {
+                    declared: SnapshotDeclaredAncestor::Named {
+                        name: "code".into(),
+                    },
+                    pinned: SnapshotPinnedProcess {
+                        pid: 84,
+                        start_time_us: None,
+                        unique_id: None,
+                        path: PathBuf::from("/Applications/VSCode.app"),
+                        name: "code".into(),
+                    },
+                },
+                SnapshotConstraint::Command { name: "git".into() },
+            ],
+            setter_euid: 501,
+            setter_ruid: 501,
+        };
+        let entry = SnapshotEntry {
+            key: "guarded".into(),
+            value: None,
+            definition: None,
+            failure: None,
+            guard: Some(guard),
+        };
+        let snap = StoreSnapshot::from_entries(vec![entry]);
+        // A guarded snapshot must bump to the current FORMAT_VERSION
+        // (DR-0030 §3).
+        assert_eq!(snap.format_version(), FORMAT_VERSION);
+        let bytes = snap.to_bytes().expect("serialize");
+        let back = StoreSnapshot::from_bytes(&bytes).expect("deserialize");
+        let round = back.into_entries().pop().unwrap();
+        let guard = round.guard.expect("guard survived");
+        assert_eq!(guard.constraints.len(), 4);
+        // Weak-form assertions on each kind — the exact struct comparison
+        // is covered by the round-trip; here we pin the discriminants.
+        assert!(matches!(guard.constraints[0], SnapshotConstraint::SameUser));
+        assert!(matches!(
+            guard.constraints[1],
+            SnapshotConstraint::SameAncestor {
+                declared: SnapshotDeclaredAncestor::SameShell { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            guard.constraints[2],
+            SnapshotConstraint::SameAncestor {
+                declared: SnapshotDeclaredAncestor::Named { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            guard.constraints[3],
+            SnapshotConstraint::Command { .. }
+        ));
+        // µs precision: the sub-ms tail of the pinned process's start_time_us
+        // must survive the JSON round-trip byte-for-byte. A regression that
+        // truncates to ms (e.g. `start_time.as_millis()` in the exporter)
+        // would round …_567 down to …_234 and break DR-0030 §Security's entity
+        // pin equality check after a graceful restart.
+        if let SnapshotConstraint::SameAncestor { pinned, .. } = &guard.constraints[1] {
+            assert_eq!(
+                pinned.start_time_us,
+                Some(1_700_000_001_234_567),
+                "µs precision must round-trip; ms truncation would zero the sub-ms tail"
+            );
+        } else {
+            panic!("expected the second constraint to be SameAncestor");
+        }
+    }
+
+    /// `from_entries` picks the wire version by content: any entry carrying
+    /// a `SnapshotGuard` bumps to `FORMAT_VERSION`; a guard-free set stays
+    /// on `VERSION_PRE_GUARD` (DR-0030 §3 "ダウングレード方向").
+    #[test]
+    fn from_entries_selects_version_by_guard_presence() {
+        let plain = StoreSnapshot::from_entries(vec![sample_entry("A")]);
+        assert_eq!(plain.format_version(), VERSION_PRE_GUARD);
+        let mut guarded_entry = sample_entry("B");
+        guarded_entry.guard = Some(SnapshotGuard {
+            constraints: vec![SnapshotConstraint::SameUser],
+            setter_euid: 0,
+            setter_ruid: 0,
+        });
+        let guarded = StoreSnapshot::from_entries(vec![guarded_entry]);
+        assert_eq!(guarded.format_version(), FORMAT_VERSION);
     }
 
     #[test]

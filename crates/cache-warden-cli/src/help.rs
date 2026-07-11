@@ -598,10 +598,40 @@ pub fn kv_set() -> HelpSpec {
                 name: "--hard-ttl DUR",
                 desc: "Hard TTL (value zeroized at expiry)",
             },
+            Row {
+                name: "--require-same-user",
+                desc: "Only readers with matching euid/ruid may kv get this value",
+            },
+            Row {
+                name: "--require-same-shell",
+                desc: "Pin the closest shell in the setter's ancestry;\n\
+                       reader must have that same process in its chain",
+            },
+            Row {
+                name: "--require-same-ancestor=NAME",
+                desc: "Pin the setter's ancestor whose basename is NAME;\n\
+                       reader must have that same process in its chain\n\
+                       (repeatable)",
+            },
+            Row {
+                name: "--require-command=NAME",
+                desc: "Reader chain must contain a process with basename\n\
+                       (or full path if `/PATH`) NAME. WEAK: spoofable by\n\
+                       dropping a same-name binary. (repeatable)",
+            },
         ],
         detail: "\
 `kv set` injects a literal, opaque value only. To register a regenerable
 command source, use `kv define` instead.
+
+Access guard (--require-*): declares who may `kv get` this value. Multiple
+--require-* flags combine with AND; a subsequent `kv set` on the same key
+replaces the declaration (an unguarded set drops all constraints). The
+`command=` kind is weak (spoofable by any process the reader can launch
+with the same executable basename or full path); use it as a hint, not a
+boundary. The strong kinds pin the setter's ancestor by process identity
+(pid + start_time [+ macOS unique_id]) so the constraint lapses when the
+pinned process exits.
 
 VALUE is positional: `kv set DB hunter2`. When VALUE is omitted the bytes are
 read from stdin (binary safe): `op read op://v/i/pw | kv set DB`. Reading from
