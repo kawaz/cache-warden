@@ -8,11 +8,13 @@
 //!   answer — no "is this pid allowed", no policy matching, no ancestry-chain
 //!   evaluation. That judgment belongs to the caller: this crate's responsibility
 //!   boundary is data retrieval, policy is the consumer's.
-//! - **Pure Rust + libc.** The only dependency is [`libc`] for the FFI surface
-//!   (`proc_pidinfo` / `proc_pidpath` / `getsockopt`); no `sysinfo`-style crate,
-//!   no build script. This crate is intentionally self-contained (no dependency
-//!   on `cache-warden`'s own types) so it can be extracted to its own repository
-//!   without carrying this workspace along.
+//! - **Minimal, system-level dependencies only.** [`libc`] carries the kernel
+//!   FFI surface (`proc_pidinfo` / `proc_pidpath` / `getsockopt`), and — on
+//!   macOS targets only — `security-framework` / `core-foundation` carry the
+//!   [`codesign`] module's `Security.framework` calls. No `sysinfo`-style
+//!   aggregator crate, no build script. This crate is intentionally
+//!   self-contained (no dependency on `cache-warden`'s own types) so it can be
+//!   extracted to its own repository without carrying this workspace along.
 //! - **Non-macOS is a shim, not a cfg wall.** Every public function compiles and
 //!   runs on any Unix target; off-macOS builds return
 //!   [`InspectError::Unavailable`] or `None` rather than failing to compile.
@@ -20,6 +22,7 @@
 //!   Linux/CI. (Unix only: the peer API is keyed by a Unix `RawFd`, so Windows
 //!   targets are out of scope by construction.)
 
+pub mod codesign;
 mod inspect;
 mod peer;
 

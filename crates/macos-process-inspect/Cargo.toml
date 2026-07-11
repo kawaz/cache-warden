@@ -10,3 +10,13 @@ description = "macOS process inspection: pid facts, ancestry walking, and Unix-d
 # 0.2.184 = the version this crate's use of LOCAL_PEERTOKEN / LOCAL_PEEREPID
 # was verified against; older 0.2.x lack those constants and fail to compile.
 libc = "0.2.184"
+
+# Code signature identity read-back for peer authentication (draft-DR-0031
+# §Security). Confined to macOS via target-specific deps so a Linux build
+# pulls none of this (the non-macOS `codesign` stubs surface no dependency
+# on Security.framework at all).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"

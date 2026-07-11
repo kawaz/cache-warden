@@ -17,6 +17,11 @@ cache-warden-authsock = { path = "../cache-warden-authsock" }
 # Approver helper IPC wire schema (draft-DR-0031 §4), shared with the
 # `cache-warden-approver` GUI helper crate's `main.rs`.
 cache-warden-approver = { path = "../cache-warden-approver" }
+# Peer code-signature identity check for the approver socket
+# (draft-DR-0031 §Security). Cross-platform: the crate itself compiles on
+# Linux with a fail-closed shim, so this stays in the default `[dependencies]`
+# table alongside the rest of `daemon::approver`'s cross-platform pieces.
+macos-process-inspect = { path = "../macos-process-inspect" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Async runtime + Unix socket I/O for the daemon (DR-0008 single-process host).

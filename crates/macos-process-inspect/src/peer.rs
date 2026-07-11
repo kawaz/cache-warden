@@ -87,6 +87,22 @@ impl AuditToken {
     pub fn pid_version(&self) -> i32 {
         self.val[7] as i32
     }
+
+    /// The raw 32-byte audit token as the kernel returned it, in native byte
+    /// order — the same shape `kSecGuestAttributeAudit` expects when handed
+    /// to `SecCodeCopyGuestWithAttributes` via a `CFData`. See
+    /// [`super::codesign`] for the peer-authentication use.
+    ///
+    /// The [`AuditToken`] struct stores each of the kernel's 8 `u32` slots
+    /// unchanged, so the reconstruction is a slot-by-slot `to_ne_bytes` —
+    /// no byte-order or width conversion happens here.
+    pub fn raw_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, v) in self.val.iter().enumerate() {
+            out[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+        }
+        out
+    }
 }
 
 /// The peer process id for the connection on `fd`, or `None` if unavailable.
@@ -219,6 +235,24 @@ mod tests {
         assert_eq!(token.pid(), Some(66));
         assert_eq!(token.asid(), 77);
         assert_eq!(token.pid_version(), 88);
+    }
+
+    #[test]
+    fn audit_token_raw_bytes_round_trips_native_slots() {
+        // Every u32 slot must serialize to exactly 4 bytes in native order,
+        // packed contiguously into 32 bytes — the shape
+        // `SecCodeCopyGuestWithAttributes(kSecGuestAttributeAudit)` expects.
+        // Using `to_ne_bytes` on the same values inline mirrors the intended
+        // implementation (native, per-slot) rather than a byte-order-specific
+        // literal that would drift on a big-endian target.
+        let vals = [0x0102_0304u32, 0, 0xffff_fffe, 42, 43, 44, 45, 46];
+        let token = AuditToken { val: vals };
+        let bytes = token.raw_bytes();
+        let mut expected = [0u8; 32];
+        for (i, v) in vals.iter().enumerate() {
+            expected[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+        }
+        assert_eq!(bytes, expected);
     }
 
     #[test]

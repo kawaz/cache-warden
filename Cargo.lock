@@ -99,6 +99,7 @@ name = "cache-warden-approver"
 version = "0.25.0"
 dependencies = [
  "block2",
+ "macos-process-inspect",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -162,6 +163,7 @@ dependencies = [
  "core-foundation-sys",
  "hmac",
  "libc",
+ "macos-process-inspect",
  "macos-tcc",
  "security-framework",
  "security-framework-sys",
@@ -585,7 +587,11 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 name = "macos-process-inspect"
 version = "0.1.0"
 dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
  "libc",
+ "security-framework",
+ "security-framework-sys",
 ]
 
 [[package]]

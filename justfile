@@ -45,9 +45,19 @@ run *ARGS: build
 
 # draft-DR-0031 Phase 1.2: build cache-warden-approver, assemble its
 # CacheWardenApprover.app bundle (debug profile) so `LSUIElement=YES` etc. can
-# be honored, and exec it. `.app` bundle-lookup happens from the binary path
-# (macOS walks up looking for `Contents/Info.plist`), so exec-ing
+# be honored, sign it, and exec it. `.app` bundle-lookup happens from the
+# binary path (macOS walks up looking for `Contents/Info.plist`), so exec-ing
 # `.app/Contents/MacOS/<name>` still gets the Info.plist applied.
+#
+# dev build も実 identity で署名する (DR-0031 §Security): 双方向 peer 認証は
+# 「peer が自分と同じ Team ID で署名されているか」で判定するため、ad-hoc 署名の
+# dev build は検証を通れない。ad-hoc 用フォールバック経路は作らない裁定なので、
+# dev 実行もここで release と同じ Developer ID Application 証明書で署名する
+# (notarization は quarantine されないローカルビルドには不要)。identity は
+# CODESIGN_IDENTITY env で上書き可、既定はローカル keychain の
+# Developer ID Application を自動検出。
+# binary は cargo の成果物を cp する (ln -f だと同一 inode の
+# target/debug/cache-warden-approver に codesign が署名を書き込んでしまう)。
 [script]
 approver-run *ARGS:
     cargo build -p cache-warden-approver
@@ -56,7 +66,14 @@ approver-run *ARGS:
     mkdir -p "$APP/Contents/MacOS"
     cp crates/cache-warden-approver/Info.plist "$APP/Contents/Info.plist"
     printf 'APPL????' > "$APP/Contents/PkgInfo"
-    ln -f target/debug/cache-warden-approver "$APP/Contents/MacOS/cache-warden-approver"
+    cp target/debug/cache-warden-approver "$APP/Contents/MacOS/cache-warden-approver"
+    identity="${CODESIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ {print $2; exit}')}"
+    if [ -z "$identity" ]; then
+        echo "error: no 'Developer ID Application' identity in keychain; set CODESIGN_IDENTITY explicitly" >&2
+        exit 1
+    fi
+    codesign --sign "$identity" --options runtime --force "$APP/Contents/MacOS/cache-warden-approver"
+    codesign --sign "$identity" --options runtime --force "$APP"
     exec "$APP/Contents/MacOS/cache-warden-approver" "$@"
 
 # check + test + build (CI entry point)

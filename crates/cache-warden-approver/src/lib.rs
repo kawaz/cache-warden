@@ -8,3 +8,12 @@
 //! `#[cfg(target_os = "macos")]` module.
 
 pub mod wire;
+
+/// draft-DR-0031 §Security: the signing Identifier prefix every process in
+/// the cache-warden family carries (daemon `com.github.kawaz.cache-warden`,
+/// helper `com.github.kawaz.cache-warden.approver`, future siblings). Both
+/// ends of the approver IPC refuse a Team-ID-matching peer whose signing
+/// Identifier does not start with this string. Lives here — next to the wire
+/// schema both ends already share — so the daemon and the helper cannot
+/// drift apart on what "cache-warden family" means.
+pub const CACHE_WARDEN_IDENTIFIER_PREFIX: &str = "com.github.kawaz.cache-warden";

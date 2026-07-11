@@ -21,9 +21,6 @@
 //! - Info.plist (`LSUIElement=YES`) + `.app` バンドル化: `.Accessory` +
 //!   `/usr/bin/open` 経由の focus 奪取は既に実機確認済みだが、実際の `.app`
 //!   バンドル生成 + codesign/notarize は release.yml 側の作業 (Phase 3)
-//! - 双方向 peer 認証 (§Security): daemon → helper / helper → daemon の identity
-//!   検証 (`getsockopt(LOCAL_PEERTOKEN)`) は未実装。現状は socketpair 相当の
-//!   name-based socket に接続するのみ
 //! - Cancel button の Rust 側 delegate class 定義 (peer_gone / 詳細 cancel reason 用、
 //!   Phase 2)
 //! - Requester icon / チップ / 詳細展開 UI (Phase 2)
@@ -88,13 +85,41 @@ mod approver {
         std::env::var_os("CACHE_WARDEN_APPROVER_SOCKET").map(PathBuf::from)
     }
 
-    /// Connect to the daemon's approver socket and read the single
-    /// `ApproveRequest` line it sends immediately after accepting (§4: helper
-    /// connects, daemon binds/accepts/sends). Blocking I/O: this runs on the
-    /// main thread before any UI is built, matching the "connect + read
-    /// before `app.run()`" requirement.
+    use cache_warden_approver::CACHE_WARDEN_IDENTIFIER_PREFIX;
+
+    /// Verify the daemon peer on the just-connected `UnixStream` has the
+    /// same code-signature identity as this helper (draft-DR-0031
+    /// §Security). Fail-closed on every deviation — the caller aborts
+    /// without ever building UI or reading the request.
+    fn verify_daemon_peer(stream: &UnixStream) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        macos_process_inspect::codesign::verify_peer(
+            stream.as_raw_fd(),
+            CACHE_WARDEN_IDENTIFIER_PREFIX,
+        )
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("daemon peer failed code-signature verification: {e}"),
+            )
+        })
+    }
+
+    /// Connect to the daemon's approver socket, verify the daemon peer's
+    /// code signature (§Security), and read the single `ApproveRequest`
+    /// line it sends immediately after accepting (§4: helper connects,
+    /// daemon binds/accepts/sends). Blocking I/O: this runs on the main
+    /// thread before any UI is built, matching the "connect + verify +
+    /// read before `app.run()`" requirement.
     fn connect_and_read_request(path: &Path) -> std::io::Result<(UnixStream, ApproveRequest)> {
         let stream = UnixStream::connect(path)?;
+        verify_daemon_peer(&stream)?;
+        // 検証を通った正当な daemon が accept 後に request を書かないまま停止
+        // した場合 (graceful restart 途中の死、実装バグ) に、helper が dialog も
+        // 出さず読み込みで無期限 hang するのを防ぐ。人間の承認操作はこの read の
+        // 後 (daemon 側 timeout の管轄) なので、request 到着だけを短く bound して
+        // よい。write 側 (ApproveResponse 送信) は timeout 対象外。
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut line = String::new();
         reader.read_line(&mut line)?;
