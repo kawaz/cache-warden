@@ -1058,6 +1058,83 @@ Phase 1.1 の結果から、以下の順で進める:
    `approver.rs` 新設 (§4/§7)
 4. 双方向 peer 認証 (§Security)
 
+### Phase 1.3 実機観察 (2026-07-11、`cache-warden-approver` v0.2)
+
+Phase 1.3 の焦点は「`.Accessory` (Dock Icon 非表示) を維持したまま自動 focus 奪取
+を成立させる」こと。試験 (a)→(d) を実機で順に叩き、**(d) のみ成立**。以下、経路
+別の観察と結論。
+
+#### 試験順序と結果 (macOS 26、`.app` バンドル + Info.plist LSUIElement=YES 上で)
+
+| 試験 | 経路 | 実観測 |
+|---|---|---|
+| (a) | `NSRunningApplication.currentApplication().activateWithOptions:` (`ActivateAllWindows | ActivateIgnoringOtherApps`) | 戻り値 `false` = request 送信自体が拒否。自プロセスへの activate は NSRunningApplication 経路では受け付けられない。指紋 sensor 無反応、Cancel で終了 |
+| (b) | `NSApplication::activate()` (macOS 14+ cooperative activation) | `isActive = false`。frontmost app が yield していないので却下。指紋 sensor 無反応、Cancel で終了 |
+| (c-1) | runtime `setActivationPolicy(.Regular)` + activate | Dock Icon 復活 (LSUIElement runtime 上書き)、`isActive = false`。指紋 sensor 無反応、Cancel で終了 |
+| (c-2) | Carbon `TransformProcessType(kProcessTransformToForegroundApplication)` + activate | OSStatus 0 (成功) でも `isActive = false`。指紋 sensor 無反応、Cancel で終了 |
+| (d) | `/usr/bin/open <bundle>.app` spawn (LaunchServices 経由) | **成立**。activation 成立 → focus 着 → 指紋 sensor 配送 → `finger-on` → `matched by <private>` → `outcome: Approved` → terminate 0。`.Accessory` 維持のまま Dock Icon 出ず |
+
+coreauthd 側の grand truth (試験 d): 起動→ `will start matching` 2 回発火 (LA 側と
+`open` 経由の再 activate それぞれ)、`finger-on` (1 回) → `matched by <private>` →
+`has finished with { ... }`。
+
+#### 結論: self-activation は macOS 26 でプロセス内 API 全経路が拒否される
+
+試験 (a)(b)(c-1)(c-2) はすべて「呼出元プロセス自身が自プロセスを activate する」
+経路で、いずれも AppKit / Carbon レイヤで却下された。**ユーザ操作起点でない
+self-activation は macOS のフォーカス盗み防止機構でブロックされる** (Apple の
+cooperative activation 設計、macOS 14 以降強化)。試験 (d) だけ成立するのは
+`/usr/bin/open` が別プロセスとして LaunchServices に activate 要求を送り、
+LaunchServices (システム側) が activation を実行するから = self ではなく別プロセス
+起点の activate として扱われる。
+
+**設計上の含意**:
+
+- helper 本実装で `.Accessory` を維持したまま focus 奪取を実現するには、`open` 経由
+  (試験 d) を採用する。ネイティブ AppKit 経路にこだわると詰む
+- Dock Icon 出さない要件 (§UX policy / §Phase 1.2) は `.Accessory` + `open` 経路で
+  両立可能
+- 試験 (c-1) で「`.Regular` に切り替えれば Dock Icon 一瞬 + focus 奪取」を狙う設計
+  は失敗した (Dock Icon は出るが focus 奪取自体が不成立)。将来 macOS で
+  cooperative activation が緩和されない限り不採用
+
+#### イベント駆動化: `NSApplicationDidFinishLaunching` 通知後に activate
+
+試験 (d) の実装で「`open` を `run()` の主線から spawn すると、window 表示より先に
+LaunchServices activation 要求が届いて no-op になる」順序競合が懸念された。sleep
+挿入は AI 雑対応 anti-pattern ([[sloppy-ai-patterns]]) なので採用しない。代わりに
+`NSNotificationCenter.defaultCenter.addObserverForName:` で
+`NSApplicationDidFinishLaunchingNotification` を待ち、その block callback から
+`open` を spawn する経路にした。順序保証:
+
+1. `app.run()` = NSApplication run loop 開始
+2. NSApplication が launch 完了 → `didFinishLaunching` 通知 post
+3. observer block 発火 (main thread) → `open <bundle>.app` spawn
+4. LaunchServices → 既実行の app に activate 要求
+5. focus 着 → 指紋 sensor input 配送開始
+
+observer の token (`Retained<ProtocolObject<dyn NSObjectProtocol>>`) は `app.run()`
+の生存期間中 drop すると解除されるので、`_focus_observer` として `run()` scope に
+保持する。
+
+#### ダイアログ位置: `mainScreen` 中央に配置
+
+Phase 1.1〜1.2 では `NSRect { origin: (0, 0), size: 400x325 }` で init していたため
+「メインスクリーンの左下」に表示され、マルチモニタ環境で謎の位置に見えた。
+`window.center()` を `setContentView` の後 / `makeKeyAndOrderFront` の前に呼ぶ
+ことで解消。`NSScreen::mainScreen` の Apple 定義は「現在キーウィンドウを持つ画面」
+なので、`.Accessory` app が起動する時点では **他アプリ (= 起動前 frontmost) のある
+画面** の中央に置かれる = ユーザが直前に触っていたモニタの中央、という自然な挙動。
+
+#### helper 本実装コード反映
+
+`crates/cache-warden-approver/src/main.rs`:
+
+- `steal_focus(window)` = `orderFrontRegardless` → `makeKeyWindow` → `open <bundle>.app` spawn
+- `register_focus_steal_on_launch(window)` = `NSApplicationDidFinishLaunching` observer 登録、observer token を返す
+- `run()` = `window.center()` で位置決め → `makeKeyAndOrderFront` → observer 登録 (token を `_focus_observer` にバインド保持) → `evaluate` → `app.run()`
+- Cargo.toml: objc2-foundation に `NSNotification` / `NSOperation` / `block2` feature 追加
+
 ## Confirmed via codex adversarial review (2026-07-10, job task-mrebtdaf-j8x4dt)
 
 codex review で「妥当な判断」と AGREED された設計要素 (kawaz レビューでの判断負荷
