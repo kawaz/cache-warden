@@ -53,13 +53,19 @@ mod approver {
         BiometricFailed,
     }
 
-    /// draft-DR-0031 §UX policy: focus 制御の default steal を実現するため
-    /// activation policy を `.Regular` にする。非バンドル起動時は Dock Icon が出るか
-    /// 出ないかが実装依存 = Phase 1.1 の実機確認項目 (出たら Info.plist + .app
-    /// バンドル化を Phase 1.2 で追加)。
+    /// activation policy を `.Accessory` に固定する (Info.plist の
+    /// `LSUIElement=YES` と一致)。Phase 1.1 で `.Regular` にすると Dock Icon が
+    /// 出る問題が確認され、Phase 1.2 で `.app` バンドル + Info.plist LSUIElement=YES
+    /// に切替。runtime で `.Regular` を呼ぶと LSUIElement=YES が上書きされて Dock
+    /// Icon が復活するため、runtime も `.Accessory` を明示する。
+    ///
+    /// `.Accessory` はフォーカス奪取に制約があるが、focus 奪取は別対策 (新
+    /// `NSApplication::activate` API / `NSRunningApplication.current.activate`
+    /// 等) で潰す。§UX policy で確認済みの通り、focus 状態が sensor input 配送の
+    /// ゲートなので、Dock Icon 出さない + focus 奪える両立が必要。
     fn init_app(mtm: MainThreadMarker) -> Retained<NSApplication> {
         let app = NSApplication::sharedApplication(mtm);
-        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         app
     }
 

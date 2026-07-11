@@ -43,6 +43,22 @@ build: check
 run *ARGS: build
     ./target/release/cache-warden "$@"
 
+# draft-DR-0031 Phase 1.2: build cache-warden-approver, assemble its
+# CacheWardenApprover.app bundle (debug profile) so `LSUIElement=YES` etc. can
+# be honored, and exec it. `.app` bundle-lookup happens from the binary path
+# (macOS walks up looking for `Contents/Info.plist`), so exec-ing
+# `.app/Contents/MacOS/<name>` still gets the Info.plist applied.
+[script]
+approver-run *ARGS:
+    cargo build -p cache-warden-approver
+    APP="target/debug/CacheWardenApprover.app"
+    rm -rf "$APP"
+    mkdir -p "$APP/Contents/MacOS"
+    cp crates/cache-warden-approver/Info.plist "$APP/Contents/Info.plist"
+    printf 'APPL????' > "$APP/Contents/PkgInfo"
+    ln -f target/debug/cache-warden-approver "$APP/Contents/MacOS/cache-warden-approver"
+    exec "$APP/Contents/MacOS/cache-warden-approver" "$@"
+
 # check + test + build (CI entry point)
 ci: check test build
 
