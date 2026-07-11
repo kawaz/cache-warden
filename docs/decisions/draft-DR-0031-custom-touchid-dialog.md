@@ -1023,6 +1023,41 @@ respect_focus_mode = true        # default; OS Focus 中は steal を attention 
 Focus mode 状態の検知 API (`NSProcessInfo.processInfo.userInterfaceLevel` /
 DND framework) は helper 本実装で調査。
 
+### Phase 1.1 実機観察 (2026-07-11、`cache-warden-approver` v0.1)
+
+Phase 1.1 (helper crate 骨組み + focus 制御) の実機確認結果:
+
+- **Dock Icon が出る**: `.Regular` activation policy の副作用として、非バンドル
+  バイナリでも Dock Icon (ターミナルアイコン + "cache-warden-approver" ラベル) が
+  表示される (kawaz スクショで確認)。**Phase 1.2 で Info.plist + `.app` バンドル化
+  + `LSUIElement=YES`** で解消する必要
+- **自動フォーカス着せず**: `steal_focus = orderFrontRegardless →
+  activateIgnoringOtherApps(true) → makeKeyWindow` の 3 呼出でもフォーカスは
+  奪えなかった。**推定原因**: (i) `LSUIElement=YES` を Info.plist に持たない
+  素バイナリでは `activateIgnoringOtherApps` の効果に制約がある可能性
+  (menu bar app 扱いにならないため)、(ii) macOS 14+ で
+  `activateIgnoringOtherApps(_:)` が deprecated、`NSApplication.activate(...)` の
+  新 API を使う必要がある可能性。両方を **Phase 1.2 で Info.plist + `.app` 化
+  してから再検証**する
+- **focus 無しでは TouchID は反応しない (前試験と一致)**: `.Regular` に変更した
+  後も、kawaz が数回試して「focus なしだと反応しない」ことを確定。coreauthd の
+  finger-on イベントも focus 着後にしか発火しない。**§UX policy の主張
+  (Apple safety design、default steal が機能上必要) は変更なし** = `.Accessory` と
+  `.Regular` の差ではなく、focus 状態そのものが sensor input 配送のゲートに
+  なっている
+
+### Phase 1.2 の順序
+
+Phase 1.1 の結果から、以下の順で進める:
+
+1. `Info.plist` (`LSUIElement=YES`) + `.app` バンドル化 (Dock Icon 消し、helper
+   app としての正当な扱いを確立)
+2. その状態で `activateIgnoringOtherApps` / 新 `NSApplication.activate(...)` API の
+   焦点奪取の効きを再検証
+3. IPC (unix socket + serde_json、承認情報 hardcoded → wire schema)、daemon 側
+   `approver.rs` 新設 (§4/§7)
+4. 双方向 peer 認証 (§Security)
+
 ## Confirmed via codex adversarial review (2026-07-10, job task-mrebtdaf-j8x4dt)
 
 codex review で「妥当な判断」と AGREED された設計要素 (kawaz レビューでの判断負荷
