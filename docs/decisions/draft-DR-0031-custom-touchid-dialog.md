@@ -1244,6 +1244,94 @@ request_approval)。guard・handler 統合は Phase 1.5。
 統合) の TouchID 実機検証とまとめて実施する。dev 実行経路は `just approver-run` が
 Developer ID 署名を組み込み済み (justfile、ad-hoc フォールバックなし)。
 
+### Phase 1.6 Block 1 実装記録 (2026-07-12)
+
+§3 採用案 (b) の**常駐 helper**を land。daemon 起動時に 1 回 bind + spawn + accept
++ verify (Phase 1.5) して、1 本の検証済み接続の上で N 個の approval を JSON Lines
+で直列に流す形。
+
+#### 実装の所在
+
+- `crates/cache-warden-cli/src/daemon/approver.rs` の `ApproverClient`: 状態は
+  `inner: tokio::sync::Mutex<InnerState>` + `socket_path` + `helper_pid: AtomicU32`
+  に集約 (承認は §8 で人間直列なので lock 1 本で足りる)。`start` で最初の接続を
+  eager 確立、`request(&self, req, timeout)` で lock → send → recv (stale
+  response 破棄ループ) → 死亡検知したら 1 回だけ再 spawn + 再送、`shutdown()` で
+  helper kill + socket file remove
+- helper 側 `crates/cache-warden-approver/src/main.rs` は 2 経路
+  (`run_persistent` / `run_standalone`) に分岐。常駐経路は background reader
+  thread が 1 行 read → mpsc::sync_channel → `dispatch_main` で main queue に
+  投げて dialog 表示 → outcome 送信完了で完了 channel を鳴らして次の read。
+  Cancel button / window close は Rust 側 delegate class (`ApproverDelegate`、
+  objc2 `define_class!`) で処理
+
+#### §3 との差分と意味論変化
+
+- §3 は on-demand spawn を「起動レイテンシ 100-300 ms」で却下しており、案 (b) を
+  そのまま採用。ただし §3 では「daemon 起動時に spawn」と書いたが、Phase 1.6 では
+  **`ApproverClient::start` 呼び出し時**に spawn する形にしている (guard 統合 =
+  Block 2 で daemon 起動フローに配線するときに再確認)
+- **helper 側 read の timeout を Phase 1.5 の 30 s から「無期限」へ変更** (常駐化
+  に伴う意味論変化)。Phase 1.5 の 30 s は one-shot 前提の bound (verify → read
+  request → dialog → exit) だったが、常駐 helper は「approval 要求が長時間来ない」
+  のが正常状態。daemon 死亡は Unix socket の kernel-side close で EOF (`read_line
+  == 0`) として捕捉されるため、hang しない
+
+#### レビュー (opus47 敵対的レビュー、2026-07-12) 反映
+
+- **C-1 (delegate lifetime、CRITICAL)**: `NSWindow.setDelegate` と
+  `NSButton.buttonWithTitle_target_action` の target はどちらも *unretained*。
+  `show_dialog_on_main` の delegate ローカル変数が return で drop されると Cancel
+  button と `windowWillClose:` が nil 宛て msgSend で silent no-op になり、TouchID
+  経路以外は outcome が daemon に届かなくなる (実機で必ず露呈)。**修正**: LA
+  completion block に `Retained<ApproverDelegate>` を capture させ、delegate を
+  block と同じ寿命に束縛。Cancel/windowWillClose 経路では `LAContext::invalidate()`
+  で LA を能動的に停止して block を発火させ、delegate をきちんと解放する
+  (常駐 helper なのでリーク蓄積を防ぐ)。DelegateIvars に `ctx: Retained<LAContext>`
+  を追加してこの経路を主流化
+- **H-1 (shutdown captive、HIGH)**: `shutdown` が pending request の `inner` lock
+  を待つと、graceful restart (§10) で helper kill が人間の指紋操作 (最長数十秒)
+  に captive されてしまう。**修正**: `ApproverClient` に `helper_pid: AtomicU32`
+  を追加し、`shutdown` は `inner` を取る前に `libc::kill(pid, SIGKILL)` で直接
+  helper を殺す (pending request の read/write が broken pipe で解けて lock が
+  releaseされる)。pid は `start` と recovery 経路で更新、recovery の dispose 前に
+  一旦 `store(0)` して新 helper を「shutdown による誤 kill」から守る
+- **H-2 (helper read timeout 消失、HIGH)**: Phase 1.5 の 30 s は one-shot 前提の
+  bound で、常駐化では意味論が変わる (上述)。**意図的な意味論変化**として
+  `spawn_reader_thread` の doc に「daemon 死亡は kernel の EOF 経路で捕捉」を明記。
+  修正は入れず (fixed timeout を入れると常駐化の意味が消える)
+- **M-1 / M-2**: LA completion block を main queue に明示 dispatch する hardening、
+  stuck live helper の自動 recovery (§9 `helper_down` bounded wait) は既存 issue
+  `2026-07-12-approver-release-hardening` に集約 (Phase 1.6 land 前提の別対応)
+
+#### issue の解決
+
+`docs/issue/2026-07-11-approver-persistent-helper-lifecycle` の受け入れ条件は
+本 Block で全て解決:
+
+| 受け入れ条件 | 状態 |
+|---|---|
+| 常駐 helper (accept ループ) への組み替え | 解決 (`ApproverClient` + reader thread + `dispatch_main`) |
+| socket file の graceful shutdown 時 cleanup | 解決 (`shutdown` で remove、`shutdown_removes_socket_file` で pin) |
+| 双方向 peer 認証 (LOCAL_PEERTOKEN) | 継承 (Phase 1.5 で land 済み) |
+| Denied/PeerGone 受信時の daemon 側挙動テスト | 解決 (`client_passes_through_denied_and_peer_gone_outcomes`) |
+| bind→spawn 順序の test pin | 解決 (`connect_before_bind_fails_which_is_why_start_binds_first`) |
+
+#### 実機 e2e の残り
+
+以下は unit test で pin できず、Block 2 (guard/handler 統合) + kawaz 在席時の
+TouchID e2e でまとめて検証:
+
+- Cancel button / Cmd+W / close button 経路で outcome が daemon に届くこと
+  (C-1 修正の観察可能な効果)
+- 1 helper プロセスが N 回の approval 後もリークしないこと (delegate + LAContext +
+  NSWindow の per-request 解放)
+- graceful restart 中の `shutdown` が in-flight approval を待たないこと (H-1 修正
+  の観察可能な効果; SIGKILL 経路)
+- 常駐 helper の 2 件目以降の request で focus 奪取が動くこと
+  (`register_focus_steal_on_launch` を捨て、`show_dialog_on_main` から直接
+  `steal_focus` を呼ぶ形に切り替えた影響)
+
 ## Confirmed via codex adversarial review (2026-07-10, job task-mrebtdaf-j8x4dt)
 
 codex review で「妥当な判断」と AGREED された設計要素 (kawaz レビューでの判断負荷
