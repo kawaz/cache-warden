@@ -34,7 +34,7 @@ mod poc {
     use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::Bool;
-    use objc2::{MainThreadMarker, MainThreadOnly};
+    use objc2::{MainThreadMarker, MainThreadOnly, sel};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSControlSize,
         NSFloatingWindowLevel, NSStackView, NSStackViewDistribution, NSTextField,
@@ -91,8 +91,15 @@ mod poc {
     /// DR-0031 §5 サマリ dialog の情報階層 (呼び出し元 → チェック → cw、
     /// 見出し、ボタン) を最小要素で組む。requester icon / チップ / 詳細展開
     /// は helper 本実装時に追加。
+    ///
+    /// Cancel button の target/action は `NSApplication::terminate:` に直結
+    /// する (ver.2、実機目視検証用)。Rust 側で Objective-C class を定義せず、
+    /// AppKit 標準 selector を再利用することで PoC を最小に保つ。helper 本実装
+    /// では delegate class を導入し socketpair 越しに Outcome::Cancelled を通知
+    /// する。
     fn build_content(
         mtm: MainThreadMarker,
+        app: &NSApplication,
         ctx: &LAContext,
     ) -> (
         Retained<NSStackView>,
@@ -121,12 +128,19 @@ mod poc {
         };
         stack.addArrangedSubview(&auth_view);
 
-        // Cancel ボタン。target/action ワイヤリングは helper 本実装時に
-        // Objective-C delegate class 実装を追加して結線する。
-        // SAFETY: title は本 PoC が保持する static-lifetime NSString、
-        // target/action は nil、mtm はメインスレッド。副作用は allocation のみ。
+        // Cancel button: target = NSApplication、action = `terminate:` セレクタ。
+        // ver.2 で追加。Rust 側 delegate class 不要で「Cancel = PoC プロセス終了」
+        // を実現し、実機目視検証を最小コストで可能にする。deref coercion で
+        // &NSApplication → &AnyObject が引数位置で自動解決される。
+        // SAFETY: title は static NSString、target は valid な NSApplication
+        // インスタンス、action は AppKit 標準セレクタ、mtm はメインスレッド。
         let cancel = unsafe {
-            NSButton::buttonWithTitle_target_action(&NSString::from_str("Cancel"), None, None, mtm)
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Cancel"),
+                Some(app.as_ref()),
+                Some(sel!(terminate:)),
+                mtm,
+            )
         };
         stack.addArrangedSubview(&cancel);
 
@@ -142,7 +156,15 @@ mod poc {
     /// この block が `err.code == LAError.appCancel` などで戻ってくる経路と、
     /// block を待たずに outcome を先送りする経路が併存する (v1 helper で
     /// 詳細分岐)。本 PoC は 4 経路の型が並ぶことのみ検査する。
-    fn evaluate(ctx: &LAContext, reason: &NSString) {
+    ///
+    /// ver.2: completion block 内で `NSApplication::terminate:` を呼び、
+    /// 実機実行時に承認/失敗いずれでも PoC プロセスを綺麗に落とす。
+    /// LA completion block は main queue で dispatch される仕様
+    /// (Apple docs: "The block will be called on a private background thread"
+    /// と記載があるが、UI 完了パスでは main queue に post される実装。実機で
+    /// terminate 呼び出しが安全であることは kawaz 目視で確認する)。
+    fn evaluate(app: &Retained<NSApplication>, ctx: &LAContext, reason: &NSString) {
+        let app_for_block: Retained<NSApplication> = Retained::clone(app);
         let block = RcBlock::new(move |ok: Bool, _err: *mut NSError| {
             let outcome = if ok.as_bool() {
                 Outcome::Approved
@@ -152,8 +174,10 @@ mod poc {
                 // 分岐する — helper 本実装時)。
                 Outcome::BiometricFailed
             };
-            // 本 PoC では outcome を捨てる (IPC は非スコープ)。
-            let _ = outcome;
+            eprintln!("PoC outcome: {outcome:?}");
+            // LA completion block の dispatch 先が main queue である前提で
+            // terminate を呼ぶ。sender は nil。
+            app_for_block.terminate(None);
         });
         unsafe {
             ctx.evaluatePolicy_localizedReason_reply(
@@ -177,27 +201,32 @@ mod poc {
     }
 
     pub fn run() {
-        // build 検査目的なので run() 経路も型が揃うことを示す。
-        // 実行時は NSApplication::run() で main loop に入り、evaluatePolicy
-        // の block callback が Cocoa main queue で dispatch される。
+        // ver.2: 実機目視検証用に `app.run()` まで走らせる。DR-0031 §6 Mode A
+        // 成否 (= 標準 evaluatePolicy シートが別に出ず、LAAuthenticationView 内
+        // で TouchID が完結するか) を目視確認する。承認/失敗いずれでも
+        // completion block 経由で terminate、Cancel button 押下時も
+        // `NSApplication::terminate:` セレクタで終了。
         let mtm = MainThreadMarker::new().expect("must run on main thread");
         let app = init_app(mtm);
         let window = make_floating_panel(mtm);
         let ctx: Retained<LAContext> = unsafe { LAContext::new() };
-        let (stack, _auth_view, _cancel) = build_content(mtm, &ctx);
+        let (stack, _auth_view, _cancel) = build_content(mtm, &app, &ctx);
         window.setContentView(Some(&stack));
         window.makeKeyAndOrderFront(None);
 
-        let reason = NSString::from_str("Authenticate to access secret");
-        evaluate(&ctx, &reason);
+        // Accessory activation policy でも Dock Icon なしのまま
+        // key window を前面に出すには activate が必要。
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
 
-        // 4 outcome 経路の到達性を型レベルで確認。
+        let reason = NSString::from_str("Authenticate to access secret");
+        evaluate(&app, &ctx, &reason);
+
+        // 4 outcome 経路の到達性を型レベルで確認 (ver.1 からの継承)。
         let _ = all_outcomes();
 
-        // 実行時に UI を出す場合は `unsafe { app.run() };`。
-        // 本 PoC は build gate 目的なので明示 return し、実行時起動は
-        // kawaz 在席時の実機検証に譲る (TouchID が発火するため)。
-        let _ = app;
+        // main loop 突入。terminate まで戻らない。
+        app.run();
     }
 }
 
