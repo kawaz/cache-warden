@@ -118,9 +118,15 @@ restart は cold start に退化する — 「認可が黙って消える」よ�
   対象が消滅) は **fail-closed で AuthFailed 拒否**。DR-0012 と同じく
   regenerate / 再認証 / TouchID を一切トリガしない (拒否がコスト・音・dialog を
   発生させない)
-- 拒否理由は daemon log (tracing) に構造化で残す。クライアント応答には
-  「access denied by entry guard」+ どの constraint 種別で落ちたかまで
-  (setter の identity 詳細は返さない — get 側に setter 情報を漏らさない)
+- 拒否理由は daemon の stderr に 1 行診断 (key + constraint 種別のみ) で残す。
+  クライアント応答には「access denied by entry guard」+ どの constraint 種別で
+  落ちたかまで (setter の identity 詳細は返さない — get 側に setter 情報を漏らさない)
+- **authsock SIGN 経路も同じ gate を通る** (kawaz 裁定 2026-07-12、issue
+  `2026-07-12-authsock-sign-dr0030-guard-scope` の案 a): `[authsock.sockets.*].keys`
+  が参照する guarded key への SIGN_REQUEST は DR-0012 gate → guard → auth/retrieval
+  の順で評価し、拒否は SSH_AGENT_FAILURE (空 payload — SSH agent wire に error 詳細
+  フィールドが無く、guard 存在の oracle も作らない)。startup preload (公開鍵導出)
+  は getter delegation ではないため対象外
 
 ### 5. CLI / config surface
 
