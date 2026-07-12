@@ -1,6 +1,6 @@
 ---
 title: kv set の guard positive ack (guard_applied) — mixed-version silent no-op 対策
-status: open
+status: resolved
 category: task
 created: 2026-07-12T04:40:02+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-12T16:27:01+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented:handler統合(commit 429fbd03)でset応答にguard_applied追加(additive,skip_serializing_if)","implemented:新CLIはack無し旧daemon検出時にKvDelでbest-effort自動削除しエラー終了","done:ack成功/ack無し自動del成功/del失敗時手動案内/wireエラー透過の4テストでpin","carried:受け入れ条件③(旧バイナリ実発火検証)はdocs/issue/2026-07-12-authsock-sign-dr0030-guard-scope.mdのBlock3 TODOへ引き継ぎ"]
 blocked_by:
 origin: 自リポ TODO (draft-DR-0030 Block 2 セキュリティレビュー)
 ---
@@ -43,12 +43,14 @@ fail-closed 分岐 (HIGH-1 対応、unknown field 拒否等) は **同一 build 
 
 ## 受け入れ条件
 
-- [ ] `kv set` の daemon 応答に `guard_applied` (または同等の positive ack)
+- [x] `kv set` の daemon 応答に `guard_applied` (または同等の positive ack)
       フィールドが追加されている
-- [ ] 新 CLI は guard 宣言 (guard flags) を伴う `kv set` 送信時、応答に ack
+- [x] 新 CLI は guard 宣言 (guard flags) を伴う `kv set` 送信時、応答に ack
       が無ければエラーとして扱い、ユーザに「guard 未適用」を明示する
 - [ ] 旧 daemon 相手の mixed-version シナリオで、上記エラーが実際に発火する
       ことを確認 (= 旧バイナリ相当のモックまたは実バイナリで検証)
+      → `docs/issue/2026-07-12-authsock-sign-dr0030-guard-scope.md` の
+      Block 3 TODO 節に引き継ぎ
 
 ## 関連
 
