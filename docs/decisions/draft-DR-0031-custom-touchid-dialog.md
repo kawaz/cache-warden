@@ -650,6 +650,11 @@ cache-warden から secret を返せるパスは 2 つ:
 - guard は無いが `[auth].command` (DR-0022) が定義済みで soft/hard expiry → cache-warden
   dialog に切り替え可 (現行 CommandAuthenticator の外部コマンド起動を dialog に置換)
 - guard も auth.command も無い entry → dialog なし (現行の透過的 get 挙動を維持)
+- authsock SIGN (guard 付き key への SIGN_REQUEST) も guard 機械評価の通過後に
+  常に cache-warden dialog (operation: "sign")。kawaz 裁定 2026-07-13 (issue
+  `2026-07-12-authsock-sign-guard-dialog-decision` 案 a)。SSH client は agent
+  応答を同期で待つため人間承認を挟める (1Password SSH agent の TouchID confirm
+  と同構図、サーバ側 LoginGraceTime 既定 120s > `APPROVER_REQUEST_TIMEOUT` 90s)
 
 **「1P 白紙委任から段階的置き換え」ロードマップの現実的制約** (codex review medium-6
 対応): 単純に「全 entry に guard を宣言 → 1P dialog を実質見なくなる」ではない。
@@ -833,10 +838,9 @@ issue に切り出した既知の制約:
   なる (secret 自体は fail-closed のまま送出されないので機密性は保たれる)。
   根治には helper 側 dialog 自体に countdown を持たせる必要があり、同 issue
   項目 5 で追跡
-- **authsock SIGN は guard の機械評価のみで dialog を出さない**: `kv.get` の
-  guarded reveal path とは非対称 (SIGN 要求は同じ guard record を評価するが
-  approver dialog を経由しない)。この非対称を是正するかどうかは issue
-  `2026-07-12-authsock-sign-guard-dialog-decision` で kawaz 裁定待ち
+- **SIGN 経路は ssh の per-key SIGN + 自動再試行で dialog が積まれやすい**
+  (幽霊承認含む) — issue `2026-07-12-approver-release-hardening` 項目 6 で
+  SIGN 適用込みで追跡
 
 ## 実装 phase 分割
 
@@ -1509,3 +1513,30 @@ Block 3b 以降で再検討する。
 `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` /
 `cargo test --workspace` すべて green、**1959 tests passed を 2 回連続実行して
 一致** (flaky なし)。実機 TouchID e2e は Block 3b に持ち越し。
+
+### SIGN dialog 統合 (2026-07-13)
+
+commit `52b95386`。issue `2026-07-12-authsock-sign-guard-dialog-decision` の
+kawaz 裁定 (案 a: SIGN 経路でも guard 通過後に dialog を出す) を実装。
+
+- **承認フロー共通部品**: `ApprovalOutcome` + `ApproverSlot::await_dialog_outcome`
+  (`wait_ready` → `request` → outcome 分類) を kv get 経路と共有。一方
+  `first_pass` / `finalize` は pre-gate・応答形式・診断文言が経路ごとに
+  異なるため意図的に分離 (無理な一体化は両経路の意味論を壊すという判断)
+- **SIGN 2 pass**: lock 保持下で guard を評価 (unguarded entry は同一 lock で
+  即署名) → lock 解放して dialog await (operation: "sign") → lock 再取得の
+  上で guard record を再評価 + registry (blob → kv_key/source の解決) を
+  再解決 (dialog 待ち中の rotate/hot-swap を fail-closed で弾く)
+- **outcome**: Approved 以外の全 outcome・helper_down・素材欠落は
+  `SSH_AGENT_FAILURE` (空 payload)。機械 gate 拒否時は dialog 自体を発火しない
+- **guard 評価の一本化**: `eval_sign_guard` に集約し、first_pass / finalize /
+  test shim の 3 重複を解消
+- **Fable レビュー反映**: MEDIUM-1 (テスト空白 + 評価ロジック 3 重複) →
+  `eval_sign_guard` 一本化で修正、MEDIUM-2 (docs 未同期) → 本編集で反映、
+  LOW-3 (registry 再解決漏れ) → finalize での再解決を実装済み、LOW-4 (SIGN
+  経路の dialog 増幅懸念) → `2026-07-12-approver-release-hardening` 項目 6 に
+  追記済み
+- **検証**: テスト 8 本追加 (approved 署名成功 / 非 approved 全 outcome /
+  helper_down / record 差し替え / registry 消滅 / 拒否時 dialog 非発火 /
+  dialog block 中の並行 get 進行 の各経路)、`cargo test --workspace` **1963
+  tests green**

@@ -126,7 +126,8 @@ restart は cold start に退化する — 「認可が黙って消える」よ�
   が参照する guarded key への SIGN_REQUEST は DR-0012 gate → guard → auth/retrieval
   の順で評価し、拒否は SSH_AGENT_FAILURE (空 payload — SSH agent wire に error 詳細
   フィールドが無く、guard 存在の oracle も作らない)。startup preload (公開鍵導出)
-  は getter delegation ではないため対象外
+  は getter delegation ではないため対象外。guard 通過後は kv.get と同じく
+  approver dialog による人間承認を経る (kawaz 裁定 2026-07-13、DR-0031 §8)
 
 ### 5. CLI / config surface
 
