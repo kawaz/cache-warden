@@ -158,8 +158,9 @@ pub enum DeniedKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuardDenied {
     /// Which constraint kind failed. Multiple failures short-circuit at
-    /// the first one — the daemon logs this as a structured field
-    /// (`tracing::warn!(kind=?, …)`).
+    /// the first one — the daemon emits this as a one-line stderr
+    /// diagnostic (key + kind only, matching the codebase's `eprintln!`
+    /// logging convention).
     pub kind: DeniedKind,
 }
 
@@ -167,6 +168,20 @@ impl GuardDenied {
     /// Shorthand constructor.
     const fn of(kind: DeniedKind) -> Self {
         Self { kind }
+    }
+}
+
+/// Wire-safe kind label for a [`DeniedKind`] (used in getter-side error
+/// messages + structured stderr diagnostics on both the control-socket
+/// `kv.get` and authsock SIGN_REQUEST paths). Value-free: the pinned
+/// identity is not part of it (DR-0030 §4 setter-identity 漏洩防止).
+pub(crate) fn denied_kind_label(kind: DeniedKind) -> &'static str {
+    match kind {
+        DeniedKind::EmptyRecord => "empty-record",
+        DeniedKind::MissingContext => "missing-context",
+        DeniedKind::SameUser => "same-user",
+        DeniedKind::SameAncestor => "same-ancestor",
+        DeniedKind::Command => "command",
     }
 }
 

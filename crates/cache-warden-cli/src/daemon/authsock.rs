@@ -67,6 +67,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use super::guard::{self as guard_eval, GetterAuditToken, GetterProcess};
 use super::peer::peer_pid;
 use super::server::{Shared, bind_control_socket};
 use super::upstream_path::resolve_upstream_path;
@@ -79,6 +80,18 @@ use crate::config::{AuthsockSocket, AuthsockSource};
 /// absent / not Active / whose PEM cannot be parsed is logged and skipped: the
 /// socket still serves the keys that did resolve. Only the *public* key is
 /// retained; the borrowed PEM is dropped at the end of each iteration.
+///
+/// # DR-0030 startup preload is not a guarded delegation
+///
+/// A DR-0030 `access_guard` restricts *who may act as the getter of the
+/// private key*, and this preload has no getter: it only derives the
+/// **public** identity for enumeration (`REQUEST_IDENTITIES`), which is
+/// public information the socket would advertise regardless. The private
+/// PEM is read only long enough to derive the public blob and is dropped
+/// before the function returns; no peer is being delegated authority over
+/// the key here. The guard evaluator therefore runs on the SIGN_REQUEST
+/// path (see [`sign_with_resolved_key`]), where a real peer *is* asking to
+/// use the private half.
 fn build_registry(
     socket_name: &str,
     keys: &[String],
@@ -1019,7 +1032,21 @@ type UpstreamRoutes = HashMap<Vec<u8>, usize>;
 /// map records which upstream owns each remote blob from the last enumeration.
 async fn handle_connection(stream: UnixStream, state: Arc<SocketState>) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    let peer = peer_pid(stream.as_raw_fd());
+    let fd = stream.as_raw_fd();
+    let peer = peer_pid(fd);
+    // DR-0030: capture the peer's audit token now, while the raw fd still
+    // refers to the connected socket. `peer_audit_token` is race-free per the
+    // kernel's `LOCAL_PEERTOKEN` contract (keyed on the fd, not on a pid), so
+    // caching it once at accept time is safe for the whole connection
+    // lifetime — SIGN_REQUEST paths derive their `SameUser` decision from
+    // this snapshot without a second syscall per message. On Linux / a
+    // non-socket / a getsockopt failure this collapses to `None`, and the
+    // guard evaluator denies whenever a `SameUser` constraint requires it
+    // (fail-closed).
+    let peer_token = macos_process_inspect::peer_audit_token(fd).map(|t| GetterAuditToken {
+        euid: t.euid(),
+        ruid: t.ruid(),
+    });
 
     // Connection-time process gate (port plan Iteration 5). A socket with a
     // non-empty `allowed_processes` admits a connection only when the peer's
@@ -1037,7 +1064,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<SocketState>) -> std::
         .map_err(std::io::Error::other)?
     {
         let response = if admitted {
-            respond(&state, peer, &msg, &mut routes).await
+            respond(&state, peer, peer_token, &msg, &mut routes).await
         } else {
             // Rejected connection: a uniform FAILURE for every message type.
             AgentMessage::failure()
@@ -1084,12 +1111,13 @@ fn process_gate_passes(peer: Option<u32>, allowed: &[String]) -> bool {
 async fn respond(
     state: &Arc<SocketState>,
     peer: Option<u32>,
+    peer_token: Option<GetterAuditToken>,
     msg: &AgentMessage,
     routes: &mut UpstreamRoutes,
 ) -> AgentMessage {
     match msg.msg_type {
         MessageType::RequestIdentities => request_identities(state, msg, routes).await,
-        MessageType::SignRequest => sign_request(state, peer, msg, routes).await,
+        MessageType::SignRequest => sign_request(state, peer, peer_token, msg, routes).await,
         _ => AgentMessage::failure(),
     }
 }
@@ -1171,6 +1199,7 @@ async fn upstream_identities(
 async fn sign_request(
     state: &Arc<SocketState>,
     peer: Option<u32>,
+    peer_token: Option<GetterAuditToken>,
     msg: &AgentMessage,
     routes: &UpstreamRoutes,
 ) -> AgentMessage {
@@ -1192,7 +1221,7 @@ async fn sign_request(
     if known_local {
         let state = Arc::clone(state);
         let msg = msg.clone();
-        return tokio::task::spawn_blocking(move || local_sign(&state, peer, &msg))
+        return tokio::task::spawn_blocking(move || local_sign(&state, peer, peer_token, &msg))
             .await
             .unwrap_or_else(|_| AgentMessage::failure());
     }
@@ -1253,9 +1282,31 @@ async fn forward_sign(upstream: &Upstream, msg: &AgentMessage) -> Option<AgentMe
 /// Sign one SIGN_REQUEST with a **local** registry key (synchronous; runs on the
 /// blocking pool). Resolves the requester ancestry from `peer`, fetches the PEM
 /// through the same auth gate as the control socket, signs, and idle-extends.
-fn local_sign(state: &SocketState, peer: Option<u32>, msg: &AgentMessage) -> AgentMessage {
+fn local_sign(
+    state: &SocketState,
+    peer: Option<u32>,
+    peer_token: Option<GetterAuditToken>,
+    msg: &AgentMessage,
+) -> AgentMessage {
     let requester: Option<Vec<ProcessInfo>> =
         peer.and_then(|pid| SystemInspector::new().ancestry(pid).ok());
+    // DR-0030 §Security TOCTOU: enrich the ancestry with `unique_id` at the
+    // *same walk* the DR-0012 gate reads, so a mid-request parent exit shows
+    // the same shorter chain to every gate. Non-macOS builds and any per-pid
+    // failure return `None` for `unique_id`, which the evaluator collapses to
+    // start_time comparison and — on a `(None, None)` pair — denies
+    // (fail-closed, matches the control-socket `kv.get` path in server.rs).
+    let guard_chain: Option<Vec<GetterProcess>> = requester.as_ref().map(|chain| {
+        chain
+            .iter()
+            .map(|info| GetterProcess {
+                info: info.clone(),
+                unique_id: macos_process_inspect::unique_id(info.pid)
+                    .ok()
+                    .map(|u| u.unique_id),
+            })
+            .collect()
+    });
     let fields = match msg.parse_sign_request() {
         Ok(f) => f,
         Err(_) => return AgentMessage::failure(),
@@ -1284,6 +1335,8 @@ fn local_sign(state: &SocketState, peer: Option<u32>, msg: &AgentMessage) -> Age
         clock: &state.shared.clock,
         kv_process_policies: &state.shared.kv_process_policies,
         authsock_cap: &state.shared.authsock_cap,
+        guard_chain: guard_chain.as_deref(),
+        guard_audit_token: peer_token,
     };
     sign_with_resolved_key(&exec, requester.as_deref(), &kv_key, &source, &fields)
 }
@@ -1337,6 +1390,20 @@ struct LocalSignCtx<'a, A: ?Sized, R, C> {
     kv_process_policies: &'a std::collections::BTreeMap<String, Vec<String>>,
     /// Capability token for store access (authsock operations use the authsock cap).
     authsock_cap: &'a cache_warden::Capability,
+    /// DR-0030: the requester's ancestry chain enriched with
+    /// `unique_id`, captured at the same walk that produced the DR-0012
+    /// `requester` above. `None` on non-macOS or when the peer pid could
+    /// not be walked. Fed to [`guard_eval::evaluate`] on a guarded key
+    /// (fail-closed when a `same-ancestor` / `same-shell` constraint
+    /// needs it but the chain is `None`).
+    guard_chain: Option<&'a [GetterProcess]>,
+    /// DR-0030: the peer's `peer_audit_token` snapshot (euid/ruid),
+    /// captured at connection accept time (`handle_connection`). Race-
+    /// free per the kernel's `LOCAL_PEERTOKEN` contract, so the
+    /// same value is reused for every SIGN_REQUEST on the connection.
+    /// `None` outside macOS or on a `getsockopt` failure; the evaluator
+    /// then denies whenever a `same-user` constraint requires it.
+    guard_audit_token: Option<GetterAuditToken>,
 }
 
 /// Test-only resolve-then-sign shim (no socket I/O): resolves the key blob to a
@@ -1378,6 +1445,8 @@ where
         clock: ctx.clock,
         kv_process_policies: ctx.kv_process_policies,
         authsock_cap: ctx.authsock_cap,
+        guard_chain: ctx.guard_chain,
+        guard_audit_token: ctx.guard_audit_token,
     };
     sign_with_resolved_key(&exec, requester, &kv_key, &source, &fields)
 }
@@ -1400,6 +1469,17 @@ struct SignExecCtx<'a, A: ?Sized, R, C> {
     kv_process_policies: &'a std::collections::BTreeMap<String, Vec<String>>,
     /// Capability token for store access (authsock operations use the authsock cap).
     authsock_cap: &'a cache_warden::Capability,
+    /// DR-0030: the requester's ancestry chain enriched with
+    /// `unique_id`, captured at the same walk that produced `requester`
+    /// above (see [`local_sign`]). `None` on non-macOS / when the peer
+    /// pid could not be walked. Fed to [`guard_eval::evaluate`] on a
+    /// guarded key (fail-closed if the constraint needs it and it is
+    /// missing).
+    guard_chain: Option<&'a [GetterProcess]>,
+    /// DR-0030: the peer's `peer_audit_token` snapshot (euid/ruid), taken
+    /// at connection accept time. Race-free per `LOCAL_PEERTOKEN`, so
+    /// reused across every SIGN_REQUEST on this connection.
+    guard_audit_token: Option<GetterAuditToken>,
 }
 
 /// Sign a SIGN_REQUEST whose key is already resolved to `kv_key` / `source`
@@ -1442,6 +1522,40 @@ where
         Ok(g) => g,
         Err(_) => return AgentMessage::failure(),
     };
+
+    // DR-0030 evaluation order ③ (symmetric with `handle_get`): a per-entry
+    // guard is checked *before* the retrieval chain so a denied requester
+    // never triggers regeneration / TouchID / a re-auth prompt on the SIGN
+    // path — the denial must be silent and cost-free. A signature is the
+    // consumption of the private key just as `kv.get` is the consumption of
+    // the plaintext; guarding the value but not the signing use would let
+    // any same-uid process bypass the setter's declared restriction
+    // (`[authsock.sockets.*].keys` can name non-reserved KV keys). §4 also
+    // requires the setter identity never crosses back to the getter side,
+    // so a denial answers with the same `SSH_AGENT_FAILURE` an unknown /
+    // filtered-out key uses (the agent protocol has no ErrorKind — the
+    // wire message shape is fixed to bare FAILURE, and the constraint kind
+    // is recorded only in the daemon's structured stderr diagnostic).
+    if let Some(record) = store.guard_of(kv_key) {
+        let chain = match ctx.guard_chain {
+            Some(c) => c,
+            None => {
+                eprintln!(
+                    "cache-warden: authsock sign denied for {kv_key:?}: guard \
+                     requires a requester chain but the peer could not be walked"
+                );
+                return AgentMessage::failure();
+            }
+        };
+        if let Err(denied) = guard_eval::evaluate(chain, ctx.guard_audit_token, record) {
+            let kind = guard_eval::denied_kind_label(denied.kind);
+            eprintln!(
+                "cache-warden: authsock sign denied for {kv_key:?}: guard \
+                 constraint {kind:?} failed"
+            );
+            return AgentMessage::failure();
+        }
+    }
 
     // Fetch the PEM through the same auth gate as the control socket. For an
     // op-sourced key the core entry may not exist yet (lazy NotLoaded): the
@@ -1580,7 +1694,8 @@ where
 mod tests {
     use super::*;
     use cache_warden::{
-        AllowAll, DenyAll, FakeClock, RunError, SecretBytes, SourceRunner, Ttl, ValueSource,
+        AllowAll, DeclaredAncestor, DenyAll, FakeClock, GuardConstraint, GuardRecord, GuardSetter,
+        PinnedProcess, RunError, SecretBytes, SourceRunner, Ttl, ValueSource,
     };
     use std::sync::Mutex;
     use std::time::Duration;
@@ -1634,6 +1749,8 @@ mod tests {
             clock,
             kv_process_policies: &no_policies,
             authsock_cap: cap,
+            guard_chain: None,
+            guard_audit_token: None,
         };
         sign_local_with_ctx(&ctx, requester, msg)
     }
@@ -1667,6 +1784,48 @@ mod tests {
             clock,
             kv_process_policies: policies,
             authsock_cap: cap,
+            guard_chain: None,
+            guard_audit_token: None,
+        };
+        sign_local_with_ctx(&ctx, requester, msg)
+    }
+
+    /// Test shim for the DR-0030 guard path on a SIGN_REQUEST: threads a
+    /// prepared `GetterProcess` chain + `GetterAuditToken` into
+    /// [`LocalSignCtx`] so tests can exercise a guarded key's sign path
+    /// without a real socket / `peer_audit_token` syscall. Mirrors
+    /// [`handle_local_sign`] with the additional guard material.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_local_sign_with_guard<A, R, C>(
+        registry: &PublicKeyRegistry,
+        filter: &FilterEvaluator,
+        store: &Mutex<Store>,
+        auth: &A,
+        runner: &R,
+        clock: &C,
+        requester: Option<&[ProcessInfo]>,
+        guard_chain: Option<&[GetterProcess]>,
+        guard_audit_token: Option<GetterAuditToken>,
+        cap: &cache_warden::Capability,
+        msg: &AgentMessage,
+    ) -> AgentMessage
+    where
+        A: Authenticator + ?Sized,
+        R: SourceRunner,
+        C: Clock,
+    {
+        let no_policies = std::collections::BTreeMap::new();
+        let ctx = LocalSignCtx {
+            registry,
+            filter,
+            store,
+            auth,
+            runner,
+            clock,
+            kv_process_policies: &no_policies,
+            authsock_cap: cap,
+            guard_chain,
+            guard_audit_token,
         };
         sign_local_with_ctx(&ctx, requester, msg)
     }
@@ -1917,6 +2076,267 @@ mod tests {
             &req,
         );
         assert_eq!(resp.msg_type, MessageType::SignResponse);
+    }
+
+    // ---- DR-0030: per-entry guard on the SIGN_REQUEST path ----
+    //
+    // These pin the same evaluation order the control-socket `handle_get`
+    // uses (DR-0030 §4 ③), extended to authsock: a guarded KV key referenced
+    // by `[authsock.sockets.*].keys` cannot be signed with unless the
+    // requester's chain + audit token satisfy the setter's declaration. The
+    // authsock wire has no ErrorKind — a denial is bare `SSH_AGENT_FAILURE`
+    // (same shape as unknown / filtered-out key), so tests assert on
+    // `MessageType::Failure` + empty payload.
+
+    /// Attach a `same-user` guard to `GITHUB_KEY` for setter uid 501. Shared
+    /// across the guard-path tests to keep each test focused on its
+    /// requester side.
+    fn install_same_user_guard(store: &Mutex<Store>, cap: &cache_warden::Capability) {
+        let record = GuardRecord::new(
+            vec![GuardConstraint::SameUser],
+            GuardSetter {
+                euid: 501,
+                ruid: 501,
+            },
+        );
+        store
+            .lock()
+            .unwrap()
+            .set_guard("GITHUB_KEY", record, cap)
+            .expect("set_guard must succeed with the authsock cap");
+    }
+
+    /// Enrich a plain `ProcessInfo` chain into `GetterProcess` with no
+    /// unique_id (the non-macOS / private-API-failure fallback). The
+    /// evaluator then compares by pid + start_time.
+    fn getter_chain(chain: &[ProcessInfo]) -> Vec<GetterProcess> {
+        chain
+            .iter()
+            .map(|info| GetterProcess {
+                info: info.clone(),
+                unique_id: None,
+            })
+            .collect()
+    }
+
+    /// A guarded key whose `same-user` constraint is satisfied by the
+    /// requester's audit token → SignResponse (the auth gate / retrieval
+    /// continues as before). Pins that a guard does not break the happy
+    /// path when the constraint holds.
+    #[test]
+    fn sign_request_guarded_key_admits_matching_requester() {
+        let clock = FakeClock::new();
+        let (store, cap, registry) = fixture(&clock);
+        install_same_user_guard(&store, &cap);
+        let chain = [proc(100, "ssh"), proc(50, "zsh")];
+        let g_chain = getter_chain(&chain);
+        let token = GetterAuditToken {
+            euid: 501,
+            ruid: 501,
+        };
+        let req = sign_request(&blob_of(ED25519_PUB), b"agent challenge", 0);
+        let resp = handle_local_sign_with_guard(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            Some(&chain),
+            Some(&g_chain),
+            Some(token),
+            &cap,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+    }
+
+    /// Constraint fails (setter recorded uid 501, getter connected as 502)
+    /// → bare `SSH_AGENT_FAILURE`. Verifies §4 "denial is silent" — no
+    /// setter identity crosses back (payload is empty), and the same
+    /// FAILURE shape an unknown key returns is reused.
+    #[test]
+    fn sign_request_guarded_key_denies_on_constraint_mismatch() {
+        let clock = FakeClock::new();
+        let (store, cap, registry) = fixture(&clock);
+        install_same_user_guard(&store, &cap);
+        let chain = [proc(100, "ssh"), proc(50, "zsh")];
+        let g_chain = getter_chain(&chain);
+        // Different euid than the setter's snapshot → same-user constraint
+        // fails inside `guard_eval::evaluate` and the whole sign path
+        // returns FAILURE before the store lock / auth gate is exercised.
+        let token = GetterAuditToken {
+            euid: 502,
+            ruid: 502,
+        };
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let resp = handle_local_sign_with_guard(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            Some(&chain),
+            Some(&g_chain),
+            Some(token),
+            &cap,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+        assert!(resp.payload.is_empty(), "FAILURE must carry no detail");
+    }
+
+    /// Guard present but the connection carries no audit token (non-macOS
+    /// / getsockopt failure) → `MissingContext` deny (fail-closed). This
+    /// pins the "material acquisition failed → deny" branch that DR-0030
+    /// §Security calls out for the `SameUser` constraint.
+    #[test]
+    fn sign_request_guarded_key_fail_closed_when_audit_token_missing() {
+        let clock = FakeClock::new();
+        let (store, cap, registry) = fixture(&clock);
+        install_same_user_guard(&store, &cap);
+        let chain = [proc(100, "ssh")];
+        let g_chain = getter_chain(&chain);
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let resp = handle_local_sign_with_guard(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            Some(&chain),
+            Some(&g_chain),
+            None, // audit token unavailable
+            &cap,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+    }
+
+    /// Guard present, `SameAncestor` constraint requires a getter chain,
+    /// and the daemon could not walk the peer's ancestry (`guard_chain =
+    /// None`) → deny before any store work. Symmetric with the
+    /// `handle_get` "peer could not be walked" branch.
+    #[test]
+    fn sign_request_guarded_key_fail_closed_when_chain_missing() {
+        let clock = FakeClock::new();
+        let (store, cap, registry) = fixture(&clock);
+        let record = GuardRecord::new(
+            vec![GuardConstraint::SameAncestor {
+                declared: DeclaredAncestor::SameShell {
+                    shell_name: "zsh".to_string(),
+                },
+                pinned: PinnedProcess {
+                    pid: 50,
+                    start_time: Some(Duration::from_secs(50)),
+                    unique_id: None,
+                    path: std::path::PathBuf::from("/bin/zsh"),
+                    name: "zsh".to_string(),
+                },
+            }],
+            GuardSetter {
+                euid: 501,
+                ruid: 501,
+            },
+        );
+        store
+            .lock()
+            .unwrap()
+            .set_guard("GITHUB_KEY", record, &cap)
+            .unwrap();
+        let token = GetterAuditToken {
+            euid: 501,
+            ruid: 501,
+        };
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let resp = handle_local_sign_with_guard(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None, // requester chain unknown
+            None, // guard chain unavailable
+            Some(token),
+            &cap,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::Failure);
+        assert!(resp.payload.is_empty());
+    }
+
+    /// A key with no `access_guard` record signs as before — DR-0030 gate
+    /// is a strict addition, unguarded keys keep the Iteration 1 behaviour
+    /// (regression pin for the "guard is opt-in per entry" property).
+    #[test]
+    fn sign_request_unguarded_key_bypasses_guard_gate() {
+        let clock = FakeClock::new();
+        let (store, cap, registry) = fixture(&clock);
+        // No `set_guard` call: `guard_of("GITHUB_KEY")` returns None and
+        // the guard block short-circuits, so even a totally-missing chain
+        // + token still signs.
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let resp = handle_local_sign_with_guard(
+            &registry,
+            &no_filter(),
+            &store,
+            &AllowAll,
+            &NoRunner,
+            &clock,
+            None,
+            None,
+            None,
+            &cap,
+            &req,
+        );
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+    }
+
+    /// Guard denial must not fire the auth gate: a `DenyAll` authenticator
+    /// would trip re-auth on a soft-expired entry, so if the guard let
+    /// evaluation reach `ensure_loaded` the test would still fail. But
+    /// here the entry is Active — the point of this test is instead that
+    /// the guard denial happens **before** the store lock is used for any
+    /// state transition (idle-extend / regenerate). We assert that after
+    /// the denied SIGN_REQUEST the entry is unchanged (still gettable
+    /// without re-auth from an `AllowAll` follow-up), pinning "no
+    /// regenerate / no TouchID / no backoff" on the deny path.
+    #[test]
+    fn sign_request_guarded_key_denial_leaves_entry_untouched() {
+        let clock = FakeClock::new();
+        let (store, cap, registry) = fixture(&clock);
+        install_same_user_guard(&store, &cap);
+        let chain = [proc(100, "ssh")];
+        let g_chain = getter_chain(&chain);
+        let deny_token = GetterAuditToken {
+            euid: 999,
+            ruid: 999,
+        };
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let denied = handle_local_sign_with_guard(
+            &registry,
+            &no_filter(),
+            &store,
+            &DenyAll, // would fail any re-auth if the deny path reached it
+            &NoRunner,
+            &clock,
+            Some(&chain),
+            Some(&g_chain),
+            Some(deny_token),
+            &cap,
+            &req,
+        );
+        assert_eq!(denied.msg_type, MessageType::Failure);
+        // Value is still there, still Active — the entry survived unchanged.
+        let mut guard = store.lock().unwrap();
+        let value = guard.get("GITHUB_KEY", &cap, &clock).ok().flatten();
+        assert!(
+            value.is_some(),
+            "denied guard must not destroy / regenerate the entry"
+        );
     }
 
     #[test]
@@ -2716,7 +3136,7 @@ mod tests {
         let state = socket_state(&[]);
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::Lock, bytes::Bytes::new());
-        let resp = respond(&state, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, &req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::Failure);
     }
 
@@ -2727,7 +3147,7 @@ mod tests {
         let state = socket_state(&[&path]);
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, &req, &mut routes).await;
 
         let ids = resp.parse_identities().unwrap();
         // Local GITHUB_KEY + the one upstream key.
@@ -2750,7 +3170,7 @@ mod tests {
         let state = socket_state(&[&path]);
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, &req, &mut routes).await;
 
         let ids = resp.parse_identities().unwrap();
         assert_eq!(ids.len(), 1, "the duplicate blob must appear once");
@@ -2768,7 +3188,7 @@ mod tests {
         let state = socket_state(&[&dead]);
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, &req, &mut routes).await;
         let ids = resp.parse_identities().unwrap();
         assert_eq!(ids.len(), 1, "local key survives a dead upstream");
         assert_eq!(ids[0].key_blob.as_ref(), blob_of(ED25519_PUB).as_slice());
@@ -2785,10 +3205,10 @@ mod tests {
         let mut routes = UpstreamRoutes::new();
 
         let enum_req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let _ = respond(&state, None, &enum_req, &mut routes).await;
+        let _ = respond(&state, None, None, &enum_req, &mut routes).await;
 
         let sign_req = sign_request(&up_id.key_blob, b"challenge", 0);
-        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::SignResponse);
         assert_eq!(resp.payload, upstream_sig.payload);
         std::fs::remove_file(&path).ok();
@@ -2805,7 +3225,7 @@ mod tests {
         let mut routes = UpstreamRoutes::new(); // empty: no prior enumeration
 
         let sign_req = sign_request(&up_id.key_blob, b"challenge", 0);
-        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::SignResponse);
         assert_eq!(resp.payload, upstream_sig.payload);
         std::fs::remove_file(&path).ok();
@@ -2820,7 +3240,7 @@ mod tests {
         let mut routes = UpstreamRoutes::new();
         let data = b"local-with-upstreams";
         let sign_req = sign_request(&blob_of(ED25519_PUB), data, 0);
-        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::SignResponse);
 
         // Verify it is a real signature by our local key.
@@ -2838,7 +3258,7 @@ mod tests {
         let state = socket_state(&[]);
         let mut routes = UpstreamRoutes::new();
         let sign_req = sign_request(b"totally-unknown-blob", b"d", 0);
-        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::Failure);
     }
 
@@ -2915,7 +3335,7 @@ mod tests {
         let state = socket_state_filtered(&[], parse_filter(&["comment=nope*"]));
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, &req, &mut routes).await;
         let ids = resp.parse_identities().unwrap();
         assert!(ids.is_empty(), "filtered-out local key must not enumerate");
     }
@@ -2925,7 +3345,7 @@ mod tests {
         let state = socket_state_filtered(&[], parse_filter(&["comment=GITHUB_KEY"]));
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, &req, &mut routes).await;
         let ids = resp.parse_identities().unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].key_blob.as_ref(), blob_of(ED25519_PUB).as_slice());
@@ -2937,7 +3357,7 @@ mod tests {
         let state = socket_state_filtered(&[], parse_filter(&["comment=nope*"]));
         let mut routes = UpstreamRoutes::new();
         let sign_req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
-        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::Failure);
     }
 
@@ -2955,7 +3375,7 @@ mod tests {
         let mut routes = UpstreamRoutes::new();
 
         let enum_req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, &enum_req, &mut routes).await;
+        let resp = respond(&state, None, None, &enum_req, &mut routes).await;
         let ids = resp.parse_identities().unwrap();
         // Only the local key enumerates; the upstream key is filtered out.
         assert_eq!(ids.len(), 1);
@@ -2968,7 +3388,7 @@ mod tests {
         // A SIGN for the hidden upstream blob is not forwarded -> FAILURE
         // (comment-only filter, no route, fallback also denies by empty comment).
         let sign_req = sign_request(&up_id.key_blob, b"x", 0);
-        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::Failure);
         std::fs::remove_file(&path).ok();
     }
@@ -2989,7 +3409,7 @@ mod tests {
 
         // No enumeration: sign the hidden blob directly.
         let sign_req = sign_request(&up_id.key_blob, b"x", 0);
-        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
         assert_eq!(
             resp.msg_type,
             MessageType::Failure,
@@ -3013,7 +3433,7 @@ mod tests {
         let mut routes = UpstreamRoutes::new();
 
         let sign_req = sign_request(&up_id.key_blob, b"x", 0);
-        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::SignResponse);
         std::fs::remove_file(&path).ok();
     }
@@ -3029,7 +3449,7 @@ mod tests {
         let mut routes = UpstreamRoutes::new();
 
         let enum_req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, &enum_req, &mut routes).await;
+        let resp = respond(&state, None, None, &enum_req, &mut routes).await;
         let ids = resp.parse_identities().unwrap();
         // The local key's comment "GITHUB_KEY" does not match *upstream*, so only
         // the upstream key passes.
@@ -3038,7 +3458,7 @@ mod tests {
         assert!(!blobs.contains(&blob_of(ED25519_PUB)));
 
         let sign_req = sign_request(&up_id.key_blob, b"x", 0);
-        let resp = respond(&state, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::SignResponse);
         assert_eq!(resp.payload, upstream_sig.payload);
         std::fs::remove_file(&path).ok();

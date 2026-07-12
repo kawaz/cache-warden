@@ -16,7 +16,9 @@ use cache_warden::{
     ValueMeta, ValueSource,
 };
 
-use crate::daemon::guard::{self as guard_eval, GetterAuditToken, GetterProcess};
+use crate::daemon::guard::{
+    self as guard_eval, GetterAuditToken, GetterProcess, denied_kind_label,
+};
 use crate::otp_type;
 use crate::protocol::wire::{
     EntryInfo, ErrorKind, GuardConstraintWire, Request, Response, SetSource, SourceSpecWire,
@@ -684,18 +686,11 @@ fn pin_ancestor_by_path(chain: &[GetterProcess], full_path: &str) -> Option<Pinn
     })
 }
 
-/// Wire-safe kind string for a [`guard_eval::DeniedKind`] (used in the
-/// getter-side error message + stderr diagnostics). Value-free: the
-/// pinned identity is not part of it (§4 漏洩防止).
-fn denied_kind_label(kind: guard_eval::DeniedKind) -> &'static str {
-    match kind {
-        guard_eval::DeniedKind::EmptyRecord => "empty-record",
-        guard_eval::DeniedKind::MissingContext => "missing-context",
-        guard_eval::DeniedKind::SameUser => "same-user",
-        guard_eval::DeniedKind::SameAncestor => "same-ancestor",
-        guard_eval::DeniedKind::Command => "command",
-    }
-}
+// `denied_kind_label` lives in [`super::guard`] so the authsock SIGN_REQUEST
+// path (which grew a symmetric guard gate in a subsequent block) reuses the
+// same wire label without duplicating the match. DR-0030 §4's "no setter
+// identity crosses back" rule is shared between the two entry points, so the
+// label list belongs with the evaluator, not with either adapter.
 
 fn getter_to_pinned(g: &GetterProcess) -> PinnedProcess {
     PinnedProcess {
