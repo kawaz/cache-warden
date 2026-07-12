@@ -67,6 +67,15 @@ draft-DR-0031 Phase 1.5 の opus47 セキュリティレビューで「land 可�
    (key, requester) の coalesce。DR-0031 §Security への v1 既知制約の明文化
    は Block 3a の docs 反映で対応済みの予定、実装対策は本 issue で追跡。
 
+   **SIGN 経路の増幅要因 (SIGN dialog 統合レビュー LOW-4、2026-07-13)**:
+   authsock SIGN 経路は ssh client が鍵ごとに SIGN を送り、失敗時に自動
+   再接続・再試行するため、guarded 鍵では get より dialog が積まれやすい。
+   `APPROVER_REQUEST_TIMEOUT` (90s) は approver 内部 lock 取得後の exchange
+   のみを bound し lock 待ちは無期限なので、pending dialog は queue 深さ ×
+   90s まで滞留する。client が諦めた後に dialog が遅れて出る「幽霊承認」も、
+   helper の PeerGone 監視 (Phase 2) が requester pid 消滅を拾わない限り
+   成立する。対策の (key, requester) coalesce は SIGN 経路にも適用すること。
+
 ## 背景
 
 draft-DR-0031 (custom TouchID dialog) の Phase 1.5 で opus47 によるセキュリ
