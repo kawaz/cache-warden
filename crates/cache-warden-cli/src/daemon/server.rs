@@ -56,6 +56,7 @@ use super::peer::peer_pid;
 use crate::config::{Config, KvDefinition};
 use crate::protocol::wire::{ErrorKind, Request, Response};
 use crate::protocol::{decode_request, encode_response};
+use cache_warden_approver::wire::ApproveRequest;
 use cache_warden_approver::wire::Outcome as WireOutcome;
 
 /// Daemon version reported by `status`.
@@ -218,6 +219,52 @@ pub(crate) struct Shared {
     pub(crate) approver: ApproverSlot,
 }
 
+/// Classified outcome of one [`ApproverSlot::await_dialog_outcome`] call —
+/// the layer shared across every gated adapter (control get, authsock
+/// sign). Everything except [`ApprovalOutcome::Approved`] is a rejection
+/// the caller must map onto its own wire-shape failure (control:
+/// `Response::Err(AuthFailed, …)`; authsock: bare `SSH_AGENT_FAILURE`
+/// plus a structured stderr diag). Distinguishing them at the daemon
+/// level lets each adapter log a matching diagnostic even though the
+/// user-facing shape collapses to one denial (draft-DR-0031 §Security:
+/// dialog outcomes are per-approval facts, not per-caller).
+#[derive(Debug)]
+pub(crate) enum ApprovalOutcome {
+    Approved,
+    /// `helper_down` / `wait_ready` timed out — §9 fail-closed shape.
+    HelperUnavailable,
+    Denied,
+    Cancelled,
+    Timeout,
+    PeerGone,
+    BiometricFailed,
+    /// A wire-level I/O failure (`ApproverClient::request` surfaced an
+    /// error before returning an outcome). The daemon logs this so an
+    /// operator can distinguish a helper glitch from a user-driven
+    /// rejection, but the user-facing wire shape is the same denial.
+    Ipc(String),
+}
+
+impl ApprovalOutcome {
+    /// A short user-facing label for the rejection reason, matching the
+    /// message shape the control adapter surfaces (`"approval denied by
+    /// user"`, `"approval cancelled"`, …). The authsock adapter reuses
+    /// this string in its structured stderr diagnostic so both surfaces
+    /// stay in lockstep with the DR-0031 §Outcomes vocabulary.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::HelperUnavailable => "approver helper unavailable",
+            Self::Denied => "approval denied by user",
+            Self::Cancelled => "approval cancelled",
+            Self::Timeout => "approval timed out",
+            Self::PeerGone => "requesting process exited before approval",
+            Self::BiometricFailed => "biometric authentication failed",
+            Self::Ipc(_) => "approver dialog failed",
+        }
+    }
+}
+
 /// The lifecycle-aware slot for the DR-0031 approver helper.
 ///
 /// `Ready(_)` and `Down` are terminal states — the daemon does not currently
@@ -296,6 +343,42 @@ impl ApproverSlot {
     /// The timeout branch also re-checks the state once more before
     /// giving up, so a `set_ready` fired exactly at the deadline is not
     /// lost.
+    /// Shared approval-dialog workflow used by every gated adapter (control
+    /// socket `kv.get`, authsock `SIGN_REQUEST`, …). Awaits the helper to
+    /// reach a terminal state, sends `request` on the DR-0031 wire, and
+    /// classifies the response into an [`ApprovalOutcome`].
+    ///
+    /// The store lock — or any adapter-side registry lock — must be
+    /// released before entering this method: dialog latency is bounded only
+    /// by the human, so holding a lock across it would queue every other
+    /// request behind a single approval.
+    ///
+    /// Each caller maps the [`ApprovalOutcome`] onto its own wire-shape
+    /// failure (control: `Response::Err(AuthFailed, …)`; authsock: bare
+    /// `SSH_AGENT_FAILURE` + a structured stderr diag) — the daemon-side
+    /// semantics stay identical, only the surface differs.
+    pub(crate) async fn await_dialog_outcome(
+        &self,
+        request: ApproveRequest,
+        starting_wait: Duration,
+        request_timeout: Duration,
+    ) -> ApprovalOutcome {
+        let Some(approver) = self.wait_ready(starting_wait).await else {
+            return ApprovalOutcome::HelperUnavailable;
+        };
+        match approver.request(request, request_timeout).await {
+            Ok(resp) => match resp.outcome {
+                WireOutcome::Approved => ApprovalOutcome::Approved,
+                WireOutcome::Denied => ApprovalOutcome::Denied,
+                WireOutcome::Cancelled => ApprovalOutcome::Cancelled,
+                WireOutcome::Timeout => ApprovalOutcome::Timeout,
+                WireOutcome::PeerGone => ApprovalOutcome::PeerGone,
+                WireOutcome::BiometricFailed => ApprovalOutcome::BiometricFailed,
+            },
+            Err(e) => ApprovalOutcome::Ipc(e.to_string()),
+        }
+    }
+
     pub(crate) async fn wait_ready(&self, timeout: Duration) -> Option<Arc<dyn Approver>> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -1468,18 +1551,18 @@ fn run_request(
 /// plus peer verification typically completes in tens of ms on a warm host
 /// and in low hundreds on a cold one) without pinning a caller for so long
 /// that a dead helper is indistinguishable from a slow one.
-const HELPER_STARTING_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const HELPER_STARTING_WAIT: Duration = Duration::from_secs(5);
 
 /// How long the daemon waits for the user to answer the approver dialog
 /// before giving up. Loose upper bound on the human interaction; matches
 /// the DR-0031 §4 wire default (`ApproveRequest.timeout_secs = 60`) plus
 /// a small allowance for the helper's own bookkeeping / peer_gone message.
-const APPROVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const APPROVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The `timeout_secs` field on the wire (the daemon's own effective timeout
 /// is `APPROVER_REQUEST_TIMEOUT`; the wire value is a hint the helper can
 /// use for its own countdown UI, currently unused — see wire.rs docs).
-const APPROVER_WIRE_TIMEOUT_SECS: u32 = 60;
+pub(crate) const APPROVER_WIRE_TIMEOUT_SECS: u32 = 60;
 
 /// Monotonically-increasing counter feeding `ApproveRequest.request_id` (a
 /// pid + monotonic number). Wire schema documents the field as an "opaque
@@ -1488,7 +1571,7 @@ const APPROVER_WIRE_TIMEOUT_SECS: u32 = 60;
 /// pending requests).
 static APPROVER_REQUEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn mint_approver_request_id() -> String {
+pub(crate) fn mint_approver_request_id() -> String {
     let n = APPROVER_REQUEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{}-{}", std::process::id(), n)
 }
@@ -1554,7 +1637,7 @@ async fn dispatch_async(
 /// resolution: dry-run stays silent. Documented here (rather than only in
 /// the DR) because the decision is enforced *at this dispatcher*, not in
 /// the handler.
-async fn run_request_async(
+pub(crate) async fn run_request_async(
     shared: &Arc<Shared>,
     peer: Option<u32>,
     peer_token: Option<GetterAuditToken>,
@@ -1630,12 +1713,6 @@ async fn run_request_async(
             chain: pass_chain,
             requester: pass_requester,
         } => {
-            let Some(approver) = shared.approver.wait_ready(HELPER_STARTING_WAIT).await else {
-                return Response::error(
-                    ErrorKind::AuthFailed,
-                    "approver helper unavailable (helper is not running)",
-                );
-            };
             let wire_req = approver_wire::build_approve_request(
                 mint_approver_request_id(),
                 key.clone(),
@@ -1646,27 +1723,27 @@ async fn run_request_async(
                 &eval_output,
                 APPROVER_WIRE_TIMEOUT_SECS,
             );
-            let resp = match approver.request(wire_req, APPROVER_REQUEST_TIMEOUT).await {
-                Ok(r) => r,
-                Err(e) => {
+            match shared
+                .approver
+                .await_dialog_outcome(wire_req, HELPER_STARTING_WAIT, APPROVER_REQUEST_TIMEOUT)
+                .await
+            {
+                ApprovalOutcome::Approved => {}
+                ApprovalOutcome::HelperUnavailable => {
                     return Response::error(
                         ErrorKind::AuthFailed,
-                        format!("approver dialog failed: {e}"),
+                        "approver helper unavailable (helper is not running)",
                     );
                 }
-            };
-            let approved = matches!(resp.outcome, WireOutcome::Approved);
-            if !approved {
-                let msg = match resp.outcome {
-                    WireOutcome::Denied => "approval denied by user",
-                    WireOutcome::Cancelled => "approval cancelled",
-                    WireOutcome::Timeout => "approval timed out",
-                    WireOutcome::PeerGone => "requesting process exited before approval",
-                    WireOutcome::BiometricFailed => "biometric authentication failed",
-                    // Approved handled above; keep exhaustive.
-                    WireOutcome::Approved => unreachable!(),
-                };
-                return Response::error(ErrorKind::AuthFailed, msg.to_string());
+                ApprovalOutcome::Ipc(err) => {
+                    return Response::error(
+                        ErrorKind::AuthFailed,
+                        format!("approver dialog failed: {err}"),
+                    );
+                }
+                other => {
+                    return Response::error(ErrorKind::AuthFailed, other.label().to_string());
+                }
             }
             let shared_second = Arc::clone(shared);
             let key_second = key.clone();

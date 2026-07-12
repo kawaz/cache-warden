@@ -138,7 +138,7 @@ struct SocketState {
     /// bound and started serving the disk-cache seed. Every hot-path read is
     /// **brief**: REQUEST_IDENTITIES snapshots the identities, and a local sign
     /// takes the read lock only to resolve the key (blob → KV key) then drops it
-    /// before the auth gate / op fetch ([`local_sign`]). The refresh takes the
+    /// before the auth gate / op fetch ([`local_sign_first_pass`]). The refresh takes the
     /// write lock only to swap the whole registry, so it never waits behind (nor
     /// stalls new readers during) a slow sign.
     registry: Arc<RwLock<PublicKeyRegistry>>,
@@ -427,7 +427,7 @@ pub struct ListenerSet {
 /// (DR-0014 lazy path) can produce their PEMs at sign time.
 ///
 /// Takes the **store lock only** (never while a registry lock is held) so it
-/// cannot invert against [`local_sign`]'s registry-read → store-lock order. A
+/// cannot invert against [`local_sign_first_pass`]'s registry-read → store-lock order. A
 /// `Conflict` is a no-op (idempotent re-start, a shared source across sockets, or
 /// a background refresh re-registering the same key); a bad TTL / other error is
 /// logged and that key skipped.
@@ -722,7 +722,7 @@ fn next_backoff(current: std::time::Duration) -> std::time::Duration {
 /// Locks are never nested: the fresh registry is built lock-free
 /// ([`op_registry_from`]), definitions are registered under the store lock alone
 /// ([`register_op_definitions`]), and the swap takes the registry write lock
-/// alone. Combined with [`local_sign`] holding the registry read lock only to
+/// alone. Combined with [`local_sign_first_pass`] holding the registry read lock only to
 /// resolve the key (never across the store lock), no lock is ever held while
 /// acquiring another here — so this cannot deadlock or invert against a sign.
 ///
@@ -1043,7 +1043,13 @@ async fn handle_connection(stream: UnixStream, state: Arc<SocketState>) -> std::
     // non-socket / a getsockopt failure this collapses to `None`, and the
     // guard evaluator denies whenever a `SameUser` constraint requires it
     // (fail-closed).
-    let peer_token = macos_process_inspect::peer_audit_token(fd).map(|t| GetterAuditToken {
+    // DR-0031 §4 dialog integration: we need both the reduced
+    // [`GetterAuditToken`] (euid/ruid, fed to the guard evaluator) and the
+    // full [`macos_process_inspect::AuditToken`] (fed to the wire
+    // adapter's `Requester.audit_token`). Both derive from the same
+    // race-free `LOCAL_PEERTOKEN` snapshot taken here at accept time.
+    let peer_token_full = macos_process_inspect::peer_audit_token(fd);
+    let peer_token = peer_token_full.map(|t| GetterAuditToken {
         euid: t.euid(),
         ruid: t.ruid(),
     });
@@ -1064,7 +1070,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<SocketState>) -> std::
         .map_err(std::io::Error::other)?
     {
         let response = if admitted {
-            respond(&state, peer, peer_token, &msg, &mut routes).await
+            respond(&state, peer, peer_token, peer_token_full, &msg, &mut routes).await
         } else {
             // Rejected connection: a uniform FAILURE for every message type.
             AgentMessage::failure()
@@ -1112,12 +1118,15 @@ async fn respond(
     state: &Arc<SocketState>,
     peer: Option<u32>,
     peer_token: Option<GetterAuditToken>,
+    peer_token_full: Option<macos_process_inspect::AuditToken>,
     msg: &AgentMessage,
     routes: &mut UpstreamRoutes,
 ) -> AgentMessage {
     match msg.msg_type {
         MessageType::RequestIdentities => request_identities(state, msg, routes).await,
-        MessageType::SignRequest => sign_request(state, peer, peer_token, msg, routes).await,
+        MessageType::SignRequest => {
+            sign_request(state, peer, peer_token, peer_token_full, msg, routes).await
+        }
         _ => AgentMessage::failure(),
     }
 }
@@ -1200,6 +1209,7 @@ async fn sign_request(
     state: &Arc<SocketState>,
     peer: Option<u32>,
     peer_token: Option<GetterAuditToken>,
+    peer_token_full: Option<macos_process_inspect::AuditToken>,
     msg: &AgentMessage,
     routes: &UpstreamRoutes,
 ) -> AgentMessage {
@@ -1213,17 +1223,98 @@ async fn sign_request(
     //    pool through the core auth gate. The filter is enforced inside the sign
     //    path (via `signable_kv_key`, using the registry's comment), so a key this
     //    socket hides yields FAILURE even though its PEM is reachable. The read
-    //    lock is dropped before dispatching (local_sign re-takes it).
-    let known_local = {
-        let registry = state.registry.read().unwrap_or_else(|e| e.into_inner());
-        registry.lookup(&key_blob).is_some()
-    };
-    if known_local {
-        let state = Arc::clone(state);
-        let msg = msg.clone();
-        return tokio::task::spawn_blocking(move || local_sign(&state, peer, peer_token, &msg))
-            .await
-            .unwrap_or_else(|_| AgentMessage::failure());
+    //    lock is dropped before dispatching (local_sign_first_pass re-takes it).
+    //
+    //    DR-0031 §8 dialog integration (SIGN parity with `kv.get`): the local
+    //    sign runs as a two-pass flow, mirroring `run_request_async`. First
+    //    pass on the blocking pool derives the requester chain, resolves the
+    //    key, runs policy + guard checks; unguarded keys return the signed
+    //    reply directly (no dialog, matching pre-DR-0031 behaviour), guarded
+    //    keys evaluate the record and — if it passes — hand back the
+    //    material needed to build the ApproveRequest. The store lock is
+    //    dropped before the async dialog await so a multi-second human
+    //    approval cannot queue every other request on this daemon behind
+    //    it. On `Approved`, the finalize pass re-takes the lock, re-evaluates
+    //    the guard fail-closed (in case a concurrent `kv.set` replaced the
+    //    record while the human was deciding — DR-0030 §5 "last declaration
+    //    wins"), then runs the same post-guard body (`sign_body_after_guard`)
+    //    the unguarded path uses. Non-`Approved` outcomes surface as bare
+    //    `SSH_AGENT_FAILURE` with a structured stderr diag naming the
+    //    reason — the agent wire has no error kind, so the diag is the audit
+    //    trail.
+    if known_local(state, &key_blob) {
+        let state1 = Arc::clone(state);
+        let msg1 = msg.clone();
+        let first = tokio::task::spawn_blocking(move || {
+            local_sign_first_pass(&state1, peer, peer_token, &msg1)
+        })
+        .await
+        .unwrap_or_else(|_| SignFirstPass::Direct(AgentMessage::failure()));
+
+        return match first {
+            SignFirstPass::Direct(resp) => resp,
+            SignFirstPass::NeedsApproval(material) => {
+                let SignNeedsApprovalMaterial {
+                    guard_eval,
+                    kv_key,
+                    source,
+                    requester,
+                    guard_chain,
+                } = *material;
+                let wire_req = super::approver_wire::build_approve_request(
+                    super::server::mint_approver_request_id(),
+                    kv_key.clone(),
+                    "sign",
+                    guard_chain.as_deref().unwrap_or(&[]),
+                    peer_token_full.as_ref(),
+                    None,
+                    &guard_eval,
+                    super::server::APPROVER_WIRE_TIMEOUT_SECS,
+                );
+                let outcome = state
+                    .shared
+                    .approver
+                    .await_dialog_outcome(
+                        wire_req,
+                        super::server::HELPER_STARTING_WAIT,
+                        super::server::APPROVER_REQUEST_TIMEOUT,
+                    )
+                    .await;
+                match outcome {
+                    super::server::ApprovalOutcome::Approved => {
+                        let state2 = Arc::clone(state);
+                        let msg2 = msg.clone();
+                        tokio::task::spawn_blocking(move || {
+                            local_sign_finalize_after_approval(
+                                &state2,
+                                peer_token,
+                                requester,
+                                guard_chain,
+                                kv_key,
+                                source,
+                                &msg2,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|_| AgentMessage::failure())
+                    }
+                    super::server::ApprovalOutcome::Ipc(err) => {
+                        eprintln!(
+                            "cache-warden: authsock sign denied for {kv_key:?}: approver \
+                             dialog failed ({err})"
+                        );
+                        AgentMessage::failure()
+                    }
+                    rejection => {
+                        eprintln!(
+                            "cache-warden: authsock sign denied for {kv_key:?}: {}",
+                            rejection.label()
+                        );
+                        AgentMessage::failure()
+                    }
+                }
+            }
+        };
     }
 
     // 2. No upstreams configured -> unknown key.
@@ -1279,23 +1370,128 @@ async fn forward_sign(upstream: &Upstream, msg: &AgentMessage) -> Option<AgentMe
     (resp.msg_type == MessageType::SignResponse).then_some(resp)
 }
 
-/// Sign one SIGN_REQUEST with a **local** registry key (synchronous; runs on the
-/// blocking pool). Resolves the requester ancestry from `peer`, fetches the PEM
-/// through the same auth gate as the control socket, signs, and idle-extends.
-fn local_sign(
+/// Whether `key_blob` is registered in this socket's live registry.
+///
+/// Extracted so [`sign_request`]'s local-fast-path check is greppable with
+/// the tests that pin it — and to keep the async dispatcher's read-lock
+/// hold to the shortest possible window (the `known_local` snapshot).
+fn known_local(state: &Arc<SocketState>, key_blob: &[u8]) -> bool {
+    let registry = state.registry.read().unwrap_or_else(|e| e.into_inner());
+    registry.lookup(key_blob).is_some()
+}
+
+/// The outcome of the SIGN first pass — the mirror of the control-socket
+/// [`crate::daemon::server::GuardedGetFirstPass`] for `kv.get`.
+///
+/// `Direct` carries either the signed reply (unguarded fast path — the
+/// same body as the pre-DR-0031 `local_sign`), an early
+/// `SSH_AGENT_FAILURE` for a policy / guard denial, or the sentinel
+/// failure for a malformed / unknown / filtered blob. `NeedsApproval`
+/// carries every piece the finalize pass will need after the dialog
+/// returns `Approved`.
+enum SignFirstPass {
+    Direct(AgentMessage),
+    /// Boxed because the `NeedsApproval` variant is >300 bytes (large
+    /// `GuardEvalOutput` + `KeySource` + a `Vec<GetterProcess>` chain)
+    /// while `Direct` is ~40 bytes; boxing the material keeps the enum
+    /// small on the common (unguarded / direct-failure) path
+    /// (`clippy::large_enum_variant`).
+    NeedsApproval(Box<SignNeedsApprovalMaterial>),
+}
+
+struct SignNeedsApprovalMaterial {
+    guard_eval: guard_eval::GuardEvalOutput,
+    kv_key: String,
+    source: KeySource,
+    /// Requester chain snapshotted at first-pass time — reused by both
+    /// the wire builder (for the dialog) and the second-pass
+    /// re-evaluation, so a mid-approval `proc_pidinfo` shift cannot
+    /// make the re-check disagree with the just-approved evaluation.
+    requester: Option<Vec<ProcessInfo>>,
+    /// Same chain enriched with `unique_id` for the guard evaluator's
+    /// second-pass re-run.
+    guard_chain: Option<Vec<GetterProcess>>,
+}
+
+/// Result of evaluating the DR-0030 guard record for a SIGN_REQUEST.
+///
+/// Shared by the three SIGN entry points that must consult the guard on a
+/// resolved KV key: the first pass ([`local_sign_first_pass`]) hands
+/// `Passed` off to the approver as dialog material; the finalize pass
+/// ([`local_sign_finalize_after_approval`]) re-checks after `Approved`
+/// and only cares that the record still passes; and the test-only
+/// [`sign_with_resolved_key`] mirrors the pre-DR-0031 inline body. The
+/// three sites differ only in what they log (site-1/3 say "guard
+/// constraint … failed", site-2 says "after approval … on re-evaluation
+/// (record changed during approval)") and in the return type they map
+/// each variant to; the branching + `guard_eval::evaluate` call is
+/// centralized here so a fourth SIGN entry cannot accidentally skip a
+/// step.
+enum SignGuardCheck {
+    /// Key has no guard record — take the unguarded path.
+    Unguarded,
+    /// Guard present and every constraint matched. The output carries
+    /// the dialog material the first pass hands off to the approver;
+    /// the finalize / legacy paths discard it (their re-check only
+    /// needs "still passes").
+    Passed(guard_eval::GuardEvalOutput),
+    /// The record required a requester chain but the peer could not be
+    /// walked (`None`). Fail-closed at every site.
+    ChainMissing,
+    /// Guard denied. Carries the wire-safe kind label
+    /// ([`guard_eval::denied_kind_label`]) for the caller's stderr diag.
+    Denied(&'static str),
+}
+
+/// Evaluate the guard on `kv_key` under an already-held store lock.
+///
+/// Extracts the tri-branch (unguarded / chain-missing / evaluate) shared
+/// by [`local_sign_first_pass`], [`local_sign_finalize_after_approval`],
+/// and [`sign_with_resolved_key`]. The caller keeps the store lock across
+/// the call and handles the site-specific logging + return-type mapping.
+fn eval_sign_guard(
+    store: &Store,
+    kv_key: &str,
+    guard_chain: Option<&[GetterProcess]>,
+    peer_token: Option<GetterAuditToken>,
+) -> SignGuardCheck {
+    let Some(record) = store.guard_of(kv_key) else {
+        return SignGuardCheck::Unguarded;
+    };
+    let Some(chain) = guard_chain else {
+        return SignGuardCheck::ChainMissing;
+    };
+    match guard_eval::evaluate(chain, peer_token, record) {
+        Ok(output) => SignGuardCheck::Passed(output),
+        Err(denied) => SignGuardCheck::Denied(guard_eval::denied_kind_label(denied.kind)),
+    }
+}
+
+/// First-pass evaluation for a local SIGN_REQUEST (blocking).
+///
+/// Mirrors [`crate::daemon::server::guarded_get_first_pass`] shape:
+///
+/// - Resolve the requester chain (best effort) and the key blob → KV key
+///   (via [`signable_key`]).
+/// - Apply the DR-0012 key-level process policy (fail-closed on an
+///   unknown requester when the key is restricted).
+/// - Take the store lock, check for a guard record. Unguarded ⇒ run the
+///   sign body inline under the held lock (single-lock hot path, matches
+///   pre-DR-0031 latency); guarded ⇒ evaluate the record fail-closed
+///   ([`guard_eval::evaluate`]), release the lock, and either return
+///   `Direct(failure)` on a denial or `NeedsApproval` with the material
+///   the wire adapter needs (guard_eval output, kv_key, source, chain).
+///
+/// The lock is released before returning `NeedsApproval` so the async
+/// dialog await never sits behind it.
+fn local_sign_first_pass(
     state: &SocketState,
     peer: Option<u32>,
     peer_token: Option<GetterAuditToken>,
     msg: &AgentMessage,
-) -> AgentMessage {
+) -> SignFirstPass {
     let requester: Option<Vec<ProcessInfo>> =
         peer.and_then(|pid| SystemInspector::new().ancestry(pid).ok());
-    // DR-0030 §Security TOCTOU: enrich the ancestry with `unique_id` at the
-    // *same walk* the DR-0012 gate reads, so a mid-request parent exit shows
-    // the same shorter chain to every gate. Non-macOS builds and any per-pid
-    // failure return `None` for `unique_id`, which the evaluator collapses to
-    // start_time comparison and — on a `(None, None)` pair — denies
-    // (fail-closed, matches the control-socket `kv.get` path in server.rs).
     let guard_chain: Option<Vec<GetterProcess>> = requester.as_ref().map(|chain| {
         chain
             .iter()
@@ -1309,36 +1505,203 @@ fn local_sign(
     });
     let fields = match msg.parse_sign_request() {
         Ok(f) => f,
-        Err(_) => return AgentMessage::failure(),
+        Err(_) => return SignFirstPass::Direct(AgentMessage::failure()),
     };
-
-    // Take the registry read lock **only to resolve the key** (blob → KV key +
-    // source, applying the socket filter), then drop it before the sign's auth
-    // gate / `op item get` / TouchID — which can block for tens of seconds. The
-    // resolved `kv_key` / `source` are cloned, so the sign never needs the
-    // registry again. Holding the read guard across that wait would let a queued
-    // background-discovery write lock (`apply_discovery`) block *new* readers on
-    // the std `RwLock` (writer-preferring on this platform), stalling every fresh
-    // REQUEST_IDENTITIES / SIGN dispatch on the async workers for the whole fetch.
     let (kv_key, source) = {
         let registry = state.registry.read().unwrap_or_else(|e| e.into_inner());
         match signable_key(&registry, &state.filter, &fields.key_blob) {
-            Some(registered) => (registered.kv_key.clone(), registered.source.clone()),
-            None => return AgentMessage::failure(),
+            Some(r) => (r.kv_key.clone(), r.source.clone()),
+            None => return SignFirstPass::Direct(AgentMessage::failure()),
         }
     };
 
-    let exec = SignExecCtx {
-        store: &state.shared.store,
-        auth: state.shared.auth.as_ref(),
-        runner: &state.shared.runner,
-        clock: &state.shared.clock,
-        kv_process_policies: &state.shared.kv_process_policies,
-        authsock_cap: &state.shared.authsock_cap,
-        guard_chain: guard_chain.as_deref(),
-        guard_audit_token: peer_token,
+    // Key-level process policy (DR-0012). Matches `sign_with_resolved_key`'s
+    // pre-gate exactly — a restricted key with an unknown requester is
+    // denied here so the dialog never fires on a request that would be
+    // refused post-approval anyway.
+    if let Some(allowed) = state.shared.kv_process_policies.get(&kv_key)
+        && !chain_gate_passes(requester.as_deref(), allowed)
+    {
+        return SignFirstPass::Direct(AgentMessage::failure());
+    }
+
+    let mut store = match state.shared.store.lock() {
+        Ok(g) => g,
+        Err(_) => return SignFirstPass::Direct(AgentMessage::failure()),
     };
-    sign_with_resolved_key(&exec, requester.as_deref(), &kv_key, &source, &fields)
+    match eval_sign_guard(&store, &kv_key, guard_chain.as_deref(), peer_token) {
+        SignGuardCheck::Unguarded => {
+            // Unguarded fast path: run the post-guard body inline while
+            // holding the lock (single lock take, identical to pre-DR-0031).
+            let resp = sign_body_after_guard(
+                &mut store,
+                state.shared.auth.as_ref(),
+                &state.shared.runner,
+                &state.shared.clock,
+                &state.shared.authsock_cap,
+                requester.as_deref(),
+                &kv_key,
+                &source,
+                &fields,
+            );
+            SignFirstPass::Direct(resp)
+        }
+        SignGuardCheck::Passed(output) => {
+            drop(store);
+            SignFirstPass::NeedsApproval(Box::new(SignNeedsApprovalMaterial {
+                guard_eval: output,
+                kv_key,
+                source,
+                requester,
+                guard_chain,
+            }))
+        }
+        SignGuardCheck::ChainMissing => {
+            drop(store);
+            eprintln!(
+                "cache-warden: authsock sign denied for {kv_key:?}: guard requires a \
+                 requester chain but the peer could not be walked"
+            );
+            SignFirstPass::Direct(AgentMessage::failure())
+        }
+        SignGuardCheck::Denied(kind) => {
+            drop(store);
+            eprintln!(
+                "cache-warden: authsock sign denied for {kv_key:?}: guard constraint \
+                 {kind:?} failed"
+            );
+            SignFirstPass::Direct(AgentMessage::failure())
+        }
+    }
+}
+
+/// Second-pass finalize after the dialog returned `Approved`.
+///
+/// Mirrors [`crate::daemon::server::guarded_get_finalize_after_approval`]:
+/// re-take the store lock, re-evaluate the guard record fail-closed
+/// (concurrent `kv.set` may have swapped the record, DR-0030 §5 "last
+/// declaration wins"), and — if it still passes — run the same
+/// post-guard body (`sign_body_after_guard`) the unguarded path used.
+/// If the guard has been *dropped* since the first pass, the entry is
+/// now unguarded and a plain sign is safe (matching the get side).
+fn local_sign_finalize_after_approval(
+    state: &SocketState,
+    peer_token: Option<GetterAuditToken>,
+    requester: Option<Vec<ProcessInfo>>,
+    guard_chain: Option<Vec<GetterProcess>>,
+    kv_key: String,
+    source: KeySource,
+    msg: &AgentMessage,
+) -> AgentMessage {
+    let fields = match msg.parse_sign_request() {
+        Ok(f) => f,
+        Err(_) => return AgentMessage::failure(),
+    };
+    // Re-resolve `signable_key` against the current registry (fail-closed on
+    // absence / kv_key drift). The first pass captured `kv_key` / `source`
+    // under a brief registry read lock and then dropped it before awaiting
+    // the (up to ~95s) approver dialog; a background op-discovery hot-swap
+    // (DR-0023 Phase 2, `Arc<RwLock<PublicKeyRegistry>>`) could have rotated
+    // the blob out — or re-registered it under a *different* KV key —
+    // during that window. Signing against the stale snapshot would use a
+    // PEM the socket no longer exposes. Take the read lock only long enough
+    // to look up + compare, then drop it before the store lock (the same
+    // lock-ordering `local_sign_first_pass` documents).
+    {
+        let registry = state.registry.read().unwrap_or_else(|e| e.into_inner());
+        match signable_key(&registry, &state.filter, &fields.key_blob) {
+            Some(reg) if reg.kv_key == kv_key => {}
+            _ => {
+                eprintln!(
+                    "cache-warden: authsock sign denied for {kv_key:?} after approval: \
+                     registry no longer resolves this blob to the approved KV key \
+                     (rotated / removed / filter-hidden during the dialog await)"
+                );
+                return AgentMessage::failure();
+            }
+        }
+    }
+    let mut store = match state.shared.store.lock() {
+        Ok(g) => g,
+        Err(_) => return AgentMessage::failure(),
+    };
+    match eval_sign_guard(&store, &kv_key, guard_chain.as_deref(), peer_token) {
+        SignGuardCheck::Unguarded | SignGuardCheck::Passed(_) => {}
+        SignGuardCheck::ChainMissing => {
+            drop(store);
+            eprintln!(
+                "cache-warden: authsock sign denied for {kv_key:?} after approval: guard \
+                 requires a requester chain but the peer could not be walked"
+            );
+            return AgentMessage::failure();
+        }
+        SignGuardCheck::Denied(kind) => {
+            drop(store);
+            eprintln!(
+                "cache-warden: authsock sign denied for {kv_key:?} after approval: guard \
+                 constraint {kind:?} failed on re-evaluation (record changed during approval)"
+            );
+            return AgentMessage::failure();
+        }
+    }
+    sign_body_after_guard(
+        &mut store,
+        state.shared.auth.as_ref(),
+        &state.shared.runner,
+        &state.shared.clock,
+        &state.shared.authsock_cap,
+        requester.as_deref(),
+        &kv_key,
+        &source,
+        &fields,
+    )
+}
+
+/// The post-guard sign body: fetch the PEM through the auth gate
+/// (lazily fetching an op key on its first use), sign, refresh the idle
+/// window, and return `SIGN_RESPONSE`. Any failure surfaces as
+/// `SSH_AGENT_FAILURE`.
+///
+/// Extracted so both the fast unguarded path (`local_sign_first_pass`'s
+/// inline branch) and the guarded finalize
+/// (`local_sign_finalize_after_approval`) share the exact same body under
+/// their respective one-shot store-lock holds. `sign_with_resolved_key`
+/// also delegates here after its own guard check, so unit tests that hit
+/// the legacy entry point keep their behaviour verbatim.
+#[allow(clippy::too_many_arguments)]
+fn sign_body_after_guard<A, R, C>(
+    store: &mut Store,
+    auth: &A,
+    runner: &R,
+    clock: &C,
+    cap: &cache_warden::Capability,
+    requester: Option<&[ProcessInfo]>,
+    kv_key: &str,
+    source: &KeySource,
+    fields: &SignRequestFields,
+) -> AgentMessage
+where
+    A: Authenticator + ?Sized,
+    R: SourceRunner,
+    C: Clock,
+{
+    if !ensure_loaded(store, kv_key, source, auth, runner, requester, cap, clock) {
+        return AgentMessage::failure();
+    }
+    let signature = match store.get(kv_key, cap, clock).ok().flatten() {
+        Some(secret) => secret.with_exposed(|bytes| {
+            let pem = String::from_utf8_lossy(bytes);
+            sign(&pem, &fields.data, fields.flags)
+        }),
+        None => return AgentMessage::failure(),
+    };
+    match signature {
+        Ok(blob) => {
+            let _ = store.extend(kv_key, cap, clock);
+            AgentMessage::sign_response(&blob)
+        }
+        Err(_) => AgentMessage::failure(),
+    }
 }
 
 /// Resolve the registered key a SIGN_REQUEST may use, or `None` to reject it.
@@ -1363,8 +1726,9 @@ fn signable_key<'r>(
 /// — trips `clippy::too_many_arguments`). Each field is a short-lived borrow of a
 /// `Shared` member; nothing here owns a secret.
 ///
-/// Test-only: production signs via [`local_sign`] → [`sign_with_resolved_key`]
-/// (resolving the key under a brief registry read lock). The unit tests drive the
+/// Test-only: production signs via [`local_sign_first_pass`] →
+/// [`sign_with_resolved_key`] (resolving the key under a brief registry
+/// read lock, gating on any DR-0031 dialog). The unit tests drive the
 /// same resolve-then-sign composition through [`sign_local_with_ctx`].
 #[cfg(test)]
 struct LocalSignCtx<'a, A: ?Sized, R, C> {
@@ -1409,7 +1773,7 @@ struct LocalSignCtx<'a, A: ?Sized, R, C> {
 /// Test-only resolve-then-sign shim (no socket I/O): resolves the key blob to a
 /// signable KV key via [`signable_key`] (registry lookup **and** the socket
 /// filter), then delegates to [`sign_with_resolved_key`]. It mirrors the exact
-/// composition production runs (`local_sign` does the same resolve + delegate,
+/// composition production runs (`local_sign_first_pass` does the same resolve + delegate,
 /// but under a live socket's registry read lock), so the SIGN_REQUEST → core →
 /// signature path stays unit-testable without a runtime or a full `SocketState`.
 #[cfg(test)]
@@ -1430,7 +1794,7 @@ where
     // Unknown key or filtered-out key: do not reveal which keys exist beyond
     // IDENTITIES. Clone the small bits we need so the registry borrow ends here,
     // before the (possibly slow) auth gate / op fetch (the source carries the op
-    // fetch spec). `local_sign` relies on the same split to bound its registry
+    // fetch spec). `local_sign_first_pass` relies on the same split to bound its registry
     // read-lock hold to just this resolution (see its lock-ordering note).
     let Some(registered) = signable_key(ctx.registry, ctx.filter, &fields.key_blob) else {
         return AgentMessage::failure();
@@ -1455,6 +1819,13 @@ where
 /// (no registry / filter — the key is already resolved). Grouped so the signing
 /// helper keeps a small argument list (`clippy::too_many_arguments`). Each field
 /// is a short-lived borrow of a `Shared` member; nothing here owns a secret.
+///
+/// Test-only: production runs the resolve + guard + body flow directly
+/// through [`local_sign_first_pass`] / [`local_sign_finalize_after_approval`]
+/// (no intermediate context struct). This kept the pre-DR-0031 unit tests
+/// (`handle_local_sign*` shims) working verbatim against
+/// [`sign_with_resolved_key`], which is itself test-only now.
+#[cfg(test)]
 struct SignExecCtx<'a, A: ?Sized, R, C> {
     /// The core store holding the private-key PEMs.
     store: &'a std::sync::Mutex<Store>,
@@ -1471,7 +1842,7 @@ struct SignExecCtx<'a, A: ?Sized, R, C> {
     authsock_cap: &'a cache_warden::Capability,
     /// DR-0030: the requester's ancestry chain enriched with
     /// `unique_id`, captured at the same walk that produced `requester`
-    /// above (see [`local_sign`]). `None` on non-macOS / when the peer
+    /// above (see [`local_sign_first_pass`]). `None` on non-macOS / when the peer
     /// pid could not be walked. Fed to [`guard_eval::evaluate`] on a
     /// guarded key (fail-closed if the constraint needs it and it is
     /// missing).
@@ -1488,8 +1859,12 @@ struct SignExecCtx<'a, A: ?Sized, R, C> {
 /// first use), signs, refreshes the idle window, and returns SIGN_RESPONSE. Any
 /// failure (denied, hard-expired static, sign error) is SSH_AGENT_FAILURE.
 ///
-/// Takes **no registry borrow**, so a caller ([`local_sign`]) can drop its
-/// registry read lock before this (potentially slow, TouchID-bearing) call.
+/// Test-only entry point kept for the pre-DR-0031 unit tests
+/// (`handle_local_sign*`). Production runs the equivalent flow through
+/// [`local_sign_first_pass`] (unguarded ⇒ inline
+/// [`sign_body_after_guard`] under one lock) or the finalize path
+/// [`local_sign_finalize_after_approval`] (guarded ⇒ re-eval + body).
+#[cfg(test)]
 fn sign_with_resolved_key<A, R, C>(
     ctx: &SignExecCtx<'_, A, R, C>,
     requester: Option<&[ProcessInfo]>,
@@ -1536,19 +1911,16 @@ where
     // filtered-out key uses (the agent protocol has no ErrorKind — the
     // wire message shape is fixed to bare FAILURE, and the constraint kind
     // is recorded only in the daemon's structured stderr diagnostic).
-    if let Some(record) = store.guard_of(kv_key) {
-        let chain = match ctx.guard_chain {
-            Some(c) => c,
-            None => {
-                eprintln!(
-                    "cache-warden: authsock sign denied for {kv_key:?}: guard \
-                     requires a requester chain but the peer could not be walked"
-                );
-                return AgentMessage::failure();
-            }
-        };
-        if let Err(denied) = guard_eval::evaluate(chain, ctx.guard_audit_token, record) {
-            let kind = guard_eval::denied_kind_label(denied.kind);
+    match eval_sign_guard(&store, kv_key, ctx.guard_chain, ctx.guard_audit_token) {
+        SignGuardCheck::Unguarded | SignGuardCheck::Passed(_) => {}
+        SignGuardCheck::ChainMissing => {
+            eprintln!(
+                "cache-warden: authsock sign denied for {kv_key:?}: guard \
+                 requires a requester chain but the peer could not be walked"
+            );
+            return AgentMessage::failure();
+        }
+        SignGuardCheck::Denied(kind) => {
             eprintln!(
                 "cache-warden: authsock sign denied for {kv_key:?}: guard \
                  constraint {kind:?} failed"
@@ -1557,42 +1929,20 @@ where
         }
     }
 
-    // Fetch the PEM through the same auth gate as the control socket. For an
-    // op-sourced key the core entry may not exist yet (lazy NotLoaded): the
-    // first sign fetches it via `op item get`, authenticates, and `set`s it.
-    if !ensure_loaded(
+    // Fetch + sign + idle-extend, shared with the DR-0031 §8 finalize
+    // path (`local_sign_finalize_after_approval`). Runs under the store
+    // lock we already hold above.
+    sign_body_after_guard(
         &mut store,
-        kv_key,
-        source,
         auth,
         runner,
-        requester,
-        ctx.authsock_cap,
         clock,
-    ) {
-        return AgentMessage::failure();
-    }
-
-    // Borrow the PEM only for the signing call, scoped by `with_exposed` (DR-0028)
-    // so the private key never escapes into an owned buffer.
-    let signature = match store.get(kv_key, ctx.authsock_cap, clock).ok().flatten() {
-        Some(secret) => secret.with_exposed(|bytes| {
-            let pem = String::from_utf8_lossy(bytes);
-            sign(&pem, &fields.data, fields.flags)
-        }),
-        None => return AgentMessage::failure(),
-    };
-
-    match signature {
-        Ok(blob) => {
-            // Idle-extend (DR-0011): a successful sign refreshes the soft window
-            // without prompting (the entry is Active here). Best effort — a
-            // failure here must not fail the signature.
-            let _ = store.extend(kv_key, ctx.authsock_cap, clock);
-            AgentMessage::sign_response(&blob)
-        }
-        Err(_) => AgentMessage::failure(),
-    }
+        ctx.authsock_cap,
+        requester,
+        kv_key,
+        source,
+        fields,
+    )
 }
 
 /// Make `key`'s value readable (Active), running the core's auth gate.
@@ -3136,7 +3486,7 @@ mod tests {
         let state = socket_state(&[]);
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::Lock, bytes::Bytes::new());
-        let resp = respond(&state, None, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::Failure);
     }
 
@@ -3147,7 +3497,7 @@ mod tests {
         let state = socket_state(&[&path]);
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &req, &mut routes).await;
 
         let ids = resp.parse_identities().unwrap();
         // Local GITHUB_KEY + the one upstream key.
@@ -3170,7 +3520,7 @@ mod tests {
         let state = socket_state(&[&path]);
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &req, &mut routes).await;
 
         let ids = resp.parse_identities().unwrap();
         assert_eq!(ids.len(), 1, "the duplicate blob must appear once");
@@ -3188,7 +3538,7 @@ mod tests {
         let state = socket_state(&[&dead]);
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &req, &mut routes).await;
         let ids = resp.parse_identities().unwrap();
         assert_eq!(ids.len(), 1, "local key survives a dead upstream");
         assert_eq!(ids[0].key_blob.as_ref(), blob_of(ED25519_PUB).as_slice());
@@ -3205,10 +3555,10 @@ mod tests {
         let mut routes = UpstreamRoutes::new();
 
         let enum_req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let _ = respond(&state, None, None, &enum_req, &mut routes).await;
+        let _ = respond(&state, None, None, None, &enum_req, &mut routes).await;
 
         let sign_req = sign_request(&up_id.key_blob, b"challenge", 0);
-        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::SignResponse);
         assert_eq!(resp.payload, upstream_sig.payload);
         std::fs::remove_file(&path).ok();
@@ -3225,7 +3575,7 @@ mod tests {
         let mut routes = UpstreamRoutes::new(); // empty: no prior enumeration
 
         let sign_req = sign_request(&up_id.key_blob, b"challenge", 0);
-        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::SignResponse);
         assert_eq!(resp.payload, upstream_sig.payload);
         std::fs::remove_file(&path).ok();
@@ -3240,7 +3590,7 @@ mod tests {
         let mut routes = UpstreamRoutes::new();
         let data = b"local-with-upstreams";
         let sign_req = sign_request(&blob_of(ED25519_PUB), data, 0);
-        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::SignResponse);
 
         // Verify it is a real signature by our local key.
@@ -3258,7 +3608,7 @@ mod tests {
         let state = socket_state(&[]);
         let mut routes = UpstreamRoutes::new();
         let sign_req = sign_request(b"totally-unknown-blob", b"d", 0);
-        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::Failure);
     }
 
@@ -3335,7 +3685,7 @@ mod tests {
         let state = socket_state_filtered(&[], parse_filter(&["comment=nope*"]));
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &req, &mut routes).await;
         let ids = resp.parse_identities().unwrap();
         assert!(ids.is_empty(), "filtered-out local key must not enumerate");
     }
@@ -3345,7 +3695,7 @@ mod tests {
         let state = socket_state_filtered(&[], parse_filter(&["comment=GITHUB_KEY"]));
         let mut routes = UpstreamRoutes::new();
         let req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, None, &req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &req, &mut routes).await;
         let ids = resp.parse_identities().unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].key_blob.as_ref(), blob_of(ED25519_PUB).as_slice());
@@ -3357,7 +3707,7 @@ mod tests {
         let state = socket_state_filtered(&[], parse_filter(&["comment=nope*"]));
         let mut routes = UpstreamRoutes::new();
         let sign_req = sign_request(&blob_of(ED25519_PUB), b"d", 0);
-        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::Failure);
     }
 
@@ -3375,7 +3725,7 @@ mod tests {
         let mut routes = UpstreamRoutes::new();
 
         let enum_req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, None, &enum_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &enum_req, &mut routes).await;
         let ids = resp.parse_identities().unwrap();
         // Only the local key enumerates; the upstream key is filtered out.
         assert_eq!(ids.len(), 1);
@@ -3388,7 +3738,7 @@ mod tests {
         // A SIGN for the hidden upstream blob is not forwarded -> FAILURE
         // (comment-only filter, no route, fallback also denies by empty comment).
         let sign_req = sign_request(&up_id.key_blob, b"x", 0);
-        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::Failure);
         std::fs::remove_file(&path).ok();
     }
@@ -3409,7 +3759,7 @@ mod tests {
 
         // No enumeration: sign the hidden blob directly.
         let sign_req = sign_request(&up_id.key_blob, b"x", 0);
-        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &sign_req, &mut routes).await;
         assert_eq!(
             resp.msg_type,
             MessageType::Failure,
@@ -3433,7 +3783,7 @@ mod tests {
         let mut routes = UpstreamRoutes::new();
 
         let sign_req = sign_request(&up_id.key_blob, b"x", 0);
-        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::SignResponse);
         std::fs::remove_file(&path).ok();
     }
@@ -3449,7 +3799,7 @@ mod tests {
         let mut routes = UpstreamRoutes::new();
 
         let enum_req = AgentMessage::new(MessageType::RequestIdentities, bytes::Bytes::new());
-        let resp = respond(&state, None, None, &enum_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &enum_req, &mut routes).await;
         let ids = resp.parse_identities().unwrap();
         // The local key's comment "GITHUB_KEY" does not match *upstream*, so only
         // the upstream key passes.
@@ -3458,7 +3808,7 @@ mod tests {
         assert!(!blobs.contains(&blob_of(ED25519_PUB)));
 
         let sign_req = sign_request(&up_id.key_blob, b"x", 0);
-        let resp = respond(&state, None, None, &sign_req, &mut routes).await;
+        let resp = respond(&state, None, None, None, &sign_req, &mut routes).await;
         assert_eq!(resp.msg_type, MessageType::SignResponse);
         assert_eq!(resp.payload, upstream_sig.payload);
         std::fs::remove_file(&path).ok();
@@ -3786,6 +4136,609 @@ mod tests {
             r2.lookup(&openssh_blob(ED25519_PUB)).is_some(),
             "the local base key persists across rebuilds"
         );
+    }
+
+    // ---- DR-0031 §8 approver-dialog integration on the SIGN path ----
+    //
+    // Pin the two-pass gated flow the control-socket `kv.get` already runs
+    // (see server.rs). A guarded reveal SIGN must (a) leave unguarded
+    // signs untouched — `FakeApprover.calls()` stays 0, (b) fire the
+    // dialog only on a guarded key whose first-pass eval passes,
+    // (c) map every non-`Approved` wire outcome onto bare FAILURE,
+    // (d) fail-closed when the helper is `Down`, and (e) re-evaluate
+    // the guard record after the dialog so a concurrent replace can
+    // still deny (DR-0030 §5 "last declaration wins").
+
+    #[cfg(target_os = "macos")]
+    use cache_warden_approver::wire::Outcome as WireOutcomeT;
+
+    /// The current process's euid+ruid — needed to build a
+    /// `GetterAuditToken` that matches a same-user guard record seeded
+    /// with `GuardSetter { euid, ruid }` derived from the *real* running
+    /// test process. `local_sign_first_pass` walks the real chain from
+    /// `std::process::id()`, so the guard evaluator receives the same
+    /// uid whether the test seeds `501` or the current uid; using the
+    /// current uid keeps the test portable across dev machines / CI.
+    #[cfg(target_os = "macos")]
+    fn current_uid() -> u32 {
+        // SAFETY: `geteuid` takes no pointer arguments and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
+    /// Attach a same-user guard to `GITHUB_KEY` bound to the current
+    /// process's uid so the SIGN first pass's real chain walk +
+    /// `peer_audit_token` derivation actually satisfy the constraint.
+    #[cfg(target_os = "macos")]
+    fn install_same_user_guard_current_uid(shared: &crate::daemon::server::Shared) {
+        let uid = current_uid();
+        let record = GuardRecord::new(
+            vec![GuardConstraint::SameUser],
+            GuardSetter {
+                euid: uid,
+                ruid: uid,
+            },
+        );
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .set_guard("GITHUB_KEY", record, &shared.authsock_cap)
+            .expect("set_guard succeeds with the authsock cap");
+    }
+
+    /// A `GetterAuditToken` matching the running test process — the
+    /// runtime shape `peer_audit_token(fd)` returns for a real
+    /// connection from this process to itself.
+    #[cfg(target_os = "macos")]
+    fn current_uid_token() -> GetterAuditToken {
+        GetterAuditToken {
+            euid: current_uid(),
+            ruid: current_uid(),
+        }
+    }
+
+    /// Build a `SocketState` (GITHUB_KEY registry, no filter, no upstream,
+    /// no policy) and install the approver `slot_setter` on its shared.
+    /// Returns the `state` and a handle to the shared for guard seeding
+    /// / call-count assertions.
+    #[cfg(target_os = "macos")]
+    fn socket_state_with_approver<F>(setup: F) -> Arc<SocketState>
+    where
+        F: FnOnce(&crate::daemon::server::Shared),
+    {
+        let state = socket_state(&[]);
+        setup(&state.shared);
+        state
+    }
+
+    /// End-to-end: guarded SIGN + Approved outcome → verifiable
+    /// `SignResponse` (the happy path of the two-pass flow). Pins that
+    /// the dialog fires exactly once (`FakeApprover.calls() == 1`) and
+    /// the finalize pass reaches the signing body.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sign_request_guarded_key_approved_returns_signature() {
+        let fake = Arc::new(super::super::approver_wire::FakeApprover::new(
+            WireOutcomeT::Approved,
+        ));
+        let fake_for_state = Arc::clone(&fake);
+        let state = socket_state_with_approver(|shared| {
+            install_same_user_guard_current_uid(shared);
+            shared.approver.set_ready(fake_for_state.clone());
+        });
+        let mut routes = HashMap::new();
+        let req = sign_request(&blob_of(ED25519_PUB), b"agent challenge", 0);
+        let resp = super::sign_request(
+            &state,
+            Some(std::process::id()),
+            Some(current_uid_token()),
+            None,
+            &req,
+            &routes,
+        )
+        .await;
+        // Silence "unused variable: routes" if this file's macro ever
+        // reshuffles — routes is genuinely read by upstream forwarding
+        // which does not fire here (blob is a local key).
+        routes.clear();
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+        assert_eq!(fake.calls(), 1, "dialog must fire exactly once");
+    }
+
+    /// Every non-`Approved` outcome on a guarded SIGN maps to bare
+    /// `SSH_AGENT_FAILURE` with an empty payload — the agent wire has
+    /// no error kind, so the classification is only observable in
+    /// stderr (which the test does not capture — the important
+    /// invariant is `Failure` + empty payload). Pins the outcome
+    /// switch in `sign_request`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sign_request_guarded_key_non_approved_outcomes_all_return_failure() {
+        for outcome in [
+            WireOutcomeT::Denied,
+            WireOutcomeT::Cancelled,
+            WireOutcomeT::Timeout,
+            WireOutcomeT::PeerGone,
+            WireOutcomeT::BiometricFailed,
+        ] {
+            let fake = Arc::new(super::super::approver_wire::FakeApprover::new(outcome));
+            let fake_for_state = Arc::clone(&fake);
+            let state = socket_state_with_approver(|shared| {
+                install_same_user_guard_current_uid(shared);
+                shared.approver.set_ready(fake_for_state.clone());
+            });
+            let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+            let resp = super::sign_request(
+                &state,
+                Some(std::process::id()),
+                Some(current_uid_token()),
+                None,
+                &req,
+                &HashMap::new(),
+            )
+            .await;
+            assert_eq!(
+                resp.msg_type,
+                MessageType::Failure,
+                "outcome {outcome:?} must map to FAILURE"
+            );
+            assert!(resp.payload.is_empty(), "FAILURE must carry no detail");
+            assert_eq!(
+                fake.calls(),
+                1,
+                "outcome {outcome:?}: dialog must fire exactly once"
+            );
+        }
+    }
+
+    /// Guarded SIGN with the approver slot in `Down` (helper unavailable)
+    /// fails closed — matches the §9 promise the control-socket
+    /// `helper_down_fails_guarded_reveal_get_closed` pins on `kv.get`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sign_request_guarded_key_with_helper_down_fails_closed() {
+        // `Shared::new_for_test` starts the approver slot in `Down`.
+        let state = socket_state_with_approver(|shared| {
+            install_same_user_guard_current_uid(shared);
+        });
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let resp = super::sign_request(
+            &state,
+            Some(std::process::id()),
+            Some(current_uid_token()),
+            None,
+            &req,
+            &HashMap::new(),
+        )
+        .await;
+        assert_eq!(resp.msg_type, MessageType::Failure);
+        assert!(resp.payload.is_empty());
+    }
+
+    /// Unguarded SIGN with a `Ready` approver never invokes the dialog —
+    /// `FakeApprover.calls()` stays 0. Pins the DR-0031 §8 promise that
+    /// the gate is opt-in per entry: adding a helper must not put the
+    /// dialog on every SSH signing request.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sign_request_unguarded_key_never_fires_dialog() {
+        let fake = Arc::new(super::super::approver_wire::FakeApprover::new(
+            WireOutcomeT::Approved,
+        ));
+        let fake_for_state = Arc::clone(&fake);
+        // No `install_same_user_guard_current_uid` — GITHUB_KEY is
+        // unguarded, so the SIGN first pass takes the fast-path branch.
+        let state = socket_state_with_approver(|shared| {
+            shared.approver.set_ready(fake_for_state.clone());
+        });
+        let req = sign_request(&blob_of(ED25519_PUB), b"agent challenge", 0);
+        let resp = super::sign_request(
+            &state,
+            Some(std::process::id()),
+            Some(current_uid_token()),
+            None,
+            &req,
+            &HashMap::new(),
+        )
+        .await;
+        assert_eq!(resp.msg_type, MessageType::SignResponse);
+        assert_eq!(fake.calls(), 0, "unguarded key must not invoke the dialog");
+    }
+
+    /// The most important second-pass property: a guard *changed*
+    /// during the dialog must fail-closed — the approval was against
+    /// the *previous* record, not the newly-installed one. Simulates
+    /// a concurrent `set_guard` swap between first pass and finalize
+    /// by using a `BlockingApprover` that pauses inside `request`
+    /// until we release it; while paused we replace the record with
+    /// a `SameUser` guard bound to a non-matching uid.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sign_request_guarded_key_record_replaced_during_approval_fails_closed() {
+        use tokio::sync::oneshot;
+
+        struct BlockingApprover {
+            entered: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+            unblock: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+            call_count: std::sync::atomic::AtomicUsize,
+        }
+        impl super::super::approver_wire::Approver for BlockingApprover {
+            fn request<'a>(
+                &'a self,
+                request: cache_warden_approver::wire::ApproveRequest,
+                _timeout: Duration,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = std::io::Result<cache_warden_approver::wire::ApproveResponse>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(async move {
+                    if let Some(tx) = self.entered.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = self.unblock.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                    Ok(cache_warden_approver::wire::ApproveResponse {
+                        v: cache_warden_approver::wire::WIRE_VERSION,
+                        request_id: request.request_id,
+                        outcome: WireOutcomeT::Approved,
+                        biometric_kind: Some("TouchID".into()),
+                    })
+                })
+            }
+            fn shutdown<'a>(
+                &'a self,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+                Box::pin(async {})
+            }
+        }
+
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (unblock_tx, unblock_rx) = oneshot::channel::<()>();
+        let blocker = Arc::new(BlockingApprover {
+            entered: tokio::sync::Mutex::new(Some(entered_tx)),
+            unblock: tokio::sync::Mutex::new(Some(unblock_rx)),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let blocker_for_state = Arc::clone(&blocker);
+        let state = socket_state_with_approver(|shared| {
+            install_same_user_guard_current_uid(shared);
+            shared.approver.set_ready(blocker_for_state.clone());
+        });
+        let state_bg = Arc::clone(&state);
+        let sign_task = tokio::spawn(async move {
+            let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+            super::sign_request(
+                &state_bg,
+                Some(std::process::id()),
+                Some(current_uid_token()),
+                None,
+                &req,
+                &HashMap::new(),
+            )
+            .await
+        });
+        entered_rx
+            .await
+            .expect("approver must enter `request` for the guarded sign");
+        // Concurrent guard swap: same key, but bound to a uid the
+        // running test process cannot satisfy. `set_guard` replaces
+        // the record (DR-0030 §5 "last declaration wins").
+        {
+            let never_uid = current_uid().wrapping_add(1);
+            let denying = GuardRecord::new(
+                vec![GuardConstraint::SameUser],
+                GuardSetter {
+                    euid: never_uid,
+                    ruid: never_uid,
+                },
+            );
+            state
+                .shared
+                .store
+                .lock()
+                .unwrap()
+                .set_guard("GITHUB_KEY", denying, &state.shared.authsock_cap)
+                .expect("swap the guard record while the dialog waits");
+        }
+        // Release the approver — finalize now re-evaluates the (new,
+        // denying) record and must fail-closed.
+        let _ = unblock_tx.send(());
+        let resp = sign_task.await.expect("sign task must not panic");
+        assert_eq!(
+            resp.msg_type,
+            MessageType::Failure,
+            "record replaced during approval must not authorize the sign"
+        );
+        assert!(resp.payload.is_empty());
+    }
+
+    /// While a guarded reveal-SIGN awaits the dialog, an unrelated
+    /// unguarded `kv.get` on the *same daemon* (same `Shared`) must
+    /// progress — the SIGN flow drops the store lock before entering
+    /// the dialog await, so a multi-second human decision cannot
+    /// queue every other request on this daemon behind it. Uses the
+    /// control-socket `run_request_async` path directly against the
+    /// authsock `SocketState.shared`, mirroring the get-side
+    /// `parallel_unguarded_get_progresses_while_gated_get_awaits_dialog`
+    /// test.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sign_request_unrelated_get_progresses_while_guarded_sign_awaits_dialog() {
+        use tokio::sync::oneshot;
+
+        struct BlockingApprover {
+            entered: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+            unblock: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        }
+        impl super::super::approver_wire::Approver for BlockingApprover {
+            fn request<'a>(
+                &'a self,
+                request: cache_warden_approver::wire::ApproveRequest,
+                _timeout: Duration,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = std::io::Result<cache_warden_approver::wire::ApproveResponse>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    if let Some(tx) = self.entered.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = self.unblock.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                    Ok(cache_warden_approver::wire::ApproveResponse {
+                        v: cache_warden_approver::wire::WIRE_VERSION,
+                        request_id: request.request_id,
+                        outcome: WireOutcomeT::Approved,
+                        biometric_kind: Some("TouchID".into()),
+                    })
+                })
+            }
+            fn shutdown<'a>(
+                &'a self,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+                Box::pin(async {})
+            }
+        }
+
+        // Set up state with GITHUB_KEY guarded. Separately seed an
+        // *unguarded* KV entry `default/U` on the same shared store;
+        // the parallel work will be a control-socket `kv.get` for
+        // that key, which needs the same store lock the guarded
+        // SIGN's dialog await must have released.
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (unblock_tx, unblock_rx) = oneshot::channel::<()>();
+        let blocker = Arc::new(BlockingApprover {
+            entered: tokio::sync::Mutex::new(Some(entered_tx)),
+            unblock: tokio::sync::Mutex::new(Some(unblock_rx)),
+        });
+        let state = socket_state_with_approver(|shared| {
+            install_same_user_guard_current_uid(shared);
+            shared.approver.set_ready(blocker.clone());
+            shared
+                .store
+                .lock()
+                .unwrap()
+                .set(
+                    "default/U".to_string(),
+                    ValueSource::Static,
+                    SecretBytes::from("unguarded-plain"),
+                    Ttl::never(),
+                    &shared.control_cap,
+                    &shared.clock,
+                )
+                .unwrap();
+        });
+
+        // Fire the guarded sign in the background — it must sit on
+        // the dialog until we send `unblock`.
+        let state_g = Arc::clone(&state);
+        let guarded = tokio::spawn(async move {
+            let req = sign_request(&blob_of(ED25519_PUB), b"data-g", 0);
+            super::sign_request(
+                &state_g,
+                Some(std::process::id()),
+                Some(current_uid_token()),
+                None,
+                &req,
+                &HashMap::new(),
+            )
+            .await
+        });
+        entered_rx
+            .await
+            .expect("approver must enter `request` for the guarded sign");
+        // The unguarded control-socket `kv.get` on the *same*
+        // `Shared` must progress while the guarded SIGN is captive on
+        // the (unreleased) approver — proving the SIGN flow released
+        // the store lock before awaiting the dialog. `run_request_async`
+        // is the same entry point the production control listener
+        // uses, so this exercises the real cross-adapter path.
+        let get_resp = crate::daemon::server::run_request_async(
+            &state.shared,
+            None,
+            None,
+            None,
+            crate::protocol::wire::Request::KvGet {
+                key: "default/U".to_string(),
+                dry_run: false,
+            },
+        )
+        .await;
+        assert!(
+            get_resp.is_ok(),
+            "unguarded kv.get must progress while a guarded SIGN is captive on the dialog: {get_resp:?}"
+        );
+        assert!(
+            !guarded.is_finished(),
+            "guarded SIGN must still be pending on the blocking approver"
+        );
+        let _ = unblock_tx.send(());
+        let guarded = guarded.await.expect("guarded task must not panic");
+        assert_eq!(guarded.msg_type, MessageType::SignResponse);
+    }
+
+    /// First-pass denial (guard bound to a uid the running test process
+    /// cannot satisfy) must NOT fire the approver dialog. Pins the
+    /// promise that a denied requester never sees TouchID / a human
+    /// prompt on the SIGN path — the denial is silent and cost-free.
+    /// The production path (`super::sign_request`) is exercised end-to-end
+    /// with a `FakeApprover(Approved)` installed; the test would fail if
+    /// the first pass ever handed the dialog a denied request. Companion
+    /// to `sign_request_unguarded_key_never_fires_dialog` from the
+    /// unguarded side.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sign_request_guarded_key_first_pass_denied_no_dialog() {
+        let fake = Arc::new(super::super::approver_wire::FakeApprover::new(
+            WireOutcomeT::Approved,
+        ));
+        let fake_for_state = Arc::clone(&fake);
+        let state = socket_state_with_approver(|shared| {
+            // Guard bound to a uid the running test process cannot
+            // satisfy — first-pass eval must deny before any dialog.
+            let never_uid = current_uid().wrapping_add(1);
+            let denying = GuardRecord::new(
+                vec![GuardConstraint::SameUser],
+                GuardSetter {
+                    euid: never_uid,
+                    ruid: never_uid,
+                },
+            );
+            shared
+                .store
+                .lock()
+                .unwrap()
+                .set_guard("GITHUB_KEY", denying, &shared.authsock_cap)
+                .expect("set_guard succeeds with the authsock cap");
+            shared.approver.set_ready(fake_for_state.clone());
+        });
+        let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+        let resp = super::sign_request(
+            &state,
+            Some(std::process::id()),
+            Some(current_uid_token()),
+            None,
+            &req,
+            &HashMap::new(),
+        )
+        .await;
+        assert_eq!(resp.msg_type, MessageType::Failure);
+        assert!(resp.payload.is_empty());
+        assert_eq!(
+            fake.calls(),
+            0,
+            "denied first-pass must not fire the approver dialog"
+        );
+    }
+
+    /// Registry hot-swap during the approver dialog await must fail-closed
+    /// at finalize. The first pass snapshots `kv_key` under a brief
+    /// registry read lock and then drops it before awaiting the (~95s)
+    /// dialog; a background op-discovery hot-swap (DR-0023 Phase 2) can
+    /// land in that window. If the blob no longer resolves under the
+    /// current registry, signing against the pre-dialog snapshot would
+    /// leak a PEM the socket no longer exposes. Uses the same
+    /// `BlockingApprover` pattern as
+    /// `sign_request_guarded_key_record_replaced_during_approval_fails_closed`
+    /// but the concurrent mutation is a registry replacement, not a
+    /// guard-record swap.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sign_request_guarded_key_registry_dropped_during_approval_fails_closed() {
+        use tokio::sync::oneshot;
+
+        struct BlockingApprover {
+            entered: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+            unblock: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        }
+        impl super::super::approver_wire::Approver for BlockingApprover {
+            fn request<'a>(
+                &'a self,
+                request: cache_warden_approver::wire::ApproveRequest,
+                _timeout: Duration,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = std::io::Result<cache_warden_approver::wire::ApproveResponse>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    if let Some(tx) = self.entered.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = self.unblock.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                    Ok(cache_warden_approver::wire::ApproveResponse {
+                        v: cache_warden_approver::wire::WIRE_VERSION,
+                        request_id: request.request_id,
+                        outcome: WireOutcomeT::Approved,
+                        biometric_kind: Some("TouchID".into()),
+                    })
+                })
+            }
+            fn shutdown<'a>(
+                &'a self,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+                Box::pin(async {})
+            }
+        }
+
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (unblock_tx, unblock_rx) = oneshot::channel::<()>();
+        let blocker = Arc::new(BlockingApprover {
+            entered: tokio::sync::Mutex::new(Some(entered_tx)),
+            unblock: tokio::sync::Mutex::new(Some(unblock_rx)),
+        });
+        let blocker_for_state = Arc::clone(&blocker);
+        let state = socket_state_with_approver(|shared| {
+            install_same_user_guard_current_uid(shared);
+            shared.approver.set_ready(blocker_for_state.clone());
+        });
+        let state_bg = Arc::clone(&state);
+        let sign_task = tokio::spawn(async move {
+            let req = sign_request(&blob_of(ED25519_PUB), b"data", 0);
+            super::sign_request(
+                &state_bg,
+                Some(std::process::id()),
+                Some(current_uid_token()),
+                None,
+                &req,
+                &HashMap::new(),
+            )
+            .await
+        });
+        entered_rx
+            .await
+            .expect("approver must enter `request` for the guarded sign");
+        // Concurrent hot-swap: replace the registry with an empty one.
+        // `known_local` already committed on the first pass; the finalize
+        // pass's re-resolve is what must catch this.
+        *state.registry.write().unwrap() = PublicKeyRegistry::new();
+        // Release the approver — finalize now re-resolves and must
+        // fail-closed (blob no longer in the registry).
+        let _ = unblock_tx.send(());
+        let resp = sign_task.await.expect("sign task must not panic");
+        assert_eq!(
+            resp.msg_type,
+            MessageType::Failure,
+            "registry dropped during approval must not authorize the sign"
+        );
+        assert!(resp.payload.is_empty());
     }
 
     #[test]

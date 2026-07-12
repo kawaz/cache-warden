@@ -44,8 +44,9 @@ pub struct ApproveRequest {
     /// The target kv entry (namespace included).
     pub key: String,
     /// The operation being authorized: `"get"` | `"extend"` | `"regenerate"`
-    /// | `"pin"`. Carried as a plain string — the daemon owns the set of
-    /// valid operations; the helper only displays it, never branches on it.
+    /// | `"pin"` | `"sign"`. Carried as a plain string — the daemon owns the
+    /// set of valid operations; the helper only displays it, never branches
+    /// on it.
     pub operation: String,
     /// The process requesting access.
     pub requester: Requester,
