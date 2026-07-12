@@ -1,6 +1,6 @@
 ---
 title: authsock SIGN 経路の guard 通過後 dialog を出すかの裁定
-status: open
+status: resolved
 category: design
 created: 2026-07-12T17:55:10+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-13T07:57:46+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0031","dr/DR-0030","implemented"]
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -57,12 +57,33 @@ kv get 経路を前提にした記述で SIGN 経路への適用は明記され�
 - **(c) 折衷**: config で socket 単位の opt-in (dialog を出す socket / 出さ
   ない socket を選べる)
 
-kawaz 裁定待ち。
+## 裁定結果 (kawaz, 2026-07-13)
+
+案 (a) 採用: SIGN 経路でも guard 通過後に dialog を出す。「socket 介して
+相手を確認するほぼ同じ構図なので共通化」という設計指示。
+
+commit 52b95386 で実装完了:
+
+- SIGN を 2 pass に分割: lock 保持下で guard を評価 → lock 解放して dialog
+  await (operation "sign") → lock 再取得の上で record 再評価 + registry
+  再解決 (fail-closed)
+- dialog outcome が Approved 以外なら `SSH_AGENT_FAILURE`
+- 機械 gate 拒否時は dialog 自体を発火しない
+- 承認フロー共通部品 (`ApprovalOutcome` / `await_dialog_outcome`) を
+  kv get 経路と共有
+- SSH client 側 timeout 懸念は 1Password SSH agent の TouchID confirm と
+  同構図で実用可と整理 (`LoginGraceTime` 120s > `APPROVER_REQUEST_TIMEOUT`
+  90s)
+- テスト 8 本 (approved / 非 approved 全 outcome / helper_down / record
+  差し替え / registry 消滅 / 拒否時 dialog 非発火 / 並行性)、Fable レビュー
+  通過 (MEDIUM 2 件は修正済み)
+
+DR-0031 §8 / DR-0030 §4 への反映は直後の docs commit で実施。
 
 ## 受け入れ条件
 
-- [ ] guard 通過後の dialog 要否について kawaz の裁定を反映する
-- [ ] 裁定結果を関連 DR (draft-DR-0031 §8 / draft-DR-0030 §4) に反映する
+- [x] guard 通過後の dialog 要否について kawaz の裁定を反映する
+- [x] 裁定結果を関連 DR (draft-DR-0031 §8 / draft-DR-0030 §4) に反映する
 
 ## 関連
 
