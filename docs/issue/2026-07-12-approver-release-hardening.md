@@ -48,6 +48,25 @@ draft-DR-0031 Phase 1.5 の opus47 セキュリティレビューで「land 可�
      「prefix 不一致」を区別しない (N-1)
    - `kSecCSStrictValidate` 採用余地 (L-4)
 
+5. **helper 側 dialog の自前 timeout (countdown) 実装 (Block 3a レビュー
+   MEDIUM-3、2026-07-12)**
+   現状 helper に dialog timeout が無く (wire の `timeout_secs` は未使用の
+   hint に留まる)、ユーザ不在で dialog が 1 つ放置されると daemon 側 90s
+   timeout 後も dialog が画面に残る。helper は直列 read のため次の request
+   を読まず、以後の guarded get が全て 90s 待ちになる (= AuthFailed の可用性
+   DoS)。fail-closed なので機密自体は安全だが、根治は helper 側 countdown
+   (Phase 2)。DR-0031 Phase 1.6 Block 1 の記録が「M-2 (stuck live helper の
+   自動 recovery) は本 issue に集約」としていたが本 issue に項目が無かった
+   drift の解消も兼ねる。
+
+6. **dialog キューの有界化 (prompt-bombing 対策、同レビュー MEDIUM-3)**
+   `APPROVER_REQUEST_TIMEOUT` (90s) は lock 取得後の exchange のみを bound
+   し、lock 待ちは無期限。同一 uid のプロセスが M 本接続して guarded get を
+   積むと M 個の dialog が順に出続ける (MFA 疲れ攻撃)。対策候補: 
+   `approver.request` 全体を timeout で包む / pending depth 上限 / 同一
+   (key, requester) の coalesce。DR-0031 §Security への v1 既知制約の明文化
+   は Block 3a の docs 反映で対応済みの予定、実装対策は本 issue で追跡。
+
 ## 背景
 
 draft-DR-0031 (custom TouchID dialog) の Phase 1.5 で opus47 によるセキュリ
@@ -61,6 +80,8 @@ draft-DR-0031 (custom TouchID dialog) の Phase 1.5 で opus47 によるセキ�
 - [ ] daemon 側 / helper 側の警告ログ prefix を統一、到達経路を確認
 - [ ] `PeerIdentifierPrefixMismatch` の診断メッセージ改善 (該当なら)
 - [ ] `kSecCSStrictValidate` 採用可否を判断
+- [ ] helper 側 dialog に自前 countdown timeout を実装 (`timeout_secs` hint を実際に消費)
+- [ ] dialog キューを有界化 (lock 待ち全体の timeout / pending depth 上限 / coalesce のいずれかを選定し実装)
 
 ## TODO
 
@@ -70,3 +91,4 @@ draft-DR-0031 (custom TouchID dialog) の Phase 1.5 で opus47 によるセキ�
 
 - `docs/decisions/draft-DR-0031-custom-touchid-dialog.md` §Security
 - `docs/issue/2026-07-11-approver-persistent-helper-lifecycle.md`
+- Block 3a レビュー MEDIUM-3 (2026-07-12): stuck live helper の可用性 DoS と prompt-bombing 対策の指摘元
