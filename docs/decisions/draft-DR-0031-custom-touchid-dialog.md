@@ -816,6 +816,28 @@ readiness を control socket serve 開始条件に組み込む** (codex review h
   で biometric-only を強制 (Password fallback を許すと「passphrase 打鍵で承認」になり
   独自 dialog の意義が薄れる)。TouchID 不在 Mac ではメッセージで「biometric 必須」を表示
 
+### v1 既知制約 (Block 3a、2026-07-12)
+
+Fable 敵対的レビューで指摘され、v1 land を止めるほどの重大度ではないと判断して
+issue に切り出した既知の制約:
+
+- **prompt-bombing**: dialog キューは無界。`APPROVER_REQUEST_TIMEOUT` (90s) は
+  1 回の exchange (send + recv) だけを bound し、`ApproverClient::request` の
+  `inner` lock 待ち自体には上限がない。同一 uid から M 個の guarded reveal-get
+  が並行到着すると、helper には M 個の dialog が順に (直列に) 出続ける。対策候補
+  (要求全体の timeout / キュー深さ上限 / 同一 key への coalesce) は issue
+  `2026-07-12-approver-release-hardening` 項目 6 で追跡
+- **dialog wedge**: helper 側は表示した dialog に対する自前の countdown /
+  timeout を持たない。ユーザが dialog を放置すると、後続の guarded reveal-get は
+  直列化された `inner` lock の後ろに並び、90 秒 × N 件分待たされる可用性 DoS に
+  なる (secret 自体は fail-closed のまま送出されないので機密性は保たれる)。
+  根治には helper 側 dialog 自体に countdown を持たせる必要があり、同 issue
+  項目 5 で追跡
+- **authsock SIGN は guard の機械評価のみで dialog を出さない**: `kv.get` の
+  guarded reveal path とは非対称 (SIGN 要求は同じ guard record を評価するが
+  approver dialog を経由しない)。この非対称を是正するかどうかは issue
+  `2026-07-12-authsock-sign-guard-dialog-decision` で kawaz 裁定待ち
+
 ## 実装 phase 分割
 
 - **Phase 1 (最小 land)**:
@@ -1355,3 +1377,135 @@ codex review で「妥当な判断」と AGREED された設計要素 (kawaz レ
   正式 Authenticator として扱っており、移行猶予が必要
 - **helper に secret 値を送らない (Security 節)**: 必須で妥当。metadata の sensitive
   扱いも強化済み (Security 節 low-8 対応)
+
+### Phase 1.6 Block 3a 実装記録 (2026-07-12)
+
+commit `3d63234e`。guard 通過後の dialog 発火配線を land。**§8 v1 の第 1 発火
+条件 (guard 付き entry の reveal-`kv.get`) のみ**を配線対象とし、`[auth].command`
+の dialog 置換と authsock SIGN への dialog 統合はスコープ外 (前者は Phase 2、後者は
+issue `2026-07-12-authsock-sign-guard-dialog-decision` で裁定待ち)。
+
+#### 実装の所在
+
+- **`daemon/approver_wire.rs` (新設)**: daemon-internal `guard::GuardEvalOutput` /
+  `GetterProcess` 等の評価器出力を、§4 の wire schema (`cache_warden_approver::wire`)
+  へ変換する adapter。`Approver` trait (`request` / `shutdown` の 2 メソッド) で
+  production 実装 (`ApproverClient`) と test 実装 (`FakeApprover`) を抽象化し、
+  ゲートされた server 層のコードが実 helper を起動せずにテストできるようにした
+- **`server.rs`**: `dispatch_async` / `run_request_async` が reveal
+  (`dry_run = false`) の `kv.get` のみを gated path (`guarded_get_first_pass` →
+  dialog await → `guarded_get_finalize_after_approval`) に通す。それ以外の全
+  request 種別は既存の `spawn_blocking(run_request)` のまま無変更
+- **`handler.rs`**: `HandlerCtx::guard_check_mode` (`GuardCheckMode::Evaluate` /
+  `GuardCheckMode::AlreadyApproved`、default は `Evaluate`) を追加。`handle_get`
+  の guard 評価ブロックはこのモードで分岐し、既存の非 approver 呼び出し (全既存
+  テスト含む) は無影響
+
+#### wire adapter の確定差分
+
+- **Duration → epoch ns**: `duration_to_epoch_ns` (`u64::try_from`、`u64::MAX` に
+  saturate) / `maybe_duration_to_ns` (`None` → `0`、既存の `ProcessChainEntry::ppid`
+  `= 0` = unknown 規約と同じ形)。sub-microsecond 精度の round-trip をテストで pin
+  (`duration_conversion_preserves_sub_microsecond_precision`)、`None` の `0` 収束も
+  専用テストで pin (`unknown_start_time_collapses_to_zero_sentinel`、将来 `u64::MAX`
+  等への変更を検知する意図)
+- **`setter_pinned` は単数**: 最初の same-ancestor 族の pin のみ (evaluator が
+  既に単数に強制している前提を adapter 側でもそのまま踏襲)
+- **`responsible_bundle_id` は v1 で常に `None`**: TCC 経由の解決は Block 3b。
+  helper 側は §4 documented の chain 探索 fallback で表示を埋める
+- **`strength` の 2 値 (`"strong"` / `"weak"`) は文字列のまま透過**: same-user
+  再宣言時の細分化ニュアンスは Block 3b 送り (§4 addendum で既にフラグ済み)
+
+#### lock 設計 (2 pass 化、最重要)
+
+guarded reveal-get を 2 pass に分割:
+
+1. **1st pass (`guarded_get_first_pass`、store lock 保持)**: reserved-namespace /
+   process-policy の pre-gate → entry が unguarded なら handler 全体を実行して
+   `GuardedGetFirstPass::Direct` で応答を確定 → guarded なら guard record を
+   評価、fail-closed で拒否時は `Direct`、成功時は `NeedsApproval`
+   (`guard_eval` + chain snapshot を保持) で **lock を解放して返す**
+2. **dialog await (lock フリー)**: `ApproverSlot::wait_ready` で helper を取得 →
+   `approver_wire::build_approve_request` で wire request を組み立て →
+   `approver.request(..)` で承認待ち (`APPROVER_REQUEST_TIMEOUT = 90s`)。人間の
+   数秒〜十数秒の操作をここで待つが、store lock は握っていないので他 request は
+   ブロックされない
+3. **2nd pass (`guarded_get_finalize_after_approval`、lock 再取得)**: guard
+   record を fail-closed で再評価してから `GuardCheckMode::AlreadyApproved` で
+   `handle_get` に通す (承認待ち中の guard 差し替えは拒否、guard 消滅は
+   unguarded として通す — §8 本文の記述通り)
+
+**store lock と approver (helper 接続) lock を同時に保持する経路はゼロ** (deadlock
+が構造的に成立しない)。
+
+#### outcome の扱い
+
+`WireOutcome::Approved` のみ値に到達する。`Denied` / `Cancelled` / `Timeout` /
+`PeerGone` / `BiometricFailed`、および接続死・helper 側 exchange タイムアウトは
+すべて `AuthFailed` に丸める (拒否理由の詳細を requester に返さない — DR-0030 §7
+の「setter identity を漏らさない」と同じ思想)。`dry_run = true` の `kv.get` は
+gated path に一切入らず dialog 非発火 (値を返さないため承認対象が観測不能。§8
+本文には dry-run 分岐の明文はなく、`run_request_async` のドキュメントコメントで
+明示した実装判断、専用テストで pin)。
+
+#### helper lifecycle: `ApproverSlot`
+
+`Starting` / `Ready(Arc<dyn Approver>)` / `Down` の 3 状態 + `tokio::sync::Notify`。
+`wait_ready(timeout)` は Notify の missed-notification race 対策
+(`notified()` を state チェックより先に生成・`enable()` してから state を見る、
+timeout 直前にも state を再チェック) を持つ。`Ready` / `Down` は現状 terminal
+(daemon は helper が一度 `Down` になった後、自動では再 spawn しない)。daemon 起動
+フローは store restore + config 定義登録が完了してからバックグラウンドで helper
+spawn を開始し、その窓に到着した guarded reveal-get は `HELPER_STARTING_WAIT = 5s`
+の bounded wait で `Starting` を吸収する。helper spawn 失敗 / バイナリ不在は即
+`Down` に遷移 (guarded entry は fail-closed、unguarded entry はこの slot を
+参照しないので無関係に透過のまま)。
+
+**§10 の厳密順序からの意図的な妥協**: draft §10 は「helper spawn → HELLO 受領
+→ control socket 開始」を厳密な起動シーケンスとして規定していたが、Block 3a の
+実装は「control socket を早期 bind + helper spawn は非同期 + `Starting` 窓は
+guarded get 側の bounded wait で吸収」という形にした。DR-0023 (daemon preload
+中の ping 応答性) とのトレードオフを優先した結果で、§10 本文とは異なる。今後
+§10 側の記述をこの実装に合わせて更新するか、起動シーケンスを厳密化するかは
+Block 3b 以降で再検討する。
+
+#### shutdown / graceful restart 統合
+
+- shutdown 経路は `ApproverSlot::current_ready()` で現在の helper handle を
+  snapshot し、あれば `approver.shutdown().await` を呼ぶ (helper kill + socket
+  file unlink)
+- **`ApproverClient` に `closed: AtomicBool` latch を追加**。`shutdown` は
+  helper への SIGKILL 送信前に latch を store し、`request` は (a) exchange
+  開始前、(b) recovery (respawn) 直前、の 2 箇所で latch をチェックする。
+  shutdown が helper を殺した直後に pending request の read が EOF で落ちても
+  再 spawn しない (= Block 1 の H-1 で塞いだ「shutdown が in-flight approval を
+  待って captive する」問題の、別角度の再発 — respawn による captive を塞ぐ)
+- **`accept_verified` に `expected_pid: Option<u32>` を追加**: spawn した子
+  プロセスの pid と、accept した peer の audit token 由来 pid が一致するかを
+  確認する。同じ signing identity を持つ「前の daemon が残した orphan helper」
+  が新 helper の connect を先取りする race を、署名検証だけでは塞げなかった
+  ため (production は常に `Some(child.id())`、`Connector::Test` のみ `None` で
+  bypass)
+
+#### レビュー (Fable 敵対的レビュー、2026-07-12) 反映
+
+- **HIGH-1 (shutdown 中の recovery captive)**: `closed` latch (上述)
+- **MEDIUM-2 (`wait_ready` の missed-notification race)**: `notified()` の
+  事前 enable + timeout 直前の再チェック
+- **MEDIUM-5 (outcome 配線のテスト空白)**: `FakeApprover` 駆動の end-to-end
+  テスト群を追加 (outcome 全分岐 + 並行性)
+- **LOW-6 (並行性テスト 2 本が名目的だった)**: `BlockingApprover` + `oneshot` で
+  実効化 (`sleep` なし)
+- **LOW-9 (accept 時の spawn child pid 未確認)**: `accept_verified` の
+  `expected_pid` (上述)
+- **MEDIUM-3 (prompt-bombing / dialog wedge) は v1 既知制約**として本節末尾の
+  Security considerations 追記 + issue `2026-07-12-approver-release-hardening`
+  項目 5/6 で追跡
+- **MEDIUM-4 (authsock SIGN の dialog 非対称) は issue
+  `2026-07-12-authsock-sign-guard-dialog-decision` で kawaz 裁定待ち**
+
+#### 検証
+
+`cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` /
+`cargo test --workspace` すべて green、**1959 tests passed を 2 回連続実行して
+一致** (flaky なし)。実機 TouchID e2e は Block 3b に持ち越し。
