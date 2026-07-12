@@ -562,10 +562,28 @@ pub enum OkPayload {
         /// Whether a key was actually removed.
         deleted: bool,
     },
-    /// Reply to [`Request::KvSet`] (acknowledgement, no payload).
+    /// Reply to [`Request::KvSet`] (acknowledgement).
+    ///
+    /// DR-0030: `guard_applied` is a **positive ack** for the guard
+    /// declaration — value-free kind labels (`"same-user"`, `"same-shell"`,
+    /// `"same-ancestor"`, `"command"`) for every constraint the daemon
+    /// actually attached to the entry (including any implicit
+    /// `same-user` injected by the daemon's
+    /// `[kv-policy] default-require-same-user`). Empty (or absent on an
+    /// older daemon) means no guard was applied. The client uses the
+    /// absence-when-declared case as a mismatched-version signal (a
+    /// pre-DR-0030 daemon silently drops the wire declaration).
     Set {
         /// Always `true`; lets `untagged` disambiguate from `Pong`.
         set: bool,
+        /// Kind labels of every applied guard constraint, in the order the
+        /// daemon attached them (strong first: same-ancestor / same-shell
+        /// / same-user, then the weak command kind). Omitted on the wire
+        /// when empty so an older daemon's byte-compatible ack format
+        /// stays valid — but that is *also* how a new client detects an
+        /// old daemon that silently dropped its guard declaration.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        guard_applied: Vec<String>,
     },
     /// Reply to [`Request::KvDefine`] (acknowledgement, no payload).
     Defined {
@@ -637,6 +655,16 @@ pub struct EntryInfo {
     /// already elapsed but the record has not yet been evicted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_until_secs: Option<u64>,
+    /// DR-0030 per-entry access guard summary: one human label per
+    /// attached constraint, strong-first, or `None` when the entry has
+    /// no guard record. Each label is value-free — the constraint kind
+    /// (and, for `same-ancestor`-family / `command`, the declared
+    /// display name) with a `" (weak)"` suffix on `command` — but never
+    /// setter identity, uid, or pid. A dialog / status renderer shows
+    /// them verbatim; older daemons that do not populate it simply omit
+    /// the field (`#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_summary: Option<Vec<String>>,
 }
 
 /// A structured error returned in a failed [`Response`].
@@ -685,11 +713,18 @@ impl Response {
         })
     }
 
-    /// Construct a `set` acknowledgement response.
-    pub fn set_ack() -> Self {
+    /// Construct a `set` acknowledgement response that reports the applied
+    /// guard-constraint kinds (DR-0030 positive ack). Callers pass an
+    /// empty vector for an unguarded set (pre-DR-0030 shape: the empty
+    /// vector serializes without a `guard_applied` field via
+    /// `skip_serializing_if`).
+    pub fn set_ack_with_guard(guard_applied: Vec<String>) -> Self {
         Response::Ok(OkResponse {
             ok: true,
-            payload: OkPayload::Set { set: true },
+            payload: OkPayload::Set {
+                set: true,
+                guard_applied,
+            },
         })
     }
 
@@ -1147,7 +1182,12 @@ mod tests {
 
     #[test]
     fn set_ack_response_roundtrips() {
-        roundtrip_response(&Response::set_ack());
+        roundtrip_response(&Response::set_ack_with_guard(Vec::new()));
+        // A guarded ack round-trips lossless-ly and carries the labels.
+        roundtrip_response(&Response::set_ack_with_guard(vec![
+            "same-user".into(),
+            "same-shell".into(),
+        ]));
     }
 
     #[test]
@@ -1193,6 +1233,7 @@ mod tests {
             value_type: None,
             source: None,
             backoff_until_secs: Some(3),
+            guard_summary: None,
         };
         let resp = Response::list_with_entries(vec!["default/K".into()], vec![info.clone()]);
         let line = serde_json::to_string(&resp).unwrap();
@@ -1236,6 +1277,7 @@ mod tests {
                     value_type: None,
                     source: None,
                     backoff_until_secs: None,
+                    guard_summary: None,
                 },
                 EntryInfo {
                     name: "P".into(),
@@ -1247,6 +1289,7 @@ mod tests {
                     value_type: Some("otp".into()),
                     source: None,
                     backoff_until_secs: None,
+                    guard_summary: None,
                 },
             ],
         );
@@ -1266,6 +1309,7 @@ mod tests {
             value_type: None,
             source: None,
             backoff_until_secs: None,
+            guard_summary: None,
         };
         let line = serde_json::to_string(&info).unwrap();
         assert!(!line.contains("pin_remaining_secs"), "{line}");

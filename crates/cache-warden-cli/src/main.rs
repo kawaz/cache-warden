@@ -123,6 +123,107 @@ fn run_client(socket: &std::path::Path, req: &protocol::wire::Request) -> Result
     render_response(resp)
 }
 
+/// Same as [`run_client`], but tailored to `kv.set` calls carrying a
+/// DR-0030 guard declaration: the daemon response **must** carry a
+/// non-empty `guard_applied` list. If it does not — because we are
+/// talking to an old daemon that predates DR-0030 and silently
+/// dropped the `guard_constraints` field — this rejects with an
+/// explanatory error rather than pretending the set succeeded.
+///
+/// A successful reply with `guard_applied` populated is echoed to
+/// stdout in the compact form `ok (guard: <labels>)` so the operator
+/// sees which constraints actually landed (matching the CLI's
+/// value-free, single-line style for management verbs).
+fn run_client_expect_guard_ack(
+    socket: &std::path::Path,
+    req: &protocol::wire::Request,
+) -> Result<(), String> {
+    let mut send = |r: &protocol::wire::Request| client::round_trip(socket, r);
+    expect_guard_ack_with_sender(req, &mut send)
+}
+
+/// Testable core of [`run_client_expect_guard_ack`]. Same contract
+/// (a `kv.set` whose ack must carry a non-empty `guard_applied`),
+/// but with the transport factored out as a callable so a unit test
+/// can drive it with a canned request/response history.
+///
+/// # Old-daemon silent-drop recovery
+///
+/// If the ack has `guard_applied` empty despite the request declaring
+/// guard constraints, the value was already accepted by the old
+/// daemon **unguarded** — merely surfacing an error would leave the
+/// entry stored *without* the requested guard. So we issue a
+/// best-effort `KvDel` for the same key over the same transport
+/// (with_define: false — a define, if any, is untouched) before
+/// returning the error, and the error message reports whether that
+/// auto-cleanup succeeded so the operator knows if a manual `kv del`
+/// is still required.
+fn expect_guard_ack_with_sender<F>(
+    req: &protocol::wire::Request,
+    send: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&protocol::wire::Request) -> Result<protocol::wire::Response, String>,
+{
+    use protocol::wire::{OkPayload, Request, Response};
+    let resp = send(req)?;
+    match resp {
+        Response::Ok(ok) => match ok.payload {
+            OkPayload::Set { guard_applied, .. } => {
+                if guard_applied.is_empty() {
+                    // Extract the key from the original request so the
+                    // auto-delete targets exactly what we just wrote.
+                    let key = match req {
+                        Request::KvSet { key, .. } => key.clone(),
+                        _ => {
+                            return Err(
+                                "internal error: expect_guard_ack invoked with a non-KvSet request"
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    let del_req = Request::KvDel {
+                        key: key.clone(),
+                        with_define: false,
+                    };
+                    let cleanup = match send(&del_req) {
+                        Ok(Response::Ok(_)) => {
+                            format!("the unguarded value at {key:?} was auto-deleted")
+                        }
+                        Ok(Response::Err(e)) => format!(
+                            "the unguarded value at {key:?} could NOT be auto-deleted \
+                             ({}: {}); run `cache-warden kv del {key}` immediately",
+                            error_kind_str(&e.error.kind),
+                            e.error.message
+                        ),
+                        Err(e) => format!(
+                            "the unguarded value at {key:?} could NOT be auto-deleted \
+                             ({e}); run `cache-warden kv del {key}` immediately"
+                        ),
+                    };
+                    return Err(format!(
+                        "daemon accepted the set but did not report any applied guard \
+                         constraints; you likely have an old cache-warden daemon that \
+                         does not enforce per-entry access guards, so the value was \
+                         stored WITHOUT the requested guard. {cleanup}. Restart the \
+                         daemon with a matching version \
+                         (`cache-warden daemon restart --graceful` or a service restart) \
+                         before relying on --require-* flags."
+                    ));
+                }
+                println!("ok (guard: {})", guard_applied.join(", "));
+                Ok(())
+            }
+            other => Err(format!("unexpected daemon response for kv.set: {other:?}")),
+        },
+        Response::Err(e) => Err(format!(
+            "{}: {}",
+            error_kind_str(&e.error.kind),
+            e.error.message
+        )),
+    }
+}
+
 /// A CLI failure: either a plain message (printed as `cache-warden: <msg>`) or
 /// a usage error that should print the offending level's help to stderr.
 ///
@@ -513,6 +614,18 @@ fn dispatch_kv(
         "pin" => or_usage(commands::parse_kv_pin(kv_args, &ns), leaf_help)?,
         _ => unreachable!("leaf_help match covers all known subcommands"),
     };
+    // DR-0030 positive-ack contract: a `kv.set` that declared guard
+    // constraints must come back with a non-empty `guard_applied` list.
+    // An old daemon that silently drops the wire declaration has no such
+    // field, `#[serde(default)]` decodes to `Vec::new()`, and the client
+    // must treat that as an error (never as a successful unguarded write).
+    if let protocol::wire::Request::KvSet {
+        guard_constraints, ..
+    } = &req
+        && !guard_constraints.is_empty()
+    {
+        return Ok(run_client_expect_guard_ack(socket, &req)?);
+    }
     Ok(run_client(socket, &req)?)
 }
 
@@ -577,16 +690,23 @@ fn render_kv_list(keys: Vec<String>, entries: Vec<protocol::wire::EntryInfo>, ns
         // Backoff hint comes from the parallel `entries` slot (if present).
         // We only emit it when the daemon supplied metadata and the backoff is
         // active (> 0 seconds remaining), keeping unaffected keys quiet.
-        let hint = if parallel {
-            entries[i]
-                .backoff_until_secs
-                .filter(|&s| s > 0)
-                .map(|s| format!("  backoff: {s}s"))
-                .unwrap_or_default()
+        let mut suffixes: Vec<String> = Vec::new();
+        if parallel {
+            if let Some(s) = entries[i].backoff_until_secs.filter(|&s| s > 0) {
+                suffixes.push(format!("backoff: {s}s"));
+            }
+            // DR-0030 per-entry access guard: surface a summary of the
+            // installed constraints (strong-first, weak marker on `command=`)
+            // so the user can see at a glance what will gate `kv get`.
+            if let Some(g) = entries[i].guard_summary.as_ref().filter(|g| !g.is_empty()) {
+                suffixes.push(format!("guard: {}", g.join(", ")));
+            }
+        }
+        if suffixes.is_empty() {
+            println!("{display_name}");
         } else {
-            String::new()
-        };
-        println!("{display_name}{hint}");
+            println!("{display_name}  {}", suffixes.join("  "));
+        }
     }
 }
 
@@ -918,6 +1038,13 @@ fn format_entry_attrs(e: &protocol::wire::EntryInfo) -> Vec<String> {
     if let Some(secs) = e.backoff_until_secs.filter(|&s| s > 0) {
         attrs.push(format!("backoff: {secs}s"));
     }
+    // DR-0030 per-entry access guard: strong-first summary labels with a
+    // `(weak)` marker on `command=`. Only shown when the daemon populated
+    // the field (older daemons omit it, so `None` = "guard status unknown"
+    // — surface nothing rather than misleadingly claim "no guard").
+    if let Some(g) = e.guard_summary.as_ref().filter(|g| !g.is_empty()) {
+        attrs.push(format!("guard: {}", g.join(", ")));
+    }
     attrs
 }
 
@@ -984,6 +1111,7 @@ mod tests {
             value_type: None,
             source: None,
             backoff_until_secs: None,
+            guard_summary: None,
         }
     }
 
@@ -1019,6 +1147,29 @@ mod tests {
         assert!(
             joined.contains("backoff: 3s"),
             "backoff_until_secs=3 must show 'backoff: 3s': {joined}"
+        );
+    }
+
+    /// DR-0030: an entry whose daemon populated `guard_summary` gets a
+    /// `guard: <labels>` attr in status; `None` (older daemon) omits
+    /// the attr entirely rather than misleadingly asserting no guard.
+    #[test]
+    fn format_entry_attrs_shows_guard_summary_when_populated() {
+        let mut e = base_entry();
+        e.guard_summary = Some(vec!["same-user".into(), "command (git) (weak)".into()]);
+        let attrs = format_entry_attrs(&e);
+        let joined = attrs.join(", ");
+        assert!(
+            joined.contains("guard: same-user, command (git) (weak)"),
+            "{joined}"
+        );
+
+        let mut e2 = base_entry();
+        e2.guard_summary = None;
+        let attrs2 = format_entry_attrs(&e2);
+        assert!(
+            !attrs2.iter().any(|a| a.starts_with("guard:")),
+            "None (unknown) must not surface a guard attr: {attrs2:?}"
         );
     }
 
@@ -1125,6 +1276,161 @@ mod tests {
             }
             CliError::Message(msg) => panic!("parse failure must stay a usage error: {msg}"),
         }
+    }
+
+    // ---- expect_guard_ack_with_sender: old-daemon silent-drop recovery ----
+    //
+    // The HIGH review finding: a `kv.set` whose ack has `guard_applied`
+    // empty (an old daemon that silently dropped the guard declaration)
+    // already stored the value on the daemon side WITHOUT the requested
+    // guard. Just surfacing an error leaves that value resident. The
+    // client must issue a best-effort `KvDel` for the same key over the
+    // same transport before returning the error, and the error message
+    // must tell the operator whether that cleanup succeeded.
+
+    use protocol::wire::{ErrorKind, Request as WireRequest, Response as WireResponse};
+
+    fn guarded_set_req() -> WireRequest {
+        WireRequest::KvSet {
+            key: "default/K".into(),
+            source: protocol::wire::SetSource::Static {
+                value_b64: String::new(),
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            guard_constraints: vec![protocol::wire::GuardConstraintWire::SameUser],
+        }
+    }
+
+    /// A recording sender: pushes each request into `history`, then pops
+    /// the next canned response from `queue`. Panics if the queue runs dry
+    /// (unexpected extra send) or a leftover response remains (unsent).
+    fn make_sender<'a>(
+        history: &'a std::cell::RefCell<Vec<WireRequest>>,
+        queue: &'a std::cell::RefCell<std::collections::VecDeque<WireResponse>>,
+    ) -> impl FnMut(&WireRequest) -> Result<WireResponse, String> + 'a {
+        move |req: &WireRequest| {
+            history.borrow_mut().push(req.clone());
+            match queue.borrow_mut().pop_front() {
+                Some(resp) => Ok(resp),
+                None => Err("recording sender: no more canned responses".to_string()),
+            }
+        }
+    }
+
+    /// Ack empty (= old daemon that silently dropped `guard_constraints`)
+    /// must trigger a best-effort `KvDel` for the same key, and the
+    /// returned error must report the auto-delete success in its message.
+    #[test]
+    fn expect_guard_ack_empty_triggers_kv_del_and_reports_auto_deleted() {
+        let history = std::cell::RefCell::new(Vec::new());
+        let queue = std::cell::RefCell::new(std::collections::VecDeque::from(vec![
+            // First: the KvSet ack — empty `guard_applied` (old daemon).
+            WireResponse::set_ack_with_guard(Vec::new()),
+            // Second: the auto-delete succeeds.
+            WireResponse::deleted(true),
+        ]));
+        let mut send = make_sender(&history, &queue);
+
+        let req = guarded_set_req();
+        let err = expect_guard_ack_with_sender(&req, &mut send).unwrap_err();
+
+        // The sender saw two calls: the original KvSet, then a KvDel for
+        // the same key with `with_define: false`.
+        let hist = history.borrow();
+        assert_eq!(hist.len(), 2, "sender must be called twice: {hist:?}");
+        assert!(matches!(hist[0], WireRequest::KvSet { .. }));
+        match &hist[1] {
+            WireRequest::KvDel { key, with_define } => {
+                assert_eq!(key, "default/K", "delete targets the same key");
+                assert!(!with_define, "delete must not remove the definition");
+            }
+            other => panic!("second request must be KvDel, got {other:?}"),
+        }
+
+        // The error message reports the auto-delete success and names the
+        // old-daemon cause + the restart hint.
+        assert!(
+            err.contains("auto-deleted"),
+            "error names cleanup success: {err}"
+        );
+        assert!(
+            err.contains("old cache-warden daemon"),
+            "error names cause: {err}"
+        );
+        assert!(err.contains("restart"), "error names remediation: {err}");
+    }
+
+    /// Ack empty + `KvDel` fails: the error must name the failure and
+    /// tell the operator to `kv del` manually. The best-effort cleanup
+    /// itself does NOT change the error's terminal shape (still Err).
+    #[test]
+    fn expect_guard_ack_empty_with_failing_del_hints_manual_cleanup() {
+        let history = std::cell::RefCell::new(Vec::new());
+        let queue = std::cell::RefCell::new(std::collections::VecDeque::from(vec![
+            WireResponse::set_ack_with_guard(Vec::new()),
+            // Second: the auto-delete errors out (e.g. daemon dropped
+            // the connection between the two exchanges).
+            WireResponse::error(ErrorKind::Internal, "boom"),
+        ]));
+        let mut send = make_sender(&history, &queue);
+
+        let req = guarded_set_req();
+        let err = expect_guard_ack_with_sender(&req, &mut send).unwrap_err();
+
+        // The delete WAS attempted (2 sends), but the message now steers
+        // the operator to run `cache-warden kv del <key>` themselves.
+        assert_eq!(history.borrow().len(), 2);
+        assert!(
+            err.contains("could NOT be auto-deleted"),
+            "error surfaces the cleanup failure: {err}"
+        );
+        assert!(
+            err.contains("cache-warden kv del default/K"),
+            "error tells operator the manual remediation: {err}"
+        );
+    }
+
+    /// Ack non-empty (= a matching-version daemon actually applied the
+    /// guard): the client succeeds without any auto-delete side effect.
+    #[test]
+    fn expect_guard_ack_populated_is_success_with_no_side_effect() {
+        let history = std::cell::RefCell::new(Vec::new());
+        let queue = std::cell::RefCell::new(std::collections::VecDeque::from(vec![
+            WireResponse::set_ack_with_guard(vec!["same-user".to_string()]),
+        ]));
+        let mut send = make_sender(&history, &queue);
+
+        let req = guarded_set_req();
+        expect_guard_ack_with_sender(&req, &mut send).expect("populated ack is success");
+
+        assert_eq!(
+            history.borrow().len(),
+            1,
+            "no auto-delete when guard was applied"
+        );
+    }
+
+    /// A wire error response is surfaced verbatim (formatted through
+    /// `error_kind_str`), no side effects.
+    #[test]
+    fn expect_guard_ack_wire_error_is_surfaced_verbatim() {
+        let history = std::cell::RefCell::new(Vec::new());
+        let queue =
+            std::cell::RefCell::new(std::collections::VecDeque::from(vec![WireResponse::error(
+                ErrorKind::BadRequest,
+                "value_b64 is not valid base64",
+            )]));
+        let mut send = make_sender(&history, &queue);
+
+        let req = guarded_set_req();
+        let err = expect_guard_ack_with_sender(&req, &mut send).unwrap_err();
+        assert!(err.contains("bad request"), "surfaces the kind: {err}");
+        assert!(
+            err.contains("value_b64"),
+            "surfaces the daemon message: {err}"
+        );
+        assert_eq!(history.borrow().len(), 1, "no auto-delete on wire error");
     }
 
     #[test]

@@ -48,6 +48,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
 use super::graceful_restart;
+use super::guard::{GetterAuditToken, GetterProcess};
 use super::handler::{self, HandlerCtx};
 use super::peer::peer_pid;
 use crate::config::{Config, KvDefinition};
@@ -168,6 +169,11 @@ pub(crate) struct Shared {
     /// `kv.get` gate, and the authsock listener shares the same `Shared` so a
     /// SIGN_REQUEST resolving a KV key consults the same table.
     pub(crate) kv_process_policies: std::collections::BTreeMap<String, Vec<String>>,
+    /// DR-0030 daemon-wide guard policy resolved from `[kv-policy]` at
+    /// startup (default-require-same-user, shell-names). Held here so
+    /// `run_request` can hand it into every [`HandlerCtx`] without
+    /// re-parsing the config each request.
+    pub(crate) kv_policy: crate::config::ResolvedKvPolicy,
     /// This process's own exec path, resolved once at startup (DR-0029 §3):
     /// graceful restart always execs *this exact path*, never re-resolving
     /// `current_exe()` at restart time (which would let a `plist`/PATH change
@@ -292,6 +298,10 @@ impl Shared {
             socket_path: String::new(),
             pid: std::process::id(),
             kv_process_policies: std::collections::BTreeMap::new(),
+            kv_policy: crate::config::ResolvedKvPolicy {
+                default_require_same_user: false,
+                shell_names: crate::config::default_shell_names(),
+            },
             exe_path: PathBuf::new(),
             argv: Vec::new(),
             restart: graceful_restart::RestartCoordinator::new(),
@@ -461,6 +471,7 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         socket_path: socket_path.display().to_string(),
         pid: std::process::id(),
         kv_process_policies: config.kv_process_policies(),
+        kv_policy: config.kv_policy(),
         exe_path,
         argv,
         restart: graceful_restart::RestartCoordinator::new(),
@@ -1085,7 +1096,21 @@ async fn serve(
 /// response line. The peer pid is resolved once at accept time.
 async fn handle_connection(stream: UnixStream, shared: Arc<Shared>) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    let peer = peer_pid(stream.as_raw_fd());
+    let fd = stream.as_raw_fd();
+    let peer = peer_pid(fd);
+    // DR-0030: capture the peer's audit token now, while the raw fd
+    // still refers to the connected socket. `peer_audit_token` is
+    // race-free per the kernel's `LOCAL_PEERTOKEN` contract (keyed on
+    // the fd, not on a pid), so caching it once at accept time is safe
+    // for the whole connection lifetime — and lets `run_request` build
+    // the guard-evaluator material without a second syscall per request.
+    // On Linux / a non-socket / a getsockopt failure this collapses to
+    // `None` (the guard evaluator then denies whenever a `SameUser`
+    // constraint requires it — fail-closed).
+    let peer_token = macos_process_inspect::peer_audit_token(fd).map(|t| GetterAuditToken {
+        euid: t.euid(),
+        ruid: t.ruid(),
+    });
 
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -1098,12 +1123,11 @@ async fn handle_connection(stream: UnixStream, shared: Arc<Shared>) -> io::Resul
         // minutes (the source command may wait on a user prompt), and that must
         // not pin an async worker (DR-0008's synchronous-work isolation).
         let shared_for_handler = Arc::clone(&shared);
-        let response =
-            tokio::task::spawn_blocking(move || dispatch(&shared_for_handler, peer, &line))
-                .await
-                .unwrap_or_else(|e| {
-                    Response::error(ErrorKind::Internal, format!("handler panicked: {e}"))
-                });
+        let response = tokio::task::spawn_blocking(move || {
+            dispatch(&shared_for_handler, peer, peer_token, &line)
+        })
+        .await
+        .unwrap_or_else(|e| Response::error(ErrorKind::Internal, format!("handler panicked: {e}")));
         let mut out = encode_response(&response).unwrap_or_else(|_| {
             r#"{"ok":false,"error":{"kind":"internal","message":"failed to encode response"}}"#
                 .to_string()
@@ -1119,20 +1143,30 @@ async fn handle_connection(stream: UnixStream, shared: Arc<Shared>) -> io::Resul
 ///
 /// Resolves the requester ancestry from `peer` (best effort) and runs the
 /// synchronous handler under the store lock.
-fn dispatch(shared: &Arc<Shared>, peer: Option<u32>, line: &str) -> Response {
+fn dispatch(
+    shared: &Arc<Shared>,
+    peer: Option<u32>,
+    peer_token: Option<GetterAuditToken>,
+    line: &str,
+) -> Response {
     let req = match decode_request(line) {
         Ok(r) => r,
         Err(e) => {
             return Response::error(ErrorKind::BadRequest, format!("malformed request: {e}"));
         }
     };
-    run_request(shared, peer, req)
+    run_request(shared, peer, peer_token, req)
 }
 
 /// Run a parsed request against the store under lock.
 ///
 /// Factored out so it can be exercised directly in tests without socket I/O.
-fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Response {
+fn run_request(
+    shared: &Arc<Shared>,
+    peer: Option<u32>,
+    peer_token: Option<GetterAuditToken>,
+    req: Request,
+) -> Response {
     // `ping` needs neither the store lock nor the requester ancestry (it just
     // returns a pong). Short-circuit before taking the lock so pings succeed
     // even while the startup blocking task holds the store lock (DR-0023 Phase 1).
@@ -1147,10 +1181,33 @@ fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Respons
         return graceful_restart::handle_request(shared);
     }
 
-    // Resolve requester ancestry from the peer pid (best effort).
+    // Resolve requester ancestry from the peer pid (best effort). This is
+    // the DR-0030 §Security "one snapshot at request receive time" point:
+    // both the plain [`ProcessInfo`] chain (used by the DR-0012 gate + the
+    // core auth context) and the enriched [`GetterProcess`] chain (fed to
+    // the guard evaluator) come from the same walk here, so a mid-request
+    // parent exit shows up consistently to every gate.
     let requester: Option<Vec<ProcessInfo>> = peer.and_then(|pid| {
         let inspector = SystemInspector::new();
         inspector.ancestry(pid).ok()
+    });
+    // Enrich each chain entry with the private-API `unique_id` when
+    // available (fail-open: any per-pid failure just drops that entry's
+    // unique_id to `None`, which the evaluator handles per DR-0030
+    // §Security's stated fallback rules). Non-macOS builds return
+    // `Err(Unavailable)` from `unique_id` for every pid, so the entire
+    // chain arrives with `unique_id: None` and the evaluator makes the
+    // fail-closed calls it already documents.
+    let guard_chain: Option<Vec<GetterProcess>> = requester.as_ref().map(|chain| {
+        chain
+            .iter()
+            .map(|info| GetterProcess {
+                info: info.clone(),
+                unique_id: macos_process_inspect::unique_id(info.pid)
+                    .ok()
+                    .map(|u| u.unique_id),
+            })
+            .collect()
     });
 
     // DR-0010: the authenticator is wired from config (CommandAuthenticator when
@@ -1184,6 +1241,9 @@ fn run_request(shared: &Arc<Shared>, peer: Option<u32>, req: Request) -> Respons
         socket: &shared.socket_path,
         requester: requester.as_deref(),
         kv_process_policies: &shared.kv_process_policies,
+        guard_chain: guard_chain.as_deref(),
+        guard_audit_token: peer_token,
+        kv_policy: &shared.kv_policy,
     };
     let response = handler::handle_request(&mut store, &ctx, req);
 
@@ -1436,6 +1496,10 @@ mod tests {
             socket_path: "/tmp/test.sock".into(),
             pid: std::process::id(),
             kv_process_policies: std::collections::BTreeMap::new(),
+            kv_policy: crate::config::ResolvedKvPolicy {
+                default_require_same_user: false,
+                shell_names: crate::config::default_shell_names(),
+            },
             exe_path: PathBuf::new(),
             argv: Vec::new(),
             restart: graceful_restart::RestartCoordinator::new(),
@@ -1455,9 +1519,10 @@ mod tests {
             hard_ttl_secs: None,
             guard_constraints: Vec::new(),
         };
-        assert!(run_request(&s, None, set).is_ok());
+        assert!(run_request(&s, None, None, set).is_ok());
         let resp = run_request(
             &s,
+            None,
             None,
             Request::KvGet {
                 key: "default/K".into(),
@@ -1476,7 +1541,7 @@ mod tests {
     #[test]
     fn dispatch_malformed_line_is_bad_request() {
         let s = shared();
-        let resp = dispatch(&s, None, "{not json");
+        let resp = dispatch(&s, None, None, "{not json");
         match resp {
             Response::Err(e) => assert_eq!(e.error.kind, ErrorKind::BadRequest),
             _ => panic!("expected error"),
@@ -1495,7 +1560,7 @@ mod tests {
         // every other platform `graceful_restart::handle_request`'s
         // early guard rejects it before touching the store at all.
         let s = shared();
-        let resp = run_request(&s, None, Request::RestartGraceful);
+        let resp = run_request(&s, None, None, Request::RestartGraceful);
         match resp {
             Response::Err(e) => assert_eq!(e.error.kind, ErrorKind::RestartAborted),
             other => panic!("expected RestartAborted, got {other:?}"),

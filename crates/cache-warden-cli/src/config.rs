@@ -102,6 +102,104 @@ pub struct Config {
     /// value-emitting verbs (`kv get` / `run` / `inject`).
     #[serde(default)]
     pub cli: CliConfig,
+    /// `[kv-policy]` section (DR-0030): daemon-wide defaults / knobs for the
+    /// per-entry access guard. `#[serde(default)]` so an old config with no
+    /// `[kv-policy]` block behaves as `KvPolicyConfig::default()` — the
+    /// pre-DR-0030 shape (guard disabled unless the client asked).
+    #[serde(default, rename = "kv-policy")]
+    pub kv_policy: KvPolicyConfig,
+}
+
+/// `[kv-policy]` section (DR-0030): daemon-wide guard knobs.
+///
+/// - `default-require-same-user` (Open Q1 裁定: default false): when true,
+///   a `kv set` with no wire-declared guard constraints is stored with an
+///   implicit `SameUser` constraint. Explicitly-declared constraints are
+///   left as-is (never merged with the implicit one — the client's
+///   declaration is the source of truth once it exists, per §5 "the last
+///   declaration wins").
+/// - `shell-names` (Open Q2 draft): the list of executable basenames the
+///   `--require-same-shell` sugar treats as "the setter's closest shell",
+///   overriding the built-in list `["zsh","bash","fish","sh","nu"]` when
+///   present. Absent → built-in list silently. Explicitly `shell-names =
+///   []` → built-in list but a stderr warning is emitted at resolve time
+///   (making the "empty means unset" fallback discoverable rather than
+///   silent, matching the "surfaced" contract). An element that is the
+///   empty string is a configuration error at parse time.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvPolicyConfig {
+    /// Whether an unguarded `kv set` is silently upgraded with an implicit
+    /// `SameUser` constraint. Default `false` = preserve pre-DR-0030
+    /// interoperability.
+    #[serde(default, rename = "default-require-same-user")]
+    pub default_require_same_user: bool,
+    /// Executable basenames the `--require-same-shell` sugar accepts as a
+    /// pinnable shell in the setter's ancestry (Open Q2 draft). `None` =
+    /// key absent from the config = fall back to the built-in list
+    /// silently. `Some(non_empty)` = override the built-in list.
+    /// `Some(empty)` = explicit `shell-names = []` = fall back to the
+    /// built-in list *with a warning* (Q2 "surfaced" contract).
+    #[serde(default, rename = "shell-names")]
+    pub shell_names: Option<Vec<String>>,
+}
+
+/// The `[kv-policy]` values resolved for daemon consumption (DR-0030): the
+/// `default-require-same-user` flag verbatim plus a guaranteed non-empty
+/// `shell_names` list (the built-in list when the config left it unset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedKvPolicy {
+    /// See [`KvPolicyConfig::default_require_same_user`].
+    pub default_require_same_user: bool,
+    /// Non-empty. The daemon walks the setter's ancestry looking for the
+    /// first entry whose basename appears in this list to satisfy
+    /// `--require-same-shell`.
+    pub shell_names: Vec<String>,
+}
+
+/// The built-in `[kv-policy] shell-names` list (DR-0030 §1). Kept as a free
+/// function so tests and [`Config::kv_policy`] share one source of truth.
+pub fn default_shell_names() -> Vec<String> {
+    vec![
+        "zsh".to_string(),
+        "bash".to_string(),
+        "fish".to_string(),
+        "sh".to_string(),
+        "nu".to_string(),
+    ]
+}
+
+/// Pure resolver for [`Config::kv_policy`] — extracted so a test can
+/// exercise the "explicit empty → built-in + warning" path without
+/// scraping stderr. Returns `(resolved, Some(warning))` when the
+/// caller wrote `shell-names = []` explicitly, `(resolved, None)`
+/// otherwise. The stderr surface is a separate concern handled by
+/// [`Config::kv_policy`].
+pub(crate) fn resolve_kv_policy(cfg: &KvPolicyConfig) -> (ResolvedKvPolicy, Option<String>) {
+    let (shell_names, warning) = match &cfg.shell_names {
+        // Absent: built-in list silently.
+        None => (default_shell_names(), None),
+        // Explicit empty: fall back to built-in and warn (Q2 "surfaced"
+        // contract — an explicit `[]` is almost always a config mistake).
+        Some(v) if v.is_empty() => (
+            default_shell_names(),
+            Some(
+                "[kv-policy] shell-names = [] is ignored; falling back to the \
+                 built-in shell list. Set shell-names to a non-empty list to \
+                 override, or remove the line to use the built-in list."
+                    .to_string(),
+            ),
+        ),
+        // Non-empty override.
+        Some(v) => (v.clone(), None),
+    };
+    (
+        ResolvedKvPolicy {
+            default_require_same_user: cfg.default_require_same_user,
+            shell_names,
+        },
+        warning,
+    )
 }
 
 /// `[cli]` section: client-side defaults (DR-0015 §4).
@@ -1091,6 +1189,21 @@ impl Config {
                 "[daemon]: fetch-failure-backoff: {e}"
             )))
         })?;
+        // Validate `[kv-policy] shell-names` element shape eagerly (DR-0030):
+        // an empty string cannot match any executable basename, so it can only
+        // ever be a config typo. Rejecting it here is cheaper than pretending
+        // to enroll a shell that will never match. `[]` (explicit) is a
+        // *runtime warning*, not a parse error — see [`resolve_kv_policy`].
+        if let Some(names) = &cfg.kv_policy.shell_names {
+            for name in names {
+                if name.is_empty() {
+                    return Err(ConfigParseError::Content(ConfigError::new(
+                        "[kv-policy]: `shell-names` must not contain an empty string \
+                         (an empty basename can never match a real process)",
+                    )));
+                }
+            }
+        }
         Ok(cfg)
     }
 
@@ -1147,6 +1260,23 @@ impl Config {
                 Some((full, entry.allowed_processes.clone()))
             })
             .collect()
+    }
+
+    /// The `[kv-policy]` section resolved into daemon-usable form (DR-0030).
+    ///
+    /// Returns the parsed `default-require-same-user` flag and a non-empty
+    /// shell-names list. When `shell-names` was left absent, the built-in
+    /// list is substituted silently. When `shell-names = []` was written
+    /// explicitly, the built-in list is still substituted *and* a stderr
+    /// warning is emitted (Q2 "surfaced" contract) — an explicit empty
+    /// list is almost always a config mistake and must not be silently
+    /// treated as "no shell available, refuse every same-shell set".
+    pub fn kv_policy(&self) -> ResolvedKvPolicy {
+        let (resolved, warning) = resolve_kv_policy(&self.kv_policy);
+        if let Some(msg) = warning {
+            eprintln!("cache-warden: {msg}");
+        }
+        resolved
     }
 
     /// The configured socket path with a leading `~/` expanded, if set.
@@ -1392,6 +1522,71 @@ socket = "~/.local/state/cache-warden/control.sock"
     fn cli_default_mode_absent_is_none() {
         let cfg = Config::parse("").unwrap();
         assert_eq!(cfg.cli_default_mode(), None);
+    }
+
+    /// DR-0030: `[kv-policy]` absent = daemon defaults (no implicit
+    /// SameUser upgrade; built-in shell-names). Pins the pre-DR-0030
+    /// interoperability shape — an existing config file that never had a
+    /// `[kv-policy]` section must not start silently guarding entries.
+    #[test]
+    fn kv_policy_defaults_when_section_absent() {
+        let cfg = Config::parse("").unwrap();
+        let p = cfg.kv_policy();
+        assert!(!p.default_require_same_user);
+        assert_eq!(p.shell_names, default_shell_names());
+    }
+
+    /// `default-require-same-user = true` is surfaced verbatim.
+    #[test]
+    fn kv_policy_default_require_same_user_parses() {
+        let cfg = Config::parse("[kv-policy]\ndefault-require-same-user = true\n").unwrap();
+        assert!(cfg.kv_policy().default_require_same_user);
+    }
+
+    /// An explicit `shell-names = [...]` overrides the built-in list;
+    /// omitting the key falls back to the built-in silently.
+    #[test]
+    fn kv_policy_shell_names_override_and_absent_silent_fallback() {
+        let cfg = Config::parse("[kv-policy]\nshell-names = [\"elvish\"]\n").unwrap();
+        let (resolved, warn) = resolve_kv_policy(&cfg.kv_policy);
+        assert_eq!(resolved.shell_names, vec!["elvish".to_string()]);
+        assert!(warn.is_none(), "explicit non-empty must not warn");
+
+        let cfg2 = Config::parse("[kv-policy]\n").unwrap();
+        let (resolved2, warn2) = resolve_kv_policy(&cfg2.kv_policy);
+        assert_eq!(resolved2.shell_names, default_shell_names());
+        assert!(warn2.is_none(), "absent shell-names must not warn");
+    }
+
+    /// LOW-c: an *explicit* `shell-names = []` falls back to the
+    /// built-in list AND surfaces a warning (Q2 "surfaced" contract).
+    /// The stderr side is checked indirectly via [`resolve_kv_policy`]
+    /// which returns the message the caller would emit.
+    #[test]
+    fn kv_policy_shell_names_explicit_empty_falls_back_with_warning() {
+        let cfg = Config::parse("[kv-policy]\nshell-names = []\n").unwrap();
+        let (resolved, warn) = resolve_kv_policy(&cfg.kv_policy);
+        assert_eq!(resolved.shell_names, default_shell_names());
+        let msg = warn.expect("explicit `shell-names = []` must warn");
+        assert!(
+            msg.contains("shell-names = []"),
+            "warning names the field: {msg}"
+        );
+        assert!(
+            msg.contains("built-in"),
+            "warning names the fallback: {msg}"
+        );
+    }
+
+    /// LOW-c: an element that is the empty string is a config error at
+    /// parse time (never at first use). `[]` is a warning-only fallback
+    /// (see previous test), but `[""]` is a hard reject.
+    #[test]
+    fn kv_policy_shell_names_empty_element_is_rejected_at_parse() {
+        let err = Config::parse("[kv-policy]\nshell-names = [\"zsh\", \"\"]\n").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("shell-names"), "error names the field: {msg}");
+        assert!(msg.contains("empty"), "error mentions empty string: {msg}");
     }
 
     #[test]

@@ -10,11 +10,13 @@
 //! every control-socket command maps onto a [`Store`] operation here.
 
 use cache_warden::{
-    Authenticator, CapError, Capability, Clock, DefineError, EntryState, ExtendAuthOutcome,
-    PinAuthOutcome, ProcessInfo, RegenerateDefOutcome, RegenerateOutcome, SecretBytes,
-    SourceRunner, Store, Ttl, ValueMeta, ValueSource,
+    Authenticator, CapError, Capability, Clock, DeclaredAncestor, DefineError, EntryState,
+    ExtendAuthOutcome, GuardConstraint, GuardRecord, GuardSetter, PinAuthOutcome, PinnedProcess,
+    ProcessInfo, RegenerateDefOutcome, RegenerateOutcome, SecretBytes, SourceRunner, Store, Ttl,
+    ValueMeta, ValueSource,
 };
 
+use crate::daemon::guard::{self as guard_eval, GetterAuditToken, GetterProcess};
 use crate::otp_type;
 use crate::protocol::wire::{
     EntryInfo, ErrorKind, GuardConstraintWire, Request, Response, SetSource, SourceSpecWire,
@@ -67,6 +69,33 @@ pub struct HandlerCtx<'a, A: ?Sized, R, C> {
     /// requester). Policy interpretation lives here in the handler/adapter layer,
     /// never in the core [`Store`] (DR-0004).
     pub kv_process_policies: &'a std::collections::BTreeMap<String, Vec<String>>,
+    /// DR-0030 evaluator material for the current request (get) / setter
+    /// snapshot (set): the requester's ancestry entries enriched with
+    /// `unique_id` when the private macOS API succeeded. `None` on any
+    /// platform / failure where the pid could not be walked at all.
+    ///
+    /// # TOCTOU boundary
+    ///
+    /// The enrichment is captured once by the connection dispatcher at
+    /// **request receive time** (server-side), then handed here for the
+    /// full duration of the handler. A parent that exits mid-evaluation
+    /// simply collapses to a shorter chain in this snapshot, which the
+    /// `guard::evaluate` short-circuit converts to `SameAncestor` denial —
+    /// the fail-closed direction (DR-0030 §Security).
+    pub guard_chain: Option<&'a [GetterProcess]>,
+    /// DR-0030: the requester's `peer_audit_token` at request receive
+    /// time, reduced to what the evaluator needs (euid/ruid). Race-free
+    /// per the kernel's `LOCAL_PEERTOKEN` contract (`peer_audit_token`
+    /// keys off the fd, not a pid), so this alone is safe to use without
+    /// a re-check. `None` on non-macOS or if the `getsockopt` failed —
+    /// the evaluator treats the missing case as `MissingContext` (fail-
+    /// closed) whenever a `SameUser` constraint requires it.
+    pub guard_audit_token: Option<GetterAuditToken>,
+    /// DR-0030 daemon-wide guard policy (default-require-same-user,
+    /// shell-names). Read at `handle_set` time to decide whether an
+    /// unguarded set is silently upgraded to require `SameUser`, and to
+    /// resolve `--require-same-shell` to a concrete pin.
+    pub kv_policy: &'a crate::config::ResolvedKvPolicy,
 }
 
 /// Handle one request against `store`, producing the response to send back.
@@ -228,6 +257,7 @@ fn collect_entry_infos<C: Clock>(store: &Store, clock: &C) -> Vec<EntryInfo> {
         let backoff_until_secs = store
             .failure_backoff_remaining(&name, clock)
             .map(|d| d.as_secs());
+        let guard_summary = store.guard_of(&name).map(summarize_guard_record);
         entries.push(EntryInfo {
             name,
             state,
@@ -238,6 +268,7 @@ fn collect_entry_infos<C: Clock>(store: &Store, clock: &C) -> Vec<EntryInfo> {
             value_type,
             source,
             backoff_until_secs,
+            guard_summary,
         });
     }
     entries
@@ -327,26 +358,17 @@ where
     if let Err(resp) = reject_reserved_namespace_write(&key) {
         return resp;
     }
-    // Fail-closed guard bounce: this handler layer does not yet build a
-    // `GuardRecord` and call `Store::set_guard`, so any wire-declared
-    // constraints would be silently dropped and the injected value would be
-    // stored without a guard. That would let a caller pass
-    // `--require-same-user --require-same-shell` on the CLI and reasonably
-    // believe the value is guarded, when in fact it is accessible to any
-    // getter that clears the reserved-namespace and DR-0012 gates. Refuse
-    // the request outright so the failure is loud, not silent.
-    //
-    // This branch is expected to disappear when the handler integration
-    // bundle wires `set_guard` / `clear_guard` in — at that point the
-    // `guard_constraints` list will be consumed there instead of rejected
-    // here. Removing the check is the single-line diff that lands with it.
-    if !guard_constraints.is_empty() {
-        return Response::error(
-            ErrorKind::BadRequest,
-            "guard constraints are not yet enforced by this daemon; \
-             refusing to store an unguarded value",
-        );
-    }
+    // DR-0030 §7: build the guard record *before* touching the store. If the
+    // client declared any constraint, or the daemon's `default-require-same-
+    // user` upgrades an unguarded set, we need the setter's peer identity
+    // and (for the `same-ancestor` family) a pinnable process from the
+    // setter's ancestry chain. A failure to gather any of that material
+    // rejects the whole request without ever calling `store.set` — better a
+    // loud "guard could not be constructed" than a silent unguarded write.
+    let guard_plan = match plan_guard_record(&guard_constraints, ctx) {
+        Ok(plan) => plan,
+        Err(resp) => return resp,
+    };
     let ttl = match Ttl::new(
         soft_ttl_secs.map(std::time::Duration::from_secs),
         hard_ttl_secs.map(std::time::Duration::from_secs),
@@ -369,20 +391,319 @@ where
     // an internal wiring bug (the handler always holds the store cap). Both are
     // reported defensively rather than swallowed.
     match store.set(
-        key,
+        key.clone(),
         ValueSource::Static,
         SecretBytes::new(bytes),
         ttl,
         ctx.store_cap,
         ctx.clock,
     ) {
-        Ok(()) => Response::set_ack(),
+        Ok(()) => {
+            // DR-0030 §5 "全置換": the current set's declaration is the
+            // whole guard state. When the plan produces a record we
+            // install it; when it is `None` (no declared constraint and
+            // no implicit `SameUser` upgrade) we drop any pre-existing
+            // record so an unguarded set can never carry over a stale
+            // guard from a previous guarded write on the same key.
+            let guard_applied: Vec<String> = match guard_plan {
+                Some(record) => {
+                    let labels = record
+                        .constraints
+                        .iter()
+                        .map(constraint_kind_label)
+                        .map(str::to_string)
+                        .collect();
+                    // `set_guard` shares the same cap gate as `set`, so a
+                    // mismatch here would be an internal wiring bug (we
+                    // just used the same `ctx.store_cap` to set the
+                    // value). MEDIUM-2 rollback: if `set_guard` fails we
+                    // must not leave the value stored *without* the guard
+                    // the caller declared. Best-effort delete the value
+                    // we just wrote before surfacing the Internal error —
+                    // better to lose the write entirely than to persist
+                    // an unguarded value that was meant to be guarded.
+                    // The `delete` result is deliberately discarded: a
+                    // second cap mismatch is the same wiring bug, and
+                    // the caller already sees Internal.
+                    if store.set_guard(key.clone(), record, ctx.store_cap).is_err() {
+                        let _ = store.delete(&key, ctx.store_cap);
+                        return Response::error(ErrorKind::Internal, "capability mismatch (guard)");
+                    }
+                    labels
+                }
+                None => {
+                    // No constraint on this set — drop any prior record
+                    // ("last declaration wins"). Cap-guarded like above.
+                    // LOW-b: symmetric with the `set_guard` branch — an
+                    // Err here is the same internal wiring bug and must
+                    // not be swallowed. We do NOT rollback the value in
+                    // this branch: an unguarded set stores an unguarded
+                    // value by design; failing to clear a stale prior
+                    // guard leaves the entry *more* restrictive, not
+                    // less, which is safe to surface as-is via Internal.
+                    if store.clear_guard(&key, ctx.store_cap).is_err() {
+                        return Response::error(ErrorKind::Internal, "capability mismatch (guard)");
+                    }
+                    Vec::new()
+                }
+            };
+            Response::set_ack_with_guard(guard_applied)
+        }
         Err(cache_warden::SetError::InvalidKey(e)) => {
             Response::error(ErrorKind::BadRequest, e.to_string())
         }
         Err(cache_warden::SetError::CapMismatch) => {
             Response::error(ErrorKind::Internal, "capability mismatch")
         }
+    }
+}
+
+/// The wire kind label surfaced in `Set { guard_applied }` and in
+/// [`EntryInfo::guard_summary`] (via [`summarize_guard_record`]). Kept as
+/// static strings for the ack (value-free by construction: only the
+/// kind, never the pinned identity).
+fn constraint_kind_label(c: &GuardConstraint) -> &'static str {
+    match c {
+        GuardConstraint::SameUser => "same-user",
+        GuardConstraint::SameAncestor {
+            declared: DeclaredAncestor::SameShell { .. },
+            ..
+        } => "same-shell",
+        GuardConstraint::SameAncestor {
+            declared: DeclaredAncestor::Named { .. },
+            ..
+        } => "same-ancestor",
+        GuardConstraint::Command { .. } => "command",
+    }
+}
+
+/// The display label surfaced in `EntryInfo::guard_summary` (`kv list` /
+/// `status`). Same value-free rule as [`constraint_kind_label`], plus the
+/// declared display name for the ancestor / command families and the
+/// `" (weak)"` suffix on `command` (DR-0030 §1b: "weak (spoofable)"
+/// documentation must appear alongside every command= surface).
+pub(crate) fn summarize_guard_record(record: &GuardRecord) -> Vec<String> {
+    let mut strong = Vec::new();
+    let mut weak = Vec::new();
+    for c in &record.constraints {
+        match c {
+            GuardConstraint::SameUser => strong.push("same-user".to_string()),
+            GuardConstraint::SameAncestor {
+                declared: DeclaredAncestor::SameShell { shell_name },
+                ..
+            } => strong.push(format!("same-shell ({shell_name})")),
+            GuardConstraint::SameAncestor {
+                declared: DeclaredAncestor::Named { name },
+                ..
+            } => strong.push(format!("same-ancestor ({name})")),
+            GuardConstraint::Command { name } => weak.push(format!("command ({name}) (weak)")),
+        }
+    }
+    // Strong-first display order (§F "強い順"): same-ancestor/same-shell/
+    // same-user before command. The individual `strong` order preserves
+    // record insertion (which the CLI parser dedups but does not reorder).
+    strong.extend(weak);
+    strong
+}
+
+/// Build the [`GuardRecord`] that should attach to this `kv.set`, or
+/// [`None`] if the entry should end up unguarded. Returns an error
+/// [`Response`] when material is missing — that path never mutates the
+/// store, so a rejected guard-plan is a no-op set.
+///
+/// # Fail-closed contract
+///
+/// 1. A wire declaration containing any `same-user` (implicit or
+///    explicit) requires `ctx.guard_audit_token`. Missing → reject.
+/// 2. A `same-ancestor` / `same-shell` constraint requires
+///    `ctx.guard_chain`. Missing → reject. When present, the pinnable
+///    entity is looked up: no match → reject (`§7` "pin 対象が存在しない
+///    宣言は成立しない"). The pinned identity is taken from the daemon's
+///    observation (never from the wire).
+/// 3. When `guard_constraints` is empty **and** `[kv-policy]
+///    default-require-same-user = true`, a `SameUser` is injected
+///    implicitly. The client sees this via the `guard_applied` ack.
+/// 4. Otherwise an empty `guard_constraints` returns `Ok(None)` —
+///    perfectly interoperable with pre-DR-0030 clients.
+fn plan_guard_record<A, R, C>(
+    declared: &[GuardConstraintWire],
+    ctx: &HandlerCtx<'_, A, R, C>,
+) -> Result<Option<GuardRecord>, Response>
+where
+    A: ?Sized,
+{
+    // Effective declaration = client's list, with an implicit SameUser
+    // pushed on the front when the config asks for it and the client
+    // sent nothing. We do not merge implicit + explicit: the moment the
+    // client declared anything, their declaration is authoritative
+    // (§5 "last declaration wins"), even if that declaration omits
+    // same-user.
+    let effective: Vec<GuardConstraintWire> = if declared.is_empty() {
+        if ctx.kv_policy.default_require_same_user {
+            vec![GuardConstraintWire::SameUser]
+        } else {
+            return Ok(None);
+        }
+    } else {
+        declared.to_vec()
+    };
+
+    // Setter identity is taken from the connection's peer audit token
+    // (§7). We only need it once, but declare fail-closed here so a
+    // wire-declared guard against a `None` token is refused before we
+    // start pinning ancestors.
+    let setter = match ctx.guard_audit_token {
+        Some(t) => GuardSetter {
+            euid: t.euid,
+            ruid: t.ruid,
+        },
+        None => {
+            return Err(Response::error(
+                ErrorKind::AuthFailed,
+                "cannot construct guard record: peer audit token unavailable",
+            ));
+        }
+    };
+
+    // For any `SameAncestor`-family entry we need to pin from the
+    // setter's chain. LOW-a: this is asymmetric with the getter side
+    // and the asymmetry is deliberate:
+    //
+    // - Set side (here): `SameUser` needs only the peer audit token
+    //   (validated above) — a missing chain is *not* fatal for a
+    //   pure-`SameUser` declaration. The `same-ancestor` family calls
+    //   `pin_ancestor` below, which returns `None` on an empty chain
+    //   and rejects the set — that path is fail-closed.
+    // - Get side (`handle_get`): a missing chain rejects unconditionally
+    //   regardless of the record's constraint kinds, because the
+    //   evaluator has *no* material to compare and cannot decide safely.
+    //
+    // The setter can prove identity with the audit token alone; the
+    // getter evaluator cannot.
+    let chain = ctx.guard_chain.unwrap_or(&[]);
+
+    let mut constraints = Vec::with_capacity(effective.len());
+    for wire in &effective {
+        match wire {
+            GuardConstraintWire::SameUser => {
+                constraints.push(GuardConstraint::SameUser);
+            }
+            GuardConstraintWire::SameShell => {
+                let pinned = match pin_ancestor(chain, |name| {
+                    ctx.kv_policy.shell_names.iter().any(|s| s.as_str() == name)
+                }) {
+                    Some(p) => p,
+                    None => {
+                        return Err(Response::error(
+                            ErrorKind::BadRequest,
+                            "--require-same-shell: no shell (zsh/bash/fish/sh/nu \
+                             or [kv-policy] shell-names) found in setter ancestry",
+                        ));
+                    }
+                };
+                constraints.push(GuardConstraint::SameAncestor {
+                    declared: DeclaredAncestor::SameShell {
+                        shell_name: pinned.name.clone(),
+                    },
+                    pinned,
+                });
+            }
+            GuardConstraintWire::SameAncestor { name } => {
+                let target = name.clone();
+                let looks_like_path = target.starts_with('/');
+                let pinned = match pin_ancestor(chain, |basename| {
+                    if looks_like_path {
+                        // Handled below (path-comparison branch).
+                        false
+                    } else {
+                        basename == target
+                    }
+                }) {
+                    Some(p) => Some(p),
+                    None if looks_like_path => pin_ancestor_by_path(chain, &target),
+                    None => None,
+                };
+                let pinned = match pinned {
+                    Some(p) => p,
+                    None => {
+                        return Err(Response::error(
+                            ErrorKind::BadRequest,
+                            format!(
+                                "--require-same-ancestor={target}: no matching entry \
+                                 in setter ancestry"
+                            ),
+                        ));
+                    }
+                };
+                constraints.push(GuardConstraint::SameAncestor {
+                    declared: DeclaredAncestor::Named { name: target },
+                    pinned,
+                });
+            }
+            GuardConstraintWire::Command { name } => {
+                // §7: command= is not identity-pinned at set time — it is
+                // a name lookup performed against the *getter*'s chain at
+                // evaluation. Just carry the declared name.
+                constraints.push(GuardConstraint::Command { name: name.clone() });
+            }
+        }
+    }
+
+    Ok(Some(GuardRecord::new(constraints, setter)))
+}
+
+/// Walk `chain` (getter-most first, toward launchd) and return the first
+/// entry whose basename satisfies `predicate`. Used to resolve
+/// `--require-same-shell` and the basename form of
+/// `--require-same-ancestor` against the setter's ancestry.
+fn pin_ancestor(
+    chain: &[GetterProcess],
+    predicate: impl Fn(&str) -> bool,
+) -> Option<PinnedProcess> {
+    chain.iter().find_map(|g| {
+        let basename = g.info.name()?;
+        if predicate(basename) {
+            Some(getter_to_pinned(g))
+        } else {
+            None
+        }
+    })
+}
+
+/// Path form of `--require-same-ancestor=/full/path`: match a chain
+/// entry whose resolved executable path equals the declared path.
+fn pin_ancestor_by_path(chain: &[GetterProcess], full_path: &str) -> Option<PinnedProcess> {
+    let target = std::path::Path::new(full_path);
+    chain.iter().find_map(|g| {
+        let path = g.info.path.as_ref()?;
+        if path == target {
+            Some(getter_to_pinned(g))
+        } else {
+            None
+        }
+    })
+}
+
+/// Wire-safe kind string for a [`guard_eval::DeniedKind`] (used in the
+/// getter-side error message + stderr diagnostics). Value-free: the
+/// pinned identity is not part of it (§4 漏洩防止).
+fn denied_kind_label(kind: guard_eval::DeniedKind) -> &'static str {
+    match kind {
+        guard_eval::DeniedKind::EmptyRecord => "empty-record",
+        guard_eval::DeniedKind::MissingContext => "missing-context",
+        guard_eval::DeniedKind::SameUser => "same-user",
+        guard_eval::DeniedKind::SameAncestor => "same-ancestor",
+        guard_eval::DeniedKind::Command => "command",
+    }
+}
+
+fn getter_to_pinned(g: &GetterProcess) -> PinnedProcess {
+    PinnedProcess {
+        pid: g.info.pid,
+        start_time: g.info.start_time,
+        unique_id: g.unique_id,
+        path: g.info.path.clone().unwrap_or_default(),
+        name: g.info.name().unwrap_or_default().to_string(),
     }
 }
 
@@ -485,6 +806,57 @@ where
             ErrorKind::AuthFailed,
             "process not permitted to access this key",
         );
+    }
+
+    // DR-0030 evaluation order ③: per-entry guard, applied *before* the
+    // retrieval chain so a denied requester never triggers regeneration /
+    // TouchID / a re-auth prompt (same reason DR-0012 sits ahead of the
+    // chain — the denial must be silent and cost-free). When the key has
+    // no guard record `guard_of` returns `None` and this whole block
+    // short-circuits.
+    //
+    // On a denial we do *not* surface which entity failed (setter identity
+    // never crosses back to the getter side, §4). We record the kind in a
+    // stderr line for structured triage; the wire message names the kind
+    // but not the pinned identity. The `GuardEvalOutput` on the success
+    // path is intentionally discarded here — it exists to feed the
+    // approver dialog wire (draft-DR-0031 §4), whose adapter is a
+    // subsequent block. Building it in-line still keeps the evaluator's
+    // API stable across that later change.
+    if let Some(record) = store.guard_of(&key) {
+        let chain = match ctx.guard_chain {
+            Some(c) => c,
+            None => {
+                eprintln!(
+                    "cache-warden: kv.get denied for {key:?}: guard requires \
+                     a requester chain but the peer could not be walked"
+                );
+                return Response::error(
+                    ErrorKind::AuthFailed,
+                    "access denied by entry guard (kind: missing-context)",
+                );
+            }
+        };
+        match guard_eval::evaluate(chain, ctx.guard_audit_token, record) {
+            Ok(_eval) => {
+                // Success: fall through to the retrieval chain below.
+                // `_eval` (`GuardEvalOutput`) will feed the DR-0031
+                // approver dialog wire once that adapter lands; for now
+                // it is intentionally dropped so the evaluator's return
+                // type stays stable across blocks.
+            }
+            Err(denied) => {
+                let kind = denied_kind_label(denied.kind);
+                eprintln!(
+                    "cache-warden: kv.get denied for {key:?}: guard \
+                     constraint {kind:?} failed"
+                );
+                return Response::error(
+                    ErrorKind::AuthFailed,
+                    format!("access denied by entry guard (kind: {kind})"),
+                );
+            }
+        }
     }
 
     // Fast path: a live (Active) value.
@@ -842,6 +1214,18 @@ mod tests {
         EMPTY.get_or_init(std::collections::BTreeMap::new)
     }
 
+    /// A shared default `[kv-policy]` (`default-require-same-user = false`,
+    /// built-in shell-names). Tests that need a different one build their
+    /// own via [`ctx_with_policy`].
+    fn default_policy() -> &'static crate::config::ResolvedKvPolicy {
+        static POLICY: std::sync::OnceLock<crate::config::ResolvedKvPolicy> =
+            std::sync::OnceLock::new();
+        POLICY.get_or_init(|| crate::config::ResolvedKvPolicy {
+            default_require_same_user: false,
+            shell_names: crate::config::default_shell_names(),
+        })
+    }
+
     fn ctx<'a, A, R>(
         auth: &'a A,
         runner: &'a R,
@@ -866,7 +1250,28 @@ mod tests {
             socket: "/tmp/test.sock",
             requester: None,
             kv_process_policies: empty_policies(),
+            guard_chain: None,
+            guard_audit_token: None,
+            kv_policy: default_policy(),
         }
+    }
+
+    /// Build a HandlerCtx with an explicit DR-0030 guard material and
+    /// policy. Used by the guard-integration tests below.
+    fn ctx_with_guard<'a, A, R>(
+        auth: &'a A,
+        runner: &'a R,
+        clock: &'a FakeClock,
+        cap: &'a cache_warden::Capability,
+        chain: Option<&'a [GetterProcess]>,
+        token: Option<GetterAuditToken>,
+        policy: &'a crate::config::ResolvedKvPolicy,
+    ) -> HandlerCtx<'a, A, R, FakeClock> {
+        let mut c = ctx(auth, runner, clock, cap);
+        c.guard_chain = chain;
+        c.guard_audit_token = token;
+        c.kv_policy = policy;
+        c
     }
 
     /// A resolved `ProcessInfo` with a basename, for building a fake requester
@@ -1094,20 +1499,57 @@ mod tests {
         assert_eq!(get_value(&resp), b"hunter2");
     }
 
-    /// A `kv set` carrying wire-declared guard constraints must fail-closed
-    /// while this handler layer does not yet enforce them: silently accepting
-    /// the write would store the value unguarded, and the caller (who wrote
-    /// `--require-same-user` on the CLI) would reasonably believe the value
-    /// is protected. Reject with `BadRequest` so the failure is loud.
-    /// (This branch disappears when the handler integration bundle lands
-    /// `set_guard` / `clear_guard`.)
+    // ---- DR-0030 guard integration: handle_set / handle_get ----
+
+    /// Build a fake `[kv-policy]` for a given `default-require-same-user`.
+    fn policy_with_default_same_user(v: bool) -> crate::config::ResolvedKvPolicy {
+        crate::config::ResolvedKvPolicy {
+            default_require_same_user: v,
+            shell_names: crate::config::default_shell_names(),
+        }
+    }
+
+    /// Build a getter chain entry from a `ProcessInfo` + optional
+    /// `unique_id` (test-only shape mirrors the daemon-side enrichment).
+    fn gp(info: ProcessInfo, unique_id: Option<u64>) -> GetterProcess {
+        GetterProcess { info, unique_id }
+    }
+
+    /// Extract the `guard_applied` list from a Set success response.
+    fn set_guard_applied(resp: &Response) -> Vec<String> {
+        match resp {
+            Response::Ok(ok) => match &ok.payload {
+                OkPayload::Set { guard_applied, .. } => guard_applied.clone(),
+                other => panic!("expected Set payload, got {other:?}"),
+            },
+            Response::Err(e) => panic!("expected ok, got error: {e:?}"),
+        }
+    }
+
+    /// A guarded `kv set` with `SameUser` builds the record and echoes the
+    /// applied kinds in the positive ack (`guard_applied`); a subsequent
+    /// get from a same-uid peer clears the guard gate. Fixes DR-0030 §7
+    /// "setter identity is daemon-observed, not caller-supplied".
     #[test]
-    fn set_with_wire_declared_guard_constraints_is_rejected_fail_closed() {
+    fn set_with_same_user_guard_installs_record_and_acks() {
         let clock = FakeClock::new();
         let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
-        let c = ctx(&AllowAll, &runner, &clock, &cap);
-
+        let chain = vec![gp(proc(100, "zsh"), None)];
+        let token = Some(GetterAuditToken {
+            euid: 501,
+            ruid: 501,
+        });
+        let policy = policy_with_default_same_user(false);
+        let c = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&chain),
+            token,
+            &policy,
+        );
         let req = Request::KvSet {
             key: "default/K".into(),
             source: SetSource::Static {
@@ -1118,9 +1560,471 @@ mod tests {
             guard_constraints: vec![GuardConstraintWire::SameUser],
         };
         let resp = handle_request(&mut store, &c, req);
+        assert_eq!(set_guard_applied(&resp), vec!["same-user".to_string()]);
+        // The core actually got a guard record installed.
+        assert!(store.guard_of("default/K").is_some());
+
+        // Same-uid getter passes.
+        let get_ok = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(get_value(&get_ok), b"hunter2");
+    }
+
+    /// A same-user-guarded entry denies a get whose peer's euid differs
+    /// (fail-closed, DR-0030 §4). The denial does NOT run the retrieval
+    /// chain — proven separately below via a definition-only key + a
+    /// runner counter.
+    #[test]
+    fn get_denied_when_same_user_guard_uids_do_not_match() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        // Setter had uid 501.
+        let setter_chain = vec![gp(proc(100, "zsh"), None)];
+        let setter_ctx = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&setter_chain),
+            Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            }),
+            default_policy(),
+        );
+        let set_req = Request::KvSet {
+            key: "default/K".into(),
+            source: SetSource::Static {
+                value_b64: encode_b64(b"secret"),
+            },
+            soft_ttl_secs: Some(SOFT),
+            hard_ttl_secs: Some(HARD),
+            guard_constraints: vec![GuardConstraintWire::SameUser],
+        };
+        assert!(handle_request(&mut store, &setter_ctx, set_req).is_ok());
+
+        // Getter has a different euid.
+        let getter_chain = vec![gp(proc(200, "zsh"), None)];
+        let getter_ctx = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&getter_chain),
+            Some(GetterAuditToken {
+                euid: 502,
+                ruid: 502,
+            }),
+            default_policy(),
+        );
+        let resp = handle_request(
+            &mut store,
+            &getter_ctx,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+        assert!(
+            err_msg(&resp).contains("same-user"),
+            "denial names the failing kind: {:?}",
+            err_msg(&resp)
+        );
+    }
+
+    /// A subsequent set with an empty `guard_constraints` list drops the
+    /// previously-installed guard: §5 "the last declaration wins".
+    #[test]
+    fn empty_set_clears_prior_guard_record() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let chain = vec![gp(proc(100, "zsh"), None)];
+        let c = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&chain),
+            Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            }),
+            default_policy(),
+        );
+        // Install a guard.
+        assert!(
+            handle_request(
+                &mut store,
+                &c,
+                Request::KvSet {
+                    key: "default/K".into(),
+                    source: SetSource::Static {
+                        value_b64: encode_b64(b"a"),
+                    },
+                    soft_ttl_secs: Some(SOFT),
+                    hard_ttl_secs: Some(HARD),
+                    guard_constraints: vec![GuardConstraintWire::SameUser],
+                },
+            )
+            .is_ok()
+        );
+        assert!(store.guard_of("default/K").is_some());
+
+        // Empty declaration on the next set clears it.
+        let resp = handle_request(&mut store, &c, set_static(b"b"));
+        assert_eq!(set_guard_applied(&resp), Vec::<String>::new());
+        assert!(store.guard_of("default/K").is_none());
+    }
+
+    /// `[kv-policy] default-require-same-user = true` promotes an
+    /// unguarded set to `SameUser`. The ack surfaces the applied kind
+    /// so the client can also observe the implicit upgrade.
+    #[test]
+    fn empty_set_upgraded_to_same_user_when_config_default_is_true() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let policy = policy_with_default_same_user(true);
+        let chain = vec![gp(proc(1, "sh"), None)];
+        let c = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&chain),
+            Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            }),
+            &policy,
+        );
+        let resp = handle_request(&mut store, &c, set_static(b"v"));
+        assert_eq!(set_guard_applied(&resp), vec!["same-user".to_string()]);
+        assert!(store.guard_of("default/K").is_some());
+    }
+
+    /// `--require-same-shell` with no shell in the setter's chain rejects
+    /// the set (§7 "pin 対象が存在しない宣言は成立しない"). The value
+    /// must not be stored.
+    #[test]
+    fn set_with_same_shell_but_no_shell_in_chain_is_rejected() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let chain = vec![gp(proc(100, "git"), None), gp(proc(1, "launchd"), None)];
+        let c = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&chain),
+            Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            }),
+            default_policy(),
+        );
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvSet {
+                key: "default/K".into(),
+                source: SetSource::Static {
+                    value_b64: encode_b64(b"v"),
+                },
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+                guard_constraints: vec![GuardConstraintWire::SameShell],
+            },
+        );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
-        // The value must not have been stored — a subsequent get returns
-        // NotFound rather than serving the injected bytes.
+        assert!(!store.has_value("default/K"), "value must not have landed");
+    }
+
+    /// `SameUser` declared but the daemon has no peer audit token
+    /// (Linux / getsockopt failure): fail-closed reject the set, don't
+    /// silently save an unguarded value.
+    #[test]
+    fn set_with_guard_but_no_audit_token_is_rejected() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let chain = vec![gp(proc(100, "zsh"), None)];
+        let c = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&chain),
+            None, // audit token unavailable
+            default_policy(),
+        );
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvSet {
+                key: "default/K".into(),
+                source: SetSource::Static {
+                    value_b64: encode_b64(b"v"),
+                },
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+                guard_constraints: vec![GuardConstraintWire::SameUser],
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+        assert!(!store.has_value("default/K"));
+    }
+
+    /// A get against a guarded key with no requester chain fails-closed
+    /// without touching the retrieval chain (proven by the value never
+    /// being read: the response is AuthFailed, not the value).
+    #[test]
+    fn get_denied_when_guarded_and_requester_chain_missing() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        // Install a guarded value.
+        let setter_chain = vec![gp(proc(100, "zsh"), None)];
+        let setter_ctx = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&setter_chain),
+            Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            }),
+            default_policy(),
+        );
+        assert!(
+            handle_request(
+                &mut store,
+                &setter_ctx,
+                Request::KvSet {
+                    key: "default/K".into(),
+                    source: SetSource::Static {
+                        value_b64: encode_b64(b"v"),
+                    },
+                    soft_ttl_secs: None,
+                    hard_ttl_secs: None,
+                    guard_constraints: vec![GuardConstraintWire::SameUser],
+                },
+            )
+            .is_ok()
+        );
+
+        // Getter has NO chain.
+        let getter_ctx = ctx(&AllowAll, &runner, &clock, &cap); // guard_chain: None
+        let resp = handle_request(
+            &mut store,
+            &getter_ctx,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+    }
+
+    /// A guarded, definition-backed key whose guard denies the getter
+    /// must NOT run the source command (the whole point of gating the
+    /// guard before the retrieval chain — no TouchID / no regeneration
+    /// on a denied requester).
+    #[test]
+    fn guarded_definition_denial_does_not_run_the_source() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"regen");
+        // Setter registers a command definition then a guarded set
+        // (guard sits on the value the set produced).
+        let setter_chain = vec![gp(proc(100, "zsh"), None)];
+        let setter_ctx = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&setter_chain),
+            Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            }),
+            default_policy(),
+        );
+        assert!(
+            handle_request(
+                &mut store,
+                &setter_ctx,
+                define_cmd("default/K", &["echo", "x"])
+            )
+            .is_ok()
+        );
+        assert!(
+            handle_request(
+                &mut store,
+                &setter_ctx,
+                Request::KvSet {
+                    key: "default/K".into(),
+                    source: SetSource::Static {
+                        value_b64: encode_b64(b"v"),
+                    },
+                    soft_ttl_secs: None,
+                    hard_ttl_secs: None,
+                    guard_constraints: vec![GuardConstraintWire::SameUser],
+                },
+            )
+            .is_ok()
+        );
+        // The set may have called `set` on the value which does not run
+        // the runner; the runner count so far is 0.
+        assert_eq!(runner.runs(), 0);
+        // A denied getter must not trigger regeneration.
+        let getter_chain = vec![gp(proc(200, "zsh"), None)];
+        let getter_ctx = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&getter_chain),
+            Some(GetterAuditToken {
+                euid: 999,
+                ruid: 999,
+            }),
+            default_policy(),
+        );
+        let resp = handle_request(
+            &mut store,
+            &getter_ctx,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+        assert_eq!(runner.runs(), 0, "denied guard must not run source");
+    }
+
+    /// `kv list` surfaces a `guard_summary` for guarded entries — with a
+    /// `(weak)` marker on `command=` entries and strong-first ordering
+    /// (Task F requirement).
+    #[test]
+    fn kv_list_surfaces_guard_summary_with_weak_marker() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let chain = vec![gp(proc(100, "zsh"), None)];
+        let c = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&chain),
+            Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            }),
+            default_policy(),
+        );
+        // Both a strong (same-user) and a weak (command=) constraint.
+        assert!(
+            handle_request(
+                &mut store,
+                &c,
+                Request::KvSet {
+                    key: "default/K".into(),
+                    source: SetSource::Static {
+                        value_b64: encode_b64(b"v"),
+                    },
+                    soft_ttl_secs: None,
+                    hard_ttl_secs: None,
+                    guard_constraints: vec![
+                        GuardConstraintWire::Command { name: "git".into() },
+                        GuardConstraintWire::SameUser,
+                    ],
+                },
+            )
+            .is_ok()
+        );
+        let resp = handle_request(&mut store, &c, Request::KvList);
+        let entries = match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::List { entries, .. } => entries,
+                other => panic!("expected List, got {other:?}"),
+            },
+            other => panic!("expected List ok, got {other:?}"),
+        };
+        let e = entries
+            .into_iter()
+            .find(|e| e.name == "default/K")
+            .expect("entry must be present");
+        let summary = e.guard_summary.expect("guarded entry must carry summary");
+        // Strong first, weak last; the weak `command` marker is present.
+        assert_eq!(summary[0], "same-user", "strong-first: {summary:?}");
+        assert!(summary.last().unwrap().contains("(weak)"), "{summary:?}");
+        assert!(summary.iter().any(|s| s.contains("command (git)")));
+    }
+
+    // ---- MEDIUM-4: same-shell / same-ancestor E2E allow + deny ----
+    //
+    // The DR-0030 §5/§7 pin construction path: a `--require-same-shell`
+    // (or `--require-same-ancestor=NAME`) set must extract a pinnable
+    // process from the setter's chain, install the record with that
+    // pinned identity, and let the same-entity getter pass while
+    // denying a chain that has the same basename but a different
+    // pid+start_time (= a *different* process instance). The tests here
+    // exercise the pin construction on set and the pin-based
+    // discrimination on get through `handle_request` end-to-end.
+
+    /// same-shell allow: the same chain (same pid + start_time) passes.
+    #[test]
+    fn same_shell_guarded_set_then_get_from_same_chain_passes() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        // Setter chain has an identifiable zsh at pid=100 / start=100s.
+        let chain = vec![gp(proc(100, "zsh"), None)];
+        let token = Some(GetterAuditToken {
+            euid: 501,
+            ruid: 501,
+        });
+        let c = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&chain),
+            token,
+            default_policy(),
+        );
+        let set = handle_request(
+            &mut store,
+            &c,
+            Request::KvSet {
+                key: "default/K".into(),
+                source: SetSource::Static {
+                    value_b64: encode_b64(b"v"),
+                },
+                soft_ttl_secs: Some(SOFT),
+                hard_ttl_secs: Some(HARD),
+                guard_constraints: vec![GuardConstraintWire::SameShell],
+            },
+        );
+        // The set succeeds and the ack names the applied kind.
+        assert_eq!(set_guard_applied(&set), vec!["same-shell".to_string()]);
+        assert!(store.guard_of("default/K").is_some(), "guard installed");
+
+        // Same chain (identical pid + start_time) reads successfully —
+        // the pin extracted from setter matches the getter chain entry.
         let get_resp = handle_request(
             &mut store,
             &c,
@@ -1129,18 +2033,320 @@ mod tests {
                 dry_run: false,
             },
         );
-        assert_eq!(err_kind(&get_resp), ErrorKind::NotFound);
+        assert_eq!(get_value(&get_resp), b"v");
     }
 
-    /// The pre-existing v1 semantics (`guard_constraints` empty) still succeed:
-    /// the fail-closed bounce above must not regress unguarded sets.
+    /// same-shell deny: a chain whose zsh has a *different* start_time
+    /// (same basename, but a *different* process instance — the pid
+    /// reuse / instance-mismatch case from DR-0030 §Security) is
+    /// denied. This proves the pin discriminates on pid + start_time,
+    /// not just basename.
     #[test]
-    fn set_with_empty_guard_constraints_still_succeeds() {
+    fn same_shell_guarded_set_then_get_from_different_start_time_is_denied() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        // Setter chain: zsh at pid=100 / start=100s (from `proc()`).
+        let setter_chain = vec![gp(proc(100, "zsh"), None)];
+        let token = Some(GetterAuditToken {
+            euid: 501,
+            ruid: 501,
+        });
+        let setter_ctx = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&setter_chain),
+            token,
+            default_policy(),
+        );
+        assert!(
+            handle_request(
+                &mut store,
+                &setter_ctx,
+                Request::KvSet {
+                    key: "default/K".into(),
+                    source: SetSource::Static {
+                        value_b64: encode_b64(b"v"),
+                    },
+                    soft_ttl_secs: Some(SOFT),
+                    hard_ttl_secs: Some(HARD),
+                    guard_constraints: vec![GuardConstraintWire::SameShell],
+                },
+            )
+            .is_ok()
+        );
+
+        // Getter chain: still a "zsh" at pid=100 but a *different*
+        // start_time — a distinct process instance under pid reuse.
+        let mut different = proc(100, "zsh");
+        different.start_time = Some(Duration::from_secs(9999));
+        let getter_chain = vec![gp(different, None)];
+        let getter_ctx = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&getter_chain),
+            token,
+            default_policy(),
+        );
+        let resp = handle_request(
+            &mut store,
+            &getter_ctx,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+        assert!(
+            err_msg(&resp).contains("same-ancestor"),
+            "denial names the same-ancestor kind: {:?}",
+            err_msg(&resp)
+        );
+    }
+
+    /// --require-same-ancestor=/absolute/path form: pin resolution goes
+    /// through `pin_ancestor_by_path` (not the basename branch), and a
+    /// get from the same chain passes.
+    #[test]
+    fn same_ancestor_by_absolute_path_set_and_get_end_to_end() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        // `proc(200, "git")` places the executable at `/usr/bin/git`.
+        let chain = vec![gp(proc(200, "git"), None), gp(proc(50, "zsh"), None)];
+        let token = Some(GetterAuditToken {
+            euid: 501,
+            ruid: 501,
+        });
+        let c = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&chain),
+            token,
+            default_policy(),
+        );
+        // A path with a leading `/` takes the pin_ancestor_by_path branch.
+        let set = handle_request(
+            &mut store,
+            &c,
+            Request::KvSet {
+                key: "default/K".into(),
+                source: SetSource::Static {
+                    value_b64: encode_b64(b"v"),
+                },
+                soft_ttl_secs: Some(SOFT),
+                hard_ttl_secs: Some(HARD),
+                guard_constraints: vec![GuardConstraintWire::SameAncestor {
+                    name: "/usr/bin/git".to_string(),
+                }],
+            },
+        );
+        assert_eq!(set_guard_applied(&set), vec!["same-ancestor".to_string()]);
+        assert!(store.guard_of("default/K").is_some());
+
+        // Same chain: the getter finds the same entity → allow.
+        let get_resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(get_value(&get_resp), b"v");
+
+        // A chain where the same basename is at a *different* absolute
+        // path (`/opt/bin/git`) does NOT satisfy the pinned entity —
+        // pid + start_time comparison rejects. This pins the path branch
+        // as distinct from the basename branch.
+        let other = ProcessInfo {
+            pid: 900,
+            ppid: Some(1),
+            path: Some(std::path::PathBuf::from("/opt/bin/git")),
+            start_time: Some(Duration::from_secs(900)),
+        };
+        let other_chain = vec![gp(other, None), gp(proc(50, "zsh"), None)];
+        let other_ctx = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&other_chain),
+            token,
+            default_policy(),
+        );
+        let deny = handle_request(
+            &mut store,
+            &other_ctx,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        );
+        assert_eq!(err_kind(&deny), ErrorKind::AuthFailed);
+    }
+
+    // ---- MEDIUM-4 #4: set failures preserve the prior guard ----
+    //
+    // A `kv.set` that fails on wire-level validation (TTL out of range,
+    // malformed base64) must not touch the store's guard record: the
+    // prior guard on the same key stays intact. Otherwise a failed
+    // set-with-bad-input could be a silent way to clear a guard.
+
+    /// Bad TTL rejected: guard from a prior guarded set stays intact.
+    #[test]
+    fn set_with_bad_ttl_keeps_prior_guard_intact() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let chain = vec![gp(proc(100, "zsh"), None)];
+        let c = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&chain),
+            Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            }),
+            default_policy(),
+        );
+        // Install a guard first.
+        assert!(
+            handle_request(
+                &mut store,
+                &c,
+                Request::KvSet {
+                    key: "default/K".into(),
+                    source: SetSource::Static {
+                        value_b64: encode_b64(b"first"),
+                    },
+                    soft_ttl_secs: Some(SOFT),
+                    hard_ttl_secs: Some(HARD),
+                    guard_constraints: vec![GuardConstraintWire::SameUser],
+                },
+            )
+            .is_ok()
+        );
+        let before = store
+            .guard_of("default/K")
+            .cloned()
+            .expect("guard installed by first set");
+
+        // Second set: soft > hard is a Ttl::new BadRequest — but this
+        // is caught *after* plan_guard_record. The guard planning path
+        // must not have side effects on the store, and the failed set
+        // must not clear the prior record either.
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvSet {
+                key: "default/K".into(),
+                source: SetSource::Static {
+                    value_b64: encode_b64(b"second"),
+                },
+                soft_ttl_secs: Some(1000),
+                hard_ttl_secs: Some(1),
+                guard_constraints: Vec::new(),
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+        let after = store
+            .guard_of("default/K")
+            .cloned()
+            .expect("guard must survive failed set");
+        assert_eq!(before, after, "prior guard record preserved verbatim");
+    }
+
+    /// Bad base64 rejected: guard from a prior guarded set stays intact.
+    #[test]
+    fn set_with_bad_base64_keeps_prior_guard_intact() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let chain = vec![gp(proc(100, "zsh"), None)];
+        let c = ctx_with_guard(
+            &AllowAll,
+            &runner,
+            &clock,
+            &cap,
+            Some(&chain),
+            Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            }),
+            default_policy(),
+        );
+        assert!(
+            handle_request(
+                &mut store,
+                &c,
+                Request::KvSet {
+                    key: "default/K".into(),
+                    source: SetSource::Static {
+                        value_b64: encode_b64(b"first"),
+                    },
+                    soft_ttl_secs: Some(SOFT),
+                    hard_ttl_secs: Some(HARD),
+                    guard_constraints: vec![GuardConstraintWire::SameUser],
+                },
+            )
+            .is_ok()
+        );
+        let before = store
+            .guard_of("default/K")
+            .cloned()
+            .expect("guard installed");
+
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvSet {
+                key: "default/K".into(),
+                source: SetSource::Static {
+                    value_b64: "not!base64!".into(),
+                },
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+                guard_constraints: Vec::new(),
+            },
+        );
+        assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+        let after = store
+            .guard_of("default/K")
+            .cloned()
+            .expect("guard must survive failed set");
+        assert_eq!(before, after);
+    }
+
+    /// The positive ack is present when a guard was applied and empty
+    /// (`Vec::new()`) when it was not: the shape used by the client to
+    /// detect a mixed-version silent no-op (an old daemon replies with
+    /// no `guard_applied` field ⇒ decodes to empty via
+    /// `#[serde(default)]`; a new daemon with a guarded set decodes to
+    /// a non-empty list).
+    #[test]
+    fn set_positive_ack_shape_distinguishes_guarded_from_unguarded() {
         let clock = FakeClock::new();
         let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
         let runner = CountingRunner::new(b"x");
         let c = ctx(&AllowAll, &runner, &clock, &cap);
-        assert!(handle_request(&mut store, &c, set_static(b"hunter2")).is_ok());
+        // Unguarded: guard_applied is empty (skip_serializing_if strips
+        // it from the wire, matching the old-daemon shape).
+        let resp = handle_request(&mut store, &c, set_static(b"v1"));
+        assert!(set_guard_applied(&resp).is_empty());
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !line.contains("guard_applied"),
+            "unguarded ack must omit guard_applied on the wire: {line}"
+        );
     }
 
     fn dry_get(key: &str) -> Request {
@@ -2298,6 +3504,9 @@ mod tests {
             socket: "/tmp/test.sock",
             requester,
             kv_process_policies: policies,
+            guard_chain: None,
+            guard_audit_token: None,
+            kv_policy: default_policy(),
         }
     }
 

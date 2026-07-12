@@ -1,10 +1,3 @@
-#![allow(dead_code)]
-// Handler integration (calling `evaluate` from `handle_get`) is deferred to
-// a follow-up bundle (kawaz's mid-gate). Until it lands the pub items here
-// have no external caller, so the crate-level dead-code lint would fire; the
-// allow lives at module scope to keep the removal a one-line delete once
-// the handler starts calling in.
-
 //! DR-0030 per-entry access guard evaluator.
 //!
 //! The core (`cache-warden`) stores a [`GuardRecord`] as plain data (DR-0004:
