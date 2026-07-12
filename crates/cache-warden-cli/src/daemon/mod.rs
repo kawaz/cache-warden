@@ -27,6 +27,7 @@
 //!   restart). `server::run` is the only caller.
 
 pub mod approver;
+pub mod approver_wire;
 pub mod authsock;
 mod graceful_restart;
 pub mod guard;

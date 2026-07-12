@@ -98,6 +98,45 @@ pub struct HandlerCtx<'a, A: ?Sized, R, C> {
     /// unguarded set is silently upgraded to require `SameUser`, and to
     /// resolve `--require-same-shell` to a concrete pin.
     pub kv_policy: &'a crate::config::ResolvedKvPolicy,
+    /// DR-0031 §8 approver-dialog integration: whether [`handle_get`] should
+    /// evaluate the entry's guard record (the default, [`GuardCheckMode::Evaluate`])
+    /// or skip that block because the server layer has already evaluated it,
+    /// shown the dialog, and re-evaluated fail-closed under the current
+    /// store lock ([`GuardCheckMode::AlreadyApproved`]).
+    ///
+    /// # Why a mode flag, not a separate entry point
+    ///
+    /// The retrieval chain below the guard block (soft-expired extend,
+    /// hard-expired regenerate, lazy-generate) is exactly the same in
+    /// either case — a second entry point would duplicate the entire tail
+    /// of [`handle_get`]. The flag defaults to `Evaluate`, so every
+    /// non-approver caller (all existing tests, all non-`kv.get` handler
+    /// paths) is unaffected.
+    ///
+    /// The server layer is responsible for **only** setting
+    /// `AlreadyApproved` after re-taking the store lock and re-evaluating
+    /// the guard record (which may have changed while the human was
+    /// deciding on the dialog) — see `server::run_request_with_dialog`.
+    pub guard_check_mode: GuardCheckMode,
+}
+
+/// DR-0031 §8: whether [`handle_get`] should run the DR-0030 guard block or
+/// skip it because a dialog approval has already cleared this get under the
+/// current store lock. See [`HandlerCtx::guard_check_mode`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum GuardCheckMode {
+    /// Normal path — evaluate the guard record if any (fail-closed on any
+    /// denial). This is the default and the mode used by every non-approver
+    /// caller.
+    #[default]
+    Evaluate,
+    /// The server layer has already shown the approver dialog, received an
+    /// `Approved` outcome, re-taken the store lock, and re-evaluated the
+    /// guard record fail-closed. The handler must not re-evaluate the guard
+    /// again (that would be redundant with the server-side re-check and
+    /// would confusingly log a second `guard evaluation` line for a single
+    /// user-approved get).
+    AlreadyApproved,
 }
 
 /// Handle one request against `store`, producing the response to send back.
@@ -818,7 +857,9 @@ where
     // approver dialog wire (draft-DR-0031 §4), whose adapter is a
     // subsequent block. Building it in-line still keeps the evaluator's
     // API stable across that later change.
-    if let Some(record) = store.guard_of(&key) {
+    if matches!(ctx.guard_check_mode, GuardCheckMode::Evaluate)
+        && let Some(record) = store.guard_of(&key)
+    {
         let chain = match ctx.guard_chain {
             Some(c) => c,
             None => {
@@ -1248,6 +1289,7 @@ mod tests {
             guard_chain: None,
             guard_audit_token: None,
             kv_policy: default_policy(),
+            guard_check_mode: GuardCheckMode::Evaluate,
         }
     }
 
@@ -3502,6 +3544,7 @@ mod tests {
             guard_chain: None,
             guard_audit_token: None,
             kv_policy: default_policy(),
+            guard_check_mode: GuardCheckMode::Evaluate,
         }
     }
 

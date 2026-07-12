@@ -13,6 +13,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Errors that can terminate the daemon's `run` loop.
 #[derive(Debug)]
@@ -47,13 +48,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
+use super::approver_wire::{self, Approver};
 use super::graceful_restart;
-use super::guard::{GetterAuditToken, GetterProcess};
-use super::handler::{self, HandlerCtx};
+use super::guard::{self as guard_eval, GetterAuditToken, GetterProcess};
+use super::handler::{self, GuardCheckMode, HandlerCtx};
 use super::peer::peer_pid;
 use crate::config::{Config, KvDefinition};
 use crate::protocol::wire::{ErrorKind, Request, Response};
 use crate::protocol::{decode_request, encode_response};
+use cache_warden_approver::wire::Outcome as WireOutcome;
 
 /// Daemon version reported by `status`.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -206,6 +209,134 @@ pub(crate) struct Shared {
     /// listeners close. Not consulted by the normal SIGINT/SIGTERM shutdown
     /// path, which does not drain (pre-existing behaviour, unchanged).
     pub(crate) active_connections: ConnectionTracker,
+    /// DR-0031 §3/§9 approver helper handle. `Some(Ready(_))` = spawned,
+    /// peer-verified helper ready to prompt. `Some(Down)` = we tried and
+    /// failed / gave up (fail-closed for guarded gets, transparent for
+    /// unguarded ones). `None` = tests or non-macOS builds that never even
+    /// tried. In every case the guard-less path (unguarded `kv.get`, non-
+    /// `kv.get`, `dry_run` gets) proceeds untouched.
+    pub(crate) approver: ApproverSlot,
+}
+
+/// The lifecycle-aware slot for the DR-0031 approver helper.
+///
+/// `Ready(_)` and `Down` are terminal states — the daemon does not currently
+/// respawn a helper after it decides to give up (§9 `helper_down`
+/// permanent). `Starting` is currently only used during the brief window
+/// between `Shared` construction and the async helper-init task filling in
+/// the final state; guarded gets that arrive in that window await the
+/// [`Notify`] with a bounded timeout ([`HELPER_STARTING_WAIT`]) before
+/// treating it as `Down`.
+pub(crate) struct ApproverSlot {
+    state: Mutex<ApproverState>,
+    notify: tokio::sync::Notify,
+}
+
+enum ApproverState {
+    Starting,
+    Ready(Arc<dyn Approver>),
+    Down,
+}
+
+impl ApproverSlot {
+    pub(crate) fn new_starting() -> Self {
+        Self {
+            state: Mutex::new(ApproverState::Starting),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+    /// A pre-constructed slot in the `Down` terminal state, used by every
+    /// non-approver-aware code path (tests, non-`run()` callers of
+    /// `Shared`). Skips the transient `Starting` bounded wait entirely —
+    /// guarded gets get `AuthFailed("approver helper unavailable")`
+    /// immediately, matching the production `helper_down` shape.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new_down() -> Self {
+        Self {
+            state: Mutex::new(ApproverState::Down),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+    pub(crate) fn set_ready(&self, a: Arc<dyn Approver>) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = ApproverState::Ready(a);
+        self.notify.notify_waiters();
+    }
+    pub(crate) fn set_down(&self) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = ApproverState::Down;
+        self.notify.notify_waiters();
+    }
+    /// Snapshot the currently-ready helper if any, without waiting. Used by
+    /// the graceful-shutdown / restart paths to call
+    /// [`Approver::shutdown`] on the live handle.
+    pub(crate) fn current_ready(&self) -> Option<Arc<dyn Approver>> {
+        let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match &*g {
+            ApproverState::Ready(a) => Some(Arc::clone(a)),
+            _ => None,
+        }
+    }
+    /// Await a terminal state, up to `timeout`. Returns `Some(approver)` if
+    /// the helper reached `Ready` in time, `None` on `Down` or on the
+    /// bounded-wait expiring (both collapse to the caller's fail-closed
+    /// branch — the distinction between "we gave up" and "we ran out of
+    /// time waiting for startup" is not meaningful at the get-path caller
+    /// level).
+    ///
+    /// # Notify race avoidance
+    ///
+    /// The `Notify` future is created and *enabled* **before** the state
+    /// guard is taken so that a concurrent [`set_ready`](Self::set_ready) /
+    /// [`set_down`](Self::set_down) landing between the state check and
+    /// registering the waiter still wakes us. Without the pre-registration
+    /// step [`tokio::sync::Notify::notified`] arms a permit only on the
+    /// first poll, so a `notify_waiters` call fired in that window would
+    /// be lost — the caller would then time out even though the slot
+    /// reached a terminal state promptly. Every loop turn re-arms a
+    /// fresh `notified` before the next state check for the same reason.
+    /// The timeout branch also re-checks the state once more before
+    /// giving up, so a `set_ready` fired exactly at the deadline is not
+    /// lost.
+    pub(crate) async fn wait_ready(&self, timeout: Duration) -> Option<Arc<dyn Approver>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Enable the waiter FIRST so a `notify_waiters` call that
+            // races the state check below still wakes us. See method doc.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            {
+                let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                match &*guard {
+                    ApproverState::Ready(a) => return Some(Arc::clone(a)),
+                    ApproverState::Down => return None,
+                    ApproverState::Starting => {}
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                // Timed out at the deadline computation itself: a
+                // `set_ready` fired between our state check and now
+                // could otherwise be missed. Re-check once before
+                // giving up.
+                let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                return match &*guard {
+                    ApproverState::Ready(a) => Some(Arc::clone(a)),
+                    _ => None,
+                };
+            }
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                // Bounded wait expired. Same re-check as above — do not
+                // let a set_ready that fired at the deadline instant
+                // leak through as a `None`.
+                let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                return match &*guard {
+                    ApproverState::Ready(a) => Some(Arc::clone(a)),
+                    _ => None,
+                };
+            }
+        }
+    }
 }
 
 /// A bounded-wait connection counter (DR-0029 §4's drain step).
@@ -306,6 +437,7 @@ impl Shared {
             argv: Vec::new(),
             restart: graceful_restart::RestartCoordinator::new(),
             active_connections: ConnectionTracker::new(),
+            approver: ApproverSlot::new_down(),
         }
     }
 }
@@ -476,6 +608,12 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         argv,
         restart: graceful_restart::RestartCoordinator::new(),
         active_connections: ConnectionTracker::new(),
+        // DR-0031 §10: helper is spawned *after* the blocking startup task
+        // (which restores the store and registers config definitions), so a
+        // guarded reveal-get arriving during that window gets the bounded
+        // `helper_starting` wait via `ApproverSlot::wait_ready`. Guard-less
+        // `kv.get` never consults this slot (§9: unguarded is transparent).
+        approver: ApproverSlot::new_starting(),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -660,6 +798,51 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         graceful_restart::receive::send_commit(stream);
     }
 
+    // DR-0031 §10: spawn the approver helper now that the store is fully
+    // restored and definitions are registered. Runs in the background so a
+    // slow helper spawn does not delay the authsock listeners below (§9:
+    // guard-less entries stay transparent even while the helper is starting
+    // / down; guarded reveal-gets await `ApproverSlot::wait_ready` with a
+    // bounded timeout). A `spawn_helper` failure transitions the slot to
+    // `Down`, which is exactly the fail-closed shape guarded gets need.
+    let approver_shared = Arc::clone(&shared);
+    let approver_socket_path = socket_path
+        .parent()
+        .map(|d| d.join("approver.sock"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/cache-warden-approver.sock"));
+    tokio::spawn(async move {
+        match resolve_approver_helper_path() {
+            Some(helper_path) => {
+                match super::approver::ApproverClient::start(
+                    helper_path,
+                    approver_socket_path,
+                    HELPER_STARTING_WAIT,
+                )
+                .await
+                {
+                    Ok(client) => {
+                        approver_shared.approver.set_ready(Arc::new(client));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "cache-warden: warning: could not start approver helper ({e}); \
+                             guarded kv.get requests will fail closed with 'approver helper \
+                             unavailable'"
+                        );
+                        approver_shared.approver.set_down();
+                    }
+                }
+            }
+            None => {
+                eprintln!(
+                    "cache-warden: warning: approver helper binary not found; \
+                     guarded kv.get requests will fail closed"
+                );
+                approver_shared.approver.set_down();
+            }
+        }
+    });
+
     // Start one SSH agent listener per `[authsock.sockets.*]` (port Iteration 1).
     // Each binds its own socket (same 0600 / stale-recovery / double-start guard
     // as the control socket) and shares this process's Store / auth / runner /
@@ -761,6 +944,17 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
 
     // Clean up the control socket file (best effort).
     let _ = std::fs::remove_file(&socket_path);
+
+    // DR-0031 §10: kill the approver helper before either
+    // (a) a graceful `execve` — an orphan helper would keep holding a
+    // socket the new daemon needs to bind — or
+    // (b) a plain clean shutdown — the helper's own `kill_on_drop` would
+    // fire on Arc drop, but a proactive shutdown also unlinks the socket
+    // file (`ApproverClient::shutdown`) so the next start's `bind` skips
+    // the stale-socket removal branch.
+    if let Some(approver) = shared.approver.current_ready() {
+        approver.shutdown().await;
+    }
 
     if restart_requested {
         // Every listener is now closed and unlinked (DR-0029 §1's fd-hygiene
@@ -1107,7 +1301,8 @@ async fn handle_connection(stream: UnixStream, shared: Arc<Shared>) -> io::Resul
     // On Linux / a non-socket / a getsockopt failure this collapses to
     // `None` (the guard evaluator then denies whenever a `SameUser`
     // constraint requires it — fail-closed).
-    let peer_token = macos_process_inspect::peer_audit_token(fd).map(|t| GetterAuditToken {
+    let peer_token_full = macos_process_inspect::peer_audit_token(fd);
+    let peer_token = peer_token_full.map(|t| GetterAuditToken {
         euid: t.euid(),
         ruid: t.ruid(),
     });
@@ -1119,15 +1314,7 @@ async fn handle_connection(stream: UnixStream, shared: Arc<Shared>) -> io::Resul
         if line.trim().is_empty() {
             continue;
         }
-        // Run the handler on the blocking pool: a regeneration can block for
-        // minutes (the source command may wait on a user prompt), and that must
-        // not pin an async worker (DR-0008's synchronous-work isolation).
-        let shared_for_handler = Arc::clone(&shared);
-        let response = tokio::task::spawn_blocking(move || {
-            dispatch(&shared_for_handler, peer, peer_token, &line)
-        })
-        .await
-        .unwrap_or_else(|e| Response::error(ErrorKind::Internal, format!("handler panicked: {e}")));
+        let response = dispatch_async(&shared, peer, peer_token, peer_token_full, &line).await;
         let mut out = encode_response(&response).unwrap_or_else(|_| {
             r#"{"ok":false,"error":{"kind":"internal","message":"failed to encode response"}}"#
                 .to_string()
@@ -1142,7 +1329,10 @@ async fn handle_connection(stream: UnixStream, shared: Arc<Shared>) -> io::Resul
 /// Parse one request line, run it against the store, and produce a response.
 ///
 /// Resolves the requester ancestry from `peer` (best effort) and runs the
-/// synchronous handler under the store lock.
+/// synchronous handler under the store lock. Retained for the pre-existing
+/// malformed-line test; live traffic goes through [`dispatch_async`] so a
+/// guarded reveal-get can await the approver dialog.
+#[cfg(test)]
 fn dispatch(
     shared: &Arc<Shared>,
     peer: Option<u32>,
@@ -1244,6 +1434,7 @@ fn run_request(
         guard_chain: guard_chain.as_deref(),
         guard_audit_token: peer_token,
         kv_policy: &shared.kv_policy,
+        guard_check_mode: GuardCheckMode::Evaluate,
     };
     let response = handler::handle_request(&mut store, &ctx, req);
 
@@ -1265,6 +1456,483 @@ fn run_request(
         );
     }
     response
+}
+
+// ---------------------------------------------------------------------------
+// DR-0031 §8 approver-dialog integration
+// ---------------------------------------------------------------------------
+
+/// How long a guarded reveal-get waits for the approver helper to reach a
+/// terminal state (`Ready` / `Down`) before treating it as `Down` and
+/// failing closed. Sized to survive the brief startup window (helper spawn
+/// plus peer verification typically completes in tens of ms on a warm host
+/// and in low hundreds on a cold one) without pinning a caller for so long
+/// that a dead helper is indistinguishable from a slow one.
+const HELPER_STARTING_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the daemon waits for the user to answer the approver dialog
+/// before giving up. Loose upper bound on the human interaction; matches
+/// the DR-0031 §4 wire default (`ApproveRequest.timeout_secs = 60`) plus
+/// a small allowance for the helper's own bookkeeping / peer_gone message.
+const APPROVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The `timeout_secs` field on the wire (the daemon's own effective timeout
+/// is `APPROVER_REQUEST_TIMEOUT`; the wire value is a hint the helper can
+/// use for its own countdown UI, currently unused — see wire.rs docs).
+const APPROVER_WIRE_TIMEOUT_SECS: u32 = 60;
+
+/// Monotonically-increasing counter feeding `ApproveRequest.request_id` (a
+/// pid + monotonic number). Wire schema documents the field as an "opaque
+/// String" — no `uuid` crate dep — and pinning uniqueness within a daemon
+/// lifetime is enough (the helper only needs to match responses to
+/// pending requests).
+static APPROVER_REQUEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn mint_approver_request_id() -> String {
+    let n = APPROVER_REQUEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{}", std::process::id(), n)
+}
+
+/// The outcome of the guard-eval first pass under the store lock, driving
+/// whether the async gated flow needs to await the dialog or can return the
+/// response the handler already produced.
+#[derive(Debug)]
+enum GuardedGetFirstPass {
+    /// Terminal response — either a happy `Ok(Get)` for an unguarded entry
+    /// (the whole handler ran) or an error (reserved-namespace / process-
+    /// policy / guard-denied / etc.). Return as-is.
+    Direct(Response),
+    /// The entry is guarded, the guard evaluation passed, and the dialog
+    /// must be shown. Carries the material the wire adapter needs to build
+    /// the `ApproveRequest`.
+    NeedsApproval {
+        guard_eval: guard_eval::GuardEvalOutput,
+        /// The requester chain snapshotted at first-pass time — reused
+        /// verbatim by both the wire builder (for the dialog) and the
+        /// second-pass re-evaluation (so a mid-approval `proc_pidinfo`
+        /// change cannot make the re-check disagree with the just-approved
+        /// evaluation).
+        chain: Option<Vec<GetterProcess>>,
+        /// Same chain in the display-only `ProcessInfo` form — needed to
+        /// feed the retrieval chain's core `AuthContext` on the second
+        /// pass (`ctx.requester`).
+        requester: Option<Vec<ProcessInfo>>,
+    },
+}
+
+/// Async replacement of [`dispatch`] that intercepts guarded reveal-`kv.get`
+/// requests to run them through the approver dialog, while every other
+/// request keeps the pre-existing `spawn_blocking(dispatch)` shape.
+async fn dispatch_async(
+    shared: &Arc<Shared>,
+    peer: Option<u32>,
+    peer_token: Option<GetterAuditToken>,
+    peer_token_full: Option<macos_process_inspect::AuditToken>,
+    line: &str,
+) -> Response {
+    let req = match decode_request(line) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(ErrorKind::BadRequest, format!("malformed request: {e}"));
+        }
+    };
+    run_request_async(shared, peer, peer_token, peer_token_full, req).await
+}
+
+/// The async gated dispatcher.
+///
+/// The gated path is narrow on purpose: **reveal** (`dry_run = false`)
+/// `kv.get`s only. Everything else flows through the pre-existing
+/// `spawn_blocking(run_request)` shape unchanged.
+///
+/// # Why `dry_run` is not gated
+///
+/// A dry-run verifies the retrieval chain (DR-0015) but never returns the
+/// secret, so displaying an approver dialog for it would ask the human to
+/// approve nothing observable. draft-DR-0031 §8's own listing of the dialog
+/// firing conditions predates a dry-run split, so this is the daemon-side
+/// resolution: dry-run stays silent. Documented here (rather than only in
+/// the DR) because the decision is enforced *at this dispatcher*, not in
+/// the handler.
+async fn run_request_async(
+    shared: &Arc<Shared>,
+    peer: Option<u32>,
+    peer_token: Option<GetterAuditToken>,
+    peer_token_full: Option<macos_process_inspect::AuditToken>,
+    req: Request,
+) -> Response {
+    // Only reveal-`kv.get`s take the gated path. Everything else uses the
+    // pre-existing `spawn_blocking(run_request)` shape.
+    let key = match &req {
+        Request::KvGet {
+            key,
+            dry_run: false,
+        } => key.clone(),
+        _ => {
+            let shared_c = Arc::clone(shared);
+            return tokio::task::spawn_blocking(move || {
+                run_request(&shared_c, peer, peer_token, req)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Response::error(ErrorKind::Internal, format!("handler panicked: {e}"))
+            });
+        }
+    };
+    let key = key.clone();
+
+    // Resolve the requester + guard chain once (same snapshot the sync
+    // `run_request` builds). Cheap-ish syscall (`proc_pidinfo`) run
+    // directly on the async worker: the ancestry walk is not "blocking" in
+    // the tokio sense (bounded time, no user prompt).
+    let requester: Option<Vec<ProcessInfo>> = peer.and_then(|pid| {
+        let inspector = SystemInspector::new();
+        inspector.ancestry(pid).ok()
+    });
+    let guard_chain: Option<Vec<GetterProcess>> = requester.as_ref().map(|chain| {
+        chain
+            .iter()
+            .map(|info| GetterProcess {
+                info: info.clone(),
+                unique_id: macos_process_inspect::unique_id(info.pid)
+                    .ok()
+                    .map(|u| u.unique_id),
+            })
+            .collect()
+    });
+
+    let shared_first = Arc::clone(shared);
+    let key_first = key.clone();
+    let chain_first = guard_chain.clone();
+    let requester_first = requester.clone();
+    let first_pass_result = tokio::task::spawn_blocking(move || {
+        guarded_get_first_pass(
+            &shared_first,
+            peer,
+            peer_token,
+            requester_first,
+            chain_first,
+            key_first,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        GuardedGetFirstPass::Direct(Response::error(
+            ErrorKind::Internal,
+            format!("handler panicked: {e}"),
+        ))
+    });
+
+    match first_pass_result {
+        GuardedGetFirstPass::Direct(resp) => resp,
+        GuardedGetFirstPass::NeedsApproval {
+            guard_eval: eval_output,
+            chain: pass_chain,
+            requester: pass_requester,
+        } => {
+            let Some(approver) = shared.approver.wait_ready(HELPER_STARTING_WAIT).await else {
+                return Response::error(
+                    ErrorKind::AuthFailed,
+                    "approver helper unavailable (helper is not running)",
+                );
+            };
+            let wire_req = approver_wire::build_approve_request(
+                mint_approver_request_id(),
+                key.clone(),
+                "get",
+                pass_chain.as_deref().unwrap_or(&[]),
+                peer_token_full.as_ref(),
+                None,
+                &eval_output,
+                APPROVER_WIRE_TIMEOUT_SECS,
+            );
+            let resp = match approver.request(wire_req, APPROVER_REQUEST_TIMEOUT).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return Response::error(
+                        ErrorKind::AuthFailed,
+                        format!("approver dialog failed: {e}"),
+                    );
+                }
+            };
+            let approved = matches!(resp.outcome, WireOutcome::Approved);
+            if !approved {
+                let msg = match resp.outcome {
+                    WireOutcome::Denied => "approval denied by user",
+                    WireOutcome::Cancelled => "approval cancelled",
+                    WireOutcome::Timeout => "approval timed out",
+                    WireOutcome::PeerGone => "requesting process exited before approval",
+                    WireOutcome::BiometricFailed => "biometric authentication failed",
+                    // Approved handled above; keep exhaustive.
+                    WireOutcome::Approved => unreachable!(),
+                };
+                return Response::error(ErrorKind::AuthFailed, msg.to_string());
+            }
+            let shared_second = Arc::clone(shared);
+            let key_second = key.clone();
+            let chain_second = pass_chain.clone();
+            let requester_second = pass_requester.clone();
+            tokio::task::spawn_blocking(move || {
+                guarded_get_finalize_after_approval(
+                    &shared_second,
+                    peer,
+                    peer_token,
+                    requester_second,
+                    chain_second,
+                    key_second,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Response::error(ErrorKind::Internal, format!("handler panicked: {e}"))
+            })
+        }
+    }
+}
+
+/// First-pass evaluation under the store lock: replicate the reserved-
+/// namespace + process-policy pre-gates from [`handler::handle_request`]
+/// (so a guarded reveal-get gets exactly the same denial semantics as an
+/// unguarded one), then either
+///
+/// - run the whole handler when the entry is unguarded (returning
+///   [`GuardedGetFirstPass::Direct`] with the response the handler
+///   produced), or
+/// - evaluate the guard record fail-closed and either return `Direct(...)`
+///   on denial or [`GuardedGetFirstPass::NeedsApproval`] on success (with
+///   the material the wire adapter will need to build the dialog).
+///
+/// The lock is released on return, so the async caller can await the
+/// dialog without keeping the store lock held: a multi-second human
+/// approval must never sit behind the store lock, or every other
+/// request on this daemon would queue behind it.
+fn guarded_get_first_pass(
+    shared: &Arc<Shared>,
+    _peer: Option<u32>,
+    peer_token: Option<GetterAuditToken>,
+    requester: Option<Vec<ProcessInfo>>,
+    guard_chain: Option<Vec<GetterProcess>>,
+    key: String,
+) -> GuardedGetFirstPass {
+    // Snapshot everything the sync handler would use, so if we fall through
+    // to the unguarded branch we can drive `handle_request` with the same
+    // context shape the pre-existing `run_request` builds.
+    let mut store = match shared.store.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return GuardedGetFirstPass::Direct(Response::error(
+                ErrorKind::Internal,
+                "store lock poisoned",
+            ));
+        }
+    };
+    // Unguarded entries take the fast path — run the whole handler here so
+    // the caller gets a single lock take + single spawn_blocking. Failure
+    // mode: the handler itself will still enforce reserved-namespace and
+    // process-policy gates, so we do not need to duplicate them.
+    if store.guard_of(&key).is_none() {
+        let auth: &dyn Authenticator = shared.auth.as_ref();
+        let ctx = HandlerCtx {
+            auth,
+            runner: &shared.runner,
+            clock: &shared.clock,
+            store_cap: &shared.control_cap,
+            otp_adapter: &shared.otp_adapter,
+            pid: shared.pid,
+            version: VERSION,
+            socket: &shared.socket_path,
+            requester: requester.as_deref(),
+            kv_process_policies: &shared.kv_process_policies,
+            guard_chain: guard_chain.as_deref(),
+            guard_audit_token: peer_token,
+            kv_policy: &shared.kv_policy,
+            guard_check_mode: GuardCheckMode::Evaluate,
+        };
+        let resp = handler::handle_request(
+            &mut store,
+            &ctx,
+            Request::KvGet {
+                key,
+                dry_run: false,
+            },
+        );
+        return GuardedGetFirstPass::Direct(resp);
+    }
+
+    // Guarded path. Apply the same pre-gates as `handle_get`.
+    if let Some((ns, _)) = key.split_once('/')
+        && crate::namespace::is_reserved_namespace(ns)
+    {
+        return GuardedGetFirstPass::Direct(Response::error(
+            ErrorKind::BadRequest,
+            format!("namespace {ns:?} is reserved and cannot be read"),
+        ));
+    }
+    if let Some(allowed) = shared.kv_process_policies.get(&key)
+        && !cache_warden_authsock::chain_gate_passes(requester.as_deref(), allowed)
+    {
+        return GuardedGetFirstPass::Direct(Response::error(
+            ErrorKind::AuthFailed,
+            "process not permitted to access this key",
+        ));
+    }
+
+    // Evaluate the guard record. Must live long enough to hand to
+    // `guard_eval::evaluate`; a `guard_of` borrow ends when we drop the
+    // reference below.
+    let record = store.guard_of(&key).expect("checked non-None above");
+    let chain_slice: &[GetterProcess] = match guard_chain.as_deref() {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "cache-warden: kv.get denied for {key:?}: guard requires a requester \
+                 chain but the peer could not be walked"
+            );
+            return GuardedGetFirstPass::Direct(Response::error(
+                ErrorKind::AuthFailed,
+                "access denied by entry guard (kind: missing-context)",
+            ));
+        }
+    };
+    match guard_eval::evaluate(chain_slice, peer_token, record) {
+        Ok(output) => {
+            // Drop the store lock explicitly by ending the scope before
+            // returning — the return moves the result out with no
+            // borrowed data.
+            drop(store);
+            GuardedGetFirstPass::NeedsApproval {
+                guard_eval: output,
+                chain: guard_chain,
+                requester,
+            }
+        }
+        Err(denied) => {
+            let kind = guard_eval::denied_kind_label(denied.kind);
+            eprintln!("cache-warden: kv.get denied for {key:?}: guard constraint {kind:?} failed");
+            GuardedGetFirstPass::Direct(Response::error(
+                ErrorKind::AuthFailed,
+                format!("access denied by entry guard (kind: {kind})"),
+            ))
+        }
+    }
+}
+
+/// Second-pass evaluation, run after the dialog returned `Approved`:
+/// re-take the store lock, re-evaluate the guard record fail-closed (the
+/// record may have been overwritten while the human was deciding), then
+/// hand the get to the sync handler with
+/// [`GuardCheckMode::AlreadyApproved`] so it does not re-evaluate the
+/// guard a third time.
+///
+/// # Why re-evaluate
+///
+/// A `kv.set` on the same key concurrent with the dialog can replace the
+/// guard record entirely (DR-0030 §5 "last declaration wins"), which
+/// might now deny a getter the *previous* record accepted. Approving the
+/// first record does not authorize a get against the second. If the guard
+/// record disappeared (concurrent unguarded `kv.set`), the entry is now
+/// unguarded and a plain get is safe — the handler handles that case.
+fn guarded_get_finalize_after_approval(
+    shared: &Arc<Shared>,
+    _peer: Option<u32>,
+    peer_token: Option<GetterAuditToken>,
+    requester: Option<Vec<ProcessInfo>>,
+    guard_chain: Option<Vec<GetterProcess>>,
+    key: String,
+) -> Response {
+    let mut store = match shared.store.lock() {
+        Ok(g) => g,
+        Err(_) => return Response::error(ErrorKind::Internal, "store lock poisoned"),
+    };
+    if let Some(record) = store.guard_of(&key) {
+        let chain_slice: &[GetterProcess] = match guard_chain.as_deref() {
+            Some(c) => c,
+            None => {
+                return Response::error(
+                    ErrorKind::AuthFailed,
+                    "access denied by entry guard (kind: missing-context) after approval",
+                );
+            }
+        };
+        if let Err(denied) = guard_eval::evaluate(chain_slice, peer_token, record) {
+            let kind = guard_eval::denied_kind_label(denied.kind);
+            eprintln!(
+                "cache-warden: kv.get denied for {key:?} after approval: guard \
+                 constraint {kind:?} failed on re-evaluation (record changed \
+                 during approval)"
+            );
+            return Response::error(
+                ErrorKind::AuthFailed,
+                format!(
+                    "access denied by entry guard (kind: {kind}); record changed \
+                     during approval"
+                ),
+            );
+        }
+    }
+    let auth: &dyn Authenticator = shared.auth.as_ref();
+    let ctx = HandlerCtx {
+        auth,
+        runner: &shared.runner,
+        clock: &shared.clock,
+        store_cap: &shared.control_cap,
+        otp_adapter: &shared.otp_adapter,
+        pid: shared.pid,
+        version: VERSION,
+        socket: &shared.socket_path,
+        requester: requester.as_deref(),
+        kv_process_policies: &shared.kv_process_policies,
+        guard_chain: guard_chain.as_deref(),
+        guard_audit_token: peer_token,
+        kv_policy: &shared.kv_policy,
+        guard_check_mode: GuardCheckMode::AlreadyApproved,
+    };
+    handler::handle_request(
+        &mut store,
+        &ctx,
+        Request::KvGet {
+            key,
+            dry_run: false,
+        },
+    )
+}
+
+/// Resolve the approver helper binary path.
+///
+/// Search order (first match wins):
+/// 1. `$CACHE_WARDEN_APPROVER_BIN` — dev / integration-test override, so
+///    a locally-built helper (`just approver-run` etc.) can be pointed at
+///    the daemon without touching config or filesystem layout.
+/// 2. `/Applications/CacheWarden.app/Contents/Helpers/CacheWardenApprover.app/Contents/MacOS/cache-warden-approver`
+///    — production layout (DR-0031 §11 nested helper bundle).
+///
+/// Returns `None` when neither candidate exists — the caller transitions
+/// the [`ApproverSlot`] to `Down` (§9 helper_down fallback).
+///
+/// # No sibling fallback
+///
+/// A `<exe_dir>/cache-warden-approver` sibling probe would sound convenient
+/// but backfires in every non-production layout that happens to have the
+/// helper built next to the daemon (Cargo's `target/debug/` in particular).
+/// Under `cargo test`, spawning the ad-hoc-signed dev helper always fails
+/// peer verification and takes 5 s to time out — long enough to leave the
+/// helper as a zombie under the daemon and to trip the graceful-restart
+/// e2e's zombie-detection assertion. Requiring an explicit env var (or the
+/// installed bundle) is the correct default.
+fn resolve_approver_helper_path() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("CACHE_WARDEN_APPROVER_BIN") {
+        let p = PathBuf::from(explicit);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let production = PathBuf::from(
+        "/Applications/CacheWarden.app/Contents/Helpers/CacheWardenApprover.app/Contents/MacOS/cache-warden-approver",
+    );
+    if production.is_file() {
+        return Some(production);
+    }
+    None
 }
 
 /// The set of signals that request a graceful daemon shutdown.
@@ -1504,7 +2172,786 @@ mod tests {
             argv: Vec::new(),
             restart: graceful_restart::RestartCoordinator::new(),
             active_connections: ConnectionTracker::new(),
+            approver: ApproverSlot::new_down(),
         })
+    }
+
+    // ---- DR-0031 §8 approver-dialog integration ----
+
+    use super::super::approver_wire::FakeApprover;
+    use super::super::guard::{GetterAuditToken, GetterProcess};
+    use cache_warden::{
+        DeclaredAncestor, GuardConstraint, GuardRecord, GuardSetter, ProcessInfo, ValueSource,
+    };
+    use cache_warden_approver::wire::Outcome as WireOutcomeT;
+
+    /// Build a `Shared` whose `approver` slot is already `Ready` with a
+    /// deterministic fake — the state a well-behaved production daemon
+    /// reaches once helper spawn + verification succeed.
+    fn shared_with_fake_approver(outcome: WireOutcomeT) -> Arc<Shared> {
+        let s = shared();
+        s.approver.set_ready(Arc::new(FakeApprover::new(outcome)));
+        s
+    }
+
+    /// Seat a guarded value directly on the shared store, side-stepping the
+    /// `handle_set` guard-plan machinery (which requires a live audit
+    /// token). The record here declares `SameUser(501, 501)`.
+    fn seed_guarded_value(shared: &Arc<Shared>, key: &str, value: &[u8]) {
+        let mut store = shared.store.lock().unwrap();
+        store
+            .set(
+                key.to_string(),
+                ValueSource::Static,
+                cache_warden::SecretBytes::new(value.to_vec()),
+                cache_warden::Ttl::never(),
+                &shared.control_cap,
+                &shared.clock,
+            )
+            .expect("seed value");
+        let record = GuardRecord::new(
+            vec![GuardConstraint::SameUser],
+            GuardSetter {
+                euid: 501,
+                ruid: 501,
+            },
+        );
+        store
+            .set_guard(key.to_string(), record, &shared.control_cap)
+            .expect("seed guard");
+    }
+
+    /// Same as [`seed_guarded_value`] but installs a `same-ancestor` pin so
+    /// the getter must match a specific pid+start_time in its chain.
+    fn seed_guarded_value_with_ancestor_pin(shared: &Arc<Shared>, key: &str, value: &[u8]) {
+        let mut store = shared.store.lock().unwrap();
+        store
+            .set(
+                key.to_string(),
+                ValueSource::Static,
+                cache_warden::SecretBytes::new(value.to_vec()),
+                cache_warden::Ttl::never(),
+                &shared.control_cap,
+                &shared.clock,
+            )
+            .expect("seed value");
+        let record = GuardRecord::new(
+            vec![GuardConstraint::SameAncestor {
+                declared: DeclaredAncestor::Named {
+                    name: "zsh".to_string(),
+                },
+                pinned: cache_warden::PinnedProcess {
+                    pid: 50,
+                    start_time: Some(Duration::from_secs(1)),
+                    unique_id: None,
+                    path: PathBuf::from("/bin/zsh"),
+                    name: "zsh".to_string(),
+                },
+            }],
+            GuardSetter {
+                euid: 501,
+                ruid: 501,
+            },
+        );
+        store
+            .set_guard(key.to_string(), record, &shared.control_cap)
+            .expect("seed guard");
+    }
+
+    fn same_user_token() -> Option<GetterAuditToken> {
+        Some(GetterAuditToken {
+            euid: 501,
+            ruid: 501,
+        })
+    }
+
+    /// The euid/ruid of the running test process. Guarded-value fixtures
+    /// that intend to *match* the real chain walk from `std::process::id()`
+    /// must seed their `GuardSetter` with this uid (not the hard-coded
+    /// `501` from [`seed_guarded_value`], which was fine for pure
+    /// first-pass unit tests but fails the SameUser check against a
+    /// real audit token derived here).
+    fn current_uid() -> u32 {
+        // SAFETY: `geteuid()` takes no pointer arguments and cannot fail
+        // per POSIX.
+        unsafe { libc::geteuid() }
+    }
+
+    /// A [`GetterAuditToken`] matching the running test process's uid,
+    /// suitable for feeding `run_request_async`'s `peer_token` parameter
+    /// on tests that seed guards with [`seed_guarded_value_current_uid`].
+    fn current_uid_token() -> Option<GetterAuditToken> {
+        Some(GetterAuditToken {
+            euid: current_uid(),
+            ruid: current_uid(),
+        })
+    }
+
+    /// Same as [`seed_guarded_value`] but with a `GuardSetter` bound to
+    /// the *current* process's uid so `guard_eval::evaluate` can accept
+    /// a real audit token derived from the running test process (via
+    /// `run_request_async`'s peer path). Used by end-to-end tests that
+    /// need first-pass to *succeed* and the dialog to actually fire.
+    fn seed_guarded_value_current_uid(shared: &Arc<Shared>, key: &str, value: &[u8]) {
+        let mut store = shared.store.lock().unwrap();
+        store
+            .set(
+                key.to_string(),
+                ValueSource::Static,
+                cache_warden::SecretBytes::new(value.to_vec()),
+                cache_warden::Ttl::never(),
+                &shared.control_cap,
+                &shared.clock,
+            )
+            .expect("seed value");
+        let uid = current_uid();
+        let record = GuardRecord::new(
+            vec![GuardConstraint::SameUser],
+            GuardSetter {
+                euid: uid,
+                ruid: uid,
+            },
+        );
+        store
+            .set_guard(key.to_string(), record, &shared.control_cap)
+            .expect("seed guard");
+    }
+
+    fn zsh_chain() -> Option<Vec<GetterProcess>> {
+        Some(vec![GetterProcess {
+            info: ProcessInfo {
+                pid: 50,
+                ppid: Some(1),
+                path: Some(PathBuf::from("/bin/zsh")),
+                start_time: Some(Duration::from_secs(1)),
+            },
+            unique_id: None,
+        }])
+    }
+
+    /// An unguarded reveal-get takes the fast branch inside
+    /// `guarded_get_first_pass`: the whole handler runs (returning the
+    /// value directly), so a downstream caller (the async gated flow) can
+    /// bypass the dialog. Pin this shape so a future refactor cannot slip
+    /// an unguarded get past a `NeedsApproval` return.
+    #[test]
+    fn first_pass_unguarded_returns_direct_success_response() {
+        let s = shared();
+        assert!(
+            run_request(
+                &s,
+                None,
+                None,
+                Request::KvSet {
+                    key: "default/K".into(),
+                    source: SetSource::Static {
+                        value_b64: encode_b64(b"v"),
+                    },
+                    soft_ttl_secs: None,
+                    hard_ttl_secs: None,
+                    guard_constraints: Vec::new(),
+                },
+            )
+            .is_ok()
+        );
+        let result = guarded_get_first_pass(&s, None, None, None, None, "default/K".to_string());
+        match result {
+            GuardedGetFirstPass::Direct(Response::Ok(ok)) => match ok.payload {
+                OkPayload::Get { value_b64 } => {
+                    assert_eq!(decode_b64(&value_b64).unwrap(), b"v")
+                }
+                other => panic!("expected Get payload, got {other:?}"),
+            },
+            other => panic!("expected Direct(Ok(Get)), got a different shape: {other:?}"),
+        }
+    }
+
+    /// A guarded reveal-get whose guard evaluation *passes* returns
+    /// `NeedsApproval` (not the value). The dialog must be shown before
+    /// the get proceeds — a `Direct(Ok(Get))` here would be a silent
+    /// bypass of DR-0031's whole gate.
+    #[test]
+    fn first_pass_guarded_matching_returns_needs_approval_not_the_value() {
+        let s = shared();
+        seed_guarded_value(&s, "default/K", b"secret");
+        let result = guarded_get_first_pass(
+            &s,
+            None,
+            same_user_token(),
+            None,
+            zsh_chain(),
+            "default/K".to_string(),
+        );
+        match result {
+            GuardedGetFirstPass::NeedsApproval { guard_eval, .. } => {
+                assert_eq!(guard_eval.constraints.len(), 1);
+                assert_eq!(guard_eval.constraints[0].kind, "same-user");
+            }
+            other => panic!("expected NeedsApproval, got {other:?}"),
+        }
+    }
+
+    /// A guarded reveal-get whose guard denies returns
+    /// `Direct(AuthFailed)` — the dialog must not fire on a denial (§Security:
+    /// dialog exposure would leak that a *guard* denied vs a *policy* denied,
+    /// and would let a rejected getter make the user click cancel repeatedly).
+    #[test]
+    fn first_pass_guarded_denied_returns_direct_auth_failed_without_approver() {
+        let s = shared();
+        seed_guarded_value(&s, "default/K", b"secret");
+        let wrong_uid_token = Some(GetterAuditToken {
+            euid: 999,
+            ruid: 999,
+        });
+        let result = guarded_get_first_pass(
+            &s,
+            None,
+            wrong_uid_token,
+            None,
+            zsh_chain(),
+            "default/K".to_string(),
+        );
+        match result {
+            GuardedGetFirstPass::Direct(Response::Err(e)) => {
+                assert_eq!(e.error.kind, ErrorKind::AuthFailed);
+                assert!(e.error.message.contains("same-user"));
+            }
+            other => panic!("expected Direct(AuthFailed), got {other:?}"),
+        }
+    }
+
+    /// Missing chain on a guarded reveal-get: `MissingContext` denial —
+    /// the DR-0030 fail-closed direction.
+    #[test]
+    fn first_pass_guarded_without_chain_is_missing_context() {
+        let s = shared();
+        seed_guarded_value(&s, "default/K", b"secret");
+        let result = guarded_get_first_pass(
+            &s,
+            None,
+            same_user_token(),
+            None,
+            None,
+            "default/K".to_string(),
+        );
+        match result {
+            GuardedGetFirstPass::Direct(Response::Err(e)) => {
+                assert_eq!(e.error.kind, ErrorKind::AuthFailed);
+                assert!(e.error.message.contains("missing-context"));
+            }
+            other => panic!("expected Direct(AuthFailed missing-context), got {other:?}"),
+        }
+    }
+
+    /// The finalize-after-approval helper re-evaluates the guard record —
+    /// if it still passes, the value is returned. This is the happy-path
+    /// second pass.
+    #[test]
+    fn finalize_after_approval_returns_value_when_guard_still_passes() {
+        let s = shared();
+        seed_guarded_value(&s, "default/K", b"secret");
+        let resp = guarded_get_finalize_after_approval(
+            &s,
+            None,
+            same_user_token(),
+            None,
+            zsh_chain(),
+            "default/K".to_string(),
+        );
+        match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::Get { value_b64 } => {
+                    assert_eq!(decode_b64(&value_b64).unwrap(), b"secret")
+                }
+                other => panic!("not Get: {other:?}"),
+            },
+            other => panic!("expected Ok(Get), got {other:?}"),
+        }
+    }
+
+    /// Concurrent `kv.set` during the dialog can drop the guard entirely.
+    /// The second pass then sees no record and the entry is unguarded —
+    /// a plain get is safe.
+    #[test]
+    fn finalize_after_approval_passes_through_when_guard_disappeared() {
+        let s = shared();
+        seed_guarded_value(&s, "default/K", b"secret");
+        // Simulate the concurrent unguarded overwrite.
+        {
+            let mut store = s.store.lock().unwrap();
+            store
+                .clear_guard("default/K", &s.control_cap)
+                .expect("clear guard");
+        }
+        let resp = guarded_get_finalize_after_approval(
+            &s,
+            None,
+            None, // no token needed once guard is gone
+            None,
+            None, // no chain needed either
+            "default/K".to_string(),
+        );
+        match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::Get { value_b64 } => {
+                    assert_eq!(decode_b64(&value_b64).unwrap(), b"secret")
+                }
+                other => panic!("not Get: {other:?}"),
+            },
+            other => panic!("expected Ok(Get), got {other:?}"),
+        }
+    }
+
+    /// The most important second-pass property: a guard *changed* while
+    /// the human was deciding must fail-closed, not silently authorize a
+    /// get the newly-installed record would have denied. Simulates a
+    /// concurrent `kv.set --require-same-ancestor=...` that installs a
+    /// pin the current getter's chain does not match.
+    #[test]
+    fn finalize_after_approval_fails_closed_when_guard_changed_to_a_denying_one() {
+        let s = shared();
+        // First pass: SameUser guard the current getter would satisfy.
+        seed_guarded_value(&s, "default/K", b"secret");
+        // Simulate the concurrent record replacement.
+        {
+            let mut store = s.store.lock().unwrap();
+            let new_record = GuardRecord::new(
+                vec![GuardConstraint::SameAncestor {
+                    declared: DeclaredAncestor::Named { name: "zsh".into() },
+                    pinned: cache_warden::PinnedProcess {
+                        pid: 99, // pid NOT in the chain
+                        start_time: Some(Duration::from_secs(1)),
+                        unique_id: None,
+                        path: PathBuf::from("/bin/zsh"),
+                        name: "zsh".to_string(),
+                    },
+                }],
+                GuardSetter {
+                    euid: 501,
+                    ruid: 501,
+                },
+            );
+            store
+                .set_guard("default/K".to_string(), new_record, &s.control_cap)
+                .expect("replace record");
+        }
+        let resp = guarded_get_finalize_after_approval(
+            &s,
+            None,
+            same_user_token(),
+            None,
+            zsh_chain(),
+            "default/K".to_string(),
+        );
+        match resp {
+            Response::Err(e) => {
+                assert_eq!(e.error.kind, ErrorKind::AuthFailed);
+                assert!(e.error.message.contains("same-ancestor"));
+                assert!(e.error.message.contains("record changed"));
+            }
+            other => panic!("expected AuthFailed record-changed, got {other:?}"),
+        }
+        // Silence unused if the pin helper is not used by every case.
+        let _ = seed_guarded_value_with_ancestor_pin as fn(&Arc<Shared>, &str, &[u8]);
+    }
+
+    /// End-to-end async: guard-less `kv.get` under a daemon whose approver
+    /// is `Down` still succeeds — the §9 fallback promise that unguarded
+    /// entries stay transparent even when the helper is unavailable.
+    #[tokio::test]
+    async fn helper_down_leaves_unguarded_get_transparent() {
+        let s = shared(); // `new_down` slot by default
+        // Set an unguarded value.
+        assert!(
+            run_request(
+                &s,
+                None,
+                None,
+                Request::KvSet {
+                    key: "default/K".into(),
+                    source: SetSource::Static {
+                        value_b64: encode_b64(b"v"),
+                    },
+                    soft_ttl_secs: None,
+                    hard_ttl_secs: None,
+                    guard_constraints: Vec::new(),
+                },
+            )
+            .is_ok()
+        );
+        let resp = run_request_async(
+            &s,
+            None,
+            None,
+            None,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        )
+        .await;
+        match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::Get { value_b64 } => {
+                    assert_eq!(decode_b64(&value_b64).unwrap(), b"v")
+                }
+                other => panic!("not Get: {other:?}"),
+            },
+            other => panic!("expected Ok(Get), got {other:?}"),
+        }
+    }
+
+    /// `ApproverSlot::wait_ready` must not lose a `set_ready` that lands
+    /// **before** any waiter arms a `Notify` — the classic
+    /// register-after-signal miss. Concretely: if the slot is already
+    /// `Ready` at the moment `wait_ready` is called, it returns
+    /// `Some(_)` immediately (the state check inside the loop catches
+    /// it), and even if it fires between a hypothetical waiter's arm
+    /// and its poll the pre-registration discipline
+    /// (`notified.enable()` **before** the state check) still delivers
+    /// the wake.
+    ///
+    /// Pins the fix for the timeout-branch "missed-notification race":
+    /// without the pre-registration + timeout-side re-check, this
+    /// `set_ready`-then-`wait_ready` sequence would time out on a bounded
+    /// wait even though the slot was ready the whole time.
+    #[tokio::test]
+    async fn wait_ready_returns_immediately_when_slot_is_already_ready() {
+        let slot = ApproverSlot::new_starting();
+        slot.set_ready(Arc::new(FakeApprover::new(WireOutcomeT::Approved)));
+        // A tight bounded wait: if the state check inside `wait_ready`
+        // missed the already-set state we would hit the timeout branch
+        // and (with the fix) still re-check + return `Some`; a
+        // regression that skipped the re-check would return `None`.
+        let got = tokio::time::timeout(
+            Duration::from_millis(50),
+            slot.wait_ready(Duration::from_millis(20)),
+        )
+        .await
+        .expect("outer timeout must not fire — wait_ready should return promptly");
+        assert!(
+            got.is_some(),
+            "wait_ready must observe an already-`Ready` slot even against a bounded timeout"
+        );
+    }
+
+    /// End-to-end async: guarded reveal-get with a `Ready` approver
+    /// returning `Approved` returns the seeded value. Pins the happy
+    /// path of the dialog-outcome switch in `run_request_async`.
+    ///
+    /// macOS-only: same chain-walk dependency as
+    /// [`helper_down_fails_guarded_reveal_get_closed`].
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn approved_outcome_returns_seeded_value_end_to_end() {
+        let s = shared_with_fake_approver(WireOutcomeT::Approved);
+        seed_guarded_value_current_uid(&s, "default/K", b"secret");
+        let resp = run_request_async(
+            &s,
+            Some(std::process::id()),
+            current_uid_token(),
+            None,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        )
+        .await;
+        match resp {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::Get { value_b64 } => {
+                    assert_eq!(decode_b64(&value_b64).unwrap(), b"secret");
+                }
+                other => panic!("expected Get payload, got {other:?}"),
+            },
+            other => panic!("expected Ok(Get), got {other:?}"),
+        }
+    }
+
+    /// Every non-`Approved` outcome the helper can return (draft-DR-0031
+    /// §Outcomes) surfaces as `AuthFailed` with a message that names the
+    /// user-visible reason. Pins the outcome→message mapping in
+    /// `run_request_async` so a future refactor cannot silently collapse
+    /// `Cancelled` into `Denied` (etc.) — each outcome has a distinct
+    /// user story and the message shape is the audit trail.
+    ///
+    /// macOS-only: same chain-walk dependency as
+    /// [`helper_down_fails_guarded_reveal_get_closed`].
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn non_approved_outcomes_all_surface_as_auth_failed_with_distinct_messages() {
+        let cases: &[(WireOutcomeT, &str)] = &[
+            (WireOutcomeT::Denied, "denied"),
+            (WireOutcomeT::Cancelled, "cancelled"),
+            (WireOutcomeT::Timeout, "timed out"),
+            (WireOutcomeT::PeerGone, "exited before approval"),
+            (
+                WireOutcomeT::BiometricFailed,
+                "biometric authentication failed",
+            ),
+        ];
+        for (outcome, expected_fragment) in cases {
+            let s = shared_with_fake_approver(*outcome);
+            seed_guarded_value_current_uid(&s, "default/K", b"secret");
+            let resp = run_request_async(
+                &s,
+                Some(std::process::id()),
+                current_uid_token(),
+                None,
+                Request::KvGet {
+                    key: "default/K".into(),
+                    dry_run: false,
+                },
+            )
+            .await;
+            match resp {
+                Response::Err(e) => {
+                    assert_eq!(
+                        e.error.kind,
+                        ErrorKind::AuthFailed,
+                        "outcome {outcome:?} must map to AuthFailed"
+                    );
+                    assert!(
+                        e.error.message.contains(expected_fragment),
+                        "outcome {outcome:?} expected message to contain {expected_fragment:?}, got {:?}",
+                        e.error.message
+                    );
+                }
+                other => panic!("outcome {outcome:?} expected AuthFailed, got {other:?}"),
+            }
+        }
+    }
+
+    /// End-to-end async: guarded reveal-get whose first-pass **passes**
+    /// (real chain walk of `std::process::id()` + audit token matching the
+    /// setter's uid) but hits a `Down` approver slot → AuthFailed with the
+    /// "helper unavailable" message. This is the §9 `helper_down`
+    /// fail-closed path for guarded gets, driven end-to-end rather than
+    /// via the missing-context short-circuit (which never reaches the
+    /// approver slot at all and therefore cannot pin the helper-unavailable
+    /// message shape).
+    ///
+    /// macOS-only: the chain walk depends on `proc_pidinfo`; on Linux the
+    /// ancestry call returns `Err(Unavailable)` and first-pass would fall
+    /// through to missing-context, defeating the point of this test.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn helper_down_fails_guarded_reveal_get_closed() {
+        let s = shared(); // `approver` slot defaults to `Down`.
+        seed_guarded_value_current_uid(&s, "default/K", b"secret");
+        let resp = run_request_async(
+            &s,
+            Some(std::process::id()),
+            current_uid_token(),
+            None,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: false,
+            },
+        )
+        .await;
+        match resp {
+            Response::Err(e) => {
+                assert_eq!(e.error.kind, ErrorKind::AuthFailed);
+                assert!(
+                    e.error.message.contains("approver helper unavailable"),
+                    "expected the helper-unavailable message, got {:?}",
+                    e.error.message
+                );
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+    }
+
+    /// `dry_run: true` never triggers the dialog even on a guarded entry:
+    /// no value is returned to gate. Pins the DR-0031 §8 daemon-side
+    /// resolution (the DR itself is silent on dry-run, so this is the
+    /// place the semantics is *stated*).
+    #[tokio::test]
+    async fn dry_run_never_takes_the_gated_path() {
+        // We install a guarded value, then issue a dry-run get. The
+        // approver slot is `Down`, so if the gated path were taken this
+        // would AuthFail. The dry-run path skips gating and the sync
+        // handler denies with `missing-context` — which is fine: the
+        // point of this test is that it does *not* hit
+        // "approver helper unavailable", proving `run_request_async`
+        // never entered the async gated branch on a dry-run.
+        let s = shared();
+        seed_guarded_value(&s, "default/K", b"secret");
+        let resp = run_request_async(
+            &s,
+            None,
+            None,
+            None,
+            Request::KvGet {
+                key: "default/K".into(),
+                dry_run: true,
+            },
+        )
+        .await;
+        match resp {
+            Response::Err(e) => {
+                assert!(
+                    !e.error.message.contains("approver"),
+                    "dry_run must not reach the approver path: {}",
+                    e.error.message
+                );
+            }
+            Response::Ok(_) => {
+                // Also acceptable — a dry-run passes the (sync) guard on
+                // a chain-less denial only if the store side accepts it,
+                // which the handler does not for a guarded entry, so
+                // this branch is not expected. Fail loudly if it happens.
+                panic!("dry_run on a guarded entry with no chain should have denied");
+            }
+        }
+    }
+
+    /// While a guarded reveal-get awaits the approver dialog, unrelated
+    /// unguarded gets on the *same* daemon must proceed — the guarded
+    /// flow drops the store lock in [`guarded_get_first_pass`] before
+    /// returning `NeedsApproval`, so a multi-second human decision cannot
+    /// queue every other request on this daemon behind it. Concurrent
+    /// test: seed a guarded value the current process would satisfy, wire
+    /// a `BlockingApprover` that signals a oneshot the instant the
+    /// dialog `request` runs and then parks until released, launch the
+    /// guarded get in a task, wait deterministically for that signal (no
+    /// `sleep`-based "give it a moment"), run the unguarded get in the
+    /// main task and assert it completes, then release the approver and
+    /// verify the guarded get resolves to the approved value.
+    ///
+    /// macOS-only: same chain-walk dependency as
+    /// [`helper_down_fails_guarded_reveal_get_closed`].
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn parallel_unguarded_get_progresses_while_gated_get_awaits_dialog() {
+        use tokio::sync::oneshot;
+
+        struct BlockingApprover {
+            entered: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+            unblock: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        }
+        impl super::super::approver_wire::Approver for BlockingApprover {
+            fn request<'a>(
+                &'a self,
+                request: cache_warden_approver::wire::ApproveRequest,
+                _timeout: Duration,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = io::Result<cache_warden_approver::wire::ApproveResponse>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    if let Some(tx) = self.entered.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                    let rx = self.unblock.lock().await.take();
+                    if let Some(rx) = rx {
+                        let _ = rx.await;
+                    }
+                    Ok(cache_warden_approver::wire::ApproveResponse {
+                        v: cache_warden_approver::wire::WIRE_VERSION,
+                        request_id: request.request_id,
+                        outcome: WireOutcomeT::Approved,
+                        biometric_kind: Some("TouchID".into()),
+                    })
+                })
+            }
+            fn shutdown<'a>(
+                &'a self,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+                Box::pin(async {})
+            }
+        }
+
+        let s = shared();
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (unblock_tx, unblock_rx) = oneshot::channel::<()>();
+        s.approver.set_ready(Arc::new(BlockingApprover {
+            entered: tokio::sync::Mutex::new(Some(entered_tx)),
+            unblock: tokio::sync::Mutex::new(Some(unblock_rx)),
+        }));
+
+        // Seed one guarded value whose first-pass will pass for the
+        // current process, plus one unguarded value.
+        seed_guarded_value_current_uid(&s, "default/G", b"secret-guarded");
+        {
+            let mut store = s.store.lock().unwrap();
+            store
+                .set(
+                    "default/U".to_string(),
+                    ValueSource::Static,
+                    cache_warden::SecretBytes::new(b"secret-unguarded".to_vec()),
+                    cache_warden::Ttl::never(),
+                    &s.control_cap,
+                    &s.clock,
+                )
+                .unwrap();
+        }
+
+        // Kick off the guarded get in a task — it will pass first-pass
+        // (real chain walk of this process + matching uid token) and
+        // block inside the approver until we send `unblock`.
+        let s_g = Arc::clone(&s);
+        let guarded_handle = tokio::spawn(async move {
+            run_request_async(
+                &s_g,
+                Some(std::process::id()),
+                current_uid_token(),
+                None,
+                Request::KvGet {
+                    key: "default/G".into(),
+                    dry_run: false,
+                },
+            )
+            .await
+        });
+
+        // Wait for the approver to prove it has entered its `request` —
+        // now the guarded get is provably sitting on the dialog and the
+        // store lock is released. No `sleep`-based fallback.
+        entered_rx
+            .await
+            .expect("approver must enter `request` for the guarded get");
+
+        // The unguarded get must complete while the guarded one is still
+        // blocked on the (unreleased) approver.
+        let unguarded = run_request_async(
+            &s,
+            None,
+            None,
+            None,
+            Request::KvGet {
+                key: "default/U".into(),
+                dry_run: false,
+            },
+        )
+        .await;
+        assert!(
+            unguarded.is_ok(),
+            "unguarded get must complete while a guarded get is captive on the dialog, got {unguarded:?}"
+        );
+        assert!(
+            !guarded_handle.is_finished(),
+            "guarded get must still be pending on the blocking approver"
+        );
+
+        // Release the approver and verify the guarded get resolves to the
+        // approved value.
+        let _ = unblock_tx.send(());
+        let guarded = guarded_handle.await.expect("guarded task must not panic");
+        match guarded {
+            Response::Ok(ok) => match ok.payload {
+                OkPayload::Get { value_b64 } => {
+                    assert_eq!(decode_b64(&value_b64).unwrap(), b"secret-guarded");
+                }
+                other => panic!("expected Get payload for guarded, got {other:?}"),
+            },
+            other => panic!("expected Ok(Get) for guarded, got {other:?}"),
+        }
     }
 
     #[test]

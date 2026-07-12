@@ -132,10 +132,12 @@ pub fn spawn_helper(helper_path: &Path, socket_path: &Path) -> io::Result<Child>
 }
 
 /// Accept connections on `listener` until one passes peer code-signature
-/// verification against this process's (draft-DR-0031 §Security), and return
-/// that verified `UnixStream`. Fail-closed on any deviation: not-a-cache-
-/// warden-family Identifier, wrong Team ID, signature validity failure,
-/// cross-uid connection, missing audit token.
+/// verification against this process's (draft-DR-0031 §Security) **and** —
+/// when `expected_pid` is `Some(pid)` — matches the pid of the child the
+/// caller spawned. Return that verified `UnixStream`. Fail-closed on any
+/// deviation: not-a-cache-warden-family Identifier, wrong Team ID, signature
+/// validity failure, cross-uid connection, missing audit token, or peer pid
+/// mismatch against the spawned child.
 ///
 /// A rejected peer is logged and its stream dropped (the peer sees `EOF`),
 /// and the loop **keeps accepting**: returning an error on the first bad
@@ -144,25 +146,67 @@ pub fn spawn_helper(helper_path: &Path, socket_path: &Path) -> io::Result<Child>
 /// gives up → real helper finds the listener gone). The loop is unbounded
 /// here by design — the caller's overall connect timeout bounds it.
 ///
+/// # Why the pid match
+///
+/// Signature verification alone is not enough: a stale helper left behind by
+/// a previous daemon (same signature, same identifier prefix — every helper
+/// this daemon ever spawned is ad-hoc-equivalent for signature purposes)
+/// can race `connect()` ahead of the just-spawned successor. The daemon
+/// would then verify the orphan and record a `Child` handle whose pid does
+/// not correspond to the conversation partner — every subsequent
+/// `SIGKILL` from [`ApproverClient::shutdown`] targets the wrong process,
+/// and every prompt goes to a helper no one accounted for. Binding the
+/// accepted peer to the freshly-spawned child's pid closes that window.
+///
+/// `expected_pid = None` is a documented Test-only bypass — the in-process
+/// fake helper connected via [`Connector::Test`] has no `Child`, so there
+/// is no pid to compare against. Production callers always pass
+/// `Some(child.id())`.
+///
 /// **Non-macOS**: the underlying
 /// [`macos_process_inspect::codesign::verify_peer`] shim uniformly rejects
 /// (there is no `Security.framework` to answer the question), which is the
 /// correct fail-closed default. The daemon is macOS-only in production —
 /// this arm exists to keep the workspace's Linux CI build green.
 #[allow(dead_code)] // Phase 1.6+: wired from daemon startup once guard integration lands
-pub async fn accept_verified(listener: &UnixListener) -> io::Result<UnixStream> {
+pub async fn accept_verified(
+    listener: &UnixListener,
+    expected_pid: Option<u32>,
+) -> io::Result<UnixStream> {
     loop {
         let (stream, _addr) = listener.accept().await?;
         use std::os::unix::io::AsRawFd;
         let fd = stream.as_raw_fd();
-        match macos_process_inspect::codesign::verify_peer(fd, CACHE_WARDEN_IDENTIFIER_PREFIX) {
-            Ok(()) => return Ok(stream),
-            Err(e) => {
-                eprintln!(
-                    "cache-warden: approver: rejecting peer that failed code-signature verification (still waiting for the real helper): {e}"
-                );
+        if let Err(e) =
+            macos_process_inspect::codesign::verify_peer(fd, CACHE_WARDEN_IDENTIFIER_PREFIX)
+        {
+            eprintln!(
+                "cache-warden: approver: rejecting peer that failed code-signature verification (still waiting for the real helper): {e}"
+            );
+            continue;
+        }
+        if let Some(want) = expected_pid {
+            // Cross-check: the audited peer must be the child we just
+            // spawned, not some earlier (orphaned) helper that raced the
+            // connect. Missing audit token is treated as a rejection —
+            // same fail-closed rationale as `verify_peer` above.
+            match macos_process_inspect::peer_audit_token(fd).and_then(|t| t.pid()) {
+                Some(got) if got == want => return Ok(stream),
+                Some(got) => {
+                    eprintln!(
+                        "cache-warden: approver: rejecting peer whose pid ({got}) does not match the spawned helper ({want}) — likely a stale orphan racing the connect"
+                    );
+                    continue;
+                }
+                None => {
+                    eprintln!(
+                        "cache-warden: approver: rejecting peer whose audit token / pid could not be resolved (needed for pid-match against spawned helper {want})"
+                    );
+                    continue;
+                }
             }
         }
+        return Ok(stream);
     }
 }
 
@@ -232,7 +276,13 @@ impl Connector {
                 connect_timeout,
             } => {
                 let child = spawn_helper(helper_path, socket_path)?;
-                let accept_fut = accept_verified(listener);
+                // `Child::id()` returns `None` only after the child has
+                // already been reaped — impossible here because we hold the
+                // handle and have not called `wait`/`try_wait` yet. Fall
+                // back to `None` (skip pid match) rather than fail-closed:
+                // an unreachable-in-practice path should not deny approvals.
+                let expected_pid = child.id();
+                let accept_fut = accept_verified(listener, expected_pid);
                 let stream = match tokio::time::timeout(*connect_timeout, accept_fut).await {
                     Ok(r) => r?,
                     Err(_) => {
@@ -260,7 +310,10 @@ impl Connector {
                 let _handle = on_reconnect(socket_path.to_path_buf());
                 let accept_fut = async {
                     if *verified {
-                        accept_verified(listener).await
+                        // `Connector::Test` has no `Child` — pass `None`
+                        // to bypass the pid-match arm (documented Test-only
+                        // path; see [`accept_verified`]'s doc).
+                        accept_verified(listener, None).await
                     } else {
                         let (s, _addr) = listener.accept().await?;
                         Ok(s)
@@ -319,6 +372,18 @@ pub struct ApproverClient {
     /// die before the daemon execs itself") block on human interaction.
     /// `0` (POSIX-invalid pid) is the "no live helper" sentinel.
     helper_pid: std::sync::atomic::AtomicU32,
+    /// Latched by [`shutdown`](Self::shutdown) *before* it sends `SIGKILL`
+    /// to the helper. Checked by [`request`](Self::request) at two points:
+    /// (a) before the first exchange, so a request that races shutdown
+    /// still returns a connection-death error immediately without spawning
+    /// anything; and (b) before the recovery path's respawn, so a pending
+    /// request whose read hit EOF *because* shutdown just killed the
+    /// helper does not resurrect a fresh helper — which would defeat the
+    /// draft-DR-0031 §10 "helper must die before the daemon execs itself"
+    /// contract and captive a graceful restart on a brand-new dialog the
+    /// user never asked for. Once set, never cleared: the client is
+    /// terminally shut down.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 /// Snapshot the helper's pid off a [`HelperConn`] for
@@ -361,6 +426,7 @@ impl ApproverClient {
             }),
             socket_path,
             helper_pid,
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -382,6 +448,18 @@ impl ApproverClient {
         request: &ApproveRequest,
         timeout: Duration,
     ) -> io::Result<ApproveResponse> {
+        // Shutdown latches `closed` before it kills the helper; refuse to
+        // start a new exchange (which would sit inside `inner.lock().await`
+        // during shutdown's socket cleanup) or, later, respawn a helper
+        // whose predecessor shutdown itself just killed. See `closed`'s
+        // doc for the full rationale.
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "approver client is shut down",
+            ));
+        }
+
         let mut guard = self.inner.lock().await;
         let InnerState {
             listener,
@@ -421,6 +499,21 @@ impl ApproverClient {
             old.dispose().await;
         }
 
+        // Re-check `closed` before spending a helper spawn on a client
+        // whose owner is asking to shut down. Without this check, a
+        // dialog interrupted by shutdown (helper SIGKILLed → our read
+        // hits EOF → is_conn_death → we would respawn) would put a fresh
+        // dialog on screen exactly when the daemon is meant to be
+        // exiting, and shutdown's `inner.lock().await` would block on
+        // the resulting exchange — inverting the graceful-restart
+        // contract this whole latch exists to protect (§10).
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "approver client is shut down",
+            ));
+        }
+
         let new_conn = connector
             .spawn_and_accept(listener, &self.socket_path)
             .await?;
@@ -450,6 +543,14 @@ impl ApproverClient {
     /// (BrokenPipe / EOF), releasing the lock so this function can finish
     /// the socket-file cleanup and return.
     pub async fn shutdown(&self) {
+        // Latch `closed` *before* the SIGKILL. Any in-flight `request`
+        // whose read is about to hit EOF (because we are about to kill
+        // the helper) will observe this on the recovery path and return
+        // a connection-aborted error instead of respawning a fresh
+        // helper and putting a new dialog on screen — see `closed`'s
+        // doc + the two check-points in `request` above.
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
         let pid = self
             .helper_pid
             .swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -630,6 +731,7 @@ mod tests {
             }),
             socket_path,
             helper_pid,
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -967,7 +1069,8 @@ mod tests {
         });
 
         let still_waiting =
-            tokio::time::timeout(Duration::from_millis(500), accept_verified(&listener)).await;
+            tokio::time::timeout(Duration::from_millis(500), accept_verified(&listener, None))
+                .await;
         assert!(
             still_waiting.is_err(),
             "accept_verified must keep accepting after a rejection, not resolve"
@@ -994,5 +1097,189 @@ mod tests {
     #[allow(dead_code)]
     fn _unused_import_reference() -> Option<TokioMutex<()>> {
         None
+    }
+
+    /// draft-DR-0031 §10 shutdown-death recovery lock: a `request` whose
+    /// read hits EOF *because* `shutdown` just SIGKILLed the helper must
+    /// NOT respawn a fresh helper and put a brand-new dialog on screen —
+    /// that would invert the "helper must die before the daemon execs
+    /// itself" contract and captive `shutdown` (which then awaits
+    /// `inner.lock()` behind the new exchange). Instead, `request` must
+    /// observe the `closed` latch and return a connection-aborted error
+    /// promptly, and `shutdown` must return in bounded time.
+    ///
+    /// The test drives a fake helper that reads a request line but never
+    /// writes the response — pinning `request` on the read-line await
+    /// exactly like a real dialog waiting on the user. Then `shutdown`
+    /// fires concurrently. With the fix, both the pending `request` and
+    /// `shutdown` finish within the outer test timeout; without it, the
+    /// `request` respawns the fake and either loops forever (in this
+    /// scripted setup a second spawn will just eat another request line
+    /// silently) or wedges `shutdown` behind that respawn's own lock.
+    #[tokio::test]
+    async fn shutdown_during_pending_request_does_not_respawn_and_returns() {
+        use tokio::sync::oneshot;
+        let socket_path = test_socket_path("shutdown-race");
+
+        // Rendezvous: the fake helper signals `read_done` the moment it
+        // has consumed the daemon's request line, then parks. That lets
+        // the main task synchronise `shutdown` to the exact instant
+        // where the daemon's `request` is sitting in `read_line`
+        // awaiting a response that will never come — no `sleep`-based
+        // "give it a moment" heuristic.
+        let (read_done_tx, read_done_rx) = oneshot::channel::<()>();
+        let read_done_slot = Arc::new(std::sync::Mutex::new(Some(read_done_tx)));
+        let read_done_slot_c = Arc::clone(&read_done_slot);
+        // The initial fake-helper task's handle is captured out through
+        // this slot so the test can abort it after `shutdown` has
+        // latched `closed` — that abort is the Test-path stand-in for
+        // production's SIGKILL (which shutdown does via
+        // `helper_pid`, but only when a real `tokio::process::Child` is
+        // present; `Connector::Test` has no `Child`, so the daemon's
+        // read side needs a manual EOF trigger).
+        let fake_abort_slot: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let fake_abort_slot_c = Arc::clone(&fake_abort_slot);
+        // Track how many times the on_reconnect callback fires. Should
+        // stay at 1 (the initial spawn) — a fix-regressing respawn
+        // would tick it to 2.
+        let spawn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawn_count_c = Arc::clone(&spawn_count);
+
+        let client = Arc::new(
+            client_with_fake_helper(socket_path.clone(), move |sp: std::path::PathBuf| {
+                spawn_count_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tx_slot = read_done_slot_c
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                let handle = tokio::spawn(async move {
+                    let stream = UnixStream::connect(&sp).await.expect("fake helper connect");
+                    let (rh, _wh) = stream.into_split();
+                    let mut reader = BufReader::new(rh);
+                    let mut line = String::new();
+                    // Consume the request line, then signal + park. The
+                    // daemon side is now blocked in `read_line` awaiting
+                    // our (never-sent) response — exactly the "dialog
+                    // waiting on the human" state we need to intercept.
+                    let _ = reader.read_line(&mut line).await;
+                    if let Some(tx) = tx_slot {
+                        let _ = tx.send(());
+                    }
+                    std::future::pending::<()>().await;
+                });
+                // Record an AbortHandle for the initial helper so the
+                // main test can abort it (simulating SIGKILL) after
+                // `shutdown` has latched `closed`. A regression that
+                // re-invokes on_reconnect would overwrite this slot;
+                // the `spawn_count == 1` assertion catches that.
+                *fake_abort_slot_c.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(handle.abort_handle());
+                handle
+            })
+            .await
+            .expect("start client"),
+        );
+
+        let client_for_req = Arc::clone(&client);
+        let req_handle = tokio::spawn(async move {
+            let req = test_request("hang");
+            client_for_req.request(&req, Duration::from_secs(60)).await
+        });
+
+        // Wait for the fake helper to prove it has consumed the request
+        // line — after this the daemon side is guaranteed to be inside
+        // its `read_line` await, so latching `closed` will land in the
+        // exact race window we want to pin.
+        read_done_rx
+            .await
+            .expect("fake helper must reach the parked state");
+
+        // Kick off `shutdown` concurrently: it latches `closed` up
+        // front (that is what this test is pinning), then blocks on
+        // `inner.lock().await`, which is currently held by the pending
+        // `request`. In production, the SIGKILL step between those two
+        // makes the request's read fault out with EOF, but
+        // `Connector::Test` has no `Child` — so `shutdown`'s `pid == 0`
+        // path is a no-op and we simulate the SIGKILL below by aborting
+        // the fake helper's task, which drops its socket half and
+        // gives the daemon's read_line the same EOF.
+        let client_for_shutdown = Arc::clone(&client);
+        let shutdown_handle = tokio::spawn(async move { client_for_shutdown.shutdown().await });
+
+        // Yield so `shutdown`'s first line (the `closed` latch store)
+        // is guaranteed to run before we abort the fake helper —
+        // otherwise the recovery path might briefly not see `closed`
+        // set and respawn (which the test would then catch, but this
+        // orders the failure at the right spot).
+        tokio::task::yield_now().await;
+
+        // Test-path stand-in for SIGKILL: dropping the fake helper's
+        // task closes its socket, so the daemon's `read_line` returns
+        // EOF and the recovery path is entered.
+        if let Some(abort) = fake_abort_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            abort.abort();
+        }
+
+        let shutdown_res = tokio::time::timeout(Duration::from_secs(2), shutdown_handle).await;
+        assert!(
+            shutdown_res.is_ok(),
+            "shutdown must complete promptly even with a pending request"
+        );
+        shutdown_res.unwrap().expect("shutdown task must not panic");
+
+        // The pending request must resolve to an error (not respawn a
+        // fresh helper and start a new dialog).
+        let req_res = tokio::time::timeout(Duration::from_secs(2), req_handle)
+            .await
+            .expect("request future must complete after shutdown")
+            .expect("request task must not panic");
+        assert!(
+            req_res.is_err(),
+            "request must fail (connection-aborted / EOF) after shutdown, not \
+             silently succeed via a respawn"
+        );
+        assert_eq!(
+            spawn_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "on_reconnect must NOT fire again after shutdown latched `closed` \
+             (a respawn here would put a fresh dialog on screen during shutdown)"
+        );
+    }
+
+    /// A follow-up `request` after `shutdown` returns the same
+    /// connection-aborted error immediately, without touching the
+    /// listener or spawning anything. Pins the "terminal state" property
+    /// of the `closed` latch.
+    #[tokio::test]
+    async fn request_after_shutdown_returns_connection_aborted() {
+        let socket_path = test_socket_path("post-shutdown");
+        let make = Arc::new(|req: ApproveRequest| {
+            Some(encode_response(&ApproveResponse {
+                v: WIRE_VERSION,
+                request_id: req.request_id,
+                outcome: Outcome::Approved,
+                biometric_kind: Some("TouchID".to_string()),
+            }))
+        });
+        let make_clone = make.clone();
+        let client = client_with_fake_helper(socket_path.clone(), move |sp| {
+            spawn_scripted_helper(sp, make_clone.clone())
+        })
+        .await
+        .expect("start client");
+
+        client.shutdown().await;
+
+        let req = test_request("after-shutdown");
+        let err = client
+            .request(&req, Duration::from_secs(5))
+            .await
+            .expect_err("request after shutdown must fail");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
     }
 }
