@@ -11,6 +11,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-07-09 | design | idea | [graceful-restart-phase3-listener-fd-inheritance](./2026-07-09-graceful-restart-phase3-listener-fd-inheritance.md) | DR-0029 Phase 1 の re-bind 方式を SCM_RIGHTS の listener fd 継承にして断ゼロ化する (任意、着手条件あり)。 |
 | 2026-07-12 | task | open | [approver-release-hardening](./2026-07-12-approver-release-hardening.md) | draft-DR-0031 Phase 1.5 の opus47 セキュリティレビューで持ち越しになった硬化項目 (standalone 無効化 / main-thread dispatch / 警… |
 | 2026-07-12 | task | open | [guard-require-cwd-constraint](./2026-07-12-guard-require-cwd-constraint.md) | draft-DR-0030 guard に `--require-cwd=PATH` constraint を追加 (direnv 的区画化)。kawaz 提案 (2026-07-12): カジュアルな… |
+| 2026-07-12 | design | open | [authsock-sign-guard-dialog-decision](./2026-07-12-authsock-sign-guard-dialog-decision.md) | authsock SIGN 経路の guard 通過後 dialog を出すかの裁定 (kv-get-peer-identity-guard / custom-touchid-dialog 横断論点)。 |
 | 2026-07-10 | design | open | [migrate-to-macos-process-inspect-crate](./2026-07-10-migrate-to-macos-process-inspect-crate.md) | 既存 process inspect 実装の macos-process-inspect crate への移行 (重複解消) |
 | 2026-07-06 | bug | open | [daemon-register-help-output-oneshot](./2026-07-06-daemon-register-help-output-oneshot.md) | v0.22.3 daemon 稼働中に v0.23.0 で `daemon register` 実行、末尾に top-level help が出力され旧 daemon… |
 | 2026-06-13 | bug | open | [op-discovery-blocks-startup](./2026-06-13-op-discovery-blocks-startup.md) | `[authsock.sockets.*].keys` を持つ config で起動すると、`run()` の |
