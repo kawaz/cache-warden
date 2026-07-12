@@ -12,6 +12,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-07-12 | task | open | [approver-release-hardening](./2026-07-12-approver-release-hardening.md) | draft-DR-0031 Phase 1.5 の opus47 セキュリティレビューで持ち越しになった硬化項目 (standalone 無効化 / main-thread dispatch / 警… |
 | 2026-07-12 | task | open | [guard-require-cwd-constraint](./2026-07-12-guard-require-cwd-constraint.md) | draft-DR-0030 guard に `--require-cwd=PATH` constraint を追加 (direnv 的区画化)。kawaz 提案 (2026-07-12): カジュアルな… |
 | 2026-07-12 | task | open | [kv-set-guard-positive-ack](./2026-07-12-kv-set-guard-positive-ack.md) | DR-0030 guard の kv set positive ack (guard_applied) — mixed-version silent no-op 対策。Block 2 レビュー HIGH-1 由… |
+| 2026-07-12 | design | open | [authsock-sign-dr0030-guard-scope](./2026-07-12-authsock-sign-dr0030-guard-scope.md) | authsock SIGN 経路 (sign_with_resolved_key) は DR-0012 gate のみで DR-0030 guard を評価しない — 適用可否の裁定… |
 | 2026-07-10 | design | open | [migrate-to-macos-process-inspect-crate](./2026-07-10-migrate-to-macos-process-inspect-crate.md) | 既存 process inspect 実装の macos-process-inspect crate への移行 (重複解消) |
 | 2026-07-06 | bug | open | [daemon-register-help-output-oneshot](./2026-07-06-daemon-register-help-output-oneshot.md) | v0.22.3 daemon 稼働中に v0.23.0 で `daemon register` 実行、末尾に top-level help が出力され旧 daemon… |
 | 2026-06-13 | bug | open | [op-discovery-blocks-startup](./2026-06-13-op-discovery-blocks-startup.md) | `[authsock.sockets.*].keys` を持つ config で起動すると、`run()` の |
