@@ -1,6 +1,6 @@
 ---
 title: authsock SIGN 経路への DR-0030 guard 適用可否
-status: open
+status: resolved
 category: design
 created: 2026-07-12T16:13:53+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-12T17:13:08+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0030","implemented","done:kawaz裁定(2026-07-12)で案a(SIGN経路にevaluator挿入)確定、commit 1e17fc67で実装。sign_with_resolved_keyにDR-0012→guard→auth/retrievalの順でgate挿入(handle_getと対称)、拒否はSSH_AGENT_FAILURE空payload、素材はaccept時peer_audit_token+SIGN要求時ancestry/unique_idの1回snapshot、startup preloadはgetter不在で対象外。テスト6本(allow/deny/token欠落/chain欠落/unguarded回帰/deny副作用ゼロ)。Fableレビュー: HIGH/MEDIUMなし、commit可。"]
 blocked_by:
 origin: 自リポ TODO
 ---
