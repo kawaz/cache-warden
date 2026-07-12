@@ -115,17 +115,24 @@ cargo test --workspace   # 1210 tests green (unit のみ)
 
 ## 未検証事項・持ち越し
 
-- handler 統合 (`handle_set` の `set_guard` 呼び出し、`handle_get` への evaluator
-  挿入) — Open Q1 裁定待ち
-- config `[kv.policy] default-require-same-user`
-- draft-DR-0031 §4 の `ApproveRequest.guard_eval` wire schema との 3 点の齟齬
-  (strength 2 値ラベル / `setter_pinned` 単数性 / start_time 単位不一致) —
-  draft-DR-0030 の「Block 2 実装記録」節に詳細記載、Block 3 で処理
-- positive ack (mixed-version で guard 宣言が旧 daemon に黙って無視される問題の
-  恒久対策) — issue `2026-07-12-kv-set-guard-positive-ack` で追跡
+- handler 統合は完了 (commit `429fbd03`)
+- authsock SIGN 経路が guard を一切評価しない未規定の穴が新規 open。issue
+  `2026-07-12-authsock-sign-dr0030-guard-scope` で裁定待ち
+- `--require-cwd` と recent-input 系の constraint 拡張の議論が進行中
+- TouchID 実機 e2e (Block 3) が残る
 
 ## 検証
 
 `cargo fmt --check` / `cargo clippy --workspace --all-targets -- -D warnings` /
 `cargo test --workspace` すべて green (1210 tests)。TouchID を伴う実機 e2e は
 handler 統合後に別ブロックで実施予定。
+
+## handler 統合 (同日追記)
+
+commit `429fbd03` で handler 統合を完了。`plan_guard_record` / positive ack /
+config `[kv-policy]` / kv list 表示を実装、`cargo test --workspace` 1233 tests
+green。詳細は draft-DR-0030 の「handler 統合記録 (2026-07-12)」節を参照。
+
+ハマり所: `[kv.policy]` は TOML の `[kv.NAME]` 定義 map と衝突して startup
+エラーになるため `[kv-policy]` に改名した (fail-loud なので事故には至らないが
+DR 表記と食い違っていた)。

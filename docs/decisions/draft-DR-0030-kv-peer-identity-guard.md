@@ -130,9 +130,12 @@ cw kv set FOO BAR --require-same-ancestor=code --require-command=git
 ```
 
 ```toml
-[kv.policy]
-default-require-same-user = true   # 既定 OFF で導入 (Open Q1)
+[kv-policy]
+default-require-same-user = false   # 既定 OFF、opt-in
 ```
+
+TOML 上 `[kv.policy]` は `[kv.NAME]` 定義 map の entry "policy" として parse され
+衝突するため、top-level `[kv-policy]` とした。
 
 - constraint は set のたびに宣言し直す。**set は record の全置換**: constraint 付き
   set は record を上書きし、**constraint なしの set は既存 record を削除する**
@@ -195,11 +198,20 @@ guard を宣言できるのは v1 では `kv set` (Static 値) のみ: definitio
 1. **`default-require-same-user` を既定 ON にするか**: 安全側だが、既存ユーザの
    マルチユーザ運用 (無いはずだが) と「constraint なし set」の完全互換を破る。
    draft は既定 OFF + config opt-in を提案
+
+   **裁定済み (kawaz 2026-07-12): 既定 false (完全互換、config opt-in)**
 2. **same-shell の shell リストの置き場所**: 組み込み固定 vs config で拡張可能。
    draft は組み込み + config `[kv.policy] shell-names = [...]` 上書き可を提案
+
+   **裁定済み (draft 案どおり実装): 組み込み [zsh, bash, fish, sh, nu] +
+   `[kv-policy] shell-names` 上書き。明示 `[]` は警告つき組み込みフォールバック**
 3. **get 拒否時の将来 UX**: custom-touchid-dialog 実装後、「拒否の代わりに人間承認へ
    エスカレーション」経路を作るか。本 DR では作らない (拒否は静かに拒否) とし、
    dialog 側 DR で再訪
+
+   TOFU + remember 方式 (不一致 → TouchID エスカレーション → TTL 付き許可記憶) の
+   検討が始まっている (2026-07-12 の議論、`--on-mismatch=deny|ask` の per-key mode
+   案)。dialog DR 側で再訪
 
 ## Block 2 実装記録 (2026-07-12)
 
@@ -325,3 +337,56 @@ core/evaluator の型との間に 3 点の未解決な齟齬がある:
 - positive ack (新 CLI + 旧 daemon の mixed-version で guard 宣言が黙って
   無視されるのを、set 応答の `guard_applied` ack 必須化で塞ぐ) は issue
   `2026-07-12-kv-set-guard-positive-ack` を参照
+
+## handler 統合記録 (2026-07-12)
+
+commit `429fbd03`。評価順序は §4 どおり ① reserved namespace gate → ② DR-0012 →
+③ per-entry guard → ④ retrieval。guard 拒否は AuthFailed + constraint 種別のみを
+返し、setter identity は非開示、regenerate / 再認証 / TouchID / backoff への
+書き込みを一切トリガしない (runner が拒否時に不発火であることをテストで pin)。
+
+### set 経路
+
+`plan_guard_record` が store 変更前に record を構築する。setter の audit token
+欠落、または pin 対象不在 (chain に宣言 shell / ancestor が居ない) の場合は
+**値を格納せず拒否**する (「値あり guard なし」の中間状態を作らない)。
+`set_guard` 呼び出し自体が失敗した場合は、格納済みの値を best-effort で
+rollback する。constraint 宣言が空の set は `clear_guard` (§5 の全置換意味論
+通り)。same-shell 展開は chain の先頭 (setter) から launchd 方向へ辿って
+最も近い shell を選ぶ (= 最も部分木の小さい選択)。
+
+### positive ack
+
+set 応答に `guard_applied` (additive フィールド) を追加した。guard 宣言に
+対して ack が付かない旧 daemon を検出した場合、CLI 側は残留した値を
+best-effort で自動削除してエラーにする (issue
+`2026-07-12-kv-set-guard-positive-ack` は resolved で archive 済み)。
+
+### kv list / status
+
+guard の有無 + 種別を value-free で表示する。strong 系 constraint を先に
+並べる順序 (strong-first)、`command=` constraint には weak marker を付ける。
+
+### セキュリティレビュー (Fable) 指摘と反映
+
+- **HIGH**: 新 CLI (guard 宣言込みの set) を旧 daemon に送ると、guard 抜きで
+  値だけが無防備に残留する。positive ack を検出して自動 del + 警告文で対処
+- **MEDIUM**: `set_guard` 失敗時の rollback が欠如していた。値の best-effort
+  rollback を実装
+- **MEDIUM**: authsock 経由の SIGN 経路が guard を一切評価しない未規定の穴が
+  ある。本 DR §4 は `handle_get` のみを規定しており、authsock SIGN 経路は
+  scope 外のまま。issue `2026-07-12-authsock-sign-dr0030-guard-scope` で
+  裁定待ち、v1 の既知の限界として明示する
+- **LOW** (4 件): コメントと実装の乖離、`clear_guard` エラーの握りつぶし、
+  `shell-names = []` の silent 挙動、`[kv.policy]` 表記の残留。すべて反映済み
+
+### 検証
+
+`cargo fmt` / `cargo clippy -- -D warnings` / `cargo test --workspace` 1233
+tests green (0 failed)。TouchID 実機 e2e は Block 3 に残る。
+
+### 残 TODO (Block 3)
+
+- authsock SIGN 経路の guard scope 裁定
+- mixed-version (新 CLI × 旧 daemon) の実発火検証
+- dialog 接続 (§6、`guard_eval` を `ApproveRequest` に載せる配線)
