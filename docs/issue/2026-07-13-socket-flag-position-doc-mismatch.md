@@ -57,11 +57,29 @@ reject される。(2026-07-13 実機コード確認済み: 上記行番号・�
 
 ## 受け入れ条件
 
-- [ ] 修正方針を (a) か (b) のいずれかで決定する
+- [ ] 修正方針を (a) / (b) / (c) のいずれかで決定する
   - (a) `main.rs` の command dispatch より前に `--socket` を tail 全体から
         (位置に関わらず) strip する — グローバル option を先頭に置ける方が
-        慣習的で `take_socket_flag` の doc 記述とも一致するため、UX 上はこちらが正解
+        慣習的で `take_socket_flag` の doc 記述とも一致する。暫定対応として
+        実施しても良いが、本命は (c)
   - (b) doc / help 文言を実装に合わせ「サブコマンドの後にのみ置ける」と訂正する
+  - (c) clap 等のまともな CLI パーサに置き換える (kawaz 提案 2026-07-13、推奨)。
+        現行の手書き dispatch (main.rs の args[0]/tail 二分 + 各 dispatch_* の
+        while ループ + 独自 help renderer + 手書き completion) は本 issue の
+        根本原因で、同種の doc/impl 乖離 (グローバル option の順序・複数指定
+        可否・`kv set` の `--require-*` との相互作用・`--help` 出力の網羅性) が
+        今後も出続ける。clap (derive) 導入で: グローバル option 定義がどこに
+        でも書ける (subcommand の前後不問)、`--help` 生成が定義から自動、
+        completion (bash/zsh/fish/powershell) が自動生成、`--` セパレータ /
+        bool フラグ / repeat フラグ の慣習実装が組み込みになる。CLAUDE 常時
+        rule `cli-design-preferences` の要件 (サブコマンドネスト / `--help`
+        セクション分け / ロングオプション基本 / `--no-xxx` 反転 / `--` セパ
+        レータ / 補完) を確認しつつ、clap 4 が全要件を満たすか比較検証してから
+        採用判断すること。既存 CLI 使い方 (`kv set --require-*`、
+        `daemon register --label` 等) を破壊しない形での段階移行が必要
+        (トップレベル → daemon → kv の順で移す等)。作業量は数百行の削除 +
+        clap 定義の再構築で大きいが、テストが 1963 件揃っているので回帰
+        リスクは制御可能
 - [ ] `cache-warden --socket PATH kv get FOO` (先頭指定) と
       `cache-warden kv --socket PATH get FOO` (サブコマンド後指定) が
       同一に動作する (または doc 通りサブコマンド後のみ動作する) ことを確認
