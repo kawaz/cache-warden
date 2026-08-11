@@ -5,9 +5,9 @@
 # 各レベル --help を正本に手書き。ロングオプションのみ。
 #
 # 設計メモ:
-#   - `--socket PATH` はトップの「コマンド名」より後ならどこでも有効
-#     (main.rs: take_socket_flag が tail 全域を走査)。なので各サブコマンドの
-#     _arguments に共通で混ぜる。リーディングの --socket は不可。
+#   - `--socket PATH` はコマンド名より前を含めどこでも有効
+#     (main.rs: take_socket_flag が argv 全域を走査)。なのでトップと各サブ
+#     コマンドの _arguments に共通で混ぜる。
 #   - `--help` / `--version` はトップではリーディング時のみ意味を持つが、
 #     深い階層では各レベルで効くため広めに許可する。
 #   - KEY は daemon の `kv list` を叩いて動的補完。daemon 不達なら静かに候補なし。
@@ -50,7 +50,7 @@ _cache-warden() {
   local context state state_descr line
   typeset -A opt_args
 
-  # 共通 --socket オプション (コマンド名の後ならどこでも有効)。
+  # 共通 --socket オプション (コマンド名の前後を問わずどこでも有効)。
   local socket_opt='--socket[Control socket path]:socket:_files'
 
   # 共通 --namespace オプション (kv 全動詞 / run / inject; DR-0017)。

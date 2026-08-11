@@ -69,37 +69,21 @@ pub fn run(args: &[String]) -> Result<(), String> {
         })
 }
 
-/// Parse `<ITEM_ID> [--account ACCOUNT]` (hand-rolled, DR-0002: no clap).
+/// Parse `<ITEM_ID> [--account ACCOUNT]` (grammar in [`crate::cli`]).
 ///
-/// The item id is the sole positional; `--account` takes the next token. Unknown
-/// flags or a missing item id / account value are errors.
+/// The item id is the sole positional; `--account` may precede or follow it.
+/// Unknown flags or a missing item id / account value are errors.
 fn parse_args(args: &[String]) -> Result<(String, Option<String>), String> {
-    let mut item_id: Option<String> = None;
-    let mut account: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--account" => {
-                let v = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--account requires a value".to_string())?;
-                account = Some(v.clone());
-                i += 2;
-            }
-            flag if flag.starts_with("--") => {
-                return Err(format!("unknown flag for op private key fetch: {flag}"));
-            }
-            positional => {
-                if item_id.is_some() {
-                    return Err(format!("unexpected extra argument: {positional}"));
-                }
-                item_id = Some(positional.to_string());
-                i += 1;
-            }
-        }
-    }
-    let item_id = item_id.ok_or_else(|| "missing item id".to_string())?;
-    Ok((item_id, account))
+    let cmd = crate::cli::op_private_key();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "op private key fetch", e))?;
+    let item_id = m
+        .get_one::<String>("ITEM_ID")
+        .cloned()
+        .ok_or("missing item id")?;
+    Ok((item_id, m.get_one::<String>("account").cloned()))
 }
 
 #[cfg(test)]

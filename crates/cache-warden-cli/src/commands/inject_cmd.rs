@@ -30,49 +30,21 @@ pub struct InjectArgs {
 /// Parse `inject`'s flags into [`InjectArgs`]. The mode flags (`--dry-run` /
 /// `--reveal`) and `--socket` are removed by the caller before this runs.
 pub fn parse_inject(args: &[String]) -> Result<InjectArgs, String> {
-    let mut out = InjectArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--in" => {
-                let v = args.get(i + 1).ok_or("--in requires a FILE argument")?;
-                out.in_file = Some(PathBuf::from(v));
-                i += 2;
-            }
-            s if s.starts_with("--in=") => {
-                out.in_file = Some(PathBuf::from(s.strip_prefix("--in=").unwrap()));
-                i += 1;
-            }
-            "--out" => {
-                let v = args.get(i + 1).ok_or("--out requires a FILE argument")?;
-                out.out_file = Some(PathBuf::from(v));
-                i += 2;
-            }
-            s if s.starts_with("--out=") => {
-                out.out_file = Some(PathBuf::from(s.strip_prefix("--out=").unwrap()));
-                i += 1;
-            }
-            "--defs" => {
-                let v = args.get(i + 1).ok_or("--defs requires a FILE argument")?;
-                out.defs.push(PathBuf::from(v));
-                i += 2;
-            }
-            s if s.starts_with("--defs=") => {
-                out.defs
-                    .push(PathBuf::from(s.strip_prefix("--defs=").unwrap()));
-                i += 1;
-            }
-            s if s.starts_with("--") => {
-                return Err(format!("unknown option for `inject`: {s}"));
-            }
-            other => {
-                return Err(format!(
-                    "`inject` takes no positional arguments (got {other:?})"
-                ));
-            }
-        }
-    }
-    Ok(out)
+    let cmd = crate::cli::inject_cmd();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "inject", e))?;
+    Ok(InjectArgs {
+        in_file: m.get_one::<String>("in").map(PathBuf::from),
+        out_file: m.get_one::<String>("out").map(PathBuf::from),
+        defs: m
+            .get_many::<String>("defs")
+            .into_iter()
+            .flatten()
+            .map(PathBuf::from)
+            .collect(),
+    })
 }
 
 /// Render a template's references into output bytes (pure, testable).

@@ -32,6 +32,15 @@ base64 = "0.22"
 # TOML configuration file parsing (DR-0010). Kept on the CLI side only; the
 # library stays dependency-minimal (DR-0002).
 toml = "0.8"
+# Argument grammar for every CLI level. Default features are off: the help text
+# is rendered by `help.rs` (the section layout the CLI contract pins), so clap
+# supplies parsing only — no color, no suggestion engine, no wrap_help.
+clap = { version = "4.5", default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
 # Peer credential lookup (LOCAL_PEERPID / SO_PEERCRED) on the control socket.
 libc = "0.2"
 # TOTP derivation for the OTP value type (DR-0016): RFC 4226/6238 HMAC-OTP.

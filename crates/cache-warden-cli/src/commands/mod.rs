@@ -1,8 +1,9 @@
 //! CLI subcommands: the daemon group (`daemon run`) and the management client
 //! (`kv`, `status`, `ping`).
 //!
-//! Argument parsing is hand-rolled (DR-0002 keeps the dependency surface small;
-//! no clap). The parse step is a pure function ([`parse_kv_set`] etc. and the
+//! The accepted grammar of each command is declared once in [`crate::cli`]
+//! (clap); the functions here apply it and turn the result into a protocol
+//! request. Every parse step is a pure function ([`parse_kv_set`] etc. and the
 //! socket resolver) so it can be unit-tested without touching a socket.
 
 pub mod client;
@@ -159,6 +160,12 @@ pub fn default_socket_path() -> PathBuf {
 /// explicitly-requested socket path (if the flag was given) and the remaining
 /// args with the flag removed.
 ///
+/// The dispatcher applies this to the **whole** argv before routing, which is
+/// what makes the flag position-independent: it may lead (`--socket P kv get K`),
+/// sit between the group and the verb (`kv --socket P get K`), or trail the
+/// arguments (`kv get K --socket P`). Scanning stops at a `--` separator, where
+/// a `--socket` is positional data rather than this flag.
+///
 /// Returning `Option` (rather than eagerly falling back to the default) lets the
 /// caller apply the full precedence chain — CLI `--socket` > `[daemon].socket`
 /// in config > the built-in default (DR-0010). See [`resolve_socket`].
@@ -275,6 +282,104 @@ pub fn reject_reserved_read_namespace(ns: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Read a duration-valued flag (`--soft-ttl` / `--hard-ttl` / ...) as seconds.
+fn duration_secs(m: &clap::ArgMatches, id: &str) -> Result<Option<u64>, String> {
+    match m.get_one::<String>(id) {
+        None => Ok(None),
+        Some(v) => Ok(Some(
+            parse_duration(v).map_err(|e| e.to_string())?.as_secs(),
+        )),
+    }
+}
+
+/// Refuse a flag-shaped NAME given to `--require-same-ancestor` /
+/// `--require-command` in the **space-separated** form.
+///
+/// Those NAMEs accept hyphen values (a `--require-command=--verbose` is a
+/// legitimate, deliberate inline value), so `--require-command --soft-ttl 30m`
+/// would otherwise pin a constraint on the literal name `--soft-ttl` and drop
+/// the intended TTL flag on the floor. The inline `=NAME` form is exempt: an
+/// inline `=--foo` was written on purpose.
+fn reject_flag_shaped_require_name(head: &[String]) -> Result<(), String> {
+    for (i, tok) in head.iter().enumerate() {
+        let name = tok.as_str();
+        if name != "--require-same-ancestor" && name != "--require-command" {
+            continue;
+        }
+        if let Some(v) = head.get(i + 1).filter(|v| v.starts_with("--")) {
+            return Err(format!(
+                "{name} NAME must not start with `--` \
+                 (looks like a forgotten argument; got {v:?}). \
+                 Use `{name}=NAME` to force an inline value if this was intentional"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Collect the DR-0030 `--require-*` declarations in the order they appear on
+/// the command line.
+///
+/// The wire order is meaningful (the daemon's evaluator logs fail-order
+/// deterministically) and the four flags are separate grammar entries, so the
+/// interleaving has to be recovered rather than read off per-flag groups.
+///
+/// Design rationale: the order comes from walking `head` (the argv before any
+/// `--`) and classifying each token's flag family, not from clap's
+/// `ArgMatches::indices_of`. clap 4 records occurrence indices only for args
+/// that take a value: a flag-only arg reports just its *last* occurrence under
+/// `ArgAction::Count` (measured: `--require-same-user --require-command g
+/// --require-same-user` yields index 4 for the boolean against 3 for the
+/// valued flag, which sorts the pair backwards), reports nothing at all under
+/// `Append` + `num_args(0)`, and rejects the repeat outright under `SetTrue`.
+/// The values themselves still come from clap, so both the `=NAME` and the
+/// space-separated forms keep their single point of truth; this pass only
+/// establishes sequence.
+fn guard_constraints_in_argv_order(
+    head: &[String],
+    m: &clap::ArgMatches,
+) -> Result<Vec<GuardConstraintWire>, String> {
+    // Each family's values in occurrence order; consumed in step with the
+    // tokens of that family as the walk encounters them.
+    let mut ancestors = m
+        .get_many::<String>("require-same-ancestor")
+        .into_iter()
+        .flatten();
+    let mut commands = m
+        .get_many::<String>("require-command")
+        .into_iter()
+        .flatten();
+
+    let mut ordered: Vec<GuardConstraintWire> = Vec::new();
+    for tok in head {
+        // An `=NAME` form carries its value in the same token; a
+        // space-separated NAME is a following token that matches no flag name
+        // (a flag-shaped NAME is refused by `reject_flag_shaped_require_name`).
+        let name = tok.split('=').next().unwrap_or(tok);
+        let next_value = |values: &mut dyn Iterator<Item = &String>| -> Result<String, String> {
+            let v = values
+                .next()
+                .ok_or_else(|| format!("{name} requires a NAME argument"))?;
+            if v.is_empty() {
+                return Err(format!("{name} NAME must not be empty"));
+            }
+            Ok(v.clone())
+        };
+        ordered.push(match name {
+            "--require-same-user" => GuardConstraintWire::SameUser,
+            "--require-same-shell" => GuardConstraintWire::SameShell,
+            "--require-same-ancestor" => GuardConstraintWire::SameAncestor {
+                name: next_value(&mut ancestors)?,
+            },
+            "--require-command" => GuardConstraintWire::Command {
+                name: next_value(&mut commands)?,
+            },
+            _ => continue,
+        });
+    }
+    Ok(ordered)
+}
+
 /// Parse the arguments to `kv set ...` into a [`Request::KvSet`].
 ///
 /// Grammar:
@@ -298,158 +403,55 @@ pub fn parse_kv_set(
     stdin_is_tty: bool,
     stdin: impl FnOnce() -> std::io::Result<Vec<u8>>,
 ) -> Result<Request, String> {
-    let (head, tail) = split_double_dash(args);
+    let (head, _tail) = split_double_dash(args);
+    let cmd = crate::cli::kv_set();
+    // Two checks the grammar itself cannot express, both scoped to the option
+    // head (after a `--` every token is positional by contract):
+    reject_flag_shaped_require_name(head)?;
+    crate::cli::reject_unknown_long_options(&cmd, head, "kv set")?;
 
-    let mut positional: Vec<String> = Vec::new();
-    let mut soft_ttl_secs: Option<u64> = None;
-    let mut hard_ttl_secs: Option<u64> = None;
-    // DR-0030: --require-* flags accumulate declared guard constraints. Order
-    // of appearance is preserved on the wire so the daemon's evaluator can
-    // log fail-order deterministically.
-    let mut guard_constraints: Vec<GuardConstraintWire> = Vec::new();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "kv set", e))?;
 
-    // Helper: consume a `--flag VAL` or `--flag=VAL` pair and return the
-    // value. Reused by every `--require-*=NAME` flag below.
-    //
-    // In the space-separated form (`--require-same-ancestor NAME`), a NAME
-    // starting with `--` is refused: it is almost certainly a forgotten
-    // argument, and swallowing the next flag as the ancestor name silently
-    // pins a nonsense constraint (chain will never contain "--soft-ttl")
-    // and drops the intended flag on the floor. The `--flag=VAL` form is
-    // exempt from that check — an inline `=--foo` was written deliberately.
-    fn take_arg_value(
-        head: &[String],
-        idx: usize,
-        inline: Option<&str>,
-        name: &str,
-    ) -> Result<(String, usize), String> {
-        match inline {
-            Some(v) => Ok((v.to_string(), 1)),
-            None => {
-                let v = head
-                    .get(idx + 1)
-                    .cloned()
-                    .ok_or_else(|| format!("{name} requires a NAME argument"))?;
-                if v.starts_with("--") {
-                    return Err(format!(
-                        "{name} NAME must not start with `--` \
-                         (looks like a forgotten argument; got {v:?}). \
-                         Use `{name}=NAME` to force an inline value if this was intentional"
-                    ));
-                }
-                Ok((v, 2))
-            }
+    // Retired grammar: answer with the replacement rather than "unknown option"
+    // (the flags stay declared in the grammar purely to reach these steers).
+    if m.contains_id("value") || m.get_flag("value-stdin") {
+        let flag = if m.get_flag("value-stdin") {
+            "--value-stdin"
+        } else {
+            "--value"
+        };
+        return Err(format!(
+            "`{flag}` was removed: the value is positional now. Use \
+             `kv set KEY VALUE`, or omit VALUE and pipe the bytes on stdin \
+             (`... | kv set KEY`)"
+        ));
+    }
+    if m.contains_id("command") {
+        return Err(
+            "`--command` was removed from `kv set`; use `kv define KEY --command ...`".to_string(),
+        );
+    }
+    for flag in ["type", "otp-digits", "otp-period", "otp-algorithm"] {
+        if m.contains_id(flag) {
+            return Err(format!(
+                "`--{flag}` is not valid on `kv set`; value types (otp) live on \
+                 definitions. Register it with `kv define KEY --type otp ...` instead"
+            ));
         }
     }
 
-    let mut i = 0;
-    while i < head.len() {
-        match head[i].as_str() {
-            "--soft-ttl" => {
-                let v = head.get(i + 1).ok_or("--soft-ttl requires an argument")?;
-                soft_ttl_secs = Some(parse_duration(v).map_err(|e| e.to_string())?.as_secs());
-                i += 2;
-            }
-            s if s.starts_with("--soft-ttl=") => {
-                soft_ttl_secs = Some(
-                    parse_duration(s.strip_prefix("--soft-ttl=").unwrap())
-                        .map_err(|e| e.to_string())?
-                        .as_secs(),
-                );
-                i += 1;
-            }
-            "--hard-ttl" => {
-                let v = head.get(i + 1).ok_or("--hard-ttl requires an argument")?;
-                hard_ttl_secs = Some(parse_duration(v).map_err(|e| e.to_string())?.as_secs());
-                i += 2;
-            }
-            s if s.starts_with("--hard-ttl=") => {
-                hard_ttl_secs = Some(
-                    parse_duration(s.strip_prefix("--hard-ttl=").unwrap())
-                        .map_err(|e| e.to_string())?
-                        .as_secs(),
-                );
-                i += 1;
-            }
-            s if s == "--value" || s == "--value-stdin" || s.starts_with("--value=") => {
-                return Err(format!(
-                    "`{}` was removed: the value is positional now. Use \
-                     `kv set KEY VALUE`, or omit VALUE and pipe the bytes on stdin \
-                     (`... | kv set KEY`)",
-                    s.split('=').next().unwrap_or(s)
-                ));
-            }
-            "--command" => {
-                return Err(
-                    "`--command` was removed from `kv set`; use `kv define KEY --command ...`"
-                        .to_string(),
-                );
-            }
-            "--type" | "--otp-digits" | "--otp-period" | "--otp-algorithm" => {
-                return Err(format!(
-                    "`{}` is not valid on `kv set`; value types (otp) live on \
-                     definitions. Register it with `kv define KEY --type otp ...` instead",
-                    head[i]
-                ));
-            }
-            s if s.starts_with("--type=")
-                || s.starts_with("--otp-digits=")
-                || s.starts_with("--otp-period=")
-                || s.starts_with("--otp-algorithm=") =>
-            {
-                let flag = s.split('=').next().unwrap_or(s);
-                return Err(format!(
-                    "`{flag}` is not valid on `kv set`; value types (otp) live on \
-                     definitions. Register it with `kv define KEY --type otp ...` instead"
-                ));
-            }
-            // DR-0030 guard flags. `--require-same-user` and
-            // `--require-same-shell` are booleans; `--require-same-ancestor` /
-            // `--require-command` take a NAME and may be repeated (each
-            // occurrence adds one constraint to the wire).
-            "--require-same-user" => {
-                guard_constraints.push(GuardConstraintWire::SameUser);
-                i += 1;
-            }
-            "--require-same-shell" => {
-                guard_constraints.push(GuardConstraintWire::SameShell);
-                i += 1;
-            }
-            s if s == "--require-same-ancestor" || s.starts_with("--require-same-ancestor=") => {
-                let inline = s.strip_prefix("--require-same-ancestor=");
-                let (name, advance) = take_arg_value(head, i, inline, "--require-same-ancestor")?;
-                if name.is_empty() {
-                    return Err("--require-same-ancestor NAME must not be empty".to_string());
-                }
-                guard_constraints.push(GuardConstraintWire::SameAncestor { name });
-                i += advance;
-            }
-            s if s == "--require-command" || s.starts_with("--require-command=") => {
-                let inline = s.strip_prefix("--require-command=");
-                let (name, advance) = take_arg_value(head, i, inline, "--require-command")?;
-                if name.is_empty() {
-                    return Err("--require-command NAME must not be empty".to_string());
-                }
-                guard_constraints.push(GuardConstraintWire::Command { name });
-                i += advance;
-            }
-            s if s.starts_with("--") => {
-                return Err(format!("unknown option for `kv set`: {s}"));
-            }
-            other => {
-                positional.push(other.to_string());
-                i += 1;
-            }
-        }
-    }
-    positional.extend(tail.iter().cloned());
+    let soft_ttl_secs = duration_secs(&m, "soft-ttl")?;
+    let hard_ttl_secs = duration_secs(&m, "hard-ttl")?;
+    let guard_constraints = guard_constraints_in_argv_order(head, &m)?;
 
-    let mut it = positional.into_iter();
-    let key = it.next().ok_or("kv set requires a KEY")?;
-    let value = it.next();
-    if let Some(extra) = it.next() {
-        return Err(format!("unexpected argument: {extra}"));
-    }
+    let key = m
+        .get_one::<String>("KEY")
+        .cloned()
+        .ok_or("kv set requires a KEY")?;
+    let value = m.get_one::<String>("VALUE").cloned();
     validate_cli_key(&key, "set")?;
     reject_reserved_write_namespace(ns, "set")?;
 
@@ -515,62 +517,22 @@ pub fn parse_source_uri(uri: &str) -> Result<crate::protocol::wire::OpSpecWire, 
     }
 }
 
-/// The extracted command flags: `(cwd, env overlay, remaining args)`.
-type CommandFlags = (
-    Option<String>,
-    std::collections::BTreeMap<String, String>,
-    Vec<String>,
-);
-
-/// Extract the `--command-cwd PATH` and repeatable `--command-env NAME=VALUE`
-/// prefix-grouping flags from `args` (DR-0018 §1), returning `(cwd, env, rest)`
-/// with those flags removed.
-///
-/// These configure the `command` source and must precede `--command` (which
-/// consumes the rest of the line as the literal argv). They are extracted from
-/// the option head only, so a literal `--command-env` inside the command argv is
-/// never consumed (same handling as `--otp-*`; see [`take_otp_flags`]).
-pub fn take_command_flags(args: &[String]) -> Result<CommandFlags, String> {
-    let mut cwd: Option<String> = None;
-    let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    let mut rest = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "--command-cwd" || a.starts_with("--command-cwd=") {
-            let inline = a.strip_prefix("--command-cwd=");
-            let v = match inline {
-                Some(v) => v.to_string(),
-                None => args
-                    .get(i + 1)
-                    .cloned()
-                    .ok_or("--command-cwd requires a PATH argument")?,
-            };
-            cwd = Some(v);
-            i += if inline.is_some() { 1 } else { 2 };
-        } else if a == "--command-env" || a.starts_with("--command-env=") {
-            let inline = a.strip_prefix("--command-env=");
-            let v = match inline {
-                Some(v) => v.to_string(),
-                None => args
-                    .get(i + 1)
-                    .cloned()
-                    .ok_or("--command-env requires a NAME=VALUE argument")?,
-            };
-            let (name, value) = v
-                .split_once('=')
-                .ok_or_else(|| format!("--command-env must be NAME=VALUE (got {v:?})"))?;
-            if name.is_empty() {
-                return Err(format!("--command-env name must not be empty (got {v:?})"));
-            }
-            env.insert(name.to_string(), value.to_string());
-            i += if inline.is_some() { 1 } else { 2 };
-        } else {
-            rest.push(a.clone());
-            i += 1;
+/// Split the repeatable `--command-env NAME=VALUE` values into an env overlay
+/// (DR-0018 §1).
+fn command_env_overlay(
+    m: &clap::ArgMatches,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut env = std::collections::BTreeMap::new();
+    for v in m.get_many::<String>("command-env").into_iter().flatten() {
+        let (name, value) = v
+            .split_once('=')
+            .ok_or_else(|| format!("--command-env must be NAME=VALUE (got {v:?})"))?;
+        if name.is_empty() {
+            return Err(format!("--command-env name must not be empty (got {v:?})"));
         }
+        env.insert(name.to_string(), value.to_string());
     }
-    Ok((cwd, env, rest))
+    Ok(env)
 }
 
 /// Parse the arguments to `kv define <KEY> ...` into a [`Request::KvDefine`].
@@ -616,84 +578,37 @@ pub fn parse_kv_define(args: &[String], ns: &str) -> Result<Request, String> {
     // Pull the value-type flags from the option head only (never from the
     // command argv or the positionals after `--`).
     let (meta, head_rest) = take_otp_flags(head)?;
-    // Pull the command cwd/env prefix-grouping flags from the head too (they
-    // configure the `command` source and must precede the consume-the-rest
-    // `--command`). A literal `--command-env` in the argv tail is untouched.
-    let (command_cwd, command_env, head_rest) = take_command_flags(&head_rest)?;
-    // Reassemble: the stripped head, then the untouched `--command ...` tail.
+    // Reassemble for the grammar: the stripped head, then the untouched
+    // `--command ...` tail (or the positionals after a leading `--`).
     let mut reassembled: Vec<String> = head_rest;
     reassembled.extend_from_slice(cmd_tail);
-    let args = reassembled.as_slice();
-
-    let mut positional: Vec<String> = Vec::new();
-    let mut command: Option<Vec<String>> = None;
-    let mut source: Option<crate::protocol::wire::OpSpecWire> = None;
-    let mut soft_ttl_secs: Option<u64> = None;
-    let mut hard_ttl_secs: Option<u64> = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--command" => {
-                // Everything after --command is the argv (consumes the rest).
-                let argv: Vec<String> = args[i + 1..].to_vec();
-                if argv.is_empty() {
-                    return Err("--command requires at least a program".to_string());
-                }
-                command = Some(argv);
-                i = args.len();
-            }
-            "--source" => {
-                let v = args.get(i + 1).ok_or("--source requires a URI argument")?;
-                source = Some(parse_source_uri(v)?);
-                i += 2;
-            }
-            s if s.starts_with("--source=") => {
-                source = Some(parse_source_uri(s.strip_prefix("--source=").unwrap())?);
-                i += 1;
-            }
-            "--soft-ttl" => {
-                let v = args.get(i + 1).ok_or("--soft-ttl requires an argument")?;
-                soft_ttl_secs = Some(parse_duration(v).map_err(|e| e.to_string())?.as_secs());
-                i += 2;
-            }
-            s if s.starts_with("--soft-ttl=") => {
-                soft_ttl_secs = Some(
-                    parse_duration(s.strip_prefix("--soft-ttl=").unwrap())
-                        .map_err(|e| e.to_string())?
-                        .as_secs(),
-                );
-                i += 1;
-            }
-            "--hard-ttl" => {
-                let v = args.get(i + 1).ok_or("--hard-ttl requires an argument")?;
-                hard_ttl_secs = Some(parse_duration(v).map_err(|e| e.to_string())?.as_secs());
-                i += 2;
-            }
-            s if s.starts_with("--hard-ttl=") => {
-                hard_ttl_secs = Some(
-                    parse_duration(s.strip_prefix("--hard-ttl=").unwrap())
-                        .map_err(|e| e.to_string())?
-                        .as_secs(),
-                );
-                i += 1;
-            }
-            s if s.starts_with("--") => {
-                return Err(format!("unknown option for `kv define`: {s}"));
-            }
-            other => {
-                positional.push(other.to_string());
-                i += 1;
-            }
-        }
+    if !positional_tail.is_empty() {
+        reassembled.push("--".to_string());
+        reassembled.extend_from_slice(positional_tail);
     }
-    positional.extend(positional_tail.iter().cloned());
 
-    let mut it = positional.into_iter();
-    let key = it.next().ok_or("kv define requires a KEY")?;
-    if let Some(extra) = it.next() {
-        return Err(format!("unexpected argument: {extra}"));
-    }
+    let cmd = crate::cli::kv_define();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(&reassembled)
+        .map_err(|e| crate::cli::parse_error(&cmd, "kv define", e))?;
+
+    let command: Option<Vec<String>> = m
+        .get_many::<String>("command")
+        .map(|v| v.cloned().collect());
+    let source = match m.get_one::<String>("source") {
+        Some(uri) => Some(parse_source_uri(uri)?),
+        None => None,
+    };
+    let soft_ttl_secs = duration_secs(&m, "soft-ttl")?;
+    let hard_ttl_secs = duration_secs(&m, "hard-ttl")?;
+    let command_cwd = m.get_one::<String>("command-cwd").cloned();
+    let command_env = command_env_overlay(&m)?;
+
+    let key = m
+        .get_one::<String>("KEY")
+        .cloned()
+        .ok_or("kv define requires a KEY")?;
     validate_cli_key(&key, "define")?;
     reject_reserved_write_namespace(ns, "define")?;
 
@@ -795,55 +710,42 @@ pub fn parse_kv_define_plan(args: &[String], ns: &str) -> Result<DefinePlan, Str
         return parse_kv_define(args, ns).map(DefinePlan::Single);
     }
 
-    // Batch mode takes no positionals at all, so a `--` separator (whose only
-    // purpose is to introduce positionals) is rejected like a positional KEY.
-    let (args, tail) = split_double_dash(args);
-    if let Some(first) = tail.first() {
+    // Batch mode shares the `kv define` grammar; what differs is which of its
+    // arguments are *allowed*. A positional KEY, `--command` and `--source` all
+    // belong to the single-definition mode, so each is refused here with a
+    // "pick one mode" steer rather than half-applying the command.
+    let cmd = crate::cli::kv_define();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "kv define --defs", e))?;
+
+    if let Some(key) = m.get_one::<String>("KEY") {
         return Err(format!(
-            "`kv define --defs FILE` takes no positional KEY (got {first:?}); \
+            "`kv define --defs FILE` takes no positional KEY (got {key:?}); \
              the keys come from the file(s)"
         ));
     }
-
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--defs" => {
-                let v = args.get(i + 1).ok_or("--defs requires a FILE argument")?;
-                files.push(PathBuf::from(v));
-                i += 2;
-            }
-            s if s.starts_with("--defs=") => {
-                files.push(PathBuf::from(s.strip_prefix("--defs=").unwrap()));
-                i += 1;
-            }
-            "--command" | "--source" => {
-                return Err(
-                    "`kv define --defs FILE` registers a whole file at once; it cannot be \
-                     combined with --command / --source (use one or the other)"
-                        .to_string(),
-                );
-            }
-            s if s.starts_with("--source=") => {
-                return Err(
-                    "`kv define --defs FILE` cannot be combined with --source (use one or \
-                     the other)"
-                        .to_string(),
-                );
-            }
-            s if s.starts_with("--") => {
-                return Err(format!("unknown option for `kv define --defs`: {s}"));
-            }
-            other => {
-                return Err(format!(
-                    "`kv define --defs FILE` takes no positional KEY (got {other:?}); \
-                     the keys come from the file(s)"
-                ));
-            }
-        }
+    if m.contains_id("command") {
+        return Err(
+            "`kv define --defs FILE` registers a whole file at once; it cannot be \
+             combined with --command / --source (use one or the other)"
+                .to_string(),
+        );
+    }
+    if m.contains_id("source") {
+        return Err(
+            "`kv define --defs FILE` cannot be combined with --source (use one or the other)"
+                .to_string(),
+        );
     }
 
+    let files: Vec<PathBuf> = m
+        .get_many::<String>("defs")
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .collect();
     if files.is_empty() {
         return Err("--defs requires a FILE argument".to_string());
     }
@@ -855,21 +757,25 @@ pub fn parse_kv_define_plan(args: &[String], ns: &str) -> Result<DefinePlan, Str
 /// `ns` is the already-resolved namespace (DR-0017 §4); the request key is the
 /// composed `NS/KEY`.
 pub fn parse_kv_single_key(verb: &str, args: &[String], ns: &str) -> Result<Request, String> {
-    let (head, tail) = split_double_dash(args);
-    if let Some(bad) = head.iter().find(|a| a.starts_with("--")) {
-        return Err(format!("unknown option for `kv {verb}`: {bad}"));
-    }
-    let positional: Vec<&String> = head.iter().chain(tail.iter()).collect();
-    if positional.len() != 1 {
-        return Err(format!("kv {verb} requires exactly one KEY"));
-    }
-    validate_cli_key(positional[0], verb)?;
+    let cmd = match verb {
+        "get" => crate::cli::kv_get(),
+        "unpin" => crate::cli::kv_unpin(),
+        other => return Err(format!("unknown kv subcommand: {other}")),
+    };
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, &format!("kv {verb}"), e))?;
+    let key = m
+        .get_one::<String>("KEY")
+        .ok_or_else(|| format!("kv {verb} requires exactly one KEY"))?;
+    validate_cli_key(key, verb)?;
     // `get` is confidentiality-gated on the reserved namespace (DR-0018 §4.5);
     // `unpin` is a lifecycle verb that reveals no value, so it is not gated.
     if verb == "get" {
         reject_reserved_read_namespace(ns)?;
     }
-    let key = crate::namespace::compose(ns, positional[0]);
+    let key = crate::namespace::compose(ns, key);
     match verb {
         "get" => Ok(Request::KvGet {
             key,
@@ -885,29 +791,18 @@ pub fn parse_kv_single_key(verb: &str, args: &[String], ns: &str) -> Result<Requ
 /// `ns` is the already-resolved namespace (DR-0017 §4); the request key is the
 /// composed `NS/KEY`.
 pub fn parse_kv_del(args: &[String], ns: &str) -> Result<Request, String> {
-    let (head, tail) = split_double_dash(args);
-    let mut positional: Vec<String> = Vec::new();
-    let mut with_define = false;
-    for a in head {
-        match a.as_str() {
-            "--with-define" => with_define = true,
-            s if s.starts_with("--") => {
-                return Err(format!("unknown option for `kv del`: {s}"));
-            }
-            other => positional.push(other.to_string()),
-        }
-    }
-    positional.extend(tail.iter().cloned());
-
-    let mut it = positional.into_iter();
-    let key = it.next().ok_or("kv del requires exactly one KEY")?;
-    if let Some(extra) = it.next() {
-        return Err(format!("unexpected argument: {extra}"));
-    }
-    validate_cli_key(&key, "del")?;
+    let cmd = crate::cli::kv_del();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "kv del", e))?;
+    let key = m
+        .get_one::<String>("KEY")
+        .ok_or("kv del requires exactly one KEY")?;
+    validate_cli_key(key, "del")?;
     Ok(Request::KvDel {
-        key: crate::namespace::compose(ns, &key),
-        with_define,
+        key: crate::namespace::compose(ns, key),
+        with_define: m.get_count("with-define") > 0,
     })
 }
 
@@ -916,22 +811,19 @@ pub fn parse_kv_del(args: &[String], ns: &str) -> Result<Request, String> {
 /// `DURATION` uses the same grammar as the TTL flags (`1h` / `30m` / `45s` /
 /// bare seconds); it is the time from now until the pin lapses.
 pub fn parse_kv_pin(args: &[String], ns: &str) -> Result<Request, String> {
-    let (head, tail) = split_double_dash(args);
-    if let Some(bad) = head.iter().find(|a| a.starts_with("--")) {
-        return Err(format!("unknown option for `kv pin`: {bad}"));
-    }
-    let positional: Vec<&String> = head.iter().chain(tail.iter()).collect();
-    if positional.len() != 2 {
-        return Err(
-            "kv pin requires exactly a KEY and a DURATION (e.g. `kv pin DB 8h`)".to_string(),
-        );
-    }
-    validate_cli_key(positional[0], "pin")?;
-    let key = crate::namespace::compose(ns, positional[0]);
-    let duration_secs = parse_duration(positional[1])
-        .map_err(|e| e.to_string())?
-        .as_secs();
-    Ok(Request::KvPin { key, duration_secs })
+    let cmd = crate::cli::kv_pin();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "kv pin", e))?;
+    let missing = || "kv pin requires exactly a KEY and a DURATION (e.g. `kv pin DB 8h`)";
+    let key = m.get_one::<String>("KEY").ok_or_else(missing)?;
+    let dur = m.get_one::<String>("DUR").ok_or_else(missing)?;
+    validate_cli_key(key, "pin")?;
+    Ok(Request::KvPin {
+        key: crate::namespace::compose(ns, key),
+        duration_secs: parse_duration(dur).map_err(|e| e.to_string())?.as_secs(),
+    })
 }
 
 /// Render a successful kv-get response by writing the decoded value to stdout.
@@ -1218,6 +1110,40 @@ mod tests {
             Request::KvSet {
                 guard_constraints, ..
             } => assert_eq!(guard_constraints, expected),
+            _ => panic!("expected KvSet"),
+        }
+    }
+
+    /// A repeated boolean guard flag must not drag its family's position to
+    /// the last occurrence: `--require-same-user --require-command g
+    /// --require-same-user` declares same-user *first*, and the duplicate
+    /// collapses into that first slot (DR-0030 fail-order determinism).
+    #[test]
+    fn kv_set_require_flag_repeat_keeps_first_occurrence_order() {
+        let req = parse_kv_set(
+            &s(&[
+                "--require-same-user",
+                "--require-command",
+                "g",
+                "--require-same-user",
+                "K",
+                "v",
+            ]),
+            "default",
+            false,
+            no_stdin,
+        )
+        .unwrap();
+        match req {
+            Request::KvSet {
+                guard_constraints, ..
+            } => assert_eq!(
+                guard_constraints,
+                vec![
+                    GuardConstraintWire::SameUser,
+                    GuardConstraintWire::Command { name: "g".into() },
+                ]
+            ),
             _ => panic!("expected KvSet"),
         }
     }

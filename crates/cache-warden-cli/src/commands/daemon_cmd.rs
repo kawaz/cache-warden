@@ -32,10 +32,17 @@ use crate::config::Config;
 /// daemon needs to bind, preload, and serve. Subcommand routing and help/usage
 /// handling live in the dispatcher (`main.rs`); this function is the leaf action.
 pub fn run_foreground(args: &[String], socket: PathBuf, config: Config) -> Result<(), String> {
-    if !args.is_empty() {
-        return Err(format!(
-            "`daemon run` takes no positional arguments: {args:?}"
-        ));
+    let cmd = crate::cli::daemon_run();
+    if let Err(e) = cmd.clone().try_get_matches_from(args) {
+        let msg = crate::cli::parse_error(&cmd, "daemon run", e);
+        // A stray positional keeps its own wording: the daemon takes its
+        // settings from the config file and the global socket flag, so there is
+        // no argument the operator could have meant here.
+        return Err(if msg.starts_with("unexpected argument") {
+            format!("`daemon run` takes no positional arguments: {args:?}")
+        } else {
+            msg
+        });
     }
     // Block the shutdown signals (SIGINT / SIGTERM) on this thread *before* the
     // runtime spawns its worker threads, so every worker — and the dedicated
@@ -106,19 +113,14 @@ pub struct RestartArgs {
 /// nothing or picking an arbitrary default, a bare `daemon restart` is a
 /// usage error naming the flag explicitly required today.
 pub fn parse_restart_args(args: &[String]) -> Result<RestartArgs, String> {
-    let mut out = RestartArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--graceful" => {
-                out.graceful = true;
-                i += 1;
-            }
-            other => {
-                return Err(format!("unknown option for `daemon restart`: {other}"));
-            }
-        }
-    }
+    let cmd = crate::cli::daemon_restart();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "daemon restart", e))?;
+    let out = RestartArgs {
+        graceful: m.get_count("graceful") > 0,
+    };
     if !out.graceful {
         return Err(
             "`daemon restart` requires `--graceful` (the only restart mode implemented so far; \
@@ -192,41 +194,17 @@ pub struct RegisterArgs {
 /// belt-and-suspenders fallback. The register-time socket is baked verbatim into
 /// the service start command (DR-0019 §2: explicit beats the resolved default).
 pub fn parse_register_args(args: &[String]) -> Result<RegisterArgs, String> {
-    let mut out = RegisterArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "--socket" {
-            let v = args.get(i + 1).ok_or("--socket requires a PATH argument")?;
-            out.socket = Some(v.clone());
-            i += 2;
-        } else if let Some(v) = a.strip_prefix("--socket=") {
-            out.socket = Some(v.to_string());
-            i += 1;
-        } else if a == "--label" {
-            let v = args.get(i + 1).ok_or("--label requires a NAME argument")?;
-            out.label = Some(v.clone());
-            i += 2;
-        } else if let Some(v) = a.strip_prefix("--label=") {
-            out.label = Some(v.to_string());
-            i += 1;
-        } else if a == "--print" {
-            out.print = true;
-            i += 1;
-        } else if a == "--executable" {
-            let v = args
-                .get(i + 1)
-                .ok_or("--executable requires a PATH argument")?;
-            out.executable = Some(v.clone());
-            i += 2;
-        } else if let Some(v) = a.strip_prefix("--executable=") {
-            out.executable = Some(v.to_string());
-            i += 1;
-        } else {
-            return Err(format!("unknown option for `daemon register`: {a}"));
-        }
-    }
-    Ok(out)
+    let cmd = crate::cli::daemon_register();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "daemon register", e))?;
+    Ok(RegisterArgs {
+        socket: m.get_one::<String>("socket").cloned(),
+        label: m.get_one::<String>("label").cloned(),
+        print: m.get_count("print") > 0,
+        executable: m.get_one::<String>("executable").cloned(),
+    })
 }
 
 /// Parsed flags for `daemon unregister` (DR-0019 §1).
@@ -238,22 +216,14 @@ pub struct UnregisterArgs {
 
 /// Parse `daemon unregister` flags (DR-0019 §1): `[--label NAME]`.
 pub fn parse_unregister_args(args: &[String]) -> Result<UnregisterArgs, String> {
-    let mut out = UnregisterArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "--label" {
-            let v = args.get(i + 1).ok_or("--label requires a NAME argument")?;
-            out.label = Some(v.clone());
-            i += 2;
-        } else if let Some(v) = a.strip_prefix("--label=") {
-            out.label = Some(v.to_string());
-            i += 1;
-        } else {
-            return Err(format!("unknown option for `daemon unregister`: {a}"));
-        }
-    }
-    Ok(out)
+    let cmd = crate::cli::daemon_unregister();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "daemon unregister", e))?;
+    Ok(UnregisterArgs {
+        label: m.get_one::<String>("label").cloned(),
+    })
 }
 
 /// The outcome of resolving the binary path to bake into the service definition

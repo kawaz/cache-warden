@@ -1,13 +1,15 @@
 //! cache-warden CLI: the daemon group (`daemon run`) and its management client.
 //!
-//! Hand-rolled argument dispatch (no clap; DR-0002 keeps dependencies small).
-//! `daemon run` starts the in-process daemon (DR-0008); the other subcommands
-//! are one-shot control-socket clients (see [`commands::client`]).
+//! Command routing lives here; the argument grammar of each level lives in
+//! [`cli`] (clap) and its help text in [`help`]. `daemon run` starts the
+//! in-process daemon (DR-0008); the other subcommands are one-shot
+//! control-socket clients (see [`commands::client`]).
 
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::process;
 
+mod cli;
 mod commands;
 mod config;
 mod daemon;
@@ -267,6 +269,31 @@ fn run() -> Result<(), CliError> {
         return Ok(());
     }
 
+    // Hidden internal subcommands, dispatched on the raw argv before anything
+    // else: the daemon re-executes its own binary with these (an op item's
+    // private-key PEM fetch; the `internal` helper group, e.g. `fda-check` for
+    // TCC authorization probing). They need neither config nor a socket, and
+    // their own arguments must reach them untouched. Never shown in help.
+    if args[0] == cache_warden_authsock::OP_PRIVATE_KEY_SUBCOMMAND {
+        return commands::op_private_key::run(&args[1..]).map_err(CliError::Message);
+    }
+    if args[0] == "internal" {
+        let code = dispatch_internal(&args[1..]);
+        if code != 0 {
+            process::exit(code);
+        }
+        return Ok(());
+    }
+
+    // Resolve the global `--socket` from the *whole* argv, so it may lead
+    // (`cache-warden --socket P kv get K`) as well as follow the command
+    // (`cache-warden kv get K --socket P`). None means "not on the CLI".
+    let (cli_socket, args) = commands::take_socket_flag(&args)?;
+    if args.is_empty() {
+        println!("{}", help::top().render());
+        return Ok(());
+    }
+
     // Top-level --version takes precedence (a bare `--version` is not "help").
     if args[0] == "--version" {
         println!("{NAME} {VERSION}");
@@ -279,29 +306,7 @@ fn run() -> Result<(), CliError> {
     }
 
     let command = args[0].clone();
-    let tail = &args[1..];
-
-    // Hidden internal subcommand: the daemon re-executes its own binary with
-    // this to fetch an op item's private-key PEM (it calls op with --format json
-    // and prints the extracted `.value`). Dispatched before config loading and
-    // socket resolution, which it does not need. Never shown in help.
-    if command == cache_warden_authsock::OP_PRIVATE_KEY_SUBCOMMAND {
-        return commands::op_private_key::run(tail).map_err(CliError::Message);
-    }
-
-    // Hidden `internal` subcommand group: subprocess helpers invoked by the
-    // daemon itself (e.g. `fda-check` for TCC authorization probing).
-    // Dispatched before config loading. Never shown in help.
-    if command == "internal" {
-        let code = dispatch_internal(tail);
-        if code != 0 {
-            process::exit(code);
-        }
-        return Ok(());
-    }
-
-    // Resolve --socket (anywhere in the tail) once; None means "not on the CLI".
-    let (cli_socket, rest) = commands::take_socket_flag(tail)?;
+    let rest: Vec<String> = args[1..].to_vec();
 
     // Load the config (or defaults) up front: every command needs the resolved
     // socket, and `daemon run` / `config` need the rest of it (DR-0010).
@@ -494,17 +499,12 @@ fn dispatch_status(
     let ns =
         namespace::resolve_namespace(ns_flag, namespace::env_namespace(), config.cli_namespace())
             .map_err(CliError::Message)?;
-    let mut all = false;
-    for a in &rest {
-        match a.as_str() {
-            "--all" => all = true,
-            other => {
-                return Err(CliError::Message(format!(
-                    "unknown argument for `status`: {other}"
-                )));
-            }
-        }
-    }
+    let cmd = cli::status();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(&rest)
+        .map_err(|e| CliError::Message(cli::parse_error(&cmd, "status", e)))?;
+    let all = m.get_count("all") > 0;
 
     let resp = client::round_trip(socket, &protocol::wire::Request::Status)?;
     let resp = match resp {
@@ -643,18 +643,16 @@ fn dispatch_kv_list(
     socket: &std::path::Path,
     ns: &str,
 ) -> Result<(), CliError> {
-    let mut all = false;
-    for a in kv_args {
-        match a.as_str() {
-            "--all" => all = true,
-            other => {
-                return Err(CliError::Usage {
-                    msg: format!("unknown argument for `kv list`: {other}"),
-                    help: help::kv_list,
-                });
-            }
+    let cmd = cli::kv_list();
+    let all = match cmd.clone().try_get_matches_from(kv_args) {
+        Ok(m) => m.get_count("all") > 0,
+        Err(e) => {
+            return Err(CliError::Usage {
+                msg: cli::parse_error(&cmd, "kv list", e),
+                help: help::kv_list,
+            });
         }
-    }
+    };
     let resp = client::round_trip(socket, &protocol::wire::Request::KvList)?;
     match resp {
         Response::Ok(ok) => match ok.payload {

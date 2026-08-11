@@ -1,7 +1,8 @@
 //! Internal subcommands: invoked by the daemon itself for subprocess helpers.
 //!
 //! These are not shown in the top-level help and are not intended for direct
-//! user invocation. The arg parser is hand-rolled (DR-0002).
+//! user invocation. Their grammar lives in [`crate::cli`] like every other
+//! level; only the usage text is local (a one-screen block, not a help page).
 
 use macos_tcc::{AuthState, Permission, check};
 
@@ -23,39 +24,25 @@ Flags:
 /// Writes the result to `--result-file` and prints it to stdout when `--raw`
 /// is set. Both flags are required.
 pub fn fda_check(args: &[String]) -> Result<(), String> {
-    let mut raw = false;
-    let mut result_file: Option<String> = None;
-    let mut i = 0;
+    let cmd = crate::cli::internal_fda_check();
+    let m = cmd.clone().try_get_matches_from(args).map_err(|e| {
+        format!(
+            "{}\n{}",
+            crate::cli::parse_error(&cmd, "internal fda-check", e),
+            usage()
+        )
+    })?;
 
-    while i < args.len() {
-        let a = &args[i];
-        if a == "--help" {
-            print!("{}", usage());
-            return Ok(());
-        } else if a == "--raw" {
-            raw = true;
-            i += 1;
-        } else if a == "--result-file" {
-            let v = args
-                .get(i + 1)
-                .ok_or("--result-file requires a PATH argument")?;
-            result_file = Some(v.clone());
-            i += 2;
-        } else if let Some(v) = a.strip_prefix("--result-file=") {
-            result_file = Some(v.to_string());
-            i += 1;
-        } else {
-            return Err(format!(
-                "unknown option for `internal fda-check`: {a}\n{}",
-                usage()
-            ));
-        }
+    if m.get_count("help") > 0 {
+        print!("{}", usage());
+        return Ok(());
     }
-
-    if !raw {
+    if m.get_count("raw") == 0 {
         return Err(format!("--raw is required\n{}", usage()));
     }
-    let path = result_file.ok_or_else(|| format!("--result-file is required\n{}", usage()))?;
+    let path = m
+        .get_one::<String>("result-file")
+        .ok_or_else(|| format!("--result-file is required\n{}", usage()))?;
 
     let state = check(Permission::FullDiskAccess);
     let result_str = if state == AuthState::Granted {
@@ -64,7 +51,7 @@ pub fn fda_check(args: &[String]) -> Result<(), String> {
         "fail\n"
     };
 
-    std::fs::write(&path, result_str).map_err(|e| e.to_string())?;
+    std::fs::write(path, result_str).map_err(|e| e.to_string())?;
     println!("{}", result_str.trim());
 
     Ok(())

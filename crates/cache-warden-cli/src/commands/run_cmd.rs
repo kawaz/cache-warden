@@ -34,57 +34,50 @@ pub struct RunArgs {
 /// may legitimately receive its own `--flags`). A missing `--` or an empty
 /// command is a usage error.
 pub fn parse_run(args: &[String]) -> Result<RunArgs, String> {
+    let cmd = crate::cli::run_cmd();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| diagnose(&cmd, args, e))?;
+
     let mut out = RunArgs::default();
-    let mut i = 0;
-    let mut saw_sep = false;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--" => {
-                out.command = args[i + 1..].to_vec();
-                saw_sep = true;
-                break;
-            }
-            "--env" => {
-                let v = args
-                    .get(i + 1)
-                    .ok_or("--env requires a NAME=VALUE argument")?;
-                out.envs.push(parse_env_assignment(v)?);
-                i += 2;
-            }
-            s if s.starts_with("--env=") => {
-                out.envs
-                    .push(parse_env_assignment(s.strip_prefix("--env=").unwrap())?);
-                i += 1;
-            }
-            "--defs" => {
-                let v = args.get(i + 1).ok_or("--defs requires a FILE argument")?;
-                out.defs.push(PathBuf::from(v));
-                i += 2;
-            }
-            s if s.starts_with("--defs=") => {
-                out.defs
-                    .push(PathBuf::from(s.strip_prefix("--defs=").unwrap()));
-                i += 1;
-            }
-            s if s.starts_with("--") => {
-                return Err(format!("unknown option for `run`: {s}"));
-            }
-            other => {
-                return Err(format!(
-                    "`run` requires `-- CMD [ARGS...]`; unexpected argument {other:?} before `--`"
-                ));
-            }
-        }
+    for v in m.get_many::<String>("env").into_iter().flatten() {
+        out.envs.push(parse_env_assignment(v)?);
     }
-    if !saw_sep {
-        return Err(
-            "`run` requires a `--` separator before the command (run ... -- CMD)".to_string(),
-        );
-    }
+    out.defs = m
+        .get_many::<String>("defs")
+        .into_iter()
+        .flatten()
+        .map(PathBuf::from)
+        .collect();
+    out.command = m
+        .get_many::<String>("CMD")
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+
     if out.command.is_empty() {
         return Err("`run` requires a command after `--` (run ... -- CMD [ARGS...])".to_string());
     }
     Ok(out)
+}
+
+/// Explain a `run` grammar failure, distinguishing a missing `--` separator
+/// from an ordinary bad flag.
+///
+/// The command argv is reachable only after `--` (`Arg::last`), so a *stray
+/// positional* with no separator present means the separator is the real cause —
+/// clap can only report the token it tripped over. A mistyped option (`--dfes`)
+/// is a different mistake and must keep naming the offending flag: blaming the
+/// separator there would hide the typo the operator needs to see.
+fn diagnose(cmd: &clap::Command, args: &[String], e: clap::Error) -> String {
+    let msg = crate::cli::parse_error(cmd, "run", e);
+    let stray_positional = msg.starts_with("unexpected argument");
+    if stray_positional && !args.iter().any(|a| a == "--") {
+        return "`run` requires a `--` separator before the command (run ... -- CMD)".to_string();
+    }
+    msg
 }
 
 /// Split one `NAME=VALUE` string. `NAME` must be non-empty and contain no `=`.
@@ -242,6 +235,26 @@ mod tests {
         assert!(parse_run(&s(&["echo"])).is_err()); // no `--`
         assert!(parse_run(&s(&["--"])).is_err()); // empty command
         assert!(parse_run(&s(&["--env", "A=b"])).is_err()); // no `--`
+    }
+
+    /// A mistyped option keeps its own diagnosis: the missing-separator
+    /// explanation must not swallow a typo the operator needs to see.
+    #[test]
+    fn parse_run_typo_flag_is_reported_as_unknown_option() {
+        let err = parse_run(&s(&["--dfes", "f", "--", "true"])).unwrap_err();
+        assert!(err.contains("--dfes"), "names the mistyped flag: {err}");
+        assert!(
+            !err.contains("`--` separator"),
+            "must not blame the separator: {err}"
+        );
+
+        // Same typo without a separator: still the flag, not the separator.
+        let err = parse_run(&s(&["--dfes", "f"])).unwrap_err();
+        assert!(err.contains("--dfes"), "names the mistyped flag: {err}");
+
+        // A stray positional with no separator *is* the separator's fault.
+        let err = parse_run(&s(&["echo"])).unwrap_err();
+        assert!(err.contains("`--` separator"), "{err}");
     }
 
     #[test]
