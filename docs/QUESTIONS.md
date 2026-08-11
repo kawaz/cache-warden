@@ -24,4 +24,15 @@
 
 ## 確認待ち
 
-(なし)
+### 👺CLP-C1: v0.27.0 (clap 化) 後の日常コマンド体感確認
+
+brew 0.27.0 への upgrade + 本番 daemon graceful restart は release 成功時に自動実行済みの想定
+(未実行なら先に `just on-success-release`)。普段の操作が従来どおり動くかの体感確認:
+
+- [ ] a: 普段使いの `cache-warden kv get <KEY>` / `status` がいつも通り動く
+- [ ] b: `cache-warden --socket <PATH> kv list` のように **--socket をコマンド名より前**に置いても効く (今回の新機能)
+- [ ] c: `cache-warden --help` / `cache-warden kv --help` の表示に違和感がない (セクション構成・情報量)
+- [ ] d: zsh 補完がいつも通り効く (サブコマンド・オプション・KEY 動的補完)
+- [ ] e: SSH (authsock 経由の鍵利用) がいつも通り動く
+
+違和感があった項目は自由文でメモしてもらえれば issue 化します。全部 OK ならチェックだけで十分。
