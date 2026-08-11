@@ -3,7 +3,7 @@ title: cache-warden 独自 TouchID 認証 dialog 実装
 status: open
 category: design
 created: 2026-06-22T21:20:33+09:00
-last_read:
+last_read: 2026-08-11T21:54:11+09:00
 open_entered: 2026-07-10T03:10:45+09:00
 wip_entered:
 blocked_entered: 2026-07-04T09:33:55+09:00
