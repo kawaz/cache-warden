@@ -1,11 +1,11 @@
 ---
 title: approver helper の release 硬化 (standalone 無効化 / main-thread dispatch / 警告ログ規約)
-status: open
+status: wip
 category: task
 created: 2026-07-12T01:14:46+09:00
 last_read: 2026-08-11T23:47:58+09:00
 open_entered: 2026-07-12T01:14:46+09:00
-wip_entered:
+wip_entered: 2026-08-11T23:52:45+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -95,6 +95,13 @@ draft-DR-0031 (custom TouchID dialog) の Phase 1.5 で opus47 によるセキ�
 ## TODO
 
 <!-- wip 時のみ -->
+
+- 着手中 (2026-08-11): 5 (dialog countdown) / 6 (キュー有界化: 全体
+  timeout + depth 上限、coalesce は後続) / 1 (standalone release 無効化) /
+  2 (main-thread dispatch) / 3 (prefix 統一) / 4 (診断分離 + `kSecCSStrictValidate`
+  調査) に worker 着手
+- Block 3b Item 2 実機で wedge / キュー積みの実サンプル取得済み:
+  `docs/journal/2026-08-11-block-3b-item2-sign-e2e.md`
 
 ## 関連
 
