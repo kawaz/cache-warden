@@ -56,12 +56,19 @@ pub struct ApproveRequest {
     /// optional for the ungated future case).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_eval: Option<GuardEval>,
-    /// Upper bound, in seconds, on how long the daemon will wait for
-    /// [`ApproveResponse`] before giving up on this request. Carried on the
-    /// wire for the helper's own future use (a Phase 2 in-dialog countdown);
-    /// Phase 1.4 enforcement is entirely daemon-side
-    /// (`cache-warden-cli::daemon::approver::exchange`'s
-    /// `tokio::time::timeout`), the helper does not run its own timer yet.
+    /// Upper bound, in seconds, on how long the user has to answer this
+    /// request.
+    ///
+    /// Enforced on both sides, for different reasons: the daemon bounds its
+    /// own wait (`cache-warden-cli::daemon::approver`'s `tokio::time::timeout`)
+    /// so a caller is never pinned indefinitely, and the helper runs the same
+    /// deadline as a dialog countdown so an abandoned dialog closes itself
+    /// (`Outcome::Timeout`) instead of blocking the next approval — the helper
+    /// serializes dialogs, so one unanswered prompt would otherwise stall all
+    /// of them. The daemon's own limit is deliberately the looser of the two,
+    /// leaving room for the helper's timeout response to arrive.
+    ///
+    /// `0` means "no helper-side countdown".
     pub timeout_secs: u32,
 }
 

@@ -17,21 +17,23 @@
 //!   `WillTerminate` observer」は常駐化では使えない (terminate すると 2 件目
 //!   以降の request が来ても helper が居ない) ため置き換え
 //! - `LAContext.evaluatePolicy` の completion block 内で outcome を確定して
-//!   dialog を閉じる。**Phase 1.5 の残課題「completion block の main-thread
-//!   明示 dispatch」は本 Phase では対応しない** (別 issue で管理) — completion
-//!   block が呼ばれるスレッドは実測 main が多いが公式保証なしという既知条件
-//!   のまま
+//!   dialog を閉じる。completion block が呼ばれるスレッドは Apple の契約に
+//!   無いので、AppKit 操作 (window.close()) は必ず `dispatch_main` 経由で
+//!   main queue に投げ直す
+//! - `ApproveRequest.timeout_secs` を helper 自身の countdown として消費する
+//!   (`arm_dialog_timeout`): 期限までに人間が答えなければ dialog を自分で
+//!   閉じて `Outcome::Timeout` を返し、次の request に進む。放置 dialog が
+//!   後続 request を無期限に塞ぐ可用性 DoS の根治
 //! - daemon が接続を切ったら (read が 0 バイト EOF) helper 側も terminate
 //!   (§7 の逆方向: daemon が居ないのに常駐しない)
+//! - `--socket` 無しの standalone dialog (dev 単独起動) は **debug build
+//!   限定**。release build は同一 uid の攻撃者が hardcoded サマリで TouchID
+//!   prompt を出せる経路を持たないよう起動を拒否する
 //!
 //! # 意図的な非スコープ (後続 Phase)
 //!
-//! - `LAContext.evaluatePolicy` completion block を明示 dispatch_main する
-//!   hardening (Phase 1.5 残課題 `2026-07-12-approver-release-hardening`)
 //! - Requester icon / チップ / 詳細展開 UI (Phase 2)
 //! - kqueue で peer_gone 検知 (Phase 2)
-//! - `timeout_secs` の helper 内タイマー (Phase 2、現状は daemon 側 timeout
-//!   のみ)
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
@@ -42,6 +44,8 @@ mod approver {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
+    /// `register_focus_steal_on_launch` (debug-only standalone path) 専用。
+    #[cfg(debug_assertions)]
     use std::ptr::NonNull;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -49,15 +53,16 @@ mod approver {
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool, NSObject, NSObjectProtocol, ProtocolObject};
     use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, sel};
+    #[cfg(debug_assertions)]
+    use objc2_app_kit::NSApplicationDidFinishLaunchingNotification;
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSApplicationDidFinishLaunchingNotification,
-        NSBackingStoreType, NSButton, NSControlSize, NSFloatingWindowLevel, NSStackView,
-        NSStackViewDistribution, NSTextField, NSUserInterfaceLayoutOrientation, NSWindow,
-        NSWindowDelegate, NSWindowStyleMask,
+        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSControlSize,
+        NSFloatingWindowLevel, NSStackView, NSStackViewDistribution, NSTextField,
+        NSUserInterfaceLayoutOrientation, NSWindow, NSWindowDelegate, NSWindowStyleMask,
     };
-    use objc2_foundation::{
-        NSError, NSNotification, NSNotificationCenter, NSPoint, NSRect, NSSize, NSString,
-    };
+    #[cfg(debug_assertions)]
+    use objc2_foundation::NSNotificationCenter;
+    use objc2_foundation::{NSError, NSNotification, NSPoint, NSRect, NSSize, NSString};
     use objc2_local_authentication::{LAContext, LAPolicy};
     use objc2_local_authentication_embedded_ui::LAAuthenticationView;
 
@@ -78,6 +83,34 @@ mod approver {
             context: *mut c_void,
             work: unsafe extern "C" fn(*mut c_void),
         );
+        /// `dispatch_time_t dispatch_time(dispatch_time_t when, int64_t delta)`
+        /// — `when = DISPATCH_TIME_NOW (0)` makes `delta` (nanoseconds) an
+        /// offset from now.
+        fn dispatch_time(when: u64, delta: i64) -> u64;
+        fn dispatch_after_f(
+            when: u64,
+            queue: *mut c_void,
+            context: *mut c_void,
+            work: unsafe extern "C" fn(*mut c_void),
+        );
+    }
+
+    /// `DISPATCH_TIME_NOW` (`dispatch/time.h`).
+    const DISPATCH_TIME_NOW: u64 = 0;
+
+    /// Box a `FnOnce` into the thin `*mut c_void` + trampoline pair libdispatch
+    /// can carry. See [`dispatch_main`]'s comment for why the two-level `Box`
+    /// is required.
+    fn into_dispatch_context<F: FnOnce() + Send + 'static>(
+        f: F,
+    ) -> (*mut c_void, unsafe extern "C" fn(*mut c_void)) {
+        let boxed: Box<Box<dyn FnOnce() + Send + 'static>> = Box::new(Box::new(f));
+        unsafe extern "C" fn trampoline(ctx: *mut c_void) {
+            let boxed: Box<Box<dyn FnOnce() + Send + 'static>> =
+                unsafe { Box::from_raw(ctx as *mut Box<dyn FnOnce() + Send + 'static>) };
+            (*boxed)();
+        }
+        (Box::into_raw(boxed) as *mut c_void, trampoline)
     }
 
     /// 任意の `FnOnce` を libdispatch の main queue で実行する。`Send` を要求
@@ -88,15 +121,29 @@ mod approver {
         // `Box<Box<dyn FnOnce>>` の 2 段 Box は「thin pointer で受け渡す」ため。
         // dispatch は `*mut c_void` しか運べないので、`Box<dyn FnOnce>` (= fat
         // pointer) を直接 into_raw できず、もう 1 段 Box して thin にする。
-        let boxed: Box<Box<dyn FnOnce() + Send + 'static>> = Box::new(Box::new(f));
-        let ctx = Box::into_raw(boxed) as *mut c_void;
-        unsafe extern "C" fn trampoline(ctx: *mut c_void) {
-            let boxed: Box<Box<dyn FnOnce() + Send + 'static>> =
-                unsafe { Box::from_raw(ctx as *mut Box<dyn FnOnce() + Send + 'static>) };
-            (*boxed)();
-        }
+        let (ctx, trampoline) = into_dispatch_context(f);
         unsafe {
             dispatch_async_f(
+                &_dispatch_main_q as *const _ as *mut c_void,
+                ctx,
+                trampoline,
+            );
+        }
+    }
+
+    /// `dispatch_main` の遅延版 — `secs` 秒後に main queue で `f` を実行する。
+    /// timer 相当を sleep ループなしで組む唯一の main-thread-safe な primitive
+    /// (kernel timer に載るので待っている間の CPU / wakeup が無い)。
+    ///
+    /// `dispatch_after` は発火をキャンセルできないので、呼び側は「発火時に
+    /// まだ意味があるか」を共有 state (take-once slot) で判定する — 詳しくは
+    /// [`arm_dialog_timeout`]。
+    fn dispatch_main_after<F: FnOnce() + Send + 'static>(secs: u32, f: F) {
+        let (ctx, trampoline) = into_dispatch_context(f);
+        unsafe {
+            let when = dispatch_time(DISPATCH_TIME_NOW, i64::from(secs) * 1_000_000_000);
+            dispatch_after_f(
+                when,
                 &_dispatch_main_q as *const _ as *mut c_void,
                 ctx,
                 trampoline,
@@ -114,6 +161,19 @@ mod approver {
     struct MainOnlySend<T>(T);
     unsafe impl<T> Send for MainOnlySend<T> {}
     unsafe impl<T> Sync for MainOnlySend<T> {}
+
+    impl<T> MainOnlySend<T> {
+        /// Unwrap on the main thread.
+        ///
+        /// Needed as a *method* rather than plain `.0` field access at the
+        /// capture site: Rust 2021 captures closure state per field path, so
+        /// `move || wrapper.0.foo()` captures the inner `T` — dropping the
+        /// `Send` this wrapper exists to assert. Calling a method forces the
+        /// whole wrapper into the closure.
+        fn into_inner(self) -> T {
+            self.0
+        }
+    }
 
     // --- IPC 経路 -----------------------------------------------------------
 
@@ -211,10 +271,10 @@ mod approver {
                 line.push('\n');
                 let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
                 if let Err(e) = w.write_all(line.as_bytes()).and_then(|_| w.flush()) {
-                    eprintln!("approver: failed to send ApproveResponse: {e}");
+                    eprintln!("cache-warden-approver: failed to send ApproveResponse: {e}");
                 }
             }
-            Err(e) => eprintln!("approver: failed to encode ApproveResponse: {e}"),
+            Err(e) => eprintln!("cache-warden-approver: failed to encode ApproveResponse: {e}"),
         }
     }
 
@@ -240,16 +300,42 @@ mod approver {
     /// response + signals the background reader.
     type PendingSlot = Arc<Mutex<Option<PendingOutcome>>>;
 
+    /// The main-thread-only objects the countdown timer needs to shut a
+    /// timed-out dialog down (`LAContext` to `invalidate()`, `NSWindow` to
+    /// `close()`).
+    struct DialogHandles {
+        ctx: Retained<LAContext>,
+        window: Retained<NSWindow>,
+    }
+
+    /// Shared slot holding the countdown timer's [`DialogHandles`].
+    ///
+    /// `dispatch_after` cannot be cancelled, so "disarming" the timer means
+    /// emptying this slot: the fired closure finds `None` and returns without
+    /// touching AppKit, and — the reason the slot exists at all — the
+    /// retained `NSWindow` / `LAContext` drop the moment the dialog is
+    /// answered instead of lingering until the timer's (up to
+    /// `timeout_secs`-long) deadline. On a persistent helper that lingering
+    /// would otherwise pile up one window per approval.
+    ///
+    /// **Only ever taken/dropped on the main thread** — every finalize path
+    /// either already runs there (AppKit delegate callbacks, the timer
+    /// closure itself) or goes through [`dispatch_main`] first (the LA
+    /// completion block, whose thread Apple does not contract).
+    type TimerSlot = Arc<Mutex<Option<MainOnlySend<DialogHandles>>>>;
+
     /// Delegate class fields. `pending` is the shared take-once slot the LA
     /// completion block also holds; `ctx` is the per-request `LAContext`
     /// that this delegate's Cancel paths (`cancelClicked:` /
     /// `windowWillClose:`) call `invalidate()` on to unblock the pending
     /// `evaluatePolicy` — see the invalidate calls below for the leak-
-    /// avoidance rationale. Storing `Retained<LAContext>` here is
-    /// consistent with the delegate being `MainThreadOnly`.
+    /// avoidance rationale; `timer` is the countdown's handle slot, emptied
+    /// by those same paths (see [`TimerSlot`]). Storing `Retained<LAContext>`
+    /// here is consistent with the delegate being `MainThreadOnly`.
     struct DelegateIvars {
         pending: PendingSlot,
         ctx: Retained<LAContext>,
+        timer: TimerSlot,
     }
 
     define_class!(
@@ -268,6 +354,9 @@ mod approver {
             #[unsafe(method(cancelClicked:))]
             fn cancel_clicked(&self, sender: Option<&AnyObject>) {
                 finalize_cancelled(&self.ivars().pending);
+                // Disarm the countdown (main thread — this is an AppKit
+                // action), releasing the window / LAContext it retains.
+                disarm_dialog_timeout(&self.ivars().timer);
                 // Invalidate `LAContext` so the pending `evaluatePolicy`
                 // completion block fires (with `LAErrorAppCancel`). That
                 // block owns a strong reference to `self` (see the
@@ -294,6 +383,7 @@ mod approver {
             #[unsafe(method(windowWillClose:))]
             fn window_will_close(&self, _notif: &NSNotification) {
                 finalize_cancelled(&self.ivars().pending);
+                disarm_dialog_timeout(&self.ivars().timer);
                 // Same leak-avoidance rationale as `cancelClicked:` —
                 // Cmd+W / red close-button paths reach here without going
                 // through the Cancel button, but the pending
@@ -313,8 +403,13 @@ mod approver {
             mtm: MainThreadMarker,
             pending: PendingSlot,
             ctx: Retained<LAContext>,
+            timer: TimerSlot,
         ) -> Retained<Self> {
-            let ivars = DelegateIvars { pending, ctx };
+            let ivars = DelegateIvars {
+                pending,
+                ctx,
+                timer,
+            };
             let this = Self::alloc(mtm).set_ivars(ivars);
             unsafe { objc2::msg_send![super(this), init] }
         }
@@ -335,6 +430,66 @@ mod approver {
         } = pending;
         write_response(&writer, &request_id, Outcome::Cancelled, None);
         let _ = completion_tx.send(());
+    }
+
+    /// Empty the countdown's handle slot. **Main thread only** (the handles
+    /// are `Retained` AppKit / LocalAuthentication objects). Idempotent.
+    fn disarm_dialog_timeout(timer: &TimerSlot) {
+        let _ = timer.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    /// Arm the dialog's own countdown from `ApproveRequest.timeout_secs`.
+    ///
+    /// Without this the helper would keep an unanswered dialog on screen
+    /// forever: the reader thread is deliberately serial (§8 approvals are
+    /// human-serial), so one abandoned dialog stalls every subsequent
+    /// request — the daemon's own 90 s timeout only frees *its* caller, not
+    /// the helper's queue. On expiry we answer the request ourselves with
+    /// [`Outcome::Timeout`], invalidate the `LAContext` (which fires the
+    /// pending `evaluatePolicy` block so it can release the delegate) and
+    /// close the window, letting the reader move on to the next request.
+    ///
+    /// Racing the human is safe in both directions: the outcome is written
+    /// by whoever wins the take-once `pending` slot, and if the user won,
+    /// this closure does nothing at all. A daemon-side timeout that already
+    /// fired is harmless too — the daemon discards responses whose
+    /// `request_id` no longer matches its pending request.
+    ///
+    /// `timeout_secs == 0` means "no countdown wanted" (the wire field is a
+    /// hint from the daemon, not a contract), so the timer is not armed.
+    fn arm_dialog_timeout(timeout_secs: u32, pending: PendingSlot, timer: TimerSlot) {
+        if timeout_secs == 0 {
+            return;
+        }
+        dispatch_main_after(timeout_secs, move || {
+            // Runs on the main queue. `None` = some finalize path already
+            // disarmed us; nothing to close and nothing to answer.
+            let Some(handles) = timer.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+                return;
+            };
+            let taken = pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let Some(PendingOutcome {
+                writer,
+                request_id,
+                completion_tx,
+            }) = taken
+            else {
+                // The user answered between the slot check above and here;
+                // their outcome stands. Dropping `handles` is all we do.
+                return;
+            };
+            eprintln!(
+                "cache-warden-approver: no answer within {timeout_secs}s, closing the dialog \
+                 (request_id={request_id:?})"
+            );
+            write_response(&writer, &request_id, Outcome::Timeout, None);
+            let _ = completion_tx.send(());
+            // Same leak-avoidance rationale as the Cancel paths: the
+            // pending `evaluatePolicy` block holds the delegate alive until
+            // it fires, and `invalidate` is what makes it fire.
+            unsafe { handles.0.ctx.invalidate() };
+            handles.0.window.close();
+        });
     }
 
     // --- window / UI --------------------------------------------------------
@@ -430,12 +585,14 @@ mod approver {
                     .arg(&bundle)
                     .spawn();
                 eprintln!(
-                    "steal_focus: open {} -> spawn = {}",
+                    "cache-warden-approver: steal_focus: open {} -> spawn = {}",
                     bundle.display(),
                     spawned.is_ok()
                 );
             }
-            None => eprintln!("steal_focus: not in .app bundle, skip open-based activation"),
+            None => eprintln!(
+                "cache-warden-approver: steal_focus: not in .app bundle, skip open-based activation"
+            ),
         }
     }
 
@@ -469,7 +626,16 @@ mod approver {
             completion_tx: completion_tx.clone(),
         };
         let pending_slot: PendingSlot = Arc::new(Mutex::new(Some(pending)));
-        let delegate = ApproverDelegate::new(mtm, pending_slot.clone(), Retained::clone(&ctx));
+        let timer_slot: TimerSlot = Arc::new(Mutex::new(Some(MainOnlySend(DialogHandles {
+            ctx: Retained::clone(&ctx),
+            window: Retained::clone(&window),
+        }))));
+        let delegate = ApproverDelegate::new(
+            mtm,
+            pending_slot.clone(),
+            Retained::clone(&ctx),
+            timer_slot.clone(),
+        );
 
         let (stack, _auth_view, _cancel) = build_content(mtm, &delegate, &ctx, &summary_text);
         window.setContentView(Some(&stack));
@@ -486,11 +652,12 @@ mod approver {
 
         // --- LA evaluatePolicy completion block ---
         //
-        // 実測では main thread に発火することが多いが公式保証なし
-        // (Phase 1.5 残課題)。ここでは worker が実行するスレッドを問わず
-        // 動くよう、outcome 送信 (socket write) は thread-safe な `writer`
-        // Mutex 経由、window.close() は dispatch_main 経由で main queue に
-        // 投げ直す。
+        // Apple does not contract which queue this block runs on (main is
+        // what we observe in practice, but that is not a guarantee), so the
+        // block itself only does thread-safe work: the outcome goes out
+        // through the `writer` Mutex, and every AppKit / main-thread-only
+        // operation (window.close(), releasing the countdown's retained
+        // handles) is dispatched onto the main queue.
         //
         // `delegate_for_block`: anchor the delegate's lifetime to this
         // block's. Both `NSWindow::setDelegate` and
@@ -504,6 +671,7 @@ mod approver {
         // precisely how the Cancel paths bring the block to fire), so
         // capturing `delegate` here holds it exactly as long as needed.
         let pending_slot_for_block = pending_slot.clone();
+        let timer_slot_for_block = timer_slot.clone();
         let window_for_block = MainOnlySend(Retained::clone(&window));
         let delegate_for_block = MainOnlySend(Retained::clone(&delegate));
 
@@ -534,14 +702,18 @@ mod approver {
             };
             write_response(&writer, &request_id, outcome, Some("TouchID".to_string()));
             let _ = completion_tx.send(());
-            // window.close() is a main-thread-only AppKit operation. Phase 1.5
-            // residual issue `2026-07-12-approver-release-hardening` covers
-            // making the LA completion block explicitly dispatch to main
-            // thread; today the block is observed to run on main in practice
-            // and this call inherits that assumption. If we ever add the
-            // explicit dispatch, this close moves into the dispatched
-            // closure.
-            window_for_block.0.close();
+            // `window.close()` and dropping the countdown's retained
+            // handles are main-thread-only; hop to the main queue rather
+            // than trusting whichever thread LocalAuthentication called us
+            // on. Retaining the window here (`Retained::clone`) is
+            // thread-safe on its own — `objc_retain` is atomic; it is
+            // *using* AppKit objects that main-thread affinity is about.
+            let window_for_close = MainOnlySend(Retained::clone(&window_for_block.0));
+            let timer_for_close = timer_slot_for_block.clone();
+            dispatch_main(move || {
+                disarm_dialog_timeout(&timer_for_close);
+                window_for_close.into_inner().close();
+            });
         });
 
         unsafe {
@@ -551,6 +723,11 @@ mod approver {
                 &block,
             );
         }
+
+        // Start the countdown only once the dialog is up and the policy
+        // evaluation is running: the deadline the daemon sent is about how
+        // long a *human* gets, so it should not be consumed by our own setup.
+        arm_dialog_timeout(req.timeout_secs, pending_slot, timer_slot);
     }
 
     // --- background reader thread ------------------------------------------
@@ -586,20 +763,22 @@ mod approver {
                 let n = match reader.read_line(&mut line) {
                     Ok(n) => n,
                     Err(e) => {
-                        eprintln!("approver: read error, terminating helper: {e}");
+                        eprintln!("cache-warden-approver: read error, terminating helper: {e}");
                         break;
                     }
                 };
                 if n == 0 {
                     // Daemon closed the socket (§7 逆方向: daemon が居ないのに
                     // 常駐しない)。Clean shutdown of the helper.
-                    eprintln!("approver: daemon closed the approver socket, terminating helper");
+                    eprintln!(
+                        "cache-warden-approver: daemon closed the approver socket, terminating helper"
+                    );
                     break;
                 }
                 let req: ApproveRequest = match serde_json::from_str(line.trim_end()) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("approver: failed to decode ApproveRequest: {e}");
+                        eprintln!("cache-warden-approver: failed to decode ApproveRequest: {e}");
                         // Malformed request: cannot signal an outcome for it
                         // (no request_id / no way to know what the daemon
                         // expected). Terminate — safer than a stuck reader.
@@ -608,7 +787,7 @@ mod approver {
                 };
                 if req.v != WIRE_VERSION {
                     eprintln!(
-                        "approver: unsupported wire version {} (helper speaks {WIRE_VERSION})",
+                        "cache-warden-approver: unsupported wire version {} (helper speaks {WIRE_VERSION})",
                         req.v
                     );
                     break;
@@ -629,7 +808,9 @@ mod approver {
                 // completion_tx send still fires — we don't deadlock.
                 if rx.recv().is_err() {
                     // tx dropped without send — dialog never completed (bug).
-                    eprintln!("approver: dialog dropped without sending outcome, terminating");
+                    eprintln!(
+                        "cache-warden-approver: dialog dropped without sending outcome, terminating"
+                    );
                     break;
                 }
             }
@@ -643,13 +824,42 @@ mod approver {
 
     // --- standalone (--socket 未指定) 経路 ---------------------------------
 
+    #[cfg(debug_assertions)]
     const STANDALONE_SUMMARY: &str = "Allow requester to read secret";
 
-    /// Phase 1.4 の one-shot 動作を維持 (dev 単独起動 `just approver-run`)。
+    /// Dispatch the `--socket`-less invocation.
+    ///
+    /// A standalone dialog puts a real TouchID prompt on screen from a
+    /// hardcoded summary, with no daemon behind it. In a shipped build that
+    /// is an attack primitive rather than a feature: any same-uid process can
+    /// `open CacheWardenApprover.app` and raise a prompt that looks exactly
+    /// like cache-warden asking for a secret — MFA-fatigue / phishing
+    /// material that dulls the reflex the whole dialog design depends on
+    /// (draft-DR-0031 §Security review L-2). Nothing legitimate needs it
+    /// either: production always spawns the helper with `--socket`.
+    ///
+    /// It stays available in debug builds because that is the dev loop
+    /// (`just approver-run`) for iterating on the dialog without a daemon.
+    fn run_without_socket() {
+        #[cfg(debug_assertions)]
+        run_standalone();
+
+        #[cfg(not(debug_assertions))]
+        {
+            eprintln!(
+                "cache-warden-approver: refusing to run without --socket \
+                 (this helper is launched by the cache-warden daemon)"
+            );
+            std::process::exit(2);
+        }
+    }
+
+    /// dev 単独起動 (`just approver-run`) の one-shot 動作。
     /// dialog 1 枚 + Approved/BiometricFailed/Cancel いずれかで terminate。
     /// terminate 経路は `NSApplicationWillTerminateNotification` observer で
     /// 「未送信 = Cancelled」を stderr にログ (IPC 無しなので Outcome だけ
     /// 表示)。
+    #[cfg(debug_assertions)]
     fn run_standalone() {
         let mtm = MainThreadMarker::new().expect("must run on main thread");
         let app = init_app(mtm);
@@ -693,7 +903,7 @@ mod approver {
             } else {
                 Outcome::BiometricFailed
             };
-            eprintln!("approver outcome (standalone, no IPC): {outcome:?}");
+            eprintln!("cache-warden-approver: outcome (standalone, no IPC): {outcome:?}");
             app_for_block.terminate(None);
         });
         unsafe {
@@ -706,6 +916,9 @@ mod approver {
         app.run();
     }
 
+    /// `run_standalone` 専用 (常駐経路は request ごとに `steal_focus` を直接
+    /// 呼ぶ)。
+    #[cfg(debug_assertions)]
     fn register_focus_steal_on_launch(
         window: &Retained<NSWindow>,
     ) -> Retained<ProtocolObject<dyn NSObjectProtocol>> {
@@ -738,12 +951,14 @@ mod approver {
         let stream = match UnixStream::connect(socket_path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("approver: connect to daemon socket {socket_path:?} failed: {e}");
+                eprintln!(
+                    "cache-warden-approver: connect to daemon socket {socket_path:?} failed: {e}"
+                );
                 std::process::exit(1);
             }
         };
         if let Err(e) = verify_daemon_peer(&stream) {
-            eprintln!("approver: daemon peer verification failed: {e}");
+            eprintln!("cache-warden-approver: daemon peer verification failed: {e}");
             std::process::exit(1);
         }
 
@@ -754,7 +969,7 @@ mod approver {
         let stream_read = match stream.try_clone() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("approver: try_clone on approver socket failed: {e}");
+                eprintln!("cache-warden-approver: try_clone on approver socket failed: {e}");
                 std::process::exit(1);
             }
         };
@@ -772,7 +987,7 @@ mod approver {
     pub fn run() {
         match resolve_socket_path() {
             Some(path) => run_persistent(&path),
-            None => run_standalone(),
+            None => run_without_socket(),
         }
     }
 }

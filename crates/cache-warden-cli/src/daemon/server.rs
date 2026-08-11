@@ -1559,9 +1559,11 @@ pub(crate) const HELPER_STARTING_WAIT: Duration = Duration::from_secs(5);
 /// a small allowance for the helper's own bookkeeping / peer_gone message.
 pub(crate) const APPROVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// The `timeout_secs` field on the wire (the daemon's own effective timeout
-/// is `APPROVER_REQUEST_TIMEOUT`; the wire value is a hint the helper can
-/// use for its own countdown UI, currently unused — see wire.rs docs).
+/// The `timeout_secs` field on the wire: the deadline the **helper** runs its
+/// dialog countdown against. Deliberately shorter than the daemon's own
+/// `APPROVER_REQUEST_TIMEOUT` so the helper's `Outcome::Timeout` response
+/// wins the race — the daemon then reports a helper-confirmed timeout rather
+/// than giving up on a dialog that is still on screen.
 pub(crate) const APPROVER_WIRE_TIMEOUT_SECS: u32 = 60;
 
 /// Monotonically-increasing counter feeding `ApproveRequest.request_id` (a

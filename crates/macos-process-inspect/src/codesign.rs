@@ -102,6 +102,14 @@ pub enum CodesignError {
     /// impossible without a team id — this variant is defensive: reachable
     /// only if a future Security.framework change decoupled the two).
     PeerUnsigned,
+    /// The peer's signature carries no signing Identifier at all, so the
+    /// required prefix cannot be checked. Distinct from
+    /// [`CodesignError::PeerIdentifierPrefixMismatch`] because the two point
+    /// at different problems: a missing identifier means the peer's signature
+    /// is shaped unlike anything this project produces (every cache-warden
+    /// binary is signed with an explicit identifier), while a mismatch means a
+    /// real, differently-named app from the same team.
+    PeerIdentifierMissing { required_prefix: String },
     /// The peer's signing Identifier does not start with the required prefix
     /// (e.g. `com.github.kawaz.cache-warden`) — same Team ID, different app
     /// family.
@@ -154,6 +162,11 @@ impl std::fmt::Display for CodesignError {
             CodesignError::PeerUnsigned => {
                 f.write_str("peer signing information carries no Team Identifier")
             }
+            CodesignError::PeerIdentifierMissing { required_prefix } => write!(
+                f,
+                "peer signature carries no signing identifier to match against the \
+                 required prefix {required_prefix:?}"
+            ),
             CodesignError::PeerIdentifierPrefixMismatch {
                 required_prefix,
                 peer_identifier,
@@ -373,7 +386,12 @@ mod imp {
                 peer_team,
             });
         }
-        let peer_identifier = peer_id.identifier.unwrap_or_default();
+        let peer_identifier =
+            peer_id
+                .identifier
+                .ok_or_else(|| CodesignError::PeerIdentifierMissing {
+                    required_prefix: required_identifier_prefix.to_string(),
+                })?;
         if !peer_identifier.starts_with(required_identifier_prefix) {
             return Err(CodesignError::PeerIdentifierPrefixMismatch {
                 required_prefix: required_identifier_prefix.to_string(),
@@ -447,7 +465,7 @@ pub fn peer_identity(fd: RawFd) -> Result<SigningIdentity, CodesignError> {
 /// the daemon → helper and helper → daemon peer authentication (draft-DR-0031
 /// §Security). Fail-closed on every deviation: ad-hoc self (see the module
 /// doc), euid mismatch, missing audit token, expired peer, unsigned peer,
-/// signature invalid, wrong team, wrong identifier prefix.
+/// signature invalid, wrong team, missing or non-matching identifier.
 ///
 /// The peer verification order is: self identity (cheapest and gates
 /// everything else), peer audit token, euid pre-check, live peer SecCode,
@@ -479,6 +497,36 @@ mod tests {
             id.team_id.is_none(),
             "an ad-hoc / unsigned test binary must not report a Team Identifier, got {id:?}"
         );
+    }
+
+    /// The "no identifier at all" and "identifier from another app family"
+    /// rejections must read as different problems — they are: the first says
+    /// the peer is not shaped like anything this project signs, the second
+    /// says it is a different app under the same Team ID. An operator
+    /// grepping syslog for signs of a same-uid impostor acts on them
+    /// differently, and collapsing both into one message (an
+    /// `unwrap_or_default()` on the identifier reports a missing identifier
+    /// as the empty-string prefix mismatch) is what this pins against.
+    #[test]
+    fn missing_and_mismatched_peer_identifier_report_differently() {
+        let missing = CodesignError::PeerIdentifierMissing {
+            required_prefix: "com.github.kawaz.cache-warden".to_string(),
+        }
+        .to_string();
+        let mismatch = CodesignError::PeerIdentifierPrefixMismatch {
+            required_prefix: "com.github.kawaz.cache-warden".to_string(),
+            peer_identifier: "com.example.other".to_string(),
+        }
+        .to_string();
+        assert!(
+            missing.contains("no signing identifier"),
+            "missing-identifier message should say the identifier is absent: {missing}"
+        );
+        assert!(
+            mismatch.contains("com.example.other"),
+            "mismatch message should name the peer's identifier: {mismatch}"
+        );
+        assert_ne!(missing, mismatch);
     }
 
     /// `verify_peer` against oneself (both ends of a `socketpair` inside the

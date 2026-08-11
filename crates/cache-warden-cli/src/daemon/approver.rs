@@ -21,6 +21,30 @@
 //! 1.6 — future work that wants overlapping prompts would need to revisit
 //! this lock and the helper-side dialog state together.
 //!
+//! # Bounded queue (prompt-bombing 対策)
+//!
+//! Serialization alone makes the queue an attack surface: any same-uid
+//! process can open M connections, fire M guarded requests, and have M
+//! dialogs march across the screen one after another — MFA fatigue by
+//! construction, and on the authsock SIGN path ssh's per-key retries pile
+//! them up without anyone attacking on purpose. Two bounds keep that in
+//! check, both applied *before* a request can reach the helper:
+//!
+//! - **depth cap** ([`MAX_PENDING_REQUESTS`]): requests beyond the cap are
+//!   refused immediately rather than queued, so the screen never owes the
+//!   user more than a handful of decisions.
+//! - **lock-wait timeout**: waiting for the serialization lock is bounded by
+//!   the same duration as the exchange itself, so a caller's total wait is
+//!   bounded (`2 × timeout`) instead of "queue depth × timeout".
+//!
+//! Both refusals surface as ordinary `Err`s, which the gated callers map to
+//! their fail-closed denial — availability is what degrades under a bombing
+//! attempt, never confidentiality.
+//!
+//! Coalescing repeat requests for the same `(key, requester)` into one dialog
+//! is the remaining lever (it would collapse ssh's retry storm into a single
+//! prompt) and is not implemented here.
+//!
 //! # Helper-death recovery (§7 逆方向)
 //!
 //! A dead helper — writes returning `BrokenPipe`, reads returning EOF — is
@@ -62,6 +86,18 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use cache_warden_approver::CACHE_WARDEN_IDENTIFIER_PREFIX;
+
+/// How many approval requests may be in the client at once (the one holding
+/// the lock plus those waiting for it) before further requests are refused
+/// outright.
+///
+/// Small on purpose: approvals are human-serial, so a legitimate backlog is
+/// a person with a couple of terminals, not a dozen. Anything deeper is
+/// either a bombing attempt or a client retry storm, and making the user
+/// walk through it is worse than denying it — the denial is what the caller
+/// would have gotten anyway once the lock-wait timeout expired, just without
+/// the queue of dialogs on the way there.
+const MAX_PENDING_REQUESTS: usize = 5;
 
 /// Bind the approver socket, removing a stale leftover first.
 ///
@@ -384,6 +420,27 @@ pub struct ApproverClient {
     /// user never asked for. Once set, never cleared: the client is
     /// terminally shut down.
     closed: std::sync::atomic::AtomicBool,
+    /// How many [`request`](Self::request) calls are currently in the client
+    /// — holding the lock or waiting for it. Compared against
+    /// [`MAX_PENDING_REQUESTS`] on entry so a flood is refused before it can
+    /// become a queue of dialogs. Maintained by [`PendingGuard`], which
+    /// decrements on every exit path including a cancelled future.
+    pending: std::sync::atomic::AtomicUsize,
+}
+
+/// Decrements [`ApproverClient::pending`] on drop.
+///
+/// A guard rather than a decrement at the end of `request`: the caller's
+/// future can be dropped mid-approval (the gated get's client disconnects,
+/// a shutdown races it), and a counter that only decremented on the happy
+/// path would ratchet up until every later request is refused — turning the
+/// anti-bombing bound into a self-inflicted outage.
+struct PendingGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// Snapshot the helper's pid off a [`HelperConn`] for
@@ -427,6 +484,7 @@ impl ApproverClient {
             socket_path,
             helper_pid,
             closed: std::sync::atomic::AtomicBool::new(false),
+            pending: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -443,11 +501,43 @@ impl ApproverClient {
     /// response whose `request_id` does not match the pending request is
     /// discarded (with a warning) and the loop keeps reading until either
     /// the matching id arrives or the outer `timeout` fires.
+    ///
+    /// Queue bounds (see the module's "Bounded queue" section): the call is
+    /// refused with `WouldBlock` when more than [`MAX_PENDING_REQUESTS`]
+    /// requests are already in flight, and with `TimedOut` when the
+    /// serialization lock does not come free within `timeout`. `timeout`
+    /// therefore bounds each of the two phases (lock wait, then exchange)
+    /// rather than the pair — a request that does get the lock still gets a
+    /// full dialog window, which is what makes a second terminal's approval
+    /// work instead of expiring the moment it is granted its turn.
     pub async fn request(
         &self,
         request: &ApproveRequest,
         timeout: Duration,
     ) -> io::Result<ApproveResponse> {
+        // Reserve a queue slot first: `fetch_add` then compare, so
+        // concurrent entrants cannot both read "depth is fine" and both
+        // proceed. The guard gives the slot back on every exit path.
+        let depth = self
+            .pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let _slot = PendingGuard(&self.pending);
+        if depth > MAX_PENDING_REQUESTS {
+            eprintln!(
+                "cache-warden: approver: refusing approval request {:?}: {depth} requests already \
+                 queued (limit {MAX_PENDING_REQUESTS}) — possible prompt-bombing",
+                request.request_id
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "too many approval requests queued ({depth} > {MAX_PENDING_REQUESTS}); \
+                     refusing rather than queueing another dialog"
+                ),
+            ));
+        }
+
         // Shutdown latches `closed` before it kills the helper; refuse to
         // start a new exchange (which would sit inside `inner.lock().await`
         // during shutdown's socket cleanup) or, later, respawn a helper
@@ -460,7 +550,21 @@ impl ApproverClient {
             ));
         }
 
-        let mut guard = self.inner.lock().await;
+        // Bound the wait for our turn. Unbounded, a caller queued behind an
+        // abandoned dialog waits "however long the human takes" per request
+        // ahead of it, with nothing to tell it the wait is hopeless.
+        let mut guard = match tokio::time::timeout(timeout, self.inner.lock()).await {
+            Ok(g) => g,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "another approval was still pending after {timeout:?}; \
+                         did not get a turn to prompt"
+                    ),
+                ));
+            }
+        };
         let InnerState {
             listener,
             conn,
@@ -732,6 +836,7 @@ mod tests {
             socket_path,
             helper_pid,
             closed: std::sync::atomic::AtomicBool::new(false),
+            pending: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1249,6 +1354,154 @@ mod tests {
             "on_reconnect must NOT fire again after shutdown latched `closed` \
              (a respawn here would put a fresh dialog on screen during shutdown)"
         );
+    }
+
+    /// Prompt-bombing bound, depth arm: with one approval parked on the
+    /// helper (a dialog waiting on a human), requests beyond
+    /// `MAX_PENDING_REQUESTS` are refused up front — `WouldBlock`, no
+    /// queueing, no dialog. Without the cap every one of them would take a
+    /// turn at the lock and march another dialog across the screen.
+    #[tokio::test]
+    async fn request_beyond_pending_cap_is_refused_without_queueing() {
+        use tokio::sync::oneshot;
+        let socket_path = test_socket_path("depth-cap");
+
+        // Fake helper: consume the request line, signal, and never reply —
+        // the daemon side stays parked in `read_line` holding `inner`,
+        // exactly like a dialog waiting on the user.
+        let (read_done_tx, read_done_rx) = oneshot::channel::<()>();
+        let read_done_slot = Arc::new(std::sync::Mutex::new(Some(read_done_tx)));
+        let client = Arc::new(
+            client_with_fake_helper(socket_path.clone(), move |sp: std::path::PathBuf| {
+                let tx_slot = read_done_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                tokio::spawn(async move {
+                    let stream = UnixStream::connect(&sp).await.expect("fake helper connect");
+                    let (rh, _wh) = stream.into_split();
+                    let mut reader = BufReader::new(rh);
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line).await;
+                    if let Some(tx) = tx_slot {
+                        let _ = tx.send(());
+                    }
+                    std::future::pending::<()>().await;
+                })
+            })
+            .await
+            .expect("start client"),
+        );
+
+        // Occupant: holds the lock for the rest of the test (long timeout so
+        // it is the cap, not its own expiry, that the others hit).
+        let occupant_client = Arc::clone(&client);
+        let occupant = tokio::spawn(async move {
+            occupant_client
+                .request(&test_request("occupant"), Duration::from_secs(600))
+                .await
+        });
+        read_done_rx
+            .await
+            .expect("fake helper must consume the first request");
+
+        // Fill the remaining slots with waiters. Each one is parked on the
+        // lock-wait; none of them can reach the helper.
+        let mut waiters = Vec::new();
+        for i in 1..MAX_PENDING_REQUESTS {
+            let c = Arc::clone(&client);
+            waiters.push(tokio::spawn(async move {
+                c.request(
+                    &test_request(&format!("waiter-{i}")),
+                    Duration::from_secs(600),
+                )
+                .await
+            }));
+        }
+        // Let every waiter reach its `pending` increment before the
+        // over-cap request is issued — otherwise the cap check could run
+        // while the queue is still filling.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        let err = client
+            .request(&test_request("over-cap"), Duration::from_secs(600))
+            .await
+            .expect_err("a request past the cap must be refused, not queued");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::WouldBlock,
+            "over-cap refusal shape: {err}"
+        );
+
+        occupant.abort();
+        for w in waiters {
+            w.abort();
+        }
+        client.shutdown().await;
+    }
+
+    /// Prompt-bombing bound, lock-wait arm: a request that never gets its
+    /// turn fails with `TimedOut` after its own `timeout`, instead of
+    /// waiting out however many human-paced dialogs are ahead of it. Pins
+    /// that the bound covers the wait for the lock, not just the exchange
+    /// that follows it.
+    #[tokio::test]
+    async fn request_waiting_for_its_turn_times_out() {
+        use tokio::sync::oneshot;
+        let socket_path = test_socket_path("lock-wait");
+
+        let (read_done_tx, read_done_rx) = oneshot::channel::<()>();
+        let read_done_slot = Arc::new(std::sync::Mutex::new(Some(read_done_tx)));
+        let client = Arc::new(
+            client_with_fake_helper(socket_path.clone(), move |sp: std::path::PathBuf| {
+                let tx_slot = read_done_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                tokio::spawn(async move {
+                    let stream = UnixStream::connect(&sp).await.expect("fake helper connect");
+                    let (rh, _wh) = stream.into_split();
+                    let mut reader = BufReader::new(rh);
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line).await;
+                    if let Some(tx) = tx_slot {
+                        let _ = tx.send(());
+                    }
+                    std::future::pending::<()>().await;
+                })
+            })
+            .await
+            .expect("start client"),
+        );
+
+        let occupant_client = Arc::clone(&client);
+        let occupant = tokio::spawn(async move {
+            occupant_client
+                .request(&test_request("occupant"), Duration::from_secs(600))
+                .await
+        });
+        read_done_rx
+            .await
+            .expect("fake helper must consume the first request");
+
+        let err = client
+            .request(&test_request("no-turn"), Duration::from_millis(150))
+            .await
+            .expect_err("a request that never gets the lock must time out");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "lock-wait timeout shape: {err}"
+        );
+        assert!(
+            err.to_string().contains("turn"),
+            "error should name the missed turn: {err}"
+        );
+
+        occupant.abort();
+        client.shutdown().await;
     }
 
     /// A follow-up `request` after `shutdown` returns the same
