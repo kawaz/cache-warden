@@ -3,7 +3,7 @@ title: approver helper の release 硬化 (standalone 無効化 / main-thread di
 status: open
 category: task
 created: 2026-07-12T01:14:46+09:00
-last_read:
+last_read: 2026-08-11T23:47:58+09:00
 open_entered: 2026-07-12T01:14:46+09:00
 wip_entered:
 blocked_entered:
