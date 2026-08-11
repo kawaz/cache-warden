@@ -84,13 +84,22 @@ draft-DR-0031 (custom TouchID dialog) の Phase 1.5 で opus47 によるセキ�
 
 ## 受け入れ条件
 
-- [ ] standalone mode の扱い (release 無効化 or feature flag) を決定し実装
-- [ ] LAContext completion block → main queue 明示 dispatch に置換
-- [ ] daemon 側 / helper 側の警告ログ prefix を統一、到達経路を確認
-- [ ] `PeerIdentifierPrefixMismatch` の診断メッセージ改善 (該当なら)
-- [ ] `kSecCSStrictValidate` 採用可否を判断
-- [ ] helper 側 dialog に自前 countdown timeout を実装 (`timeout_secs` hint を実際に消費)
-- [ ] dialog キューを有界化 (lock 待ち全体の timeout / pending depth 上限 / coalesce のいずれかを選定し実装)
+- [x] standalone mode の扱い (release 無効化 or feature flag) を決定し実装 —
+  release は `#[cfg(debug_assertions)]` gate で無効化 (commit 1218a74e)
+- [x] LAContext completion block → main queue 明示 dispatch に置換
+- [x] daemon 側 / helper 側の警告ログ prefix を統一、到達経路を確認 — helper
+  側は `cache-warden-approver:` に統一
+- [x] `PeerIdentifierPrefixMismatch` の診断メッセージ改善 — `PeerIdentifierMissing`
+  を分離して診断品質を改善
+- [x] `kSecCSStrictValidate` 採用可否を判断 — 不採用。静的 API 用の flag で
+  動的 SecCode 検証には効かないため。根拠は draft-DR-0031 の release 硬化
+  land 節
+- [x] helper 側 dialog に自前 countdown timeout を実装 (`timeout_secs` hint を実際に消費) —
+  実機確認済み (2026-08-12)
+- [ ] dialog キューを有界化 (lock 待ち全体の timeout / pending depth 上限 / coalesce のいずれかを選定し実装) —
+  depth 上限 + 2 段 timeout まで実装済み。残 = (key, requester) coalesce
+  (SIGN 経路の per-key 再試行対策の本命)。実装済み分は commit 1218a74e、
+  fable レビュー LOW 3 件のみ
 
 ## TODO
 
