@@ -1,11 +1,11 @@
 ---
 title: top-level --socket が実際にはサブコマンド後にしか置けない (doc/impl 乖離)
-status: open
+status: wip
 category: bug
 created: 2026-07-13T17:54:24+09:00
 last_read: 2026-08-11T23:47:53+09:00
 open_entered: 2026-07-13T17:54:24+09:00
-wip_entered:
+wip_entered: 2026-08-11T23:59:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -97,3 +97,5 @@ reject される。(2026-07-13 実機コード確認済み: 上記行番号・�
 ## TODO
 
 <!-- wip 時のみ -->
+
+- 修正方針は (c) clap 置換で確定 (kawaz 裁定済み推奨案)。codex worker で実装着手 (2026-08-11)。
