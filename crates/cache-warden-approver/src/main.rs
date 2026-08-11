@@ -174,6 +174,23 @@ mod approver {
             .unwrap_or_else(|| "requester".to_string())
     }
 
+    /// Summary 行。operation を動詞句にして「何が起きるか」を dialog に示す
+    /// (wire doc の「helper only displays it, never branches」どおり、未知の
+    /// operation は verbatim 表示に落として認可判断には使わない)。
+    fn summary_line(req: &ApproveRequest) -> String {
+        let verb = match req.operation.as_str() {
+            "sign" => "sign with",
+            "get" | "extend" | "regenerate" | "pin" => "read",
+            other => other,
+        };
+        format!(
+            "Allow {} to {} {}",
+            requester_display_name(req),
+            verb,
+            req.key
+        )
+    }
+
     /// Direct blocking write of `ApproveResponse` on the shared writer. Idempotent
     /// callers wrap this with a "take once" slot to enforce single-send per
     /// request (Cancel / Approved / BiometricFailed の競合防止)。
@@ -444,7 +461,7 @@ mod approver {
         let app = NSApplication::sharedApplication(mtm);
         let window = make_floating_panel(mtm);
         let ctx: Retained<LAContext> = unsafe { LAContext::new() };
-        let summary_text = format!("Allow {} to read {}", requester_display_name(&req), req.key);
+        let summary_text = summary_line(&req);
 
         let pending = PendingOutcome {
             writer: writer.clone(),
