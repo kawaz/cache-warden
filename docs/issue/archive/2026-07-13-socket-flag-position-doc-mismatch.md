@@ -1,6 +1,6 @@
 ---
 title: top-level --socket が実際にはサブコマンド後にしか置けない (doc/impl 乖離)
-status: wip
+status: resolved
 category: bug
 created: 2026-07-13T17:54:24+09:00
 last_read: 2026-08-11T23:47:53+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-08-11T23:59:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-12T00:48:55+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0002","implemented","done:commit 541ff256, clap 4 (builder) 置換で修正案(c)実装。動機バグ2件 (先頭--socket位置 / ハイフン始まりVALUE) 実機解消確認、既存テスト無改変で1277 passed、completion 15/15 PASS、fable MEDIUM指摘 (argv順反転) 対応済み"]
 blocked_by:
 origin: Block 3b e2e 検証中の kawaz 指摘 (2026-07-13)
 ---
