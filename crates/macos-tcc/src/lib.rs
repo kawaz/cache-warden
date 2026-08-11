@@ -92,15 +92,23 @@ mod macos {
 
     /// Check `p` by probing a protected path (in-process, no subprocess).
     ///
-    /// Under the `fda` feature: attempt to `stat`
-    /// `/Library/Application Support/com.apple.TCC/TCC.db`. Access succeeds
-    /// only when Full Disk Access has been granted.
+    /// Under the `fda` feature: attempt to **open and read** one byte of
+    /// `/Library/Application Support/com.apple.TCC/TCC.db`. FDA gates the
+    /// read, not the stat — `fs::metadata` succeeds without FDA (macOS 26
+    /// 実機確認 2026-08-12) and reported a false Granted, which suppressed
+    /// the register-time grant flow entirely. A denied open also makes TCC
+    /// record the attempt, so the app appears in the Full Disk Access pane
+    /// (toggle OFF) without the user hunting it via the "+" button — that
+    /// listing side effect is part of the intended grant UX, not incidental.
     pub fn check(p: Permission) -> AuthState {
         match p {
             Permission::FullDiskAccess => {
                 #[cfg(feature = "fda")]
                 {
-                    std::fs::metadata("/Library/Application Support/com.apple.TCC/TCC.db")
+                    use std::io::Read;
+                    let mut byte = [0u8; 1];
+                    std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db")
+                        .and_then(|mut f| f.read(&mut byte))
                         .map(|_| AuthState::Granted)
                         .unwrap_or(AuthState::NotGranted)
                 }
