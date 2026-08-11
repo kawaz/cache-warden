@@ -1505,7 +1505,8 @@ socket = "~/.local/state/cache-warden/control.sock"
 "#,
         )
         .unwrap();
-        // SAFETY: single-threaded test.
+        // Serialized: env mutation is process-global (see test_env).
+        let _env = crate::test_env::lock();
         let saved = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", "/home/tester") };
         assert_eq!(
@@ -1957,7 +1958,8 @@ keys = ["K"]
 "#,
         )
         .unwrap();
-        // SAFETY: single-threaded test.
+        // Serialized: env mutation is process-global (see test_env).
+        let _env = crate::test_env::lock();
         let saved = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", "/home/tester") };
         let socks = cfg.authsock_sockets();
@@ -2030,7 +2032,8 @@ upstreams = ["~/.1password/agent.sock", "/tmp/other.sock"]
 "#,
         )
         .unwrap();
-        // SAFETY: single-threaded test.
+        // Serialized: env mutation is process-global (see test_env).
+        let _env = crate::test_env::lock();
         let saved = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", "/home/tester") };
         let socks = cfg.authsock_sockets();

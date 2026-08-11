@@ -1090,7 +1090,8 @@ type = "magic"
 
     #[test]
     fn state_path_uses_xdg_state_home() {
-        // SAFETY: single-threaded test; saved/restored below.
+        // Serialized: env mutation is process-global (see test_env).
+        let _env = crate::test_env::lock();
         let saved = std::env::var_os("XDG_STATE_HOME");
         unsafe { std::env::set_var("XDG_STATE_HOME", "/tmp/xdgstate") };
         assert_eq!(

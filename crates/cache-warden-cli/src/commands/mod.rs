@@ -977,7 +977,8 @@ mod tests {
 
     #[test]
     fn default_socket_uses_xdg_state_home() {
-        // SAFETY: single-threaded test; we restore via tempenv-style save/clear.
+        // Serialized: env mutation is process-global (see test_env).
+        let _env = crate::test_env::lock();
         let saved = std::env::var_os("XDG_STATE_HOME");
         unsafe { std::env::set_var("XDG_STATE_HOME", "/tmp/xdgstate") };
         let p = default_socket_path();

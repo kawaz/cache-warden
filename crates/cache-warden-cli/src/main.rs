@@ -18,6 +18,8 @@ mod namespace;
 mod otp_type;
 mod protocol;
 mod refs;
+#[cfg(test)]
+mod test_env;
 mod totp;
 
 use commands::client;

@@ -132,7 +132,8 @@ mod tests {
     fn group_container_path_is_redirected_to_a_state_symlink() {
         // Point XDG_STATE_HOME at a temp dir so the symlink lands there.
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test; restored below.
+        // Serialized: env mutation is process-global (see test_env).
+        let _env = crate::test_env::lock();
         let saved = std::env::var_os("XDG_STATE_HOME");
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
 

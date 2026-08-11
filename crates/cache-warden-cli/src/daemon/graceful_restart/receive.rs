@@ -253,7 +253,9 @@ mod tests {
         // returning `EBADF` is treated as a fatal bug, not a recoverable
         // `Err`) and aborted this very test process. This test's mere
         // completion (not a SIGABRT crash) is the regression check.
-        // SAFETY: test-only env mutation, single-threaded at this point.
+        // Serialized: env mutation is process-global (see test_env).
+        let _env = crate::test_env::lock();
+        // SAFETY: test-only env mutation, serialized by the lock above.
         unsafe {
             std::env::set_var(HANDOFF_FD_ENV, "987654");
         }
@@ -289,7 +291,9 @@ mod tests {
         // must fall back to None.
         drop(a); // immediate EOF
         let fd = b.into_raw_fd();
-        // SAFETY: test-only env mutation, single-threaded at this point.
+        // Serialized: env mutation is process-global (see test_env).
+        let _env = crate::test_env::lock();
+        // SAFETY: test-only env mutation, serialized by the lock above.
         unsafe {
             std::env::set_var(HANDOFF_FD_ENV, fd.to_string());
         }
