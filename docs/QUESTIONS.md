@@ -20,19 +20,7 @@
 
 ## 裁定待ち
 
-### 👺E2E-Q1: Block 3b Item 2 (authsock SIGN 実機 e2e) の開始合図
-
-- [ ] a: 今やる (kawaz 在席 + TouchID 連打あり。開始前に隔離 config 追記 + dev daemon rebuild/codesign の準備をこちらで実施)
-- [ ] b: 後日 (それまで副線 = clap 移行 / issue 消化を進める)
-
-実機は kawaz 在席必須のため合図待ち。なお TouchID 連打 Phase は Opus [1m] セッション推奨 (Fable safeguard 警戒、[state file](file:///Users/kawaz/.cache/claude-session-state/cache-warden/20260715-1210.md) §5)。
-
-### 👺PSH-Q1: push (v0.26.0) のタイミング
-
-- [ ] a (推奨): Block 3b 全完了 (Item 6 まで) 後に push
-- [ ] b: 実装 land 済みの現時点で先に push (未 push 43 commits を早く出す)
-
-（a 推奨: 実機 e2e で修正が出る可能性があり、リリースまとまり単位の push 運用とも整合）
+(なし)
 
 ## 確認待ち
 
