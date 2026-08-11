@@ -48,7 +48,7 @@ cache-warden 独自の TouchID 認証 dialog を実装し、**要求元プロセ
 <!-- wip 時のみ -->
 
 - [x] UX 設計確定 (シンプル/詳細展開の UI モデル、draft-DR-0031 で 2 段情報階層確定)
-- [ ] 実装言語 (Rust 統一 vs Swift + SwiftUI) の判断待ち
+- [x] 実装言語 (Rust + helper .app 構成) 確定、Phase 1.1〜1.6 land 済み
 - [ ] LAAuthenticationView の埋め込み PoC
 - [x] crate-macos-process-inspect の peer 情報取得 API を利用して dialog に表示
 - [ ] cache HIT のみ dialog 発火 (v1 判断) の妥当性確認
@@ -81,7 +81,7 @@ cache-warden 独自の TouchID 認証 dialog を実装し、**要求元プロセ
 
 **A 案 (Rust 完結、`localizedReason` 圧縮) は放棄**。1P 方式と等価な UX を目指す。
 
-**実装言語は Open Question**: 案 A (Rust 統一 + objc2 系、550-850 行) vs 案 B (Swift + SwiftUI、350-550 行)。draft は Rust 統一を推奨 (build system 変更最小、wire schema 共有可能、Rust オンリー原則維持)。kawaz レビューで最終判断。
+**実装言語は Rust 統一 (案 A) で確定** (550-850 行、build system 変更最小、wire schema 共有可能、Rust オンリー原則維持)。helper .app 構成で Phase 1.1〜1.6 land 済み (詳細は下記「進捗」節)。
 
 Open questions (draft-DR-0031 §Open Questions):
 
@@ -99,7 +99,14 @@ Open questions (draft-DR-0031 §Open Questions):
 
 codex 敵対的レビュー (job ID: task-mrebtdaf-j8x4dt) 実施中、findings 受領で DR に反映。
 
-status は open のまま、実装着手は kawaz 承認後。
+## 進捗 (2026-08-11 更新)
+
+- 実装は draft-DR-0031 のもと大きく前進済み: Phase 1.1〜1.6 (helper crate / .app バンドル + LSUIElement / focus 制御 / IPC unix socket / 双方向 code-signature peer 認証 / helper 常駐化) land 済み
+- Block 3a (guard 通過後の approver dialog 発火配線、commit 3d63234e) + authsock SIGN 経路への dialog 統合 (52b95386) land 済み
+- 実装言語は Rust + helper .app 構成で確定 (旧記述「実装言語判断待ち」「実装着手は kawaz 承認後」は解消済み)
+- 実機 e2e = Block 3b は Item 1 (get 経路基本動線、TouchID 発火→approve→値取得を coreauthd で 6+ サイクル確認) 通過済み。残 = Item 2〜6 (SIGN 動線実機 / focus / graceful restart / helper down / coreauthd 全体照合)、kawaz 在席必須
+- 受け入れ条件のうち「要求元コマンド+引数表示」「対象 secret identity 表示」「guard 評価結果表示」は実装済み、「プロセスツリー表示」「シンプル/詳細切替」「peer exit ハンドリング」は release-hardening issue (2026-07-12-approver-release-hardening) 側で追跡
+- close は Block 3b 完了時に判断
 
 ## 関連
 
