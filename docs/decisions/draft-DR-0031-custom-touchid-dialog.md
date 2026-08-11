@@ -1540,3 +1540,19 @@ kawaz 裁定 (案 a: SIGN 経路でも guard 通過後に dialog を出す) を�
   helper_down / record 差し替え / registry 消滅 / 拒否時 dialog 非発火 /
   dialog block 中の並行 get 進行 の各経路)、`cargo test --workspace` **1963
   tests green**
+
+### Block 3b Item 2 実機 e2e (2026-08-11)
+
+SIGN 動線を実機で通過 (詳細は `docs/journal/2026-08-11-block-3b-item2-sign-e2e.md`):
+
+- approve → 署名成功 / cancel・90s timeout → `SSH_AGENT_FAILURE` / timeout 後の
+  幽霊承認は daemon が `discarding stale response` で明示破棄 (fail-closed 維持) を
+  coreauthd grand truth + daemon log で確認
+- dialog wedge + SIGN キュー積み (§v1 既知制約) の実機サンプルを取得
+  (`2026-07-12-approver-release-hardening` 項目 5/6 の裏付け)
+- dialog 表示中の graceful restart が承認待ちに捕まらず完了 (Block 1 H-1 の
+  SIGKILL 経路、Item 4 相当) / helper SIGKILL 後の要求は 1 回だけ再 spawn + 再送
+  (recovery、Item 5) も観測
+- **発見 bug**: dialog summary が operation を無視して常に "read" 表示 → SIGN で
+  誤表示。`summary_line()` で operation を動詞句化して修正 (commit `b8d4ec72`)、
+  修正後の "sign with" 表示を実機確認
