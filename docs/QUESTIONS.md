@@ -20,7 +20,13 @@
 
 ## 裁定待ち
 
-(なし)
+### 👺PSH-Q2: v0.27.0 (clap 移行 + approver 硬化) の push タイミング
+
+- [ ] a (推奨): 次回 kawaz 在席時に push (CLI パーサ全置換なので、brew 更新後に日常コマンドの体感確認ができる状態が望ましい)
+- [ ] b: 今すぐ push (テストは workspace 1277 green / completion 15/15、レビュー済み)
+
+内容: clap 4 置換 (`541ff256`、issue socket-flag-position-doc-mismatch close) +
+approver release 硬化 6/7 項目 (`1218a74e`、dialog wedge 根治は実機確認済み) + docs/issue 群。
 
 ## 確認待ち
 
