@@ -3,7 +3,7 @@ title: top-level --socket が実際にはサブコマンド後にしか置けな
 status: open
 category: bug
 created: 2026-07-13T17:54:24+09:00
-last_read:
+last_read: 2026-08-11T23:47:53+09:00
 open_entered: 2026-07-13T17:54:24+09:00
 wip_entered:
 blocked_entered:
