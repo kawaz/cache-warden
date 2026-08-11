@@ -1556,3 +1556,34 @@ SIGN 動線を実機で通過 (詳細は `docs/journal/2026-08-11-block-3b-item2
 - **発見 bug**: dialog summary が operation を無視して常に "read" 表示 → SIGN で
   誤表示。`summary_line()` で operation を動詞句化して修正 (commit `b8d4ec72`)、
   修正後の "sign with" 表示を実機確認
+
+### release 硬化 land (2026-08-12)
+
+issue `2026-07-12-approver-release-hardening` の 7 項目のうち 6 件を実装
+(commit `1218a74e`、fable レビュー LOW 3 件のみで commit 可判定):
+
+- **§v1 既知制約の「dialog wedge」解消**: helper が wire の `timeout_secs` (60s) を
+  dispatch_after ベースの main-queue timer で消費し、期限で `Outcome::Timeout` 送信 +
+  `LAContext.invalidate()` + dialog 自動 close → 次 request へ。実機確認済み
+  (daemon log `no answer within 60s, closing the dialog` + dialog の自動消滅を目視)。
+  disarm は take-once TimerSlot (per-request Arc) で表現し、前 request の timer が
+  次 dialog を殺す誤爆は構造的に不可能
+- **§v1 既知制約の「無界キュー」有界化**: `ApproverClient::request` に
+  `MAX_PENDING_REQUESTS = 5` の depth 上限 (超過は helper に届く前に即拒否) +
+  lock 待ち / exchange の **2 段 timeout**。全体 1 本の timeout にしなかったのは、
+  順番が回った時点で期限を消費済みの後続が原理的に承認不能になるため (深さ上限が
+  総遅延を bound するので N×90s 退行はない)。`(key, requester)` coalesce は未実装
+  (SIGN の per-key 再試行対策の本命として issue 項目 6 に残る)
+- standalone mode は `#[cfg(debug_assertions)]` gate (release build は stderr 1 行 +
+  exit 2、TouchID 疲れ攻撃面の除去)
+- LA completion block の AppKit 操作を dispatch_main に統一 / helper stderr prefix を
+  `cache-warden-approver: ` に統一 / `CodesignError::PeerIdentifierMissing` を
+  prefix 不一致と診断分離
+- **`kSecCSStrictValidate` は不採用**: SecStaticCode (静的検証) 用 flag で、
+  audit token 由来の動的 `SecCodeCheckValidity` には効かず、ディスク上 bundle の
+  静的検証の追加は pid 再利用 TOCTOU 回避のため意図的に捨てたディスク読みの復活に
+  なるため
+- outcome の cancel / timeout 区別をクライアント向けエラーに出す件は
+  issue `2026-08-12-approver-outcome-in-client-errors` (kawaz 裁定 2026-08-12) で追跡。
+  SSH agent 経路は wire に error 詳細フィールドが無く構造的に不可、daemon stderr は
+  cancelled / timed out を既に区別
