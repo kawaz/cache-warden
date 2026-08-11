@@ -1,6 +1,6 @@
 ---
 title: kv get peer-identity guard
-status: wip
+status: resolved
 category: design
 created: 2026-06-22T21:18:58+09:00
 last_read: 2026-08-11T21:54:04+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-07-10T09:59:04+09:00
 blocked_entered: 2026-07-04T09:33:55+09:00
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-11T21:55:20+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/draft-DR-0030:implemented", "done:CommandAuthenticatorとの関係はDR-0030§6に記録", "done:Open questions 3点はkawaz裁定済み(2026-07-12)"]
 blocked_by: []
 origin: 自リポ TODO
 ---
