@@ -3,7 +3,7 @@ title: kv get peer-identity guard
 status: wip
 category: design
 created: 2026-06-22T21:18:58+09:00
-last_read:
+last_read: 2026-08-11T21:54:04+09:00
 open_entered: 2026-07-10T03:11:57+09:00
 wip_entered: 2026-07-10T09:59:04+09:00
 blocked_entered: 2026-07-04T09:33:55+09:00
