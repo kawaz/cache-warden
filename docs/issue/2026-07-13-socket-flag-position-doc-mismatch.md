@@ -86,6 +86,14 @@ reject される。(2026-07-13 実機コード確認済み: 上記行番号・�
 - [ ] `take_socket_flag` の doc コメントと `main.rs` 側のコメントが実装と
       一致していることを確認
 
+## 追加実機サンプル (2026-08-11、Block 3b Item 2 準備中)
+
+`kv set --namespace test --require-same-shell sshkey "<PEM>"` のように VALUE
+位置引数が `-----BEGIN OPENSSH PRIVATE KEY-----` で始まると、手書きパーサが
+`--` 始まりトークンをオプションと誤認して reject する。回避は `--` セパレータ
+(`... --require-same-shell -- sshkey "<PEM>"`)。clap 置換 (推奨案 c) なら
+`allow_hyphen_values` 相当で自然に解決する系の症状であり、置換動機の追加材料。
+
 ## TODO
 
 <!-- wip 時のみ -->
