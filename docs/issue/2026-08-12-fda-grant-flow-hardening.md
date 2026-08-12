@@ -34,17 +34,19 @@ ON → `auth_value=2` を確認済み。
 
 ## 受け入れ条件
 
-- [ ] register 時以外の検知経路: 既 register 環境では誘導が走らないため、daemon
-      startup または `daemon status` で FDA 未付与を警告 + 誘導する経路を追加
-      (「register し直していない環境で放置」の再発防止)
-- [ ] `wait_for_grant` のイベント駆動化: 現行ポーリングを `com.apple.TCC.access.changed`
-      distributed notification 購読 (要実機裏取り)、または TCC.db の FSEvents 監視 +
-      probe 再実行に置換検討 (kawaz 要望 2026-08-12「変化のイベント取れる?」)
-- [ ] `has_op_sources` 条件の再考: op source が無くても authsock の op discovery 等で
-      FDA が要る構成がないか確認
-- [ ] 検証用に作った同 bundle ID の `/tmp/CacheWardenProbe.app` を削除
-- [ ] `.claude/rules/daemon-notarized-binary.md` の「未実装の誘導フロー」記述が古い
-      ため、実装状況に合わせて修正
+- [x] register 時以外の検知経路: daemon startup で検知 + helper 説明ダイアログ、
+      `daemon status` に FDA 行を control socket 問い合わせで追加 (commit 4278fa55)
+- [x] `wait_for_grant` のイベント駆動化: helper の live 表示は
+      `com.apple.tcc.access.changed` 購読 (wake-up hint) + 2s fallback poll で実装。
+      register の CLI テキストフロー側 `wait_for_grant` は従来ポーリングのまま
+      (旧経路、必要になれば同構造を適用)。実現性調査は
+      `docs/findings/2026-08-12-tcc-change-event-feasibility.md`
+- [x] `has_op_sources` 条件の再考: command source の `argv[0]` basename=="op" を
+      追加。env/sh -c 経由は静的検出不能で対象外と doc 化
+- [ ] 検証用に作った同 bundle ID の `/tmp/CacheWardenProbe.app` を削除 (rm 権限なし、
+      kawaz 依頼)
+- [x] `.claude/rules/daemon-notarized-binary.md` の「未実装の誘導フロー」記述が古い
+      ため、実装状況に合わせて修正 (commit 82635e05)
 
 ## UX 仕様 (kawaz 裁定 2026-08-12)
 
@@ -74,3 +76,9 @@ live 状態監視は本 issue 既記載のイベント駆動化 (`com.apple.TCC.
 ## TODO
 
 <!-- wip 時のみ -->
+
+- 実機 e2e マトリクス (findings の 5 項目: 通知の OFF→ON/ON→OFF 発火・遅延回数・
+  受信可能プロセス種別・userInfo 内容・OS 世代差)
+- helper in-process probe の attribution 裏取り (daemon granted と helper granted
+  のズレ有無)
+- 説明ダイアログの表示・緑化・Dismissed/Granted 送信の実機確認
