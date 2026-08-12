@@ -1,6 +1,6 @@
 ---
 title: kv get の承認拒否エラーで cancel と timeout を区別して返す
-status: wip
+status: resolved
 category: task
 created: 2026-08-12T00:21:39+09:00
 last_read: 2026-08-12T13:23:08+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-08-12T13:22:25+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-12T13:31:58+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented (commit 4703a7ae)","kv get 経路で cancelled/timed out を区別、他 outcome は approval was not granted に丸め (DR-0030 §7 適用)","正確な outcome は daemon ログに保持","SSH agent 経路対象外を draft-DR-0031 に追記","経緯注記: issue 起票時の「全 outcome が AuthFailed に丸められている」は実態と逆で実装は全5 outcome を区別開示済みだった。本変更は裁定意図に合わせ開示を2区分へ絞る修正"]
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -49,7 +49,7 @@ draft-DR-0031 の outcome 丸め規定。
 
 ## 受け入れ条件
 
-- [ ] kv get (control socket) 経路のクライアント向けエラー文言が cancelled
+- [x] kv get (control socket) 経路のクライアント向けエラー文言が cancelled
       と timed out を区別する
-- [ ] DR-0030 §7 (setter identity 非開示) を侵害しない
-- [ ] SSH agent (SIGN) 経路は対象外であることが明記されている
+- [x] DR-0030 §7 (setter identity 非開示) を侵害しない
+- [x] SSH agent (SIGN) 経路は対象外であることが明記されている
