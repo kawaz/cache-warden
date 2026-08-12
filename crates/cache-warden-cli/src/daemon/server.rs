@@ -46,7 +46,7 @@ use cache_warden::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use super::approver_wire::{self, Approver};
 use super::graceful_restart;
@@ -234,7 +234,7 @@ pub(crate) struct Shared {
 /// level lets each adapter log a matching diagnostic even though the
 /// user-facing shape collapses to one denial (draft-DR-0031 §Security:
 /// dialog outcomes are per-approval facts, not per-caller).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ApprovalOutcome {
     Approved,
     /// `helper_down` / `wait_ready` timed out — §9 fail-closed shape.
@@ -332,6 +332,98 @@ impl ApprovalOutcome {
 pub(crate) struct ApproverSlot {
     state: Mutex<ApproverState>,
     notify: tokio::sync::Notify,
+    /// The approvals currently on screen (or queued for it), keyed by the
+    /// question they ask. A second request for a question already in flight
+    /// joins the first instead of stacking another dialog — see
+    /// [`CoalesceKey`] and [`ApproverSlot::await_dialog_outcome`].
+    inflight: Mutex<std::collections::HashMap<CoalesceKey, broadcast::Sender<ApprovalOutcome>>>,
+}
+
+/// What makes two approval requests "the same question", for coalescing.
+///
+/// # Why these fields
+///
+/// An approval answers "may *this process* do *this thing* to *this entry*",
+/// so the identity has to pin all three or a shared answer would be answering
+/// something the user was never asked:
+///
+/// - `key` — the entry. Different entries are different secrets.
+/// - `operation` — reading a key and signing with it are different asks, and
+///   the dialog says so in as many words ("read" vs "sign with"), so they
+///   must not share an answer.
+/// - `pid` + `pid_version` — the requesting process *instance*. `pid` alone
+///   is not an identity: macOS reuses it, and `pid_version` is exactly the
+///   generation counter that tells a live process from a later one wearing
+///   its number (the same pairing DR-0031 §7 uses for peer-exit detection
+///   and DR-0030 §Security for pinned identities).
+/// - `euid` — belt and braces. The approver socket is 0600 so a
+///   cross-user requester should be impossible already; including the uid
+///   means a bug elsewhere degrades into "no coalescing" rather than into
+///   one user's approval answering another's request.
+///
+/// # What this deliberately does not do
+///
+/// Only *concurrent* requests share an answer. The entry is removed the
+/// moment the leader has one, so a request arriving afterwards raises a
+/// fresh prompt. This is not "remember the approval for N seconds" — that
+/// would be a real weakening of the one-prompt-per-access contract, and it
+/// is not what the retry storms need: ssh's per-key SIGN retries all pile up
+/// *while the first prompt is still open*.
+///
+/// Nor does it merge requests from *different processes* (each is its own
+/// `pid` + `pid_version`): a storm of parallel ssh clients asking for the
+/// same key raises one prompt per process by design — a different process is
+/// a different question — and the queue's depth cap, not coalescing, is what
+/// bounds that shape of pile-up.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CoalesceKey {
+    key: String,
+    operation: String,
+    pid: u32,
+    pid_version: u32,
+    euid: u32,
+}
+
+impl CoalesceKey {
+    /// Derive the key from a wire request, or `None` when the request
+    /// carries no usable requester identity.
+    ///
+    /// `None` means "do not coalesce this one": without a trustworthy
+    /// process identity there is no way to tell two requesters apart, and
+    /// guessing would risk handing one caller's approval to another. A
+    /// separate prompt is the conservative failure mode.
+    fn from_request(req: &ApproveRequest) -> Option<Self> {
+        let token = &req.requester.audit_token;
+        if token.pid == 0 {
+            return None;
+        }
+        Some(Self {
+            key: req.key.clone(),
+            operation: req.operation.clone(),
+            pid: token.pid,
+            pid_version: token.pid_version,
+            euid: token.euid,
+        })
+    }
+}
+
+/// Removes the in-flight entry when the leader is done with it — including
+/// when the leader's future is dropped mid-approval (its client
+/// disconnected, a shutdown raced it). Without the `Drop`, an abandoned
+/// leader would leave its key in the map forever and every later request
+/// for that question would wait on an answer nobody is coming back with.
+struct InflightGuard<'a> {
+    map: &'a Mutex<std::collections::HashMap<CoalesceKey, broadcast::Sender<ApprovalOutcome>>>,
+    key: CoalesceKey,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
 }
 
 enum ApproverState {
@@ -345,6 +437,7 @@ impl ApproverSlot {
         Self {
             state: Mutex::new(ApproverState::Starting),
             notify: tokio::sync::Notify::new(),
+            inflight: Mutex::new(std::collections::HashMap::new()),
         }
     }
     /// A pre-constructed slot in the `Down` terminal state, used by every
@@ -357,6 +450,7 @@ impl ApproverSlot {
         Self {
             state: Mutex::new(ApproverState::Down),
             notify: tokio::sync::Notify::new(),
+            inflight: Mutex::new(std::collections::HashMap::new()),
         }
     }
     pub(crate) fn set_ready(&self, a: Arc<dyn Approver>) {
@@ -413,6 +507,112 @@ impl ApproverSlot {
     /// `SSH_AGENT_FAILURE` + a structured stderr diag) — the daemon-side
     /// semantics stay identical, only the surface differs.
     pub(crate) async fn await_dialog_outcome(
+        &self,
+        request: ApproveRequest,
+        starting_wait: Duration,
+        request_timeout: Duration,
+    ) -> ApprovalOutcome {
+        // Join an identical approval already in flight rather than stacking
+        // a second dialog for the same question (see `CoalesceKey`). ssh is
+        // the case that forces this: it sends a SIGN per key and retries on
+        // failure, so one guarded key can queue a dozen prompts that all ask
+        // the user the same thing.
+        let coalesce_key = CoalesceKey::from_request(&request);
+        // Decide leader vs. follower under the map lock, and hold nothing
+        // across an await (the lock is a std mutex; the awaits below can
+        // last as long as a human takes to answer).
+        enum Role {
+            Follow(broadcast::Receiver<ApprovalOutcome>),
+            Lead(Option<broadcast::Sender<ApprovalOutcome>>),
+        }
+        let role = match &coalesce_key {
+            Some(ck) => {
+                let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+                match map.get(ck) {
+                    Some(tx) => Role::Follow(tx.subscribe()),
+                    None => {
+                        let (tx, _rx) = broadcast::channel(1);
+                        map.insert(ck.clone(), tx.clone());
+                        Role::Lead(Some(tx))
+                    }
+                }
+            }
+            None => Role::Lead(None),
+        };
+        let sender = match role {
+            Role::Follow(rx) => {
+                // `coalesce_key` is `Some` on this arm by construction.
+                let ck = coalesce_key.as_ref().expect("follower has a key");
+                return self.follow_inflight(ck, rx, request_timeout).await;
+            }
+            Role::Lead(sender) => sender,
+        };
+        // From here on this call is the leader: it owns the dialog, and
+        // whatever it learns is broadcast to everyone who joined meanwhile.
+        // The guard drops the entry even if this future is cancelled, so an
+        // abandoned approval cannot wedge later ones.
+        let _guard = coalesce_key.as_ref().map(|ck| InflightGuard {
+            map: &self.inflight,
+            key: ck.clone(),
+        });
+
+        let outcome = self
+            .run_dialog(request, starting_wait, request_timeout)
+            .await;
+
+        // Retire the entry *before* publishing: a request arriving after the
+        // answer is a new question and must raise its own prompt, not attach
+        // to one that is already over.
+        drop(_guard);
+        if let Some(tx) = sender {
+            // Fails only when nobody joined — the ordinary case.
+            let _ = tx.send(outcome.clone());
+        }
+        outcome
+    }
+
+    /// Wait for the approval this request joined.
+    ///
+    /// # Deadlines
+    ///
+    /// Every waiter bounds its own wait with its own `request_timeout`; the
+    /// dialog's lifetime belongs to the leader alone. A follower that runs
+    /// out of time while the prompt is still up gets [`Timeout`] and fails
+    /// closed, even though the user might have approved a moment later —
+    /// which is the same thing that would have happened to it without
+    /// coalescing, and it keeps the rule to one sentence instead of
+    /// arithmetic over other callers' deadlines. A follower can never wait
+    /// *longer* than it asked to.
+    ///
+    /// [`Timeout`]: ApprovalOutcome::Timeout
+    async fn follow_inflight(
+        &self,
+        key: &CoalesceKey,
+        mut rx: broadcast::Receiver<ApprovalOutcome>,
+        request_timeout: Duration,
+    ) -> ApprovalOutcome {
+        eprintln!(
+            "cache-warden: approver: joining the approval already on screen for {:?} ({}), \
+             pid {} — not raising a second prompt",
+            key.key, key.operation, key.pid
+        );
+        match tokio::time::timeout(request_timeout, rx.recv()).await {
+            Ok(Ok(outcome)) => outcome,
+            // The leader went away without an answer (its caller
+            // disconnected, or a shutdown cut it short). Nothing was
+            // decided, so this fails closed like any other unanswered
+            // approval; the caller may try again, which will raise a fresh
+            // prompt now that the entry is gone.
+            Ok(Err(_)) => ApprovalOutcome::Ipc(
+                "the approval this request joined ended without an answer".to_string(),
+            ),
+            Err(_) => ApprovalOutcome::Timeout,
+        }
+    }
+
+    /// Put one dialog on screen and classify what comes back. The
+    /// leader-only half of [`await_dialog_outcome`].
+    async fn run_dialog(
         &self,
         request: ApproveRequest,
         starting_wait: Duration,
@@ -2450,6 +2650,259 @@ mod tests {
         let s = shared();
         s.approver.set_ready(Arc::new(FakeApprover::new(outcome)));
         s
+    }
+
+    // ---- approval coalescing (issue 2026-07-12-approver-release-hardening) ----
+
+    /// An approver that parks every call until the test hands out permits,
+    /// so several approvals can be in flight at once and the test can see
+    /// exactly how many dialogs were actually raised.
+    struct ParkingApprover {
+        calls: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Semaphore,
+        outcome: WireOutcomeT,
+    }
+
+    impl ParkingApprover {
+        fn new(outcome: WireOutcomeT) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                release: tokio::sync::Semaphore::new(0),
+                outcome,
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl super::super::approver_wire::Approver for ParkingApprover {
+        fn request<'a>(
+            &'a self,
+            request: cache_warden_approver::wire::ApproveRequest,
+            _timeout: Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = io::Result<cache_warden_approver::wire::ApproveResponse>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let permit = self.release.acquire().await.expect("semaphore open");
+                permit.forget();
+                Ok(cache_warden_approver::wire::ApproveResponse {
+                    v: cache_warden_approver::wire::WIRE_VERSION,
+                    request_id: request.request_id,
+                    outcome: self.outcome,
+                    biometric_kind: None,
+                })
+            })
+        }
+        fn shutdown<'a>(
+            &'a self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+    }
+
+    /// A wire request with the identity fields coalescing keys on. Every
+    /// other field (notably `request_id`) is incidental — two requests that
+    /// ask the same question differ in their ids, which is precisely why the
+    /// id must not be part of the key.
+    fn coalesce_request(
+        request_id: &str,
+        key: &str,
+        operation: &str,
+        pid: u32,
+    ) -> cache_warden_approver::wire::ApproveRequest {
+        use cache_warden_approver::wire::{AuditToken, Requester};
+        cache_warden_approver::wire::ApproveRequest {
+            v: cache_warden_approver::wire::WIRE_VERSION,
+            request_id: request_id.to_string(),
+            key: key.to_string(),
+            operation: operation.to_string(),
+            requester: Requester {
+                chain: vec![],
+                audit_token: AuditToken {
+                    euid: 501,
+                    ruid: 501,
+                    egid: 20,
+                    pid,
+                    pid_version: 1,
+                },
+                responsible_bundle_id: None,
+            },
+            guard_eval: None,
+            timeout_secs: 60,
+        }
+    }
+
+    /// Spin (yielding, never sleeping) until `cond` holds.
+    async fn until<F: Fn() -> bool>(cond: F) {
+        for _ in 0..10_000 {
+            if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition never became true");
+    }
+
+    /// A duplicate of an approval already on screen joins it instead of
+    /// raising a second dialog, and both callers get the same answer.
+    ///
+    /// This is what makes ssh survivable: it sends a SIGN per key and
+    /// retries, so without coalescing one guarded key marches a queue of
+    /// identical prompts across the screen. Checked for an approval *and* a
+    /// refusal — the shared answer is whatever the leader got, not just the
+    /// happy path.
+    #[tokio::test]
+    async fn duplicate_requests_join_one_dialog_and_share_its_answer() {
+        for outcome in [WireOutcomeT::Approved, WireOutcomeT::Cancelled] {
+            let slot = Arc::new(ApproverSlot::new_starting());
+            let approver = Arc::new(ParkingApprover::new(outcome));
+            slot.set_ready(Arc::clone(&approver) as Arc<dyn super::super::approver_wire::Approver>);
+
+            let leader = {
+                let slot = Arc::clone(&slot);
+                tokio::spawn(async move {
+                    slot.await_dialog_outcome(
+                        coalesce_request("first", "default/K", "sign", 4242),
+                        Duration::from_secs(5),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                })
+            };
+            // The leader is inside the dialog once the approver has been
+            // called; only then can a second request find it in flight.
+            until(|| approver.calls() == 1).await;
+
+            let follower = {
+                let slot = Arc::clone(&slot);
+                tokio::spawn(async move {
+                    slot.await_dialog_outcome(
+                        coalesce_request("second", "default/K", "sign", 4242),
+                        Duration::from_secs(5),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                })
+            };
+            // Wait until the follower has actually subscribed (observable as
+            // a receiver on the leader's broadcast channel), so releasing the
+            // dialog below cannot outrun it.
+            until(|| {
+                slot.inflight
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|tx| tx.receiver_count() > 0)
+            })
+            .await;
+
+            approver.release.add_permits(1);
+            let (a, b) = (
+                leader.await.expect("leader task"),
+                follower.await.expect("follower task"),
+            );
+
+            assert_eq!(
+                approver.calls(),
+                1,
+                "the duplicate must not have raised a second dialog"
+            );
+            let expected = match outcome {
+                WireOutcomeT::Approved => "approved",
+                _ => "approval cancelled",
+            };
+            assert_eq!(a.label(), expected, "leader outcome");
+            assert_eq!(b.label(), expected, "follower must get the leader's answer");
+
+            // The question is retired once answered: a later request for the
+            // same thing is a new ask and must raise its own prompt.
+            assert!(
+                slot.inflight.lock().unwrap().is_empty(),
+                "the in-flight entry must be gone once the answer is out"
+            );
+        }
+    }
+
+    /// Different entry, different operation, different process — each is a
+    /// different question and gets its own prompt. Coalescing that collapsed
+    /// any of these would answer something the user was never asked.
+    #[tokio::test]
+    async fn different_key_operation_or_requester_do_not_join() {
+        let slot = Arc::new(ApproverSlot::new_starting());
+        let approver = Arc::new(ParkingApprover::new(WireOutcomeT::Approved));
+        slot.set_ready(Arc::clone(&approver) as Arc<dyn super::super::approver_wire::Approver>);
+
+        let variants = [
+            ("r1", "default/K", "get", 4242u32),
+            // same requester + operation, other entry
+            ("r2", "default/OTHER", "get", 4242),
+            // same requester + entry, other operation
+            ("r3", "default/K", "sign", 4242),
+            // same entry + operation, other process
+            ("r4", "default/K", "get", 9999),
+        ];
+        let mut tasks = Vec::new();
+        for (id, key, op, pid) in variants {
+            let slot = Arc::clone(&slot);
+            tasks.push(tokio::spawn(async move {
+                slot.await_dialog_outcome(
+                    coalesce_request(id, key, op, pid),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await
+            }));
+        }
+
+        // All four must reach the approver — none of them joined another.
+        until(|| approver.calls() == variants.len()).await;
+        approver.release.add_permits(variants.len());
+        for t in tasks {
+            assert_eq!(t.await.expect("task").label(), "approved");
+        }
+        assert_eq!(approver.calls(), variants.len());
+    }
+
+    /// A requester the daemon could not identify (no usable pid on the audit
+    /// token) is never coalesced: with no identity there is no way to tell
+    /// two callers apart, and a shared answer could hand one caller's
+    /// approval to another. Separate prompts are the conservative failure.
+    #[tokio::test]
+    async fn unidentifiable_requesters_are_never_coalesced() {
+        let slot = Arc::new(ApproverSlot::new_starting());
+        let approver = Arc::new(ParkingApprover::new(WireOutcomeT::Approved));
+        slot.set_ready(Arc::clone(&approver) as Arc<dyn super::super::approver_wire::Approver>);
+
+        let mut tasks = Vec::new();
+        for id in ["a", "b"] {
+            let slot = Arc::clone(&slot);
+            tasks.push(tokio::spawn(async move {
+                // pid 0 = "no identity resolved" on this wire.
+                slot.await_dialog_outcome(
+                    coalesce_request(id, "default/K", "get", 0),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await
+            }));
+        }
+        until(|| approver.calls() == 2).await;
+        approver.release.add_permits(2);
+        for t in tasks {
+            assert_eq!(t.await.expect("task").label(), "approved");
+        }
+        assert!(
+            slot.inflight.lock().unwrap().is_empty(),
+            "unidentifiable requests must not register an in-flight entry"
+        );
     }
 
     /// Seat a guarded value directly on the shared store, side-stepping the

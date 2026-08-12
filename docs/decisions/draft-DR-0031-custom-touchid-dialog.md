@@ -1588,8 +1588,34 @@ issue `2026-07-12-approver-release-hardening` の 7 項目のうち 6 件を実�
   `MAX_PENDING_REQUESTS = 5` の depth 上限 (超過は helper に届く前に即拒否) +
   lock 待ち / exchange の **2 段 timeout**。全体 1 本の timeout にしなかったのは、
   順番が回った時点で期限を消費済みの後続が原理的に承認不能になるため (深さ上限が
-  総遅延を bound するので N×90s 退行はない)。`(key, requester)` coalesce は未実装
-  (SIGN の per-key 再試行対策の本命として issue 項目 6 に残る)
+  総遅延を bound するので N×90s 退行はない)
+
+### (key, requester) coalesce (2026-08-12)
+
+SIGN の per-key 再試行対策の本命。`ApproverSlot::await_dialog_outcome` に実装
+(kv get / authsock SIGN の両経路が通る層なので 1 箇所で両方に効く)。
+
+- **同一性の定義**: `(key, operation, requester pid, pid_version, euid)`。
+  operation を含めるのは read と sign が dialog 文言からして別の問い
+  (`summary_line()` の動詞句) だから。pid 単独ではなく `pid_version` と組にする
+  のは pid 再利用を別プロセスとして弾くため (§7 peer exit / DR-0030 §Security の
+  pin と同じ語彙)。euid は socket 0600 の前提が壊れた場合の保険
+- **合流の意味論**: 進行中 (pending / 表示中) の同一問い合わせにのみ合流し、
+  leader の outcome を全 waiter に配る。**答えが出た時点で entry を除去する**ので、
+  完了後に来た要求は新しい dialog を出す。「承認を N 秒記憶する」ではない
+  (それは 1 アクセス 1 承認の契約を実際に弱める。retry storm は最初の dialog が
+  開いている間に積み上がるので、この範囲で十分)
+- **timeout の扱い**: 各 waiter は自分の `request_timeout` で自分の待ちだけを
+  bound する (dialog の寿命は leader のもの)。後着 waiter が dialog 表示中に
+  期限切れした場合は `Timeout` で fail-closed — coalesce が無くても同じ結果に
+  なる挙動で、他 waiter の deadline を跨いだ算術を持ち込まずに済む。後着が自分の
+  要求より長く待たされることはない
+- **leader 消失時**: leader の future が drop された場合 (client 切断 / shutdown)
+  は `InflightGuard` の `Drop` が entry を除去し、follower は「答えの出ないまま
+  終わった」として fail-closed。再要求すれば新しい dialog が出る
+- **requester 識別不能時 (audit token の pid が取れない) は coalesce しない**
+  (識別子が無いと別 caller を区別できず、他人の承認を配る恐れがあるため)
+- **FdaPrompt は対象外** (fire-and-forget かつ helper 側 `AtomicBool` で 1 枚制限)
 - standalone mode は `#[cfg(debug_assertions)]` gate (release build は stderr 1 行 +
   exit 2、TouchID 疲れ攻撃面の除去)
 - LA completion block の AppKit 操作を dispatch_main に統一 / helper stderr prefix を
