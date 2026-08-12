@@ -3,7 +3,7 @@ title: kv get の承認拒否エラーで cancel と timeout を区別して返�
 status: wip
 category: task
 created: 2026-08-12T00:21:39+09:00
-last_read: 2026-08-12T13:21:35+09:00
+last_read: 2026-08-12T13:23:08+09:00
 open_entered: 2026-08-12T00:21:39+09:00
 wip_entered: 2026-08-12T13:22:25+09:00
 blocked_entered:
