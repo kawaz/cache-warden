@@ -269,6 +269,55 @@ impl ApprovalOutcome {
             Self::Ipc(_) => "approver dialog failed",
         }
     }
+
+    /// The message a **client** gets when this outcome denies its request —
+    /// deliberately coarser than [`label`](Self::label), which is the
+    /// daemon's own log vocabulary.
+    ///
+    /// Two outcomes are told apart because they call for opposite next
+    /// moves, and a caller that cannot tell them apart gets one of them
+    /// wrong (kawaz 裁定 2026-08-12):
+    ///
+    /// - **cancelled** — a person saw the prompt and said no. Asking again
+    ///   just puts the same prompt back on their screen.
+    /// - **timed out** — nobody answered. The request was never actually
+    ///   judged, so retrying when someone is present is the right move.
+    ///
+    /// Everything else collapses into one indistinguishable denial. Whether
+    /// the finger did not match, whether the caller's own process vanished
+    /// mid-prompt, whether a policy refused before anyone was asked — none
+    /// of that changes what the caller should do next (it does not get the
+    /// secret), and each distinction is a bit of information about the user
+    /// or the entry's guard that a caller has no business learning by
+    /// probing (DR-0030 §7's non-disclosure applied to the dialog's
+    /// outcomes).
+    ///
+    /// Three variants share that arm without ever reaching it in practice:
+    /// `Approved` is not a denial at all, and the control path answers
+    /// [`HelperUnavailable`](Self::HelperUnavailable) / [`Ipc`](Self::Ipc)
+    /// before it gets here — those two are broken plumbing rather than a
+    /// verdict on the request, and saying so plainly is what lets an
+    /// operator fix them. They are listed so this match stays exhaustive
+    /// and so a future caller that does route them here gets the safe
+    /// wording by default.
+    pub(crate) fn client_message(&self) -> &'static str {
+        match self {
+            Self::Cancelled => {
+                "approval declined at the confirmation prompt; \
+                 asking again will only re-prompt — check with the user first"
+            }
+            Self::Timeout => {
+                "approval timed out: the confirmation prompt went unanswered; \
+                 retry while someone is at the machine"
+            }
+            Self::Approved
+            | Self::Denied
+            | Self::PeerGone
+            | Self::BiometricFailed
+            | Self::HelperUnavailable
+            | Self::Ipc(_) => "approval was not granted",
+        }
+    }
 }
 
 /// The lifecycle-aware slot for the DR-0031 approver helper.
@@ -1770,7 +1819,13 @@ pub(crate) async fn run_request_async(
                     );
                 }
                 other => {
-                    return Response::error(ErrorKind::AuthFailed, other.label().to_string());
+                    // Log the precise outcome for the operator, hand the
+                    // client the coarser message (see `client_message`).
+                    eprintln!("cache-warden: kv.get denied for {key:?}: {}", other.label());
+                    return Response::error(
+                        ErrorKind::AuthFailed,
+                        other.client_message().to_string(),
+                    );
                 }
             }
             let shared_second = Arc::clone(shared);
@@ -2871,30 +2926,25 @@ mod tests {
         }
     }
 
-    /// Every non-`Approved` outcome the helper can return (draft-DR-0031
-    /// §Outcomes) surfaces as `AuthFailed` with a message that names the
-    /// user-visible reason. Pins the outcome→message mapping in
-    /// `run_request_async` so a future refactor cannot silently collapse
-    /// `Cancelled` into `Denied` (etc.) — each outcome has a distinct
-    /// user story and the message shape is the audit trail.
+    /// Every non-`Approved` outcome surfaces as `AuthFailed`, and the
+    /// message tells the client apart exactly two situations: a person
+    /// declined, and nobody answered. Those call for opposite next moves
+    /// (do not re-prompt vs. retry when someone is around), which is why
+    /// they are worth distinguishing at all — see
+    /// [`ApprovalOutcome::client_message`].
+    ///
+    /// Everything else is one indistinguishable denial on purpose: a client
+    /// that could tell a failed fingerprint from a policy refusal could
+    /// learn things about the user and the entry's guard by probing
+    /// (DR-0030 §7). The precise outcome still reaches the daemon log.
     ///
     /// macOS-only: same chain-walk dependency as
     /// [`helper_down_fails_guarded_reveal_get_closed`].
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn non_approved_outcomes_all_surface_as_auth_failed_with_distinct_messages() {
-        let cases: &[(WireOutcomeT, &str)] = &[
-            (WireOutcomeT::Denied, "denied"),
-            (WireOutcomeT::Cancelled, "cancelled"),
-            (WireOutcomeT::Timeout, "timed out"),
-            (WireOutcomeT::PeerGone, "exited before approval"),
-            (
-                WireOutcomeT::BiometricFailed,
-                "biometric authentication failed",
-            ),
-        ];
-        for (outcome, expected_fragment) in cases {
-            let s = shared_with_fake_approver(*outcome);
+    async fn client_sees_declined_and_timed_out_apart_but_every_other_denial_alike() {
+        async fn message_for(outcome: WireOutcomeT) -> String {
+            let s = shared_with_fake_approver(outcome);
             seed_guarded_value_current_uid(&s, "default/K", b"secret");
             let resp = run_request_async(
                 &s,
@@ -2914,15 +2964,51 @@ mod tests {
                         ErrorKind::AuthFailed,
                         "outcome {outcome:?} must map to AuthFailed"
                     );
-                    assert!(
-                        e.error.message.contains(expected_fragment),
-                        "outcome {outcome:?} expected message to contain {expected_fragment:?}, got {:?}",
-                        e.error.message
-                    );
+                    e.error.message
                 }
                 other => panic!("outcome {outcome:?} expected AuthFailed, got {other:?}"),
             }
         }
+
+        let declined = message_for(WireOutcomeT::Cancelled).await;
+        let timed_out = message_for(WireOutcomeT::Timeout).await;
+        assert!(declined.contains("declined"), "{declined}");
+        assert!(timed_out.contains("timed out"), "{timed_out}");
+        assert_ne!(
+            declined, timed_out,
+            "declined and timed out must not read alike — they call for opposite next moves"
+        );
+
+        // The rolled-up denials: identical to each other, and carrying none
+        // of the words that would give the distinction away.
+        let mut rolled = Vec::new();
+        for outcome in [
+            WireOutcomeT::Denied,
+            WireOutcomeT::PeerGone,
+            WireOutcomeT::BiometricFailed,
+        ] {
+            let msg = message_for(outcome).await;
+            for leak in [
+                "biometric",
+                "finger",
+                "exited",
+                "guard",
+                "setter",
+                "declined",
+            ] {
+                assert!(
+                    !msg.to_lowercase().contains(leak),
+                    "outcome {outcome:?} message leaks {leak:?}: {msg}"
+                );
+            }
+            rolled.push(msg);
+        }
+        assert!(
+            rolled.windows(2).all(|w| w[0] == w[1]),
+            "every rolled-up denial must read identically, got {rolled:?}"
+        );
+        assert_ne!(rolled[0], declined);
+        assert_ne!(rolled[0], timed_out);
     }
 
     /// End-to-end async: guarded reveal-get whose first-pass **passes**

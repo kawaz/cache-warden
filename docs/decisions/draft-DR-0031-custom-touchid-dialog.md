@@ -1452,6 +1452,22 @@ gated path に一切入らず dialog 非発火 (値を返さないため承認�
 本文には dry-run 分岐の明文はなく、`run_request_async` のドキュメントコメントで
 明示した実装判断、専用テストで pin)。
 
+##### 丸めの現行仕様 (2026-08-12 更新、kawaz 裁定)
+
+`AuthFailed` に丸める点は変わらないが、**control socket 経路のエラー文言だけは
+`Cancelled` と `Timeout` を区別する** (issue `2026-08-12-approver-outcome-in-client-errors`)。
+「人が見て断った」と「誰も答えなかった」は requester の次の行動が逆になる
+(再要求すべきでない / 人が居る時に再要求してよい) ため、区別しないと必ずどちらかを
+間違える。それ以外の `Denied` / `PeerGone` / `BiometricFailed` / helper 不在 /
+接続死は**単一の区別不能な拒否文言に丸めたまま**で、指紋不一致・呼び出し元プロセスの
+消滅・guard 拒否のいずれであったかは requester から観測できない (DR-0030 §7 の
+非開示を dialog outcome に適用)。正確な outcome は daemon ログ側に出る。
+
+**SSH agent (SIGN) 経路はこの区別ができない** — agent protocol の失敗応答が
+`SSH_AGENT_FAILURE` (空 payload) で、error 詳細を運ぶフィールドが wire に無い
+構造上の制約。SIGN 経路の cancelled / timed out の区別は daemon stderr の
+診断ログでのみ得られる。
+
 #### helper lifecycle: `ApproverSlot`
 
 `Starting` / `Ready(Arc<dyn Approver>)` / `Down` の 3 状態 + `tokio::sync::Notify`。
