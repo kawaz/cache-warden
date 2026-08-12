@@ -34,14 +34,10 @@ tccd: AUTHREQ_PROMPTING: msgID=..., service=kTCCServiceSystemPolicyAppData,
   - 原則 app 版を使う (notarize 済み)
   - System Settings → Privacy & Security → **Full Disk Access** に `CacheWarden.app` を追加 (FDA ON)
   - DR-0020 で `.app` + `AssociatedBundleIdentifiers` による TCC 永続化は完了済み、FDA ON で AppData を包含 → dialog 恒久消去 (findings/2026-06-14-macos-tcc-fda.md)
-- **未実装の誘導フロー**: cache-warden の `daemon register` フロー終盤で FDA 未付与時に System Settings 誘導 + ポーリングする。authsock-warden の `src/cli/commands/service.rs` に既実装、cache-warden 移植は `docs/issue/2026-06-14-fda-check-flow-port.md` で管理
-- **開発中の CLI バイナリ** (= 短時間で終わる `cache-warden status` / `cache-warden kv list` 等): ローカルビルドで OK
-  - PATH 上の `cache-warden` (homebrew or `cargo install`) が dev build でも実害なし
-  - 単発実行で終わるので Gatekeeper ダイアログが頻発しない
-
-## 適用範囲
-
-- **daemon プロセス** (= 常駐する `cache-warden daemon run`): 原則 app 版
+- **FDA 誘導フロー**: `daemon register` 終盤で FDA 未付与時に System Settings 誘導 +
+  付与待ちを行う (`crates/cache-warden-cli/src/commands/daemon_cmd.rs` の register、
+  判定は `crates/macos-tcc` の open+read probe)。ダイアログ版の誘導 (helper 経由) は
+  `docs/issue/2026-08-12-fda-grant-flow-hardening.md` で整備中
   - 通常の dogfood 中は `/Applications/CacheWarden.app` 経由で launchd 稼働
   - dev build を daemon として走らせるのは「変更を実機で検証する明示意図」がある時だけ
 - **開発中の CLI バイナリ** (= 短時間で終わる `cache-warden status` / `cache-warden kv list` 等): ローカルビルドで OK
