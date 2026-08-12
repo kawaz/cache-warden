@@ -490,10 +490,26 @@ preload = true
     let (mut daemon, socket) = spawn_with_config(dir.path(), cfg);
 
     // Pin EXT for an hour while it is still Active (approved by `true`).
-    let resp = request(
-        &socket,
-        r#"{"cmd":"kv.pin","key":"default/EXT","duration_secs":3600}"#,
-    );
+    // Preload runs in the startup background task after the socket binds
+    // (DR-0023: bind first, preload async), so a reachable daemon may not
+    // have registered EXT yet — retry while the key is still unknown.
+    let resp = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = request(
+                &socket,
+                r#"{"cmd":"kv.pin","key":"default/EXT","duration_secs":3600}"#,
+            );
+            if resp["error"]["kind"] != "not_found" {
+                break resp;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "EXT never registered after startup: {resp}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
     assert_eq!(resp["ok"], true, "pin approved by `true`: {resp}");
     assert_eq!(resp["pinned"], true);
 
