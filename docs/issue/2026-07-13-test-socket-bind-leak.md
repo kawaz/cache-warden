@@ -1,11 +1,11 @@
 ---
 title: cargo test 実行中に実環境の ~/.ssh/agent-*.sock.cw へ bind 試行が走る (テスト隔離不足)
-status: open
+status: wip
 category: bug
 created: 2026-07-13T07:58:55+09:00
 last_read: 2026-08-12T13:47:46+09:00
 open_entered: 2026-07-13T07:58:55+09:00
-wip_entered:
+wip_entered: 2026-08-12T13:48:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
