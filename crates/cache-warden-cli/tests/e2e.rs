@@ -1086,14 +1086,29 @@ fn persisted_definition_survives_daemon_restart() {
     let resp = request(&socket, r#"{"cmd":"ping"}"#);
     assert_eq!(resp["ok"], true);
 
-    // status shows PERSISTED as a restored (lazy) definition.
-    let resp = request(&socket, r#"{"cmd":"status"}"#);
-    let p = resp["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["name"] == "default/PERSISTED")
-        .expect("PERSISTED restored after restart");
+    // status shows PERSISTED as a restored (lazy) definition. The restore runs
+    // in the background *after* the control socket binds (DR-0023: bind first,
+    // restore async), so a reachable daemon does not yet imply the entry is
+    // back — poll status until it appears rather than asserting one snapshot.
+    let p = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = request(&socket, r#"{"cmd":"status"}"#);
+            if let Some(p) = resp["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == "default/PERSISTED")
+            {
+                break p.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PERSISTED never restored after restart: {resp}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
     assert_eq!(p["defined"], true, "restored as a definition: {p}");
 
     // get regenerates the value from the restored definition.
@@ -1205,20 +1220,42 @@ fn persisted_config_priority_merge_drops_clashing_persisted_entry() {
     assert_eq!(resp["ok"], true);
 
     // DB resolves to the CONFIG definition, not the stale persisted one.
-    let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/DB"}"#);
-    assert_eq!(
-        B64.decode(resp["value_b64"].as_str().unwrap()).unwrap(),
-        b"from-config",
-        "config definition wins the merge"
-    );
+    // Definition registration runs in the startup background task after the
+    // socket binds (DR-0023: bind first, restore async), so a reachable daemon
+    // does not yet imply DB is defined — poll until the get succeeds.
+    let value = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = request(&socket, r#"{"cmd":"kv.get","key":"default/DB"}"#);
+            if let Some(b64) = resp["value_b64"].as_str() {
+                break B64.decode(b64).unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "DB never became gettable after startup: {resp}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert_eq!(value, b"from-config", "config definition wins the merge");
 
     // The rewrite normalized the state file to current truth: DB's persisted
-    // argv must now be the config's (config-priority), not the stale one.
-    let after = std::fs::read_to_string(&state_file).unwrap();
-    assert!(
-        !after.contains("stale-persisted"),
-        "stale persisted entry must be removed from disk: {after}"
-    );
+    // argv must now be the config's (config-priority), not the stale one. The
+    // rewrite is likewise asynchronous — poll for the normalized content.
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let after = std::fs::read_to_string(&state_file).unwrap();
+            if !after.contains("stale-persisted") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stale persisted entry must be removed from disk: {after}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     let pid = daemon.child.id();
     unsafe {
