@@ -1,11 +1,11 @@
 ---
 title: FDA 付与フローの再整備
-status: open
+status: wip
 category: task
 created: 2026-08-12T01:55:02+09:00
 last_read: 2026-08-12T12:35:48+09:00
 open_entered: 2026-08-12T01:55:02+09:00
-wip_entered:
+wip_entered: 2026-08-12T12:36:43+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
