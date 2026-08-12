@@ -20,7 +20,16 @@
 
 ## 裁定待ち
 
-(なし)
+### 👺PSH-Q3: FDA 誘導フロー実装分の push タイミング
+
+FDA 付与フロー ([issue](issue/2026-08-12-fda-grant-flow-hardening.md)) の実装が commit 済み
+(fable5-high レビュー + delta 承認、全テスト green)。ただし実機 e2e (ダイアログ表示・
+緑化・通知発火) は kawaz 在席が要るため未実施。未 push は既存 4 commits (macos-tcc fix
+ほか) + 今回 5 commits。
+
+- [ ] a: 実機 e2e を先にやってから push (在席時に一緒に確認 → v0.28.0)
+- [ ] b: 先に push して release (v0.28.0)、実機 e2e はリリース版で行う
+- [ ] c: macos-tcc fix 分だけ v0.27.1 で先に出し、FDA フローは実機 e2e 後に v0.28.0
 
 ## 確認待ち
 
