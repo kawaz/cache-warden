@@ -1,6 +1,6 @@
 ---
 title: approver helper の release 硬化 (standalone 無効化 / main-thread dispatch / 警告ログ規約)
-status: wip
+status: resolved
 category: task
 created: 2026-07-12T01:14:46+09:00
 last_read: 2026-08-12T13:33:20+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-08-11T23:52:45+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-12T13:40:00+09:00
 discard_reason:    # 1-line JSON array string[] 例: ["discarded","環境が変わった"]
 pending_reason:    # 1-line JSON array string[] 例: ["pending","v2 待ち"]
-close_reason:      # close 時に update が記録。1-line JSON array string[] 例: ["dr/DR-0007","implemented"]
+close_reason: ["done","commit/1218a74e","commit/abfc7249","全 6 項目完了。dialog キュー有界化は depth 上限 + 2 段 timeout に加え (key, operation, pid+pid_version, euid) coalesce を実装 (fable5-high delta 承認)。進行中のみ合流、回答時 entry 除去、複数プロセス storm は非合流で depth cap が受け皿","fable レビュー LOW 3 件は記録不在で特定不能のため approver キュー領域の fresh low-severity 総ざらいで代替 (Low 4 件検出、L1 は doc 追記のみ対応、L2-L4 は現状維持判定)"]
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -96,10 +96,13 @@ draft-DR-0031 (custom TouchID dialog) の Phase 1.5 で opus47 によるセキ�
   land 節
 - [x] helper 側 dialog に自前 countdown timeout を実装 (`timeout_secs` hint を実際に消費) —
   実機確認済み (2026-08-12)
-- [ ] dialog キューを有界化 (lock 待ち全体の timeout / pending depth 上限 / coalesce のいずれかを選定し実装) —
-  depth 上限 + 2 段 timeout まで実装済み。残 = (key, requester) coalesce
-  (SIGN 経路の per-key 再試行対策の本命)。実装済み分は commit 1218a74e、
-  fable レビュー LOW 3 件のみ
+- [x] dialog キューを有界化 (lock 待ち全体の timeout / pending depth 上限 / coalesce のいずれかを選定し実装) —
+  depth 上限 + 2 段 timeout (commit 1218a74e) に加え (key, operation,
+  pid+pid_version, euid) coalesce を実装 (commit abfc7249、fable5-high delta
+  承認)。進行中のみ合流・回答時 entry 除去 (承認の記憶なし)、複数プロセス
+  storm は意図的に非合流で depth cap が受け皿。approver キュー領域の
+  fresh な low-severity 総ざらいで代替検査 (Low 4 件検出、L1 は doc 追記の
+  み対応、L2-L4 は現状維持判定)
 
 ## TODO
 
