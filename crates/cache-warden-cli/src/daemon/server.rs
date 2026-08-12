@@ -217,6 +217,12 @@ pub(crate) struct Shared {
     /// tried. In every case the guard-less path (unguarded `kv.get`, non-
     /// `kv.get`, `dry_run` gets) proceeds untouched.
     pub(crate) approver: ApproverSlot,
+    /// Whether this daemon's config can spawn `op`, and therefore whether
+    /// Full Disk Access is worth reporting at all (`crate::fda`). Fixed at
+    /// startup: it is a property of the config, unlike the permission state
+    /// itself, which is probed per `status` request.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fda_applicable: bool,
 }
 
 /// Classified outcome of one [`ApproverSlot::await_dialog_outcome`] call —
@@ -521,6 +527,7 @@ impl Shared {
             restart: graceful_restart::RestartCoordinator::new(),
             active_connections: ConnectionTracker::new(),
             approver: ApproverSlot::new_down(),
+            fda_applicable: false,
         }
     }
 }
@@ -674,6 +681,12 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
     // been handed to the serve loop, without needing a Mutex or rebuilding
     // the whole Shared struct.
     let otp_adapter = crate::daemon::otp_adapter::OtpAdapter::new(bundle.otp_cap);
+    // Whether Full Disk Access is relevant to this config at all — a property
+    // of the config, so resolved once here and carried on `Shared`.
+    #[cfg(target_os = "macos")]
+    let fda_applicable = crate::fda::has_op_sources(&config);
+    #[cfg(not(target_os = "macos"))]
+    let fda_applicable = false;
     let shared = Arc::new(Shared {
         store: Mutex::new(bundle.store),
         control_cap: bundle.control_cap,
@@ -697,6 +710,7 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         // `helper_starting` wait via `ApproverSlot::wait_ready`. Guard-less
         // `kv.get` never consults this slot (§9: unguarded is transparent).
         approver: ApproverSlot::new_starting(),
+        fda_applicable,
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -893,6 +907,7 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         .parent()
         .map(|d| d.join("approver.sock"))
         .unwrap_or_else(|| PathBuf::from("/tmp/cache-warden-approver.sock"));
+    let fda_prompt_wanted = fda_prompt_wanted(fda_applicable);
     tokio::spawn(async move {
         match resolve_approver_helper_path() {
             Some(helper_path) => {
@@ -904,7 +919,11 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
                 .await
                 {
                     Ok(client) => {
-                        approver_shared.approver.set_ready(Arc::new(client));
+                        let client = Arc::new(client);
+                        if fda_prompt_wanted {
+                            request_fda_prompt(&client).await;
+                        }
+                        approver_shared.approver.set_ready(client);
                     }
                     Err(e) => {
                         eprintln!(
@@ -1512,6 +1531,13 @@ fn run_request(
         pid: shared.pid,
         version: VERSION,
         socket: &shared.socket_path,
+        // Probed for `status` alone — see the field's doc for why not for
+        // every request.
+        full_disk_access: if matches!(req, Request::Status) {
+            Some(current_fda_status(shared))
+        } else {
+            None
+        },
         requester: requester.as_deref(),
         kv_process_policies: &shared.kv_process_policies,
         guard_chain: guard_chain.as_deref(),
@@ -1820,6 +1846,7 @@ fn guarded_get_first_pass(
             pid: shared.pid,
             version: VERSION,
             socket: &shared.socket_path,
+            full_disk_access: None,
             requester: requester.as_deref(),
             kv_process_policies: &shared.kv_process_policies,
             guard_chain: guard_chain.as_deref(),
@@ -1959,6 +1986,7 @@ fn guarded_get_finalize_after_approval(
         pid: shared.pid,
         version: VERSION,
         socket: &shared.socket_path,
+        full_disk_access: None,
         requester: requester.as_deref(),
         kv_process_policies: &shared.kv_process_policies,
         guard_chain: guard_chain.as_deref(),
@@ -2012,6 +2040,101 @@ fn resolve_approver_helper_path() -> Option<PathBuf> {
         return Some(production);
     }
     None
+}
+
+/// Probe this daemon's Full Disk Access state for a `status` reply.
+///
+/// The daemon is the only process that can answer usefully: TCC attributes a
+/// probe to whoever performs it, and this process — running from
+/// `CacheWarden.app` — is the one whose permission decides whether `op`
+/// launches quietly. That is why `daemon status` asks the daemon instead of
+/// probing on its own behalf.
+#[cfg(target_os = "macos")]
+fn current_fda_status(shared: &Arc<Shared>) -> crate::protocol::wire::FdaStatusWire {
+    use crate::protocol::wire::FdaStatusWire;
+    if !shared.fda_applicable {
+        return FdaStatusWire::NotApplicable;
+    }
+    if macos_tcc::current_app_bundle().is_none() {
+        return FdaStatusWire::Unknown;
+    }
+    match crate::fda::check_in_process() {
+        macos_tcc::AuthState::Granted => FdaStatusWire::Granted,
+        macos_tcc::AuthState::NotGranted => FdaStatusWire::NotGranted,
+        macos_tcc::AuthState::Unknown => FdaStatusWire::Unknown,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn current_fda_status(_shared: &Arc<Shared>) -> crate::protocol::wire::FdaStatusWire {
+    crate::protocol::wire::FdaStatusWire::NotApplicable
+}
+
+/// How long [`request_fda_prompt`] gives the send (see
+/// [`super::approver::ApproverClient::notify_fda_prompt`]). Generous for one
+/// line on a fresh connection, and nothing depends on it succeeding — the
+/// daemon runs identically either way.
+const FDA_PROMPT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Decide whether this startup should ask the helper to explain Full Disk
+/// Access, and say what it found in the log either way.
+///
+/// Three conditions, all necessary:
+///
+/// - the config can spawn `op` (`applicable`, resolved at startup — otherwise
+///   the permission buys nothing),
+/// - this daemon runs from the installed `.app` bundle (a bare binary has no
+///   TCC identity to grant, and the probe below would answer about the wrong
+///   process),
+/// - the permission is not granted yet.
+///
+/// The probe is in-process on purpose: this process *is* the bundle, so its
+/// own read attempt is attributed correctly — no re-launch trick needed
+/// (unlike the CLI surfaces; see [`crate::fda`]).
+#[cfg(target_os = "macos")]
+fn fda_prompt_wanted(applicable: bool) -> bool {
+    if !applicable {
+        return false;
+    }
+    if macos_tcc::current_app_bundle().is_none() {
+        eprintln!(
+            "cache-warden: full disk access: not checked (this daemon is not running from \
+             CacheWarden.app, so there is no bundle identity to grant it to)"
+        );
+        return false;
+    }
+    let state = crate::fda::check_in_process();
+    eprintln!("cache-warden: full disk access: {state}");
+    state != macos_tcc::AuthState::Granted
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fda_prompt_wanted(_applicable: bool) -> bool {
+    false
+}
+
+/// Ask the helper to put the Full Disk Access explainer on screen, once per
+/// daemon start.
+///
+/// Fire-and-forget in both directions: the send is bounded and its failure is
+/// logged rather than propagated, and no reply is awaited. A daemon that
+/// cannot explain the permission still works — the user just keeps answering
+/// the system's own dialog on each `op` launch, which is the status quo this
+/// prompt is trying to end, not a new failure.
+async fn request_fda_prompt(client: &super::approver::ApproverClient) {
+    let request_id = mint_approver_request_id();
+    match client
+        .notify_fda_prompt(request_id, FDA_PROMPT_SEND_TIMEOUT)
+        .await
+    {
+        Ok(()) => eprintln!(
+            "cache-warden: full disk access: asked the approver helper to explain how to grant it"
+        ),
+        Err(e) => eprintln!(
+            "cache-warden: warning: could not show the Full Disk Access explainer ({e}); \
+             macOS will keep asking for permission on every `op` launch until it is granted"
+        ),
+    }
 }
 
 /// The set of signals that request a graceful daemon shutdown.
@@ -2252,6 +2375,7 @@ mod tests {
             restart: graceful_restart::RestartCoordinator::new(),
             active_connections: ConnectionTracker::new(),
             approver: ApproverSlot::new_down(),
+            fda_applicable: false,
         })
     }
 

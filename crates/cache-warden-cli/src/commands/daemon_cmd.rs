@@ -349,23 +349,6 @@ fn build_definition(
     def
 }
 
-/// Return `true` when the config has at least one `op`-sourced kv entry or
-/// `op`-kind authsock source, indicating that Full Disk Access is needed for
-/// `op` CLI invocations at runtime.
-#[cfg(target_os = "macos")]
-fn has_op_sources(config: &Config) -> bool {
-    let has_kv_op = config
-        .kv
-        .values()
-        .any(|entry| entry.source.as_deref() == Some("op"));
-    let has_authsock_op = config
-        .authsock
-        .sources
-        .values()
-        .any(|src| src.kind.as_str() == "op");
-    has_kv_op || has_authsock_op
-}
-
 /// Execute `daemon register` (DR-0019 §1/§2/§3).
 ///
 /// `parsed` is the already-parsed `daemon register` flags: the dispatcher
@@ -423,8 +406,8 @@ pub fn register(
     // user through the System Settings grant flow when FDA is not yet set.
     #[cfg(target_os = "macos")]
     {
-        if has_op_sources(&config) {
-            let self_check_args = &["internal", "fda-check", "--raw"];
+        if crate::fda::has_op_sources(&config) {
+            let self_check_args = crate::fda::SELF_CHECK_ARGS;
             match macos_tcc::current_app_bundle() {
                 Some(app_path) => {
                     // Try up to 3 times in case the first probe fails transiently.
@@ -536,14 +519,105 @@ pub fn unregister(parsed: UnregisterArgs) -> Result<(), String> {
 /// `unregister` flag grammar; the dispatcher reworks the "unknown option"
 /// wording for this subcommand before calling here). Every error this
 /// function returns is a backend failure.
-pub fn status(parsed: UnregisterArgs) -> Result<(), String> {
+///
+/// `config` and `socket` are used only for the Full Disk Access section:
+/// `socket` to ask the running daemon for its own permission state, `config`
+/// to decide whether the question is worth raising when no daemon answers.
+pub fn status(parsed: UnregisterArgs, config: &Config, socket: &Path) -> Result<(), String> {
     let label = parsed
         .label
         .unwrap_or_else(|| service::default_label().to_string());
     let backend = service::backend()?;
     let st = backend.status(&label)?;
     print!("{}", st.render(&label));
+    if let Some(section) = render_fda_section(config, socket) {
+        print!("{section}");
+    }
     Ok(())
+}
+
+/// The Full Disk Access section appended to `daemon status`, or `None` when
+/// there is nothing worth saying.
+///
+/// # Why this asks the daemon
+///
+/// TCC attributes a permission probe to the process that performs it. The
+/// `cache-warden` binary answering this command is normally the Homebrew /
+/// cargo build on `PATH` — a different identity from the daemon running out
+/// of `CacheWarden.app`, and not the one whose permission decides whether
+/// `op` launches quietly. So the authority is the daemon's own in-process
+/// probe, fetched over the control socket ([`Request::Status`]); this side
+/// only formats the answer.
+///
+/// With no daemon answering there is no authority to quote, so the section
+/// says exactly that instead of guessing — and only when the local config
+/// suggests the permission matters at all.
+#[cfg(target_os = "macos")]
+fn render_fda_section(config: &Config, socket: &Path) -> Option<String> {
+    match query_daemon_fda(socket) {
+        Some(state) => fda_section_for(state),
+        None => crate::fda::has_op_sources(config)
+            .then(|| "full disk access: not checked (no answer from the daemon)\n".to_string()),
+    }
+}
+
+/// Ask the running daemon for its Full Disk Access state.
+///
+/// `None` covers every "no answer" shape — daemon down, socket gone, an error
+/// response, or a daemon too old to report the field — all of which lead to
+/// the same "not checked" line rather than to a verdict.
+#[cfg(target_os = "macos")]
+fn query_daemon_fda(socket: &Path) -> Option<crate::protocol::wire::FdaStatusWire> {
+    use crate::protocol::wire::{OkPayload, Request, Response};
+    match crate::commands::client::round_trip_or_close(socket, &Request::Status) {
+        Ok(Some(Response::Ok(ok))) => match ok.payload {
+            OkPayload::Status {
+                full_disk_access, ..
+            } => full_disk_access,
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Format the Full Disk Access section for a state the daemon reported.
+///
+/// Appended below the fixed-width table rather than added as a row: the key is
+/// too long for the table's column, and the not-granted case has to say what
+/// to do about it, which one aligned row cannot.
+#[cfg(target_os = "macos")]
+fn fda_section_for(state: crate::protocol::wire::FdaStatusWire) -> Option<String> {
+    use crate::protocol::wire::FdaStatusWire;
+    match state {
+        // Nothing in this daemon's config launches `op`, so the permission
+        // would buy it nothing — saying so would just be one more line to read.
+        FdaStatusWire::NotApplicable => None,
+        FdaStatusWire::Granted => Some("full disk access: granted\n".to_string()),
+        FdaStatusWire::NotGranted => Some(
+            concat!(
+                "full disk access: not granted\n",
+                "  turn CacheWarden on in System Settings > Privacy & Security > Full Disk Access.\n",
+                "  Until then macOS asks for permission every time cache-warden runs `op`.\n"
+            )
+            .to_string(),
+        ),
+        // The daemon needs the permission but cannot say whether it has it —
+        // today that means it is running outside CacheWarden.app, where there
+        // is no bundle identity for the permission to attach to.
+        FdaStatusWire::Unknown => Some(
+            concat!(
+                "full disk access: unknown\n",
+                "  the daemon is not running from CacheWarden.app, so the permission cannot be\n",
+                "  granted to it. Re-register with the installed app to fix this.\n"
+            )
+            .to_string(),
+        ),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn render_fda_section(_config: &Config, _socket: &Path) -> Option<String> {
+    None
 }
 
 #[cfg(test)]
@@ -556,6 +630,49 @@ mod tests {
 
     fn s(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// The granted line stays to one row; the states the user can act on
+    /// carry the fix on following indented lines. `NotApplicable` prints
+    /// nothing at all — a daemon that never runs `op` has no permission
+    /// problem to mention. Every rendered section ends with a newline so it
+    /// appends cleanly under the status table.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fda_section_states_the_fix_only_when_something_needs_fixing() {
+        use crate::protocol::wire::FdaStatusWire;
+
+        assert_eq!(
+            fda_section_for(FdaStatusWire::Granted).as_deref(),
+            Some("full disk access: granted\n")
+        );
+        assert_eq!(fda_section_for(FdaStatusWire::NotApplicable), None);
+
+        for state in [FdaStatusWire::NotGranted, FdaStatusWire::Unknown] {
+            let text = fda_section_for(state).expect("an actionable state must render");
+            assert!(text.starts_with("full disk access: "), "{text}");
+            assert!(text.lines().count() >= 2, "must explain the fix: {text}");
+            assert!(text.ends_with('\n'), "{text}");
+        }
+    }
+
+    /// With no daemon answering, `daemon status` reports that the state was
+    /// not checked rather than probing on its own behalf (which would report
+    /// the CLI binary's permission, not the daemon's) — and only bothers
+    /// saying so when the local config suggests `op` is in play.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fda_section_without_a_daemon_reports_not_checked_only_when_op_is_configured() {
+        let unreachable = Path::new("/nonexistent/cache-warden-test.sock");
+
+        assert_eq!(render_fda_section(&cfg(), unreachable), None);
+
+        let with_op =
+            Config::parse("[kv.token]\nsource = \"op\"\nop.uri = \"op://v/i/f\"\n").unwrap();
+        let text =
+            render_fda_section(&with_op, unreachable).expect("an op config must say something");
+        assert!(text.contains("not checked"), "{text}");
+        assert!(text.contains("no answer from the daemon"), "{text}");
     }
 
     #[test]

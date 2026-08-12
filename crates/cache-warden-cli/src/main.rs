@@ -14,6 +14,7 @@ mod commands;
 mod config;
 mod daemon;
 mod defs;
+mod fda;
 mod help;
 mod mode;
 mod namespace;
@@ -83,6 +84,9 @@ fn render_response(resp: Response) -> Result<(), String> {
                     version,
                     socket,
                     entries,
+                    // Reported by `daemon status`, not by the top-level
+                    // entry listing this arm renders.
+                    full_disk_access: _,
                 } => {
                     println!("daemon: {NAME} {version} (pid {pid})");
                     println!("socket: {socket}");
@@ -417,7 +421,7 @@ fn dispatch_daemon(
                     .map_err(|e| e.replace("daemon unregister", "daemon status")),
                 help::daemon_status,
             )?;
-            commands::daemon_cmd::status(parsed).map_err(CliError::Message)
+            commands::daemon_cmd::status(parsed, &config, &socket).map_err(CliError::Message)
         }
         "restart" => {
             if help::wants_help(tail) {

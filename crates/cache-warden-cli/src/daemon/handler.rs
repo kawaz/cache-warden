@@ -59,6 +59,15 @@ pub struct HandlerCtx<'a, A: ?Sized, R, C> {
     pub version: &'a str,
     /// Control socket path (for `status`).
     pub socket: &'a str,
+    /// macOS Full Disk Access state (for `status`), probed by the server
+    /// layer when a `status` request arrives and left `None` otherwise.
+    ///
+    /// Probed per request rather than cached at startup because the user can
+    /// grant the permission at any time — a value sampled once would keep
+    /// reporting the state the daemon booted with. It is *not* probed for
+    /// other request kinds: an ungranted probe is a denied read that TCC
+    /// records, and doing that on every `kv.get` would be noise.
+    pub full_disk_access: Option<crate::protocol::wire::FdaStatusWire>,
     /// The requesting peer's process ancestry chain, or `None` when it could
     /// not be determined. Forwarded into the core auth context for audit, and —
     /// for the key-level gate below — checked against `kv_process_policies`.
@@ -235,6 +244,7 @@ where
         ctx.version.to_string(),
         ctx.socket.to_string(),
         entries,
+        ctx.full_disk_access,
     )
 }
 
@@ -1284,6 +1294,7 @@ mod tests {
             pid: 1234,
             version: "test",
             socket: "/tmp/test.sock",
+            full_disk_access: None,
             requester: None,
             kv_process_policies: empty_policies(),
             guard_chain: None,
@@ -3539,6 +3550,7 @@ mod tests {
             pid: 1234,
             version: "test",
             socket: "/tmp/test.sock",
+            full_disk_access: None,
             requester,
             kv_process_policies: policies,
             guard_chain: None,

@@ -66,7 +66,9 @@ mod approver {
     use objc2_local_authentication::{LAContext, LAPolicy};
     use objc2_local_authentication_embedded_ui::LAAuthenticationView;
 
-    use cache_warden_approver::wire::{ApproveRequest, ApproveResponse, Outcome, WIRE_VERSION};
+    use cache_warden_approver::wire::{
+        ApproveRequest, ApproveResponse, HelperRequest, HelperResponse, Outcome, WIRE_VERSION,
+    };
 
     // --- libdispatch FFI: main-queue への任意 closure dispatch -------------
     //
@@ -260,13 +262,20 @@ mod approver {
         outcome: Outcome,
         biometric_kind: Option<String>,
     ) {
-        let resp = ApproveResponse {
-            v: WIRE_VERSION,
-            request_id: request_id.to_string(),
-            outcome,
-            biometric_kind,
-        };
-        match serde_json::to_string(&resp) {
+        write_line(
+            writer,
+            &HelperResponse::Approve(ApproveResponse {
+                v: WIRE_VERSION,
+                request_id: request_id.to_string(),
+                outcome,
+                biometric_kind,
+            }),
+        );
+    }
+
+    /// Serialize one enveloped response and write it to the daemon.
+    fn write_line(writer: &Arc<Mutex<UnixStream>>, resp: &HelperResponse) {
+        match serde_json::to_string(resp) {
             Ok(mut line) => {
                 line.push('\n');
                 let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -730,6 +739,439 @@ mod approver {
         arm_dialog_timeout(req.timeout_secs, pending_slot, timer_slot);
     }
 
+    // --- Full Disk Access explainer -----------------------------------------
+
+    /// The Full Disk Access explainer window (draft-DR-0031 の UX 仕様、issue
+    /// `2026-08-12-fda-grant-flow-hardening`)。
+    ///
+    /// # なぜ設定画面を直接開かないか
+    ///
+    /// 突然 System Settings が前面に出ても、ユーザは「どのアプリが何のために
+    /// 開いたのか」が分からない (複数アプリが同時に同じことをすれば尚更)。
+    /// なので **まず説明を出し、開くのはユーザがボタンを押した時だけ** にする。
+    ///
+    /// # 承認 dialog との共存
+    ///
+    /// この window は floating level にせず、focus も奪わない (`orderFront`
+    /// のみ、`steal_focus` の LaunchServices 経由 activate は使わない)。
+    /// 承認 dialog は focus が無いと指紋 sensor input が届かない
+    /// (draft-DR-0031 §UX policy) ので、こちらが focus を取り合うと **承認が
+    /// 完了できなくなる**。急ぐのは承認、待てるのが FDA 付与、という優先順位を
+    /// window の見た目 (level / activation) で表現している。
+    ///
+    /// 表示言語は日本語 — 同じ FDA 付与フローの先行実装 (`daemon register` の
+    /// 誘導メッセージ) が日本語で、同一手順の説明が言語で割れる方が読み手に
+    /// とって不親切なため。承認 dialog の英語表記とは別surface として扱う。
+    mod fda {
+        use super::{
+            Arc, MainOnlySend, Mutex, UnixStream, dispatch_main, dispatch_main_after, init_app,
+            write_line,
+        };
+        use objc2::rc::Retained;
+        use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+        use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, sel};
+        use objc2_app_kit::{
+            NSApplication, NSBackingStoreType, NSButton, NSColor, NSStackView,
+            NSStackViewDistribution, NSTextField, NSUserInterfaceLayoutOrientation, NSWindow,
+            NSWindowDelegate, NSWindowStyleMask,
+        };
+        use objc2_foundation::{
+            NSDistributedNotificationCenter, NSNotification, NSNotificationSuspensionBehavior,
+            NSPoint, NSRect, NSSize, NSString,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use cache_warden_approver::wire::{
+            FdaOutcome, FdaPromptRequest, FdaPromptResponse, HelperResponse, WIRE_VERSION,
+        };
+
+        /// The distributed notification macOS posts when a TCC authorization
+        /// changes, used purely as a wake-up hint.
+        ///
+        /// **Private implementation detail, not API**: the name exists in
+        /// Apple's own binaries and other software subscribes to it, but
+        /// Apple documents neither the name, its firing conditions, nor any
+        /// payload (`docs/findings/2026-08-12-tcc-change-event-feasibility.md`).
+        /// So it is confined to this one constant, and nothing here treats
+        /// receiving it as evidence of a grant — the authority is always the
+        /// probe, and [`schedule_poll`] keeps the window correct if the
+        /// notification never arrives or is renamed out from under us.
+        const TCC_CHANGED_NOTIFICATION: &str = "com.apple.tcc.access.changed";
+
+        /// Poll cadence for the fallback re-probe, while the window is open.
+        const POLL_INTERVAL_SECS: u32 = 2;
+
+        const WINDOW_WIDTH: f64 = 460.0;
+        const TEXT_WIDTH: f64 = 420.0;
+
+        const HEADING: &str = "cache-warden にフルディスクアクセスを許可してください";
+        const WHY: &str = "cache-warden はシークレットの取得に 1Password CLI (op) を起動します。\
+            フルディスクアクセスが無いと、op を起動するたびに macOS の許可ダイアログが表示されます。";
+        const HOW: &str = "下のボタンで設定画面を開き、リストの「CacheWarden」を探して\
+            スイッチを ON にしてください。";
+        const DECLINE_NOTE: &str = "許可しなくても cache-warden は使えます。\
+            その場合はアップデートのたびに確認ダイアログが出るので、都度 OK してください。";
+        const STATUS_NOT_GRANTED: &str = "現在: 未許可";
+        const STATUS_GRANTED: &str = "設定が確認できました。このダイアログは閉じて構いません。";
+
+        /// At most one explainer at a time. The daemon asks once per start, but
+        /// a second request (a restart racing the first window, a future
+        /// caller) must raise the existing window rather than stack another.
+        static WINDOW_OPEN: AtomicBool = AtomicBool::new(false);
+
+        /// The live explainer's main-thread state.
+        struct FdaDialog {
+            window: Retained<NSWindow>,
+            status: Retained<NSTextField>,
+            /// The window's delegate and both buttons' target. AppKit holds
+            /// all three *unretained*, so this is the strong reference that
+            /// keeps the callbacks alive.
+            delegate: Retained<FdaDelegate>,
+            writer: Arc<Mutex<UnixStream>>,
+            request_id: String,
+            granted: bool,
+            /// Whether an [`FdaPromptResponse`] has already gone out. Grant
+            /// answers immediately (while the window stays up for the user to
+            /// read); otherwise the answer is written when the window closes.
+            answered: bool,
+        }
+
+        /// The shared slot holding the live explainer, if any.
+        ///
+        /// Taking the dialog out of the slot is what ends its life: the poll
+        /// closure finds `None` and stops re-arming, and — since the delegate
+        /// holds a clone of this same `Arc` — dropping the dialog is also what
+        /// breaks the delegate↔slot reference cycle. **Main thread only**: the
+        /// contents are AppKit objects.
+        type FdaSlot = Arc<Mutex<Option<MainOnlySend<FdaDialog>>>>;
+
+        struct FdaIvars {
+            slot: FdaSlot,
+        }
+
+        define_class!(
+            #[unsafe(super(NSObject))]
+            #[thread_kind = MainThreadOnly]
+            #[name = "CacheWardenFdaDelegate"]
+            #[ivars = FdaIvars]
+            struct FdaDelegate;
+
+            impl FdaDelegate {
+                /// "設定を開く" ボタン。ここで初めて System Settings を開く。
+                #[unsafe(method(openSettingsClicked:))]
+                fn open_settings_clicked(&self, _sender: Option<&AnyObject>) {
+                    if let Err(e) = macos_tcc::open_settings(macos_tcc::Permission::FullDiskAccess)
+                    {
+                        eprintln!(
+                            "cache-warden-approver: could not open the Full Disk Access settings pane: {e}"
+                        );
+                    }
+                }
+
+                /// "閉じる" ボタン。`windowWillClose:` が後始末を担う。
+                #[unsafe(method(closeClicked:))]
+                fn close_clicked(&self, _sender: Option<&AnyObject>) {
+                    let window = {
+                        let guard = self
+                            .ivars()
+                            .slot
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        guard.as_ref().map(|d| Retained::clone(&d.0.window))
+                    };
+                    if let Some(window) = window {
+                        window.close();
+                    }
+                }
+
+                /// [`TCC_CHANGED_NOTIFICATION`] 受信 — 権限が動いたので
+                /// probe し直す。通知が来ない環境でも [`schedule_poll`] が
+                /// 拾うので、この経路が無音でも壊れない。
+                #[unsafe(method(tccChanged:))]
+                fn tcc_changed(&self, _notif: &NSNotification) {
+                    refresh(&self.ivars().slot);
+                }
+
+                #[unsafe(method(windowWillClose:))]
+                fn window_will_close(&self, _notif: &NSNotification) {
+                    finalize(&self.ivars().slot);
+                }
+            }
+
+            unsafe impl NSObjectProtocol for FdaDelegate {}
+
+            unsafe impl NSWindowDelegate for FdaDelegate {}
+        );
+
+        impl FdaDelegate {
+            fn new(mtm: MainThreadMarker, slot: FdaSlot) -> Retained<Self> {
+                let this = Self::alloc(mtm).set_ivars(FdaIvars { slot });
+                unsafe { objc2::msg_send![super(this), init] }
+            }
+        }
+
+        /// Probe Full Disk Access from this helper process.
+        ///
+        /// **裏取り未**: probe は helper 自身の open+read なので、TCC が
+        /// これを (daemon = responsible process ではなく) helper 単体の
+        /// アクセスとして扱う可能性がある。その場合 daemon 側が granted でも
+        /// ここが not granted に見える (逆は無い) ため、live 表示が遅れて
+        /// 緑にならないだけで、誤って「許可済み」と表示することはない
+        /// (fail-safe 側に転ぶ)。実機での attribution 確認は未実施。
+        fn probe() -> bool {
+            macos_tcc::check(macos_tcc::Permission::FullDiskAccess) == macos_tcc::AuthState::Granted
+        }
+
+        /// Re-probe and, on a fresh grant, switch the window to its confirmed
+        /// state and answer the daemon. Idempotent and cheap enough to call
+        /// from both the notification and the poll. **Main thread only.**
+        fn refresh(slot: &FdaSlot) {
+            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(dialog) = guard.as_mut().map(|d| &mut d.0) else {
+                return;
+            };
+            if dialog.granted || !probe() {
+                return;
+            }
+            dialog.granted = true;
+            dialog
+                .status
+                .setStringValue(&NSString::from_str(STATUS_GRANTED));
+            dialog
+                .status
+                .setTextColor(Some(&NSColor::systemGreenColor()));
+            if !dialog.answered {
+                dialog.answered = true;
+                write_line(
+                    &dialog.writer,
+                    &HelperResponse::FdaPrompt(FdaPromptResponse {
+                        v: WIRE_VERSION,
+                        request_id: dialog.request_id.clone(),
+                        outcome: FdaOutcome::Granted,
+                    }),
+                );
+            }
+        }
+
+        /// Re-arm the fallback probe for as long as the window is open.
+        ///
+        /// Design rationale: the event subscription
+        /// ([`TCC_CHANGED_NOTIFICATION`]) is the primary signal — this poll
+        /// exists only because that notification's delivery to a background
+        /// `.Accessory` process is not something we have confirmed on a real
+        /// machine, and a status light that silently never turns green would
+        /// be worse than a few probes. It is scoped as tightly as a fallback
+        /// should be: it runs only while the explainer is on screen, stops the
+        /// moment the window closes or the permission is granted, and rides a
+        /// kernel timer (`dispatch_after`) rather than a sleeping thread.
+        fn schedule_poll(slot: FdaSlot) {
+            dispatch_main_after(POLL_INTERVAL_SECS, move || {
+                {
+                    let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    match guard.as_ref() {
+                        // Window closed — stop re-arming.
+                        None => return,
+                        // Already confirmed — nothing left to watch for.
+                        Some(d) if d.0.granted => return,
+                        Some(_) => {}
+                    }
+                }
+                refresh(&slot);
+                schedule_poll(slot);
+            });
+        }
+
+        /// End the explainer: answer the daemon if the grant never came,
+        /// unsubscribe, and drop the window. Idempotent. **Main thread only.**
+        fn finalize(slot: &FdaSlot) {
+            let taken = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let Some(dialog) = taken.map(MainOnlySend::into_inner) else {
+                return;
+            };
+            if !dialog.answered {
+                write_line(
+                    &dialog.writer,
+                    &HelperResponse::FdaPrompt(FdaPromptResponse {
+                        v: WIRE_VERSION,
+                        request_id: dialog.request_id.clone(),
+                        outcome: FdaOutcome::Dismissed,
+                    }),
+                );
+            }
+            // Detach every unretained reference to the delegate *before* its
+            // last strong reference can go away.
+            dialog
+                .window
+                .setDelegate(None::<&ProtocolObject<dyn NSWindowDelegate>>);
+            unsafe {
+                NSDistributedNotificationCenter::defaultCenter().removeObserver_name_object(
+                    dialog.delegate.as_ref() as &AnyObject,
+                    Some(&NSString::from_str(TCC_CHANGED_NOTIFICATION)),
+                    None,
+                );
+            }
+            WINDOW_OPEN.store(false, Ordering::Release);
+
+            // Release the dialog — and with it the delegate — on the *next*
+            // main-queue turn rather than here.
+            //
+            // This function's usual caller is `windowWillClose:`, i.e. an
+            // Objective-C method running on the delegate itself, and the
+            // dialog we just took out of the slot holds that delegate's only
+            // strong reference (AppKit's window-delegate and button-target
+            // pointers are both unretained). Dropping it inline would
+            // deallocate the receiver while its own method is still on the
+            // stack. Deferring costs one queue hop and makes the release
+            // unconditionally safe, whichever path called us. The approval
+            // dialog avoids the same hazard differently — its delegate is
+            // owned by the LocalAuthentication completion block, so it is
+            // never released from inside its own callback.
+            let deferred = MainOnlySend(dialog);
+            dispatch_main(move || drop(deferred.into_inner()));
+        }
+
+        fn label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+            let field = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
+            field.setPreferredMaxLayoutWidth(TEXT_WIDTH);
+            field
+        }
+
+        /// Put the explainer on screen. **Called on the main thread only**
+        /// (via `dispatch_main` from the reader thread).
+        pub fn show_fda_dialog_on_main(req: FdaPromptRequest, writer: Arc<Mutex<UnixStream>>) {
+            let mtm =
+                MainThreadMarker::new().expect("show_fda_dialog_on_main must run on main thread");
+            if WINDOW_OPEN.swap(true, Ordering::AcqRel) {
+                eprintln!(
+                    "cache-warden-approver: a Full Disk Access explainer is already open; \
+                     ignoring the duplicate request (request_id={:?})",
+                    req.request_id
+                );
+                return;
+            }
+            // The approval path calls this too; harmless if it already ran.
+            let _app: Retained<NSApplication> = init_app(mtm);
+
+            let slot: FdaSlot = Arc::new(Mutex::new(None));
+            let delegate = FdaDelegate::new(mtm, Arc::clone(&slot));
+
+            let window = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    NSWindow::alloc(mtm),
+                    NSRect {
+                        origin: NSPoint { x: 0.0, y: 0.0 },
+                        size: NSSize {
+                            width: WINDOW_WIDTH,
+                            height: 320.0,
+                        },
+                    },
+                    NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
+            };
+            window.setTitle(&NSString::from_str("cache-warden: フルディスクアクセス"));
+            unsafe { window.setReleasedWhenClosed(false) };
+
+            let stack = NSStackView::new(mtm);
+            stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+            stack.setDistribution(NSStackViewDistribution::Fill);
+            stack.addArrangedSubview(&label(mtm, HEADING));
+            stack.addArrangedSubview(&label(mtm, WHY));
+            stack.addArrangedSubview(&label(mtm, HOW));
+
+            let granted = probe();
+            let status = label(
+                mtm,
+                if granted {
+                    STATUS_GRANTED
+                } else {
+                    STATUS_NOT_GRANTED
+                },
+            );
+            let status_color = if granted {
+                NSColor::systemGreenColor()
+            } else {
+                NSColor::systemRedColor()
+            };
+            status.setTextColor(Some(&status_color));
+            stack.addArrangedSubview(&status);
+
+            let open_button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("フルディスクアクセスの設定を開く"),
+                    Some(delegate.as_ref()),
+                    Some(sel!(openSettingsClicked:)),
+                    mtm,
+                )
+            };
+            stack.addArrangedSubview(&open_button);
+            stack.addArrangedSubview(&label(mtm, DECLINE_NOTE));
+            let close_button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("閉じる"),
+                    Some(delegate.as_ref()),
+                    Some(sel!(closeClicked:)),
+                    mtm,
+                )
+            };
+            stack.addArrangedSubview(&close_button);
+
+            window.setContentView(Some(&stack));
+            let as_window_delegate: &ProtocolObject<dyn NSWindowDelegate> =
+                ProtocolObject::from_ref(&*delegate);
+            window.setDelegate(Some(as_window_delegate));
+
+            // Live watch: event subscription first, poll as the fallback.
+            unsafe {
+                NSDistributedNotificationCenter::defaultCenter()
+                    .addObserver_selector_name_object_suspensionBehavior(
+                        delegate.as_ref() as &AnyObject,
+                        sel!(tccChanged:),
+                        Some(&NSString::from_str(TCC_CHANGED_NOTIFICATION)),
+                        None,
+                        NSNotificationSuspensionBehavior::DeliverImmediately,
+                    );
+            }
+
+            // Already granted when the window went up (the daemon's probe and
+            // this one disagreed, or the user granted it in between): answer
+            // `Granted` now. Leaving it unanswered would send `Dismissed` on
+            // close and tell the daemon's log the exact opposite of what
+            // happened. The window still opens — it is the confirmation the
+            // user is owed, in its green state.
+            if granted {
+                write_line(
+                    &writer,
+                    &HelperResponse::FdaPrompt(FdaPromptResponse {
+                        v: WIRE_VERSION,
+                        request_id: req.request_id.clone(),
+                        outcome: FdaOutcome::Granted,
+                    }),
+                );
+            }
+
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(MainOnlySend(FdaDialog {
+                window: Retained::clone(&window),
+                status,
+                delegate,
+                writer,
+                request_id: req.request_id,
+                granted,
+                answered: granted,
+            }));
+
+            window.center();
+            // Order front without activating: the approval dialog needs the
+            // focus more than this one does (see the module doc).
+            window.orderFrontRegardless();
+
+            if !granted {
+                schedule_poll(slot);
+            }
+        }
+    }
+
     // --- background reader thread ------------------------------------------
 
     /// Persistent connection reader. On its own std::thread so the AppKit
@@ -775,14 +1217,37 @@ mod approver {
                     );
                     break;
                 }
-                let req: ApproveRequest = match serde_json::from_str(line.trim_end()) {
+                let envelope: HelperRequest = match serde_json::from_str(line.trim_end()) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("cache-warden-approver: failed to decode ApproveRequest: {e}");
+                        eprintln!("cache-warden-approver: failed to decode a request: {e}");
                         // Malformed request: cannot signal an outcome for it
                         // (no request_id / no way to know what the daemon
                         // expected). Terminate — safer than a stuck reader.
                         break;
+                    }
+                };
+
+                let req = match envelope {
+                    HelperRequest::Approve(req) => req,
+                    HelperRequest::FdaPrompt(prompt) => {
+                        if prompt.v != WIRE_VERSION {
+                            eprintln!(
+                                "cache-warden-approver: unsupported wire version {} (helper speaks {WIRE_VERSION})",
+                                prompt.v
+                            );
+                            break;
+                        }
+                        // Deliberately *not* awaited: the explainer stays up
+                        // while the user walks through System Settings, and
+                        // approvals must keep flowing the whole time. Show it
+                        // and go straight back to reading (draft-DR-0031 §4:
+                        // the FDA prompt is not part of the approval queue).
+                        let writer_for_fda = writer.clone();
+                        dispatch_main(move || {
+                            fda::show_fda_dialog_on_main(prompt, writer_for_fda);
+                        });
+                        continue;
                     }
                 };
                 if req.v != WIRE_VERSION {

@@ -523,6 +523,20 @@ pub enum OkPayload {
         socket: String,
         /// The entries, value-free (name / state / remaining TTL).
         entries: Vec<EntryInfo>,
+        /// macOS Full Disk Access state, probed by the daemon when this
+        /// request arrives.
+        ///
+        /// Only the daemon can answer this: TCC attributes the probe to
+        /// whichever process performs it, and the daemon — running from
+        /// `CacheWarden.app` — is the process whose permission decides
+        /// whether `op` launches quietly. A CLI on `PATH` probing on its own
+        /// behalf would answer a different question entirely.
+        ///
+        /// Omitted on the wire when absent (non-macOS, or an older daemon
+        /// that never probed), which a client renders as "not checked"
+        /// rather than as a verdict.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        full_disk_access: Option<FdaStatusWire>,
     },
     /// Reply to [`Request::KvGet`].
     Get {
@@ -608,6 +622,25 @@ pub enum OkPayload {
         /// Always `true`; lets `untagged` disambiguate the reply.
         restarting: bool,
     },
+}
+
+/// The daemon's Full Disk Access state, reported on
+/// [`OkPayload::Status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FdaStatusWire {
+    /// Granted: `op` launches without a permission dialog.
+    Granted,
+    /// Not granted: macOS will ask the user on every `op` launch.
+    NotGranted,
+    /// This daemon never spawns `op` (no `op`-backed source in its config),
+    /// so the permission would buy it nothing. Clients say nothing at all
+    /// rather than reporting a state nobody needs to act on.
+    NotApplicable,
+    /// The permission is relevant but the state could not be established —
+    /// today, a daemon running outside `CacheWarden.app`, which has no bundle
+    /// identity for the permission to be granted to.
+    Unknown,
 }
 
 /// Value-free description of a stored entry, for `status`.
@@ -829,7 +862,13 @@ impl Response {
     }
 
     /// Construct a `status` success response.
-    pub fn status(pid: u32, version: String, socket: String, entries: Vec<EntryInfo>) -> Self {
+    pub fn status(
+        pid: u32,
+        version: String,
+        socket: String,
+        entries: Vec<EntryInfo>,
+        full_disk_access: Option<FdaStatusWire>,
+    ) -> Self {
         Response::Ok(OkResponse {
             ok: true,
             payload: OkPayload::Status {
@@ -837,6 +876,7 @@ impl Response {
                 version,
                 socket,
                 entries,
+                full_disk_access,
             },
         })
     }
@@ -1292,8 +1332,43 @@ mod tests {
                     guard_summary: None,
                 },
             ],
+            Some(FdaStatusWire::NotGranted),
         );
         roundtrip_response(&resp);
+    }
+
+    /// The Full Disk Access field is optional on the wire in both directions:
+    /// a daemon that has nothing to report omits it entirely (an older daemon
+    /// never writes it at all), and a payload without it still decodes as a
+    /// `status` reply. Its kebab-case strings are part of the schema, so pin
+    /// them rather than trusting a round-trip with itself.
+    #[test]
+    fn status_full_disk_access_is_optional_and_its_strings_are_pinned() {
+        let without = Response::status(1, "v".into(), "/s".into(), vec![], None);
+        let line = serde_json::to_string(&without).expect("encode");
+        assert!(!line.contains("full_disk_access"), "{line}");
+        assert_eq!(
+            serde_json::from_str::<Response>(&line).expect("decode"),
+            without
+        );
+
+        for (state, expected) in [
+            (FdaStatusWire::Granted, "granted"),
+            (FdaStatusWire::NotGranted, "not-granted"),
+            (FdaStatusWire::NotApplicable, "not-applicable"),
+            (FdaStatusWire::Unknown, "unknown"),
+        ] {
+            let resp = Response::status(1, "v".into(), "/s".into(), vec![], Some(state));
+            let line = serde_json::to_string(&resp).expect("encode");
+            assert!(
+                line.contains(&format!("\"full_disk_access\":\"{expected}\"")),
+                "{line}"
+            );
+            assert_eq!(
+                serde_json::from_str::<Response>(&line).expect("decode"),
+                resp
+            );
+        }
     }
 
     #[test]

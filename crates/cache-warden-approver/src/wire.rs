@@ -22,13 +22,102 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Wire protocol version carried on every [`ApproveRequest`] / [`ApproveResponse`].
+/// Wire protocol version carried on every message body.
 ///
-/// The daemon and helper ship as one binary release (Phase 1.4 has no
-/// independent versioning story yet), so this is a forward-compatibility
-/// placeholder rather than a live negotiation — bump it when a breaking wire
-/// change ships and something needs to tell old from new.
-pub const WIRE_VERSION: u32 = 1;
+/// The daemon and helper ship as one binary release, so this is a
+/// forward-compatibility marker rather than a live negotiation — bump it when
+/// a breaking wire change ships and something needs to tell old from new.
+/// Version 2 wraps every message in the [`HelperRequest`] / [`HelperResponse`]
+/// envelope; a v1 peer sends a bare `ApproveRequest` object, which a v2 peer
+/// rejects for lack of the `type` tag.
+pub const WIRE_VERSION: u32 = 2;
+
+/// Everything the daemon can send the helper, one JSON object per line.
+///
+/// Internally tagged (`{"type":"approve",…}`) rather than externally tagged so
+/// each variant's fields stay at the top level: the message bodies already
+/// carry `v` and `request_id`, and keeping those at a fixed depth means the
+/// framing stays as hand-inspectable (`nc` / `socat`) as the single-message v1
+/// wire was.
+// Design rationale (`large_enum_variant`): boxing the approval body would buy
+// nothing here. An envelope exists for exactly as long as it takes to
+// serialize or match one message — never stored, never collected — so the size
+// difference costs one stack copy per message, against a heap allocation and
+// an indirection at every construction and match site if it were boxed.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HelperRequest {
+    /// Ask the user to approve one secret access ([`ApproveRequest`]).
+    Approve(ApproveRequest),
+    /// Ask the helper to put the Full Disk Access explainer on screen
+    /// ([`FdaPromptRequest`]).
+    FdaPrompt(FdaPromptRequest),
+}
+
+/// Everything the helper can send the daemon, one JSON object per line.
+///
+/// See [`HelperRequest`] for the tagging rationale. The two response kinds are
+/// **not** interleaved on a single logical queue: an [`FdaPromptResponse`] can
+/// arrive at any time (the explainer stays open for as long as the user takes
+/// to visit System Settings), including in the middle of an approval exchange.
+/// The daemon's read loop therefore treats a non-matching message the same way
+/// it treats a stale `request_id` — log it and keep reading for the reply it
+/// is waiting on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HelperResponse {
+    /// The outcome of one approval dialog ([`ApproveResponse`]).
+    Approve(ApproveResponse),
+    /// The outcome of the Full Disk Access explainer ([`FdaPromptResponse`]).
+    FdaPrompt(FdaPromptResponse),
+}
+
+/// Ask the helper to show the Full Disk Access explainer (daemon → helper).
+///
+/// Deliberately payload-free beyond the envelope fields: the helper owns both
+/// the explanation text and the live state probe (it re-checks TCC itself
+/// rather than being told a state that would be stale by the time the window
+/// is on screen).
+///
+/// This is a **fire-and-forget** notification. The daemon does not block on
+/// [`FdaPromptResponse`], and the helper does not serialize this dialog behind
+/// the approval queue — an explainer left open while the user walks through
+/// System Settings must never stall a TouchID prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FdaPromptRequest {
+    /// Protocol version (see [`WIRE_VERSION`]).
+    pub v: u32,
+    /// Opaque identifier, echoed on [`FdaPromptResponse::request_id`] so the
+    /// daemon log can pair the two.
+    pub request_id: String,
+}
+
+/// How the Full Disk Access explainer ended (helper → daemon).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FdaPromptResponse {
+    /// Protocol version (see [`WIRE_VERSION`]).
+    pub v: u32,
+    /// Echoes [`FdaPromptRequest::request_id`].
+    pub request_id: String,
+    /// The final state of the explainer.
+    pub outcome: FdaOutcome,
+}
+
+/// The final state of the Full Disk Access explainer
+/// (`FdaPromptResponse.outcome`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FdaOutcome {
+    /// The helper observed the permission being granted while the window was
+    /// open (the window switches to its green "confirmed" state and the user
+    /// can close it at leisure).
+    Granted,
+    /// The window was closed while the permission was still ungranted. Not an
+    /// error: declining is a supported choice — the daemon keeps running and
+    /// the user answers the per-launch system dialog instead.
+    Dismissed,
+}
 
 /// The approval request (daemon → helper), one JSON object per line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -364,6 +453,105 @@ mod tests {
         assert!(!line.contains("biometric_kind"));
         let decoded: ApproveResponse = serde_json::from_str(&line).expect("deserialize");
         assert_eq!(decoded, resp);
+    }
+
+    /// The envelope's `type` tag strings are a fixed part of the schema (a
+    /// rename is a breaking wire change), and the tag must sit alongside the
+    /// body's own fields rather than nesting them — pin both properties.
+    #[test]
+    fn helper_request_envelope_tags_are_pinned_and_flat() {
+        let approve = HelperRequest::Approve(ApproveRequest {
+            v: WIRE_VERSION,
+            request_id: "req-env".to_string(),
+            key: "ns/k".to_string(),
+            operation: "get".to_string(),
+            requester: Requester {
+                chain: vec![],
+                audit_token: AuditToken {
+                    euid: 501,
+                    ruid: 501,
+                    egid: 20,
+                    pid: 1,
+                    pid_version: 0,
+                },
+                responsible_bundle_id: None,
+            },
+            guard_eval: None,
+            timeout_secs: 60,
+        });
+        let line = serde_json::to_string(&approve).expect("serialize");
+        assert!(line.starts_with(r#"{"type":"approve","v":"#), "{line}");
+        assert!(
+            line.contains(r#""request_id":"req-env""#),
+            "body fields stay at the top level: {line}"
+        );
+        assert_eq!(
+            serde_json::from_str::<HelperRequest>(&line).expect("deserialize"),
+            approve
+        );
+
+        let fda = HelperRequest::FdaPrompt(FdaPromptRequest {
+            v: WIRE_VERSION,
+            request_id: "fda-1".to_string(),
+        });
+        let line = serde_json::to_string(&fda).expect("serialize");
+        assert_eq!(
+            line,
+            format!(r#"{{"type":"fda_prompt","v":{WIRE_VERSION},"request_id":"fda-1"}}"#)
+        );
+        assert_eq!(
+            serde_json::from_str::<HelperRequest>(&line).expect("deserialize"),
+            fda
+        );
+    }
+
+    /// Same pinning for the response envelope, plus [`FdaOutcome`]'s
+    /// snake_case strings.
+    #[test]
+    fn helper_response_envelope_and_fda_outcome_strings_are_pinned() {
+        let approve = HelperResponse::Approve(ApproveResponse {
+            v: WIRE_VERSION,
+            request_id: "r".to_string(),
+            outcome: Outcome::Approved,
+            biometric_kind: None,
+        });
+        let line = serde_json::to_string(&approve).expect("serialize");
+        assert!(line.starts_with(r#"{"type":"approve","v":"#), "{line}");
+        assert_eq!(
+            serde_json::from_str::<HelperResponse>(&line).expect("deserialize"),
+            approve
+        );
+
+        for (outcome, expected) in [
+            (FdaOutcome::Granted, "granted"),
+            (FdaOutcome::Dismissed, "dismissed"),
+        ] {
+            let resp = HelperResponse::FdaPrompt(FdaPromptResponse {
+                v: WIRE_VERSION,
+                request_id: "fda-1".to_string(),
+                outcome,
+            });
+            let line = serde_json::to_string(&resp).expect("serialize");
+            assert_eq!(
+                line,
+                format!(
+                    r#"{{"type":"fda_prompt","v":{WIRE_VERSION},"request_id":"fda-1","outcome":"{expected}"}}"#
+                )
+            );
+            assert_eq!(
+                serde_json::from_str::<HelperResponse>(&line).expect("deserialize"),
+                resp
+            );
+        }
+    }
+
+    /// A v1 peer's bare (un-enveloped) `ApproveRequest` must not decode as a
+    /// v2 envelope: the version bump exists precisely so an old message is
+    /// rejected rather than half-interpreted.
+    #[test]
+    fn untagged_v1_message_is_rejected_by_the_v2_envelope() {
+        let v1_line = r#"{"v":1,"request_id":"old","key":"ns/k","operation":"get","requester":{"chain":[],"audit_token":{"euid":501,"ruid":501,"egid":20,"pid":1,"pid_version":0}},"timeout_secs":60}"#;
+        assert!(serde_json::from_str::<HelperRequest>(v1_line).is_err());
     }
 
     /// `Outcome`'s snake_case wire form is a fixed part of the schema (a

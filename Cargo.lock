@@ -106,6 +106,7 @@ version = "0.27.0"
 dependencies = [
  "block2",
  "macos-process-inspect",
+ "macos-tcc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

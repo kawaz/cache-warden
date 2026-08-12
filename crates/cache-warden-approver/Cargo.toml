@@ -35,9 +35,14 @@ serde_json = "1"
 # macOS-only (LocalAuthenticationEmbeddedUI), so there is no non-macOS build
 # to keep green here — unlike the daemon side, which needs the shim.
 macos-process-inspect = { path = "../macos-process-inspect" }
+# Full Disk Access probe for the explainer window's live status
+# (the helper re-checks TCC itself rather than trusting a state the daemon
+# sampled before the window was even on screen).
+macos-tcc = { path = "../macos-tcc" }
 block2 = "0.6"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
+    "NSDistributedNotificationCenter",
     "NSError",
     "NSGeometry",
     "NSNotification",
@@ -49,6 +54,7 @@ objc2-foundation = { version = "0.3", features = [
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSButton",
+    "NSColor",
     "NSControl",
     "NSResponder",
     "NSStackView",

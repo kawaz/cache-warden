@@ -45,6 +45,16 @@
 //! is the remaining lever (it would collapse ssh's retry storm into a single
 //! prompt) and is not implemented here.
 //!
+//! # Two message kinds, one connection
+//!
+//! Since wire v2 the connection carries an envelope
+//! ([`cache_warden_approver::wire::HelperRequest`]) rather than a bare
+//! approval, because the daemon also asks the helper to display the Full Disk
+//! Access explainer ([`ApproverClient::notify_fda_prompt`]). Only approvals
+//! are request/response pairs; the explainer is fire-and-forget and its reply
+//! is logged wherever it happens to be read. Nothing about the serialization
+//! or the queue bounds below applies to it — see that method's doc.
+//!
 //! # Helper-death recovery (§7 逆方向)
 //!
 //! A dead helper — writes returning `BrokenPipe`, reads returning EOF — is
@@ -54,6 +64,13 @@
 //! §9 `helper_down`). Unbounded respawn would hide a persistently-broken
 //! helper as a slow success; a single retry is enough to survive a crashed
 //! helper without masking a systemic failure.
+//!
+//! That same bound is what keeps a wire-version mismatch from becoming a
+//! respawn loop. A helper that speaks a different version exits when it reads
+//! the request, so the daemon sees EOF, respawns once, hits the same EOF, and
+//! returns the error — one extra spawn per request, not a spin. (Daemon and
+//! helper ship as one release, so this is a bad-install shape rather than a
+//! supported configuration.)
 //!
 //! # Stale-response discipline
 //!
@@ -78,7 +95,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cache_warden_approver::wire::{ApproveRequest, ApproveResponse, WIRE_VERSION};
+use cache_warden_approver::wire::{
+    ApproveRequest, ApproveResponse, FdaPromptRequest, HelperRequest, HelperResponse, WIRE_VERSION,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -632,6 +651,71 @@ impl ApproverClient {
         do_exchange(conn.as_mut().unwrap(), request, timeout).await
     }
 
+    /// Ask the helper to put the Full Disk Access explainer on screen and
+    /// return as soon as the request is on the wire — **no response is
+    /// awaited**.
+    ///
+    /// # Why fire-and-forget, and why it does not use the approval queue
+    ///
+    /// The explainer is not an approval: it stays open for as long as the
+    /// user needs to find CacheWarden in System Settings, and it carries no
+    /// answer the daemon has to act on (the permission either becomes granted
+    /// or it does not — nothing here gates a secret). Waiting for it would
+    /// hold the serialization lock across that entire span and stall every
+    /// TouchID prompt behind it, which is exactly the "dialog wedge" the
+    /// approval path went to some trouble to eliminate. So this call only
+    /// borrows the lock long enough to write one line, and the helper answers
+    /// on its own schedule — the reply is picked up and logged by whichever
+    /// [`do_exchange`] happens to read it (or discarded with the connection
+    /// if none does).
+    ///
+    /// It is likewise excluded from [`MAX_PENDING_REQUESTS`]: that cap bounds
+    /// how many *dialogs the user owes an answer to* can pile up, and this
+    /// window asks for no answer.
+    ///
+    /// `lock_timeout` bounds the whole call (waiting for the lock plus the
+    /// write). Expiring is benign — the daemon logs it and carries on
+    /// unprompted, which is the same place it would have been without the
+    /// explainer.
+    pub async fn notify_fda_prompt(
+        &self,
+        request_id: String,
+        lock_timeout: Duration,
+    ) -> io::Result<()> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "approver client is shut down",
+            ));
+        }
+        let envelope = HelperRequest::FdaPrompt(FdaPromptRequest {
+            v: WIRE_VERSION,
+            request_id,
+        });
+        let mut line = serde_json::to_string(&envelope)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        line.push('\n');
+
+        let send = async {
+            let mut guard = self.inner.lock().await;
+            let Some(conn) = guard.conn.as_mut() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no live approver helper connection",
+                ));
+            };
+            conn.writer.write_all(line.as_bytes()).await?;
+            conn.writer.flush().await
+        };
+        match tokio::time::timeout(lock_timeout, send).await {
+            Ok(r) => r,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("could not send the Full Disk Access prompt within {lock_timeout:?}"),
+            )),
+        }
+    }
+
     /// Kill the helper, drop the connection, and remove the socket file.
     /// Idempotent — a second call is a no-op. Called by the daemon shutdown
     /// path so the next daemon start's `bind` does not have to fall back to
@@ -706,7 +790,8 @@ async fn do_exchange(
     timeout: Duration,
 ) -> io::Result<ApproveResponse> {
     let exchange = async {
-        let mut line = serde_json::to_string(request)
+        let envelope = HelperRequest::Approve(request.clone());
+        let mut line = serde_json::to_string(&envelope)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         line.push('\n');
         conn.writer.write_all(line.as_bytes()).await?;
@@ -721,8 +806,38 @@ async fn do_exchange(
                     "helper closed the approver socket before responding",
                 ));
             }
-            let resp = serde_json::from_str::<ApproveResponse>(resp_line.trim_end())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let resp = match serde_json::from_str::<HelperResponse>(resp_line.trim_end())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            {
+                HelperResponse::Approve(resp) => resp,
+                HelperResponse::FdaPrompt(fda) => {
+                    // The FDA explainer runs on its own timeline (the user
+                    // may leave it open for minutes while visiting System
+                    // Settings), so its reply can land in the middle of an
+                    // approval exchange. It is nobody's pending response —
+                    // log the outcome and keep reading for ours.
+                    //
+                    // The version is checked here too, for the same reason
+                    // the approval arm checks it: a future v3 helper's
+                    // `granted` must not be read with v2 meaning. It is only
+                    // logged, though — this message gates nothing, so a
+                    // mismatch is not worth failing the *approval* the caller
+                    // is actually waiting on.
+                    if fda.v != WIRE_VERSION {
+                        eprintln!(
+                            "cache-warden: approver: ignoring a Full Disk Access reply with \
+                             unsupported wire version {} (daemon speaks {WIRE_VERSION})",
+                            fda.v
+                        );
+                        continue;
+                    }
+                    eprintln!(
+                        "cache-warden: approver: Full Disk Access prompt {:?} (v{}) ended: {:?}",
+                        fda.request_id, fda.v, fda.outcome
+                    );
+                    continue;
+                }
+            };
             if resp.v != WIRE_VERSION {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -840,6 +955,17 @@ mod tests {
         })
     }
 
+    /// Decode one wire line as an approval request, panicking on anything
+    /// else — the scripted fakes below only ever expect approvals, so an
+    /// FDA-prompt line reaching them is a test-setup error worth failing on.
+    fn decode_approve(line: &str) -> Option<ApproveRequest> {
+        match serde_json::from_str::<HelperRequest>(line.trim_end()) {
+            Ok(HelperRequest::Approve(req)) => Some(req),
+            Ok(HelperRequest::FdaPrompt(_)) => panic!("scripted fake got an unexpected FDA prompt"),
+            Err(_) => None,
+        }
+    }
+
     /// A fake helper that processes N requests over one connection: reads a
     /// line, decodes an `ApproveRequest`, calls `make_response(req)` to
     /// derive the reply, writes it, and repeats. Exits cleanly on EOF or
@@ -863,9 +989,8 @@ mod tests {
                 if n == 0 {
                     break;
                 }
-                let req: ApproveRequest = match serde_json::from_str(line.trim_end()) {
-                    Ok(r) => r,
-                    Err(_) => break,
+                let Some(req) = decode_approve(&line) else {
+                    break;
                 };
                 let Some(bytes) = make_response(req) else {
                     break;
@@ -881,7 +1006,7 @@ mod tests {
     }
 
     fn encode_response(resp: &ApproveResponse) -> Vec<u8> {
-        let mut s = serde_json::to_string(resp).expect("encode");
+        let mut s = serde_json::to_string(&HelperResponse::Approve(resp.clone())).expect("encode");
         s.push('\n');
         s.into_bytes()
     }
@@ -1501,6 +1626,98 @@ mod tests {
         );
 
         occupant.abort();
+        client.shutdown().await;
+    }
+
+    /// `notify_fda_prompt` puts the envelope on the wire and returns without
+    /// waiting for a reply — the explainer's lifetime is the user's, not the
+    /// daemon's. The fake helper here answers nothing at all; the call must
+    /// still complete.
+    #[tokio::test]
+    async fn notify_fda_prompt_sends_the_envelope_and_does_not_await_a_reply() {
+        use cache_warden_approver::wire::FdaOutcome;
+        use tokio::sync::oneshot;
+        let socket_path = test_socket_path("fda-notify");
+
+        let (seen_tx, seen_rx) = oneshot::channel::<String>();
+        let seen_slot = Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+        let client = client_with_fake_helper(socket_path.clone(), move |sp| {
+            let tx_slot = seen_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            tokio::spawn(async move {
+                let stream = UnixStream::connect(&sp).await.expect("fake helper connect");
+                let (rh, _wh) = stream.into_split();
+                let mut reader = BufReader::new(rh);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                if let Some(tx) = tx_slot {
+                    let _ = tx.send(line);
+                }
+                std::future::pending::<()>().await;
+            })
+        })
+        .await
+        .expect("start client");
+
+        client
+            .notify_fda_prompt("fda-req".to_string(), Duration::from_secs(5))
+            .await
+            .expect("fire-and-forget send must succeed");
+
+        let line = seen_rx.await.expect("helper must receive the prompt");
+        let decoded: HelperRequest =
+            serde_json::from_str(line.trim_end()).expect("decode envelope");
+        assert_eq!(
+            decoded,
+            HelperRequest::FdaPrompt(FdaPromptRequest {
+                v: WIRE_VERSION,
+                request_id: "fda-req".to_string(),
+            })
+        );
+        // Reference the response type so the wire pairing stays visible here
+        // even though this path never reads one.
+        let _ = FdaOutcome::Granted;
+
+        client.shutdown().await;
+    }
+
+    /// An FDA-prompt response landing mid-approval must be logged and skipped,
+    /// not mistaken for the approval's reply nor treated as a protocol error:
+    /// the explainer answers on the user's schedule, which can be any moment.
+    #[tokio::test]
+    async fn approval_exchange_skips_an_interleaved_fda_response() {
+        use cache_warden_approver::wire::{FdaOutcome, FdaPromptResponse};
+        let socket_path = test_socket_path("fda-interleave");
+        let make = Arc::new(|req: ApproveRequest| {
+            let mut bytes = serde_json::to_string(&HelperResponse::FdaPrompt(FdaPromptResponse {
+                v: WIRE_VERSION,
+                request_id: "fda-req".to_string(),
+                outcome: FdaOutcome::Granted,
+            }))
+            .expect("encode fda")
+            .into_bytes();
+            bytes.push(b'\n');
+            bytes.extend_from_slice(&encode_response(&ApproveResponse {
+                v: WIRE_VERSION,
+                request_id: req.request_id,
+                outcome: Outcome::Approved,
+                biometric_kind: Some("TouchID".to_string()),
+            }));
+            Some(bytes)
+        });
+        let make_clone = make.clone();
+        let client = client_with_fake_helper(socket_path.clone(), move |sp| {
+            spawn_scripted_helper(sp, make_clone.clone())
+        })
+        .await
+        .expect("start client");
+
+        let resp = client
+            .request(&test_request("after-fda"), Duration::from_secs(5))
+            .await
+            .expect("the approval reply must still be delivered");
+        assert_eq!(resp.request_id, "after-fda");
+        assert_eq!(resp.outcome, Outcome::Approved);
+
         client.shutdown().await;
     }
 
