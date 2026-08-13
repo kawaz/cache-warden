@@ -4,7 +4,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
-| 2026-08-14 | idea | idea | [signed-by](./2026-08-14-signed-by.md) | llm-gateway の OAuth クレデンシャル Store バックエンドとして cache-warden を使いたい、という kawaz 提案。要件は 3 点… |
 | 2026-07-10 | design | idea | [remote-approval-web-passkey](./2026-07-10-remote-approval-web-passkey.md) | Tailscale 直達 + WebAuthn passkey によるリモート承認 (kawaz 裁定 2026-07-10 で確定)。daemon が tailnet 内 HTTPS で承認ページ… |
 | 2026-06-14 | idea | idea | [ssh-agent-provider-architecture](./2026-06-14-ssh-agent-provider-architecture.md) | 現状の authsock アダプタは **「中継役（relay）」前提**の名残: |
 | 2026-06-14 | bug | idea | [touchid-blocks-blocking-pool](./2026-06-14-touchid-blocks-blocking-pool.md) | SIGN_REQUEST 処理は `spawn_blocking` で blocking pool に乗せ、その中で **`store` の `std::sy… |
@@ -17,6 +16,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-07-06 | bug | open | [daemon-register-help-output-oneshot](./2026-07-06-daemon-register-help-output-oneshot.md) | v0.22.3 daemon 稼働中に v0.23.0 で `daemon register` 実行、末尾に top-level help が出力され旧 daemon… |
 | 2026-06-13 | bug | open | [op-discovery-blocks-startup](./2026-06-13-op-discovery-blocks-startup.md) | `[authsock.sockets.*].keys` を持つ config で起動すると、`run()` の |
 | 2026-06-22 | design | open | [custom-touchid-dialog](./2026-06-22-custom-touchid-dialog.md) | cache-warden 独自の TouchID 認証 dialog を実装し、**要求元プロセスの透明性**を 1Password 既定の dialog よ… |
+| 2026-08-14 | idea | wip | [signed-by](./2026-08-14-signed-by.md) | llm-gateway の OAuth クレデンシャル Store バックエンドとして cache-warden を使いたい、という kawaz 提案。要件は 3 点… |
 | 2026-08-12 | task | wip | [fda-grant-flow-hardening](./2026-08-12-fda-grant-flow-hardening.md) | FDA 付与フローの再整備 (2026-08-12 実機バグ発見の後続)。FDA 判定 (macos-tcc) を open+read ベース… |
 | 2026-06-15 | design | pending-sublimation | [changelog-md-adoption](./2026-06-15-changelog-md-adoption.md) | DR-0024 / DR-0025 のような minor breaking change (= pre-1.0 で minor bump、API surfac… |
 
