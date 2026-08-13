@@ -20,13 +20,7 @@
 
 ## 裁定待ち
 
-### 👺VLT-Q1: vault 設計の裁定残り 2 件 (a = 非対称 recipient は裁定済み)
-
-背景は [3 者レビュー統合](research/2026-08-14-vault-design-tri-review.md) §1.1 / §1.7。
-
-- [ ] b: CAS に加えて **refresh 着手時 claim** (`refreshing(expected_version, expiry)` への CAS 遷移後に provider を叩く) を入れる — 並行 refresh の provider 側ファミリー失効を防ぐ
-- [ ] b': claim は入れず「gateway 側 singleflight を契約として明記」で済ます
-- [ ] c: recovery slot を**初期化時必須生成 (スキップ不可) + 1Password と独立媒体に保管**を運用要件化 (passkey も recovery も 1P だと相関故障で全滅)
+(なし)
 
 ## 確認待ち
 
