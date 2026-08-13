@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-08-14 | idea | idea | [signed-by](./2026-08-14-signed-by.md) | llm-gateway の OAuth クレデンシャル Store バックエンドとして cache-warden を使いたい、という kawaz 提案。要件は 3 点… |
 | 2026-07-10 | design | idea | [remote-approval-web-passkey](./2026-07-10-remote-approval-web-passkey.md) | Tailscale 直達 + WebAuthn passkey によるリモート承認 (kawaz 裁定 2026-07-10 で確定)。daemon が tailnet 内 HTTPS で承認ページ… |
 | 2026-06-14 | idea | idea | [ssh-agent-provider-architecture](./2026-06-14-ssh-agent-provider-architecture.md) | 現状の authsock アダプタは **「中継役（relay）」前提**の名残: |
 | 2026-06-14 | bug | idea | [touchid-blocks-blocking-pool](./2026-06-14-touchid-blocks-blocking-pool.md) | SIGN_REQUEST 処理は `spawn_blocking` で blocking pool に乗せ、その中で **`store` の `std::sy… |
