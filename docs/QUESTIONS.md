@@ -20,7 +20,20 @@
 
 ## 裁定待ち
 
-(なし)
+### 👺VLT-Q1: vault 設計の裁定差し戻し 3 件 (3 系統レビュー起因)
+
+背景は [3 者レビュー統合](research/2026-08-14-vault-design-tri-review.md) §1.1 / §1.2 / §1.7。
+
+- [ ] a: スロットを**非対称 recipient (age 同型)** にする — DEK ローテ・スロット追加が ceremony ゼロで完結し「削除時常時ローテ」裁定がそのまま実装可能になる (統括推奨)
+- [ ] a': 対称 KEK のまま、削除は header 除去のみ + DEK ローテは明示 rotate コマンド化 (未 rotate 警告付き)
+- [ ] b: CAS に加えて **refresh 着手時 claim** (`refreshing(expected_version, expiry)` への CAS 遷移後に provider を叩く) を入れる — 並行 refresh の provider 側ファミリー失効を防ぐ
+- [ ] b': claim は入れず「gateway 側 singleflight を契約として明記」で済ます
+- [ ] c: recovery slot を**初期化時必須生成 (スキップ不可) + 1Password と独立媒体に保管**を運用要件化 (passkey も recovery も 1P だと相関故障で全滅)
+
+### 👺VLT-C1: DR 起草前の実機/環境確認 (kawaz 側)
+
+- [ ] a: **1Password 管理 passkey で PRF 拡張が使えるか** (ブラウザで https://webauthn.io 等の PRF デモ、または 1P の対応ドキュメント確認。No なら鍵管理層の設計が変わるため最優先)
+- [ ] b: llm-gateway のビルドが **hardened runtime + library validation 有効**か (signed-by の強度前提)
 
 ## 確認待ち
 
