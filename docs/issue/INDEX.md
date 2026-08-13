@@ -15,7 +15,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-07-12 | task | open | [guard-require-cwd-constraint](./2026-07-12-guard-require-cwd-constraint.md) | draft-DR-0030 guard に `--require-cwd=PATH` constraint を追加 (direnv 的区画化)。kawaz 提案 (2026-07-12): カジュアルな… |
 | 2026-07-10 | design | open | [migrate-to-macos-process-inspect-crate](./2026-07-10-migrate-to-macos-process-inspect-crate.md) | 既存 process inspect 実装の macos-process-inspect crate への移行 (重複解消) |
 | 2026-07-06 | bug | open | [daemon-register-help-output-oneshot](./2026-07-06-daemon-register-help-output-oneshot.md) | v0.22.3 daemon 稼働中に v0.23.0 で `daemon register` 実行、末尾に top-level help が出力され旧 daemon… |
-| 2026-07-13 | bug | wip | [test-socket-bind-leak](./2026-07-13-test-socket-bind-leak.md) | `cargo test --workspace` 実行中に実環境の `~/.ssh/agent-*.sock.cw` へ bind 試行が走る (テスト隔離不足)。稼働 daemon の排他で実害は未発生。 |
 | 2026-06-13 | bug | open | [op-discovery-blocks-startup](./2026-06-13-op-discovery-blocks-startup.md) | `[authsock.sockets.*].keys` を持つ config で起動すると、`run()` の |
 | 2026-06-22 | design | open | [custom-touchid-dialog](./2026-06-22-custom-touchid-dialog.md) | cache-warden 独自の TouchID 認証 dialog を実装し、**要求元プロセスの透明性**を 1Password 既定の dialog よ… |
 | 2026-08-12 | task | wip | [fda-grant-flow-hardening](./2026-08-12-fda-grant-flow-hardening.md) | FDA 付与フローの再整備 (2026-08-12 実機バグ発見の後続)。FDA 判定 (macos-tcc) を open+read ベース… |

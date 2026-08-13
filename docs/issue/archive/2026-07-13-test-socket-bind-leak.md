@@ -1,6 +1,6 @@
 ---
 title: cargo test 実行中に実環境の ~/.ssh/agent-*.sock.cw へ bind 試行が走る (テスト隔離不足)
-status: wip
+status: resolved
 category: bug
 created: 2026-07-13T07:58:55+09:00
 last_read: 2026-08-12T13:47:46+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-08-12T13:48:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-14T00:29:40+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:修正完了 (commit d9fa0163)。発生源=テストが CACHE_WARDEN_CONFIG 未指定で daemon spawn→config_search_paths() が実 config (~/.config/cache-warden/config.toml) へフォールバック→[authsock.sockets.*] の実 socket へ bind 試行 (before 79 件実測、e2e.rs 43 + inject_run_e2e.rs 36)。デフォルト socket パス解決の $HOME フォールバック説は無罪","done:対処=tempdir の空 config を pin する方式に統一 (product コード無変更、既存注入点 CACHE_WARDEN_CONFIG で足りた)。help_cli.rs の /nonexistent パス指定も同じ穴で修正","done:after は cargo test --workspace で実パス bind 試行 0 件を確認、受け入れ条件2点チェック済みで close"]
 blocked_by:
 origin: SIGN dialog 統合レビュー (2026-07-13、Fable レビュー) でのスコープ外観測
 ---
