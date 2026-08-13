@@ -68,19 +68,25 @@ fn b64(bytes: &[u8]) -> String {
     B64.encode(bytes)
 }
 
+/// Write an empty config in `dir` and return its path, for pinning via
+/// `$CACHE_WARDEN_CONFIG`.
+///
+/// Every daemon spawned by these tests must pin a config. Otherwise resolution
+/// falls through to the ambient `$XDG_CONFIG_HOME/cache-warden/config.toml` /
+/// `~/.config/...`, and on a dogfooding host that config's `[authsock.sockets]`
+/// makes the test daemon bind the developer's real `~/.ssh/agent-*.sock.cw`
+/// and its `[authsock.sources]` seed real `op`-discovered keys into `kv.list`.
+fn empty_config(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("config.toml");
+    std::fs::write(&path, "").expect("write empty config");
+    path
+}
+
 #[test]
 fn full_lifecycle_over_control_socket() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
-    // Pin an empty config via `$CACHE_WARDEN_CONFIG` (unlike the `--socket`
-    // path exercised here, every other spawn in this file already isolates
-    // its config via `spawn_with_config` / an explicit `.env(...)`). Without
-    // this, the daemon falls through to any ambient
-    // `$XDG_CONFIG_HOME/cache-warden/config.toml` / `~/.config/...`, and a
-    // config with `[authsock.sources]` would seed real `op`-discovered keys
-    // into `kv.list`, breaking the exact-list assertion below.
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "").expect("write empty config");
+    let config_path = empty_config(dir.path());
 
     let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
         .arg("daemon")
@@ -557,15 +563,7 @@ preload = true
 #[test]
 fn pin_missing_key_is_not_found() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("control.sock");
-    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
-        .arg("daemon")
-        .arg("run")
-        .arg("--socket")
-        .arg(&socket)
-        .spawn()
-        .expect("spawn daemon");
-    let mut daemon = Daemon { child };
+    let (mut daemon, socket) = spawn_plain(dir.path());
 
     let resp = request(
         &socket,
@@ -586,7 +584,7 @@ fn pin_missing_key_is_not_found() {
     let _ = wait_for_exit(&mut daemon, Duration::from_secs(10));
 }
 
-/// Spawn a daemon with no config, control socket pinned via `--socket`.
+/// Spawn a daemon with an empty config, control socket pinned via `--socket`.
 fn spawn_plain(dir: &Path) -> (Daemon, std::path::PathBuf) {
     let socket = dir.join("control.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
@@ -594,6 +592,7 @@ fn spawn_plain(dir: &Path) -> (Daemon, std::path::PathBuf) {
         .arg("run")
         .arg("--socket")
         .arg(&socket)
+        .env("CACHE_WARDEN_CONFIG", empty_config(dir))
         .spawn()
         .expect("spawn daemon");
     (Daemon { child }, socket)
@@ -1324,16 +1323,7 @@ fn kv_get_dry_run_returns_verified_without_value_over_the_wire() {
 #[test]
 fn double_start_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("control.sock");
-
-    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
-        .arg("daemon")
-        .arg("run")
-        .arg("--socket")
-        .arg(&socket)
-        .spawn()
-        .expect("spawn first daemon");
-    let mut first = Daemon { child };
+    let (mut first, socket) = spawn_plain(dir.path());
 
     // Ensure the first daemon is up.
     let resp = request(&socket, r#"{"cmd":"ping"}"#);
@@ -1345,6 +1335,7 @@ fn double_start_is_refused() {
         .arg("run")
         .arg("--socket")
         .arg(&socket)
+        .env("CACHE_WARDEN_CONFIG", empty_config(dir.path()))
         .output()
         .expect("spawn second daemon");
     assert!(
@@ -1373,15 +1364,7 @@ fn otp_value_type_over_control_socket() {
     const SEED_B32: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("control.sock");
-    let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
-        .arg("daemon")
-        .arg("run")
-        .arg("--socket")
-        .arg(&socket)
-        .spawn()
-        .expect("spawn daemon");
-    let mut daemon = Daemon { child };
+    let (mut daemon, socket) = spawn_plain(dir.path());
 
     // --- kv.define an OTP key whose command emits the seed (6 digits default) ---
     let def = format!(

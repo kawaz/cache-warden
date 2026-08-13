@@ -56,13 +56,22 @@ fn request(socket: &Path, json_line: &str) -> serde_json::Value {
     serde_json::from_str(line.trim_end()).expect("parse json")
 }
 
+/// Spawn a daemon with an empty config, control socket pinned via `--socket`.
+///
+/// Pinning `$CACHE_WARDEN_CONFIG` is what keeps the daemon off the ambient
+/// `$XDG_CONFIG_HOME/cache-warden/config.toml` / `~/.config/...`, whose
+/// `[authsock.sockets]` would otherwise make this test bind the developer's
+/// real `~/.ssh/agent-*.sock.cw`.
 fn spawn_plain(dir: &Path) -> (Daemon, std::path::PathBuf) {
     let socket = dir.join("control.sock");
+    let config = dir.join("config.toml");
+    std::fs::write(&config, "").expect("write empty config");
     let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
         .arg("daemon")
         .arg("run")
         .arg("--socket")
         .arg(&socket)
+        .env("CACHE_WARDEN_CONFIG", &config)
         .spawn()
         .expect("spawn daemon");
     (Daemon { child }, socket)

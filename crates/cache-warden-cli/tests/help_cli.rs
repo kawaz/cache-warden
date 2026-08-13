@@ -16,10 +16,19 @@ use std::process::{Command, Output};
 /// Invoke the built `cache-warden` binary with `args`. A bogus `--socket` keeps
 /// any command that *would* reach the daemon from touching a real socket; help
 /// and usage paths short-circuit before any connection attempt.
+///
+/// The pinned config is an *empty* file in a tempdir, which is what makes these
+/// runs see no configuration at all: config resolution takes the first
+/// candidate that exists, so a non-existent `$CACHE_WARDEN_CONFIG` would fall
+/// through to the ambient `$XDG_CONFIG_HOME` / `~/.config/...` and let a
+/// dogfooding host's real config sway the output.
 fn cw(args: &[&str]) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").expect("write empty config");
     Command::new(env!("CARGO_BIN_EXE_cache-warden"))
         .args(args)
-        .env("CACHE_WARDEN_CONFIG", "/nonexistent/cw-help-test.toml")
+        .env("CACHE_WARDEN_CONFIG", &config)
         .output()
         .expect("spawn cache-warden")
 }
