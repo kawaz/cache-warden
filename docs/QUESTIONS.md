@@ -20,7 +20,20 @@
 
 ## 裁定待ち
 
-(なし)
+### 👺DR34-Q1: draft-DR-0033/0034 の accept 判断と Open Questions
+
+[draft-DR-0033 (signed-by)](decisions/draft-DR-0033-signed-by-constraint.md) と
+[draft-DR-0034 (暗号化永続 vault)](decisions/draft-DR-0034-encrypted-persistent-vault.md) を
+起草済み (3 系統レビュー全項目消化)。DR 全文レビューの上:
+
+- [ ] a: 両 DR の方向性 accept (細部指摘は自由文で)
+- [ ] b: [DR-0034 Open Q1](decisions/draft-DR-0034-encrypted-persistent-vault.md#open-questions) — graceful restart handoff に DEK を含める (再起動後も unlocked 維持)
+- [ ] b': 同 Q1 — DEK を含めない (再起動ごとに unlock ceremony、既存思想に忠実)
+- [ ] c: [DR-0034 Open Q2](decisions/draft-DR-0034-encrypted-persistent-vault.md#open-questions) — vault rollback を防御対象にする (単調カウンタを Keychain/SE 外部アンカーへ。裁定 6 と緊張)
+- [ ] c': 同 Q2 — rollback は防御対象外と明記 (真の失効は OAuth 側 revoke)
+
+DR-0033 側の Open Q 4 件 (hardened runtime 実行時検証 / version 下限 / 解除フラグ命名 /
+crate API 範囲) は実装時判断で足りる粒度なので裁定不要 (異論あれば自由文で)。
 
 ## 確認待ち
 
