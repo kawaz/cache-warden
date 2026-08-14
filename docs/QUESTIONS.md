@@ -20,16 +20,7 @@
 
 ## 裁定待ち
 
-### 👺DR34-Q1: draft-DR-0033/0034 の accept 判断と Open Questions
-
-[draft-DR-0033 (signed-by)](decisions/draft-DR-0033-signed-by-constraint.md) と
-[draft-DR-0034 (暗号化永続 vault)](decisions/draft-DR-0034-encrypted-persistent-vault.md) を
-起草済み (3 系統レビュー全項目消化)。DR 全文レビューの上:
-
-a (accept) / b (DEK handoff 同梱) は裁定済み・DR 反映済み。残り Q2 のみ:
-
-- [ ] c: vault rollback を防御対象にする (単調カウンタを Keychain/SE 外部アンカーへ。裁定 6 と緊張。買えるのは fail-loud 検出のみで機密性は上がらない)
-- [ ] c': rollback は防御対象外と明記 (**統括推奨** — rollback 可能な攻撃者はオフライン復号で同等以上が既に可能、version 巻き戻りの実害は §3a の再認証回復契約で受け止まる。分析は [DR-0034 Open Q2](decisions/draft-DR-0034-encrypted-persistent-vault.md#open-questions))
+(なし)
 
 ## 確認待ち
 

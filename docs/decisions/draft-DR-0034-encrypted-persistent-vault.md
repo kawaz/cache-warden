@@ -320,7 +320,7 @@ DR-0029 の handoff snapshot と vault はどちらも「再起動を越えて�
 | crash による version 巻き戻し → 消費済み RT の再利用 | CAS 成功の返却は fsync 完了後、version は永続かつ単調 (§4) |
 | crash による新 RT の消失 | set ack は fsync 完了後 (§3)。provider 応答後〜durable ack 前の窓は消せない → 明示再認証への回復契約 (§3a) |
 | 認可の cold start 消失 | guard record / owner principal / CAS version を vault に同梱 (§1d、DR-0033 §7) |
-| **vault ファイルの rollback (旧世代への丸ごと差し戻し)** | **未裁定 — Open Q2**。AEAD は正当な旧ファイルへの差し戻しを検出できない |
+| vault ファイルの rollback (旧世代への丸ごと差し戻し) | **防御対象外と明記** (裁定 2026-08-14、Open Q2)。rollback 可能な攻撃者はオフライン復号で同等以上が既に可能。version 巻き戻りの実害は §3a の再認証回復契約で受け止める |
 | unlock 中のメモリからの DEK 窃取 | mlock + zeroize + `with_exposed` (§6)。ただし unlock 中は既存の in-memory 秘密と同じ強度になるだけ、と明記 |
 | 旧 inode / バックアップの残留 | 防御対象外と明記。真の失効は OAuth 側 revoke (§7) |
 
@@ -369,20 +369,14 @@ DR-0029 の handoff snapshot と vault はどちらも「再起動を越えて�
 
 1. ~~graceful restart handoff に DEK を含めるか~~ — **裁定済み (2026-08-14): 含める**。
    §11 に反映済み。
-2. **vault rollback 脅威の扱い** (tri-review §2、sol C3): AEAD は「正当だが古い vault
-   ファイル」への丸ごと差し戻しを検出できない。統括分析 (2026-08-14): rollback 可能な
-   攻撃者 (same-uid でディスクに書ける) は旧ファイルのコピーを旧スロット秘密でオフライン
-   復号する方が早く、**開示面で rollback 固有の新規攻撃は無い** (§7 の「過去コピーには
-   失効が効かない」に包含される)。実害の本体は整合性/可用性 — CAS version の巻き戻りで
-   消費済み RT を再利用しファミリー失効 (ただし §3a の回復契約 = 再認証で自己検出・回復
-   する)。外部単調カウンタ (下記 a) が買えるのは fail-loud の検出能力のみで機密性は
-   上がらない。二択:
-   - **(a) 単調カウンタを外部の信頼アンカーに置く** (Keychain / SE に `dek_generation` /
-     CAS version の高水位を記録)。検出可能になるが Keychain/SE 依存 (裁定 6 と緊張) +
-     アンカー破損時の復旧設計が要る。
-   - **(b) 防御対象外と明記する** (真の失効は OAuth 側 revoke に委ねる)。**統括推奨** —
-     rollback 攻撃者はオフライン復号で同等以上が既に可能で、実害側は既存の回復契約で
-     受け止まるため。
+2. ~~vault rollback 脅威の扱い~~ — **裁定済み (2026-08-14): 防御対象外と明記する**。
+   根拠: rollback 可能な攻撃者 (same-uid でディスクに書ける) は旧ファイルのコピーを
+   旧スロット秘密でオフライン復号する方が早く、**開示面で rollback 固有の新規攻撃は無い**
+   (§7 の「過去コピーには失効が効かない」に包含される)。実害の本体は整合性/可用性 —
+   CAS version の巻き戻りで消費済み RT を再利用しファミリー失効するが、§3a の回復契約
+   (再認証フロー) で自己検出・回復する。外部単調カウンタ (Keychain/SE アンカー) が買えるのは
+   fail-loud の検出能力のみで機密性は上がらず、Keychain/SE 依存 (裁定 6 と緊張) と
+   アンカー破損時の復旧設計という対価に見合わない (不採用)。真の失効は OAuth 側 revoke。
 3. ~~idle lock timeout の既定値~~ — **裁定済み (2026-08-14): 既定は idle lock なし**
    (unlock は明示 `cw vault lock` かプロセス終了まで持続、config で有効化可)。passkey の
    役目は「起動時の鍵の取り出しと登録」であって存在確認ではない (kawaz)。§6 の lock 契機
