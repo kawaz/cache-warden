@@ -317,6 +317,24 @@ pub enum Request {
         /// audit token (never trust caller-supplied process identities).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         guard_constraints: Vec<GuardConstraintWire>,
+        /// DR-0034 §4 compare-and-swap guard: write only if the entry is still
+        /// at this version. `None` (the pre-DR-0034 default, and what an older
+        /// client sends) means "write unconditionally", preserving the
+        /// historical behaviour exactly.
+        ///
+        /// `0` is not "no version" — it means **"I expect this key not to
+        /// exist"**, since versions start at 1. That makes a create race
+        /// safely against another create rather than silently overwriting it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_version: Option<u64>,
+        /// The token from a `kv.claim` on this key (DR-0034 §4).
+        ///
+        /// Required while a claim is active, ignored otherwise. It is what
+        /// stops a caller whose claim lapsed — and who was replaced by someone
+        /// else mid-refresh — from writing anyway: the version check alone
+        /// cannot catch that, because nothing has written in between.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claim_token: Option<String>,
     },
     /// Register a *typed source* definition for a key (DR-0014 §1 / DR-0018 §1).
     ///
@@ -387,6 +405,43 @@ pub enum Request {
     KvUnpin {
         /// The key to unpin.
         key: String,
+    },
+    /// Take the refresh claim on a key (DR-0034 §4), so that only this caller
+    /// contacts the upstream credential provider.
+    ///
+    /// Named to match `kv.pin` / `kv.unpin`: same "take a hold, release the
+    /// hold" shape, same positional duration.
+    ///
+    /// The reply carries a token that must be presented to `kv.set` while the
+    /// claim is active, and again to `kv.unclaim`. A key that is already
+    /// claimed replies [`ErrorKind::AlreadyClaimed`] — the signal to wait for
+    /// the new value rather than start a second refresh.
+    #[serde(rename = "kv.claim")]
+    KvClaim {
+        /// The key to claim.
+        key: String,
+        /// Claim only if the entry is still at this version (DR-0034 §4). A
+        /// claim taken from a stale read would be racing an update it has not
+        /// seen.
+        expected_version: u64,
+        /// How long the claim holds before it lapses, in seconds. The lapse is
+        /// a liveness backstop for a caller that dies mid-refresh; the token,
+        /// not the expiry, is what makes the hold safe.
+        duration_secs: u64,
+    },
+    /// Release a claim taken with `kv.claim` without writing a value
+    /// (DR-0034 §4).
+    ///
+    /// For the caller that claimed, called the provider and got nothing worth
+    /// storing. Releasing lets the next caller start at once instead of
+    /// waiting out the expiry.
+    #[serde(rename = "kv.unclaim")]
+    KvUnclaim {
+        /// The key to release.
+        key: String,
+        /// The token returned by the `kv.claim` being released. Required so a
+        /// caller whose claim lapsed cannot cancel the claim that replaced it.
+        claim_token: String,
     },
     /// Trigger a graceful restart (DR-0029): serialize the store's full state,
     /// verify the current binary's on-disk image, and hand the state to a
@@ -598,6 +653,17 @@ pub enum OkPayload {
         /// old daemon that silently dropped its guard declaration.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         guard_applied: Vec<String>,
+        /// The entry's version after this write (DR-0034 §4), which is what a
+        /// caller passes as the next `expected_version`.
+        ///
+        /// `Option` rather than a bare `u64` defaulting to zero, for the same
+        /// reason `guard_applied` is a vector whose emptiness is meaningful: an
+        /// older daemon omits the field entirely, and a client must be able to
+        /// tell "this daemon does not do CAS" from "this entry is at version
+        /// 0". Versions start at 1, so a zero default would have been a
+        /// sentinel pretending to be a value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
     },
     /// Reply to [`Request::KvDefine`] (acknowledgement, no payload).
     Defined {
@@ -615,6 +681,26 @@ pub enum OkPayload {
     Unpinned {
         /// Whether the key existed (the pin, if any, was dropped).
         unpinned: bool,
+    },
+    /// Reply to [`Request::KvClaim`] (DR-0034 §4).
+    Claimed {
+        /// Always `true`; lets `untagged` disambiguate the reply.
+        claimed: bool,
+        /// The entry's current version — unchanged by the claim, since a claim
+        /// alters no value. Echoed so the caller can pass it straight back as
+        /// `kv.set`'s `expected_version`.
+        version: u64,
+        /// The capability to present on `kv.set` / `kv.unclaim` while this
+        /// claim holds. Unguessable, but not a secret: it authorizes finishing
+        /// or cancelling this refresh, nothing else.
+        claim_token: String,
+        /// Seconds until the claim lapses.
+        claim_expires_in_secs: u64,
+    },
+    /// Reply to [`Request::KvUnclaim`].
+    Unclaimed {
+        /// Always `true`; lets `untagged` disambiguate the reply.
+        unclaimed: bool,
     },
     /// Reply to an *accepted* [`Request::RestartGraceful`] (DR-0029). See that
     /// variant's doc for why a client should not expect a second response.
@@ -698,6 +784,18 @@ pub struct EntryInfo {
     /// the field (`#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_summary: Option<Vec<String>>,
+    /// The entry's DR-0034 §4 CAS version, or `None` for an entry that has no
+    /// version (and from a daemon that predates them). Value-free: a counter
+    /// of how many times the value changed, never the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+    /// Seconds until an active refresh claim lapses, or `None` when nothing
+    /// holds the entry (DR-0034 §4). The token is deliberately **not** here —
+    /// `status` and `kv list` are readable by anyone who can reach the socket,
+    /// and handing out the token would let a bystander cancel or complete
+    /// someone else's refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_expires_in_secs: Option<u64>,
 }
 
 /// A structured error returned in a failed [`Response`].
@@ -709,6 +807,20 @@ pub struct WireError {
     pub kind: ErrorKind,
     /// A human-readable, secret-free description.
     pub message: String,
+    /// The entry's actual version, on [`ErrorKind::CasMismatch`] (DR-0034 §4).
+    ///
+    /// A typed field rather than a number embedded in `message`: the losing
+    /// side of a compare-and-swap needs this value to retry, and making it
+    /// parse the prose would freeze the wording into an API. `0` means the
+    /// entry does not exist. Absent for every other error kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<u64>,
+    /// Seconds until the holding claim lapses, on
+    /// [`ErrorKind::AlreadyClaimed`] (DR-0034 §4) — how long a caller would
+    /// wait if it chose to wait rather than give up. Absent for every other
+    /// error kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_expires_in_secs: Option<u64>,
 }
 
 /// Machine-readable error categories on the wire.
@@ -730,6 +842,26 @@ pub enum ErrorKind {
     UpstreamFailed,
     /// An internal daemon error (lock poisoned, etc.).
     Internal,
+    /// A `kv.set` / `kv.claim` carrying `expected_version` lost a
+    /// compare-and-swap: the entry is at a different version now (DR-0034 §4).
+    /// **Nothing was written.** [`WireError::current_version`] carries the
+    /// version actually found, to retry from.
+    ///
+    /// Deliberately distinct from `bad_request`: a CAS loss is a normal
+    /// outcome of a race, not a malformed call, and a client that conflates
+    /// the two would retry when it should re-read.
+    CasMismatch,
+    /// A `kv.claim` found an unlapsed claim already held (DR-0034 §4).
+    /// [`WireError::claim_expires_in_secs`] says how long it holds.
+    ///
+    /// The caller should wait for the value the holder is fetching, **not**
+    /// contact the provider itself — doing so is the double-refresh the claim
+    /// exists to prevent.
+    AlreadyClaimed,
+    /// A `kv.set` on a claimed entry presented no claim token, or the wrong
+    /// one (DR-0034 §4). The usual cause is a claim that lapsed and was taken
+    /// over while this caller was still working.
+    ClaimTokenMismatch,
     /// A `daemon.restart_graceful` request was rejected before touching any
     /// listener or socket (DR-0029): exec-target verification failed, a
     /// restart is already in progress, or graceful restart is unsupported on
@@ -751,12 +883,93 @@ impl Response {
     /// empty vector for an unguarded set (pre-DR-0030 shape: the empty
     /// vector serializes without a `guard_applied` field via
     /// `skip_serializing_if`).
+    ///
+    /// Test-only since DR-0034 §4: production sets always know the entry's new
+    /// version and use [`Self::set_ack_with_guard_and_version`]. This one is
+    /// kept so the wire tests can still build the pre-DR-0034 ack shape and
+    /// assert it stays byte-compatible.
+    #[cfg(test)]
     pub fn set_ack_with_guard(guard_applied: Vec<String>) -> Self {
         Response::Ok(OkResponse {
             ok: true,
             payload: OkPayload::Set {
                 set: true,
                 guard_applied,
+                version: None,
+            },
+        })
+    }
+
+    /// [`Self::set_ack_with_guard`] plus the entry's new CAS version
+    /// (DR-0034 §4).
+    pub fn set_ack_with_guard_and_version(guard_applied: Vec<String>, version: u64) -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::Set {
+                set: true,
+                guard_applied,
+                version: Some(version),
+            },
+        })
+    }
+
+    /// Construct a `kv.claim` success response (DR-0034 §4).
+    pub fn claimed_ack(version: u64, claim_token: String, claim_expires_in_secs: u64) -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::Claimed {
+                claimed: true,
+                version,
+                claim_token,
+                claim_expires_in_secs,
+            },
+        })
+    }
+
+    /// Construct a `kv.unclaim` success response.
+    pub fn unclaimed_ack() -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::Unclaimed { unclaimed: true },
+        })
+    }
+
+    /// Construct the failure response for a lost compare-and-swap
+    /// (DR-0034 §4), carrying the version to retry from.
+    pub fn cas_mismatch(current_version: u64) -> Self {
+        let message = if current_version == 0 {
+            "the entry does not exist; re-read it and retry with the version you find".to_string()
+        } else {
+            format!(
+                "the entry changed since it was read (it is now at version {current_version}); \
+                 re-read it and retry"
+            )
+        };
+        Response::Err(ErrResponse {
+            ok: false,
+            error: WireError {
+                kind: ErrorKind::CasMismatch,
+                message,
+                current_version: Some(current_version),
+                claim_expires_in_secs: None,
+            },
+        })
+    }
+
+    /// Construct the failure response for a key someone else is already
+    /// refreshing (DR-0034 §4).
+    pub fn already_claimed(claim_expires_in_secs: u64) -> Self {
+        Response::Err(ErrResponse {
+            ok: false,
+            error: WireError {
+                kind: ErrorKind::AlreadyClaimed,
+                message: format!(
+                    "another refresh is already in progress for this key \
+                     (for up to {claim_expires_in_secs}s); wait for the new value \
+                     rather than refreshing it again"
+                ),
+                current_version: None,
+                claim_expires_in_secs: Some(claim_expires_in_secs),
             },
         })
     }
@@ -888,6 +1101,8 @@ impl Response {
             error: WireError {
                 kind,
                 message: message.into(),
+                current_version: None,
+                claim_expires_in_secs: None,
             },
         })
     }
@@ -922,6 +1137,220 @@ mod tests {
         roundtrip_request(&Request::Ping);
     }
 
+    // ---- DR-0034 §4: CAS + claims ----
+
+    /// The additive contract, in the direction that matters most: a `kv.set`
+    /// line produced by a **pre-DR-0034 client** (no `expected_version`, no
+    /// `claim_token`) must still parse, and must mean "write
+    /// unconditionally". If these defaulted to anything else, upgrading the
+    /// daemon would change what every existing client's writes do.
+    #[test]
+    fn a_pre_cas_kv_set_line_still_parses_as_an_unconditional_write() {
+        let line = r#"{"cmd":"kv.set","key":"DB","source":{"kind":"static","value_b64":"cHc="}}"#;
+        let req: Request = serde_json::from_str(line).expect("old line parses");
+        match req {
+            Request::KvSet {
+                expected_version,
+                claim_token,
+                ..
+            } => {
+                assert_eq!(expected_version, None);
+                assert_eq!(claim_token, None);
+            }
+            other => panic!("expected KvSet, got {other:?}"),
+        }
+    }
+
+    /// …and the reverse: a `kv.set` that carries neither field must serialize
+    /// without them, so an old daemon sees exactly the bytes it always saw.
+    #[test]
+    fn a_kv_set_without_cas_fields_serializes_to_the_old_bytes() {
+        let req = Request::KvSet {
+            key: "DB".into(),
+            source: SetSource::Static {
+                value_b64: "cHc=".into(),
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            guard_constraints: Vec::new(),
+            expected_version: None,
+            claim_token: None,
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(!line.contains("expected_version"), "{line}");
+        assert!(!line.contains("claim_token"), "{line}");
+    }
+
+    #[test]
+    fn kv_set_carries_expected_version_and_claim_token_when_set() {
+        let req = Request::KvSet {
+            key: "NS/TOK".into(),
+            source: SetSource::Static {
+                value_b64: "cHc=".into(),
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            guard_constraints: Vec::new(),
+            expected_version: Some(7),
+            claim_token: Some("abcdefghijklmnopqrstuv".into()),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains(r#""expected_version":7"#), "{line}");
+        assert!(
+            line.contains(r#""claim_token":"abcdefghijklmnopqrstuv""#),
+            "{line}"
+        );
+        roundtrip_request(&req);
+    }
+
+    /// Zero is a meaningful `expected_version` ("this key must not exist"), so
+    /// it must survive the round trip rather than being elided as a default.
+    #[test]
+    fn expected_version_zero_is_carried_not_elided() {
+        let req = Request::KvSet {
+            key: "NS/NEW".into(),
+            source: SetSource::Static {
+                value_b64: "cHc=".into(),
+            },
+            soft_ttl_secs: None,
+            hard_ttl_secs: None,
+            guard_constraints: Vec::new(),
+            expected_version: Some(0),
+            claim_token: None,
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains(r#""expected_version":0"#), "{line}");
+        roundtrip_request(&req);
+    }
+
+    #[test]
+    fn kv_claim_and_unclaim_use_their_command_tags() {
+        let claim = Request::KvClaim {
+            key: "NS/TOK".into(),
+            expected_version: 3,
+            duration_secs: 60,
+        };
+        let line = serde_json::to_string(&claim).unwrap();
+        assert!(line.contains(r#""cmd":"kv.claim""#), "{line}");
+        assert!(line.contains(r#""expected_version":3"#), "{line}");
+        assert!(line.contains(r#""duration_secs":60"#), "{line}");
+        roundtrip_request(&claim);
+
+        let unclaim = Request::KvUnclaim {
+            key: "NS/TOK".into(),
+            claim_token: "abcdefghijklmnopqrstuv".into(),
+        };
+        let line = serde_json::to_string(&unclaim).unwrap();
+        assert!(line.contains(r#""cmd":"kv.unclaim""#), "{line}");
+        roundtrip_request(&unclaim);
+    }
+
+    /// The set ack's `version` is `Option` so its absence is readable as "this
+    /// daemon does not do CAS" rather than as version 0 — the same
+    /// old-daemon-detection trick `guard_applied` uses.
+    #[test]
+    fn a_set_ack_without_a_version_is_distinguishable_from_version_zero() {
+        let old = r#"{"ok":true,"set":true}"#;
+        let resp: Response = serde_json::from_str(old).expect("old ack parses");
+        match resp {
+            Response::Ok(OkResponse {
+                payload: OkPayload::Set { version, .. },
+                ..
+            }) => assert_eq!(version, None, "absent means 'no CAS support'"),
+            other => panic!("expected a Set ack, got {other:?}"),
+        }
+
+        let line = serde_json::to_string(&Response::set_ack_with_guard(Vec::new())).unwrap();
+        assert_eq!(
+            line, r#"{"ok":true,"set":true}"#,
+            "byte-compatible with old"
+        );
+    }
+
+    #[test]
+    fn a_set_ack_with_a_version_carries_it() {
+        let resp = Response::set_ack_with_guard_and_version(vec!["same-user".into()], 8);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""version":8"#), "{line}");
+        assert!(line.contains(r#""guard_applied":["same-user"]"#), "{line}");
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn claim_and_unclaim_acks_round_trip() {
+        let resp = Response::claimed_ack(3, "abcdefghijklmnopqrstuv".into(), 60);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""claimed":true"#), "{line}");
+        assert!(line.contains(r#""version":3"#), "{line}");
+        assert!(line.contains(r#""claim_expires_in_secs":60"#), "{line}");
+        roundtrip_response(&resp);
+
+        let resp = Response::unclaimed_ack();
+        assert!(
+            serde_json::to_string(&resp)
+                .unwrap()
+                .contains(r#""unclaimed":true"#)
+        );
+        roundtrip_response(&resp);
+    }
+
+    /// The CAS loser must be able to read the version to retry from as a
+    /// number, without parsing the message text.
+    #[test]
+    fn a_cas_mismatch_carries_the_current_version_as_a_field() {
+        let resp = Response::cas_mismatch(11);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""kind":"cas_mismatch""#), "{line}");
+        assert!(line.contains(r#""current_version":11"#), "{line}");
+        match serde_json::from_str::<Response>(&line).unwrap() {
+            Response::Err(e) => {
+                assert_eq!(e.error.current_version, Some(11));
+                assert_eq!(e.error.claim_expires_in_secs, None);
+            }
+            other => panic!("expected an error response, got {other:?}"),
+        }
+    }
+
+    /// Version 0 in a mismatch means "the entry does not exist", so it must be
+    /// carried rather than skipped as a default-looking value.
+    #[test]
+    fn a_cas_mismatch_on_a_missing_entry_reports_version_zero() {
+        let line = serde_json::to_string(&Response::cas_mismatch(0)).unwrap();
+        assert!(line.contains(r#""current_version":0"#), "{line}");
+    }
+
+    #[test]
+    fn an_already_claimed_error_carries_the_remaining_seconds() {
+        let resp = Response::already_claimed(42);
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""kind":"already_claimed""#), "{line}");
+        assert!(line.contains(r#""claim_expires_in_secs":42"#), "{line}");
+        roundtrip_response(&resp);
+    }
+
+    /// Every other error stays byte-identical to the pre-DR-0034 shape: the
+    /// two structured fields are skipped when absent.
+    #[test]
+    fn an_ordinary_error_gains_no_new_fields_on_the_wire() {
+        let line = serde_json::to_string(&Response::error(ErrorKind::NotFound, "nope")).unwrap();
+        assert_eq!(
+            line,
+            r#"{"ok":false,"error":{"kind":"not_found","message":"nope"}}"#
+        );
+    }
+
+    /// The new error kinds must serialize snake_case like every existing one.
+    #[test]
+    fn the_new_error_kinds_are_snake_case() {
+        for (kind, want) in [
+            (ErrorKind::CasMismatch, "cas_mismatch"),
+            (ErrorKind::AlreadyClaimed, "already_claimed"),
+            (ErrorKind::ClaimTokenMismatch, "claim_token_mismatch"),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{want}\""));
+        }
+    }
+
     #[test]
     fn kv_set_static_roundtrips() {
         let req = Request::KvSet {
@@ -932,6 +1361,8 @@ mod tests {
             soft_ttl_secs: Some(3600),
             hard_ttl_secs: Some(86400),
             guard_constraints: Vec::new(),
+            expected_version: None,
+            claim_token: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""cmd":"kv.set""#));
@@ -1096,6 +1527,8 @@ mod tests {
                 },
                 GuardConstraintWire::Command { name: "git".into() },
             ],
+            expected_version: None,
+            claim_token: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         // Encoding shape (kebab-case tag, spelled kinds).
@@ -1274,6 +1707,8 @@ mod tests {
             source: None,
             backoff_until_secs: Some(3),
             guard_summary: None,
+            version: None,
+            claim_expires_in_secs: None,
         };
         let resp = Response::list_with_entries(vec!["default/K".into()], vec![info.clone()]);
         let line = serde_json::to_string(&resp).unwrap();
@@ -1318,6 +1753,8 @@ mod tests {
                     source: None,
                     backoff_until_secs: None,
                     guard_summary: None,
+                    version: None,
+                    claim_expires_in_secs: None,
                 },
                 EntryInfo {
                     name: "P".into(),
@@ -1330,6 +1767,8 @@ mod tests {
                     source: None,
                     backoff_until_secs: None,
                     guard_summary: None,
+                    version: None,
+                    claim_expires_in_secs: None,
                 },
             ],
             Some(FdaStatusWire::NotGranted),
@@ -1385,6 +1824,8 @@ mod tests {
             source: None,
             backoff_until_secs: None,
             guard_summary: None,
+            version: None,
+            claim_expires_in_secs: None,
         };
         let line = serde_json::to_string(&info).unwrap();
         assert!(!line.contains("pin_remaining_secs"), "{line}");

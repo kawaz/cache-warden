@@ -27,6 +27,9 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # Wipes DEK / private key / plaintext buffers; the "serde" feature gives
 # `Zeroizing<Vec<u8>>` its Serialize/Deserialize used by the body schema.
 zeroize = { version = "1", features = ["serde"] }
+# Constant-time comparison of claim tokens (DR-0034 §4). Already in the tree
+# via curve25519-dalek, so this adds no new crate to the dependency graph.
+subtle = "2"
 # Body plaintext schema (DR-0034 §1d). serde_json matches the DR-0029 snapshot's
 # encoding so the two "carry state across a restart" formats stay legible to the
 # same tooling.

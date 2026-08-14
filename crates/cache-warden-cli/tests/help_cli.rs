@@ -58,6 +58,8 @@ fn help_flag_goes_to_stdout_exit_zero_at_every_level() {
         &["kv", "get", "--help"][..],
         &["kv", "del", "--help"][..],
         &["kv", "pin", "--help"][..],
+        &["kv", "claim", "--help"][..],
+        &["kv", "unclaim", "--help"][..],
         &["run", "--help"][..],
         &["inject", "--help"][..],
         &["config", "--help"][..],
@@ -88,6 +90,56 @@ fn kv_set_help_carries_options_and_kv_pin_carries_detail() {
     assert!(set_help.contains("KEY [VALUE]"));
     assert!(!set_help.contains("--value-stdin"));
     assert!(stdout(&cw(&["kv", "pin", "--help"])).contains("Hold the value Active"));
+}
+
+/// DR-0034 §4: the concurrency surface has to be discoverable from help alone —
+/// the group lists the two new verbs, and both CAS flags appear on `kv set`.
+#[test]
+fn kv_help_surfaces_claim_unclaim_and_the_cas_flags() {
+    let group = stdout(&cw(&["kv", "--help"]));
+    assert!(group.contains("claim"), "{group}");
+    assert!(group.contains("unclaim"), "{group}");
+
+    let set_help = stdout(&cw(&["kv", "set", "--help"]));
+    assert!(set_help.contains("--expected-version N"), "{set_help}");
+    assert!(set_help.contains("--claim-token TOKEN"), "{set_help}");
+
+    let claim_help = stdout(&cw(&["kv", "claim", "--help"]));
+    assert!(claim_help.contains("<KEY> <DUR>"), "{claim_help}");
+    assert!(claim_help.contains("--expected-version N"), "{claim_help}");
+    // The two error outcomes a caller must handle differently.
+    assert!(claim_help.contains("wait"), "{claim_help}");
+    assert!(claim_help.contains("re-read"), "{claim_help}");
+
+    let unclaim_help = stdout(&cw(&["kv", "unclaim", "--help"]));
+    assert!(
+        unclaim_help.contains("--claim-token TOKEN"),
+        "{unclaim_help}"
+    );
+}
+
+/// A `kv claim` missing its required version is a usage error (leaf help to
+/// stderr, exit 1), not a request sent with a guessed version.
+#[test]
+fn kv_claim_without_expected_version_is_a_usage_error() {
+    let o = cw(&["kv", "claim", "DB", "30s"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty(), "no help on stdout for a usage error");
+    let err = stderr(&o);
+    assert!(err.contains("--expected-version"), "{err}");
+    assert!(
+        err.contains("cache-warden kv claim"),
+        "leaf help shown: {err}"
+    );
+}
+
+#[test]
+fn kv_unclaim_without_token_is_a_usage_error() {
+    let o = cw(&["kv", "unclaim", "DB"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = stderr(&o);
+    assert!(err.contains("--claim-token"), "{err}");
+    assert!(err.contains("cache-warden kv unclaim"), "{err}");
 }
 
 #[test]

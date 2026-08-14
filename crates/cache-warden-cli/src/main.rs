@@ -40,7 +40,25 @@ fn render_response(resp: Response) -> Result<(), String> {
         Response::Ok(ok) => {
             match ok.payload {
                 OkPayload::Pong { .. } => println!("pong"),
-                OkPayload::Set { .. } => println!("ok"),
+                OkPayload::Set { version, .. } => match version {
+                    // The version is what a caller passes back as the next
+                    // `--expected-version`, so it is worth showing.
+                    Some(v) => println!("ok (version {v})"),
+                    None => println!("ok"),
+                },
+                OkPayload::Claimed {
+                    version,
+                    claim_token,
+                    claim_expires_in_secs,
+                    ..
+                } => {
+                    // The token goes to stdout on its own line so a shell can
+                    // capture it with `$(...)`; the human-readable context goes
+                    // to stderr so it does not end up in that capture.
+                    eprintln!("claimed key at version {version} for {claim_expires_in_secs}s");
+                    println!("{claim_token}");
+                }
+                OkPayload::Unclaimed { .. } => println!("unclaimed"),
                 OkPayload::Defined { .. } => println!("defined"),
                 OkPayload::Deleted { deleted } => {
                     println!("{}", if deleted { "deleted" } else { "not found" })
@@ -122,6 +140,9 @@ fn error_kind_str(kind: &protocol::wire::ErrorKind) -> &'static str {
         UpstreamFailed => "upstream failed",
         Internal => "internal error",
         RestartAborted => "restart aborted",
+        CasMismatch => "version conflict",
+        AlreadyClaimed => "already being refreshed",
+        ClaimTokenMismatch => "claim token mismatch",
     }
 }
 
@@ -556,6 +577,8 @@ fn dispatch_kv(
         "list" => help::kv_list,
         "pin" => help::kv_pin,
         "unpin" => help::kv_unpin,
+        "claim" => help::kv_claim,
+        "unclaim" => help::kv_unclaim,
         other => {
             return Err(CliError::Message(format!(
                 "unknown kv subcommand: {other} (try `{NAME} kv --help`)"
@@ -618,6 +641,8 @@ fn dispatch_kv(
             leaf_help,
         )?,
         "pin" => or_usage(commands::parse_kv_pin(kv_args, &ns), leaf_help)?,
+        "claim" => or_usage(commands::parse_kv_claim(kv_args, &ns), leaf_help)?,
+        "unclaim" => or_usage(commands::parse_kv_unclaim(kv_args, &ns), leaf_help)?,
         _ => unreachable!("leaf_help match covers all known subcommands"),
     };
     // DR-0030 positive-ack contract: a `kv.set` that declared guard
@@ -1116,6 +1141,8 @@ mod tests {
             source: None,
             backoff_until_secs: None,
             guard_summary: None,
+            version: None,
+            claim_expires_in_secs: None,
         }
     }
 
@@ -1303,6 +1330,8 @@ mod tests {
             soft_ttl_secs: None,
             hard_ttl_secs: None,
             guard_constraints: vec![protocol::wire::GuardConstraintWire::SameUser],
+            expected_version: None,
+            claim_token: None,
         }
     }
 

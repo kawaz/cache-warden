@@ -87,6 +87,38 @@ pub enum VaultError {
     },
     /// No slot in the vault matches the credential supplied to unlock.
     NoMatchingSlot,
+    /// A compare-and-swap write was refused: the entry's version is not the
+    /// one the caller expected, so something else wrote in between (DR-0034
+    /// §4). No write happened — the caller re-reads and decides.
+    CasMismatch {
+        /// The entry's actual version. `0` means the entry does not exist.
+        current: u64,
+    },
+    /// A refresh is already claimed on this entry and has not lapsed
+    /// (DR-0034 §4). The caller should wait for the value rather than call the
+    /// provider itself.
+    AlreadyClaimed {
+        /// When the holding claim lapses, in milliseconds since the Unix epoch.
+        expires_at_epoch_ms: u64,
+    },
+    /// The entry has an active claim and the write did not present a claim
+    /// token. Take the claim (or wait for the holder) rather than writing
+    /// around it.
+    ClaimRequired {
+        /// When the holding claim lapses, in milliseconds since the Unix epoch.
+        expires_at_epoch_ms: u64,
+    },
+    /// A claim token was presented but is not the one the active claim holds.
+    ///
+    /// The usual cause is the exact race the token exists to catch: this
+    /// caller's claim lapsed, another caller took it, and this write arrived
+    /// late (DR-0034 §4).
+    ClaimTokenMismatch,
+    /// A claim token was not a well-formed token at all (wrong length, or a
+    /// character outside base64url).
+    MalformedClaimToken,
+    /// The named entry does not exist in this vault.
+    EntryNotFound,
     /// The requested slot id is not present in this vault.
     SlotNotFound,
     /// Removing this slot would leave the vault with no recipients at all,
@@ -161,6 +193,40 @@ impl fmt::Display for VaultError {
             VaultError::NoMatchingSlot => {
                 write!(f, "no slot in this vault matches the credential supplied")
             }
+            VaultError::CasMismatch { current } => {
+                if *current == 0 {
+                    write!(
+                        f,
+                        "the entry does not exist; re-read it and retry with the version you find"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "the entry changed since it was read (it is now at version {current}); \
+                         re-read it and retry"
+                    )
+                }
+            }
+            VaultError::AlreadyClaimed { .. } => write!(
+                f,
+                "another refresh is already in progress for this entry; \
+                 wait for the new value rather than refreshing it again"
+            ),
+            VaultError::ClaimRequired { .. } => write!(
+                f,
+                "a refresh is in progress for this entry; \
+                 present that claim's token to write, or wait for it to finish"
+            ),
+            VaultError::ClaimTokenMismatch => write!(
+                f,
+                "this claim token is not the one currently holding the entry: \
+                 the claim lapsed and another caller took it. Re-read and claim again"
+            ),
+            VaultError::MalformedClaimToken => write!(
+                f,
+                "claim token is not well-formed: expected 22 base64url characters"
+            ),
+            VaultError::EntryNotFound => write!(f, "no such entry in this vault"),
             VaultError::SlotNotFound => write!(f, "no such slot in this vault"),
             VaultError::LastSlot => write!(
                 f,

@@ -70,7 +70,7 @@ use crate::source::ValueSource;
 /// accept any version in `[MIN_SUPPORTED_VERSION, FORMAT_VERSION]` (see the
 /// module doc's "Wire format compatibility" section) and reject anything
 /// outside that range rather than guess.
-pub(crate) const FORMAT_VERSION: u32 = 2;
+pub(crate) const FORMAT_VERSION: u32 = 3;
 
 /// The oldest `format_version` this build still knows how to read. Only
 /// moves forward if a future format change is *breaking* (at which point the
@@ -86,6 +86,18 @@ pub(crate) const MIN_SUPPORTED_VERSION: u32 = 1;
 /// (DR-0030 §3 "ダウングレード方向"). Guard-free workloads keep producing
 /// v1 snapshots so older-build downgrade stays cold-startable.
 pub(crate) const VERSION_PRE_GUARD: u32 = 1;
+
+/// Wire version that carries guards but no refresh arbitration state
+/// (DR-0034 §4). Emitted when entries carry guards but no version or claim,
+/// so a build that predates DR-0034 can still import a guarded snapshot.
+///
+/// Same downgrade reasoning as [`VERSION_PRE_GUARD`], one generation later: a
+/// snapshot carrying a CAS version or a claim steps up to [`FORMAT_VERSION`]
+/// so an older build refuses it rather than importing and silently dropping
+/// them. Dropping a version would reset the counter a compare-and-swap relies
+/// on; dropping a claim would reopen the double-refresh window it exists to
+/// close.
+pub(crate) const VERSION_PRE_REFRESH: u32 = 2;
 
 /// Whether `v` falls within the inclusive `[MIN_SUPPORTED_VERSION,
 /// FORMAT_VERSION]` range this build accepts. Shared by
@@ -193,6 +205,17 @@ pub(crate) struct SnapshotDefinition {
     pub(crate) source_meta_fields: BTreeMap<String, String>,
 }
 
+/// A snapshotted in-progress refresh claim (DR-0034 §4), mirroring
+/// [`crate::RefreshClaim`] for the wire — the same mirror-rather-than-derive
+/// split [`SnapshotGuard`] uses, so the domain type stays free of a
+/// serialization concern.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SnapshotRefreshClaim {
+    pub(crate) token: String,
+    pub(crate) claimed_at_epoch_ms: u64,
+    pub(crate) expires_at_epoch_ms: u64,
+}
+
 /// A snapshotted fetch-failure backoff record (DR-0022), as a wall-clock
 /// instant + duration rather than a process-local [`crate::clock::Monotonic`].
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -293,6 +316,19 @@ pub(crate) struct SnapshotEntry {
     /// `None`, matching the additive-compat template.
     #[serde(default)]
     pub(crate) guard: Option<SnapshotGuard>,
+    /// DR-0034 §4 CAS version. `None` means the key has no version (and is
+    /// what an older snapshot, which never wrote the field, deserializes to).
+    ///
+    /// Carried independently of `value`, unlike `guard`: a version outlives
+    /// the value it counted (see `Store::versions`), so pruning it to match a
+    /// live value would reset the counter across a restart and reintroduce
+    /// exactly the stale-writer race it exists to stop.
+    #[serde(default)]
+    pub(crate) version: Option<u64>,
+    /// DR-0034 §4 in-progress refresh claim. Bound to the live value like
+    /// `guard` is, and exported only alongside one.
+    #[serde(default)]
+    pub(crate) refresh_claim: Option<SnapshotRefreshClaim>,
 }
 
 /// A serialized capture of a [`crate::Store`]'s full state (DR-0029 §2),
@@ -340,9 +376,16 @@ impl StoreSnapshot {
     /// silently dropping the guard); otherwise the snapshot stays on
     /// [`VERSION_PRE_GUARD`] to keep guard-free downgrade paths working.
     pub(crate) fn from_entries(entries: Vec<SnapshotEntry>) -> Self {
+        let any_refresh = entries
+            .iter()
+            .any(|e| e.version.is_some() || e.refresh_claim.is_some());
         let any_guarded = entries.iter().any(|e| e.guard.is_some());
-        let format_version = if any_guarded {
+        // Step up only as far as the content requires, so a workload that uses
+        // none of these keeps producing snapshots an older build can import.
+        let format_version = if any_refresh {
             FORMAT_VERSION
+        } else if any_guarded {
+            VERSION_PRE_REFRESH
         } else {
             VERSION_PRE_GUARD
         };
@@ -694,6 +737,8 @@ mod tests {
             definition: None,
             failure: None,
             guard: None,
+            version: None,
+            refresh_claim: None,
         }
     }
 
@@ -906,11 +951,16 @@ mod tests {
             definition: None,
             failure: None,
             guard: Some(guard),
+            version: None,
+            refresh_claim: None,
         };
         let snap = StoreSnapshot::from_entries(vec![entry]);
-        // A guarded snapshot must bump to the current FORMAT_VERSION
-        // (DR-0030 §3).
-        assert_eq!(snap.format_version(), FORMAT_VERSION);
+        // A guarded snapshot must bump past the pre-guard version (DR-0030
+        // §3). It lands on VERSION_PRE_REFRESH rather than FORMAT_VERSION
+        // because DR-0034 added a further generation for refresh state: a
+        // guard-only snapshot must stay importable by a build that has guards
+        // but not claims, so it steps up exactly one generation, not two.
+        assert_eq!(snap.format_version(), VERSION_PRE_REFRESH);
         let bytes = snap.to_bytes().expect("serialize");
         let back = StoreSnapshot::from_bytes(&bytes).expect("deserialize");
         let round = back.into_entries().pop().unwrap();
@@ -967,7 +1017,63 @@ mod tests {
             setter_ruid: 0,
         });
         let guarded = StoreSnapshot::from_entries(vec![guarded_entry]);
-        assert_eq!(guarded.format_version(), FORMAT_VERSION);
+        assert_eq!(guarded.format_version(), VERSION_PRE_REFRESH);
+    }
+
+    /// The DR-0034 generation of the same rule: refresh state forces the
+    /// current version, so a build that predates claims refuses the snapshot
+    /// rather than importing it and dropping them.
+    #[test]
+    fn from_entries_steps_up_again_for_refresh_state() {
+        let mut versioned = sample_entry("A");
+        versioned.version = Some(7);
+        assert_eq!(
+            StoreSnapshot::from_entries(vec![versioned]).format_version(),
+            FORMAT_VERSION
+        );
+
+        let mut claimed = sample_entry("B");
+        claimed.refresh_claim = Some(SnapshotRefreshClaim {
+            token: "tok".into(),
+            claimed_at_epoch_ms: 1,
+            expires_at_epoch_ms: 2,
+        });
+        assert_eq!(
+            StoreSnapshot::from_entries(vec![claimed]).format_version(),
+            FORMAT_VERSION
+        );
+    }
+
+    /// A version and a claim must survive the wire round trip: the version is
+    /// what a compare-and-swap compares against after a restart, and a claim
+    /// that lost its token would be one nobody could complete or release.
+    #[test]
+    fn refresh_state_round_trips_through_the_wire() {
+        let mut e = sample_entry("A");
+        e.version = Some(9);
+        e.refresh_claim = Some(SnapshotRefreshClaim {
+            token: "abcdefghijklmnopqrstuv".into(),
+            claimed_at_epoch_ms: 1_700_000_000_000,
+            expires_at_epoch_ms: 1_700_000_060_000,
+        });
+        let bytes = StoreSnapshot::from_entries(vec![e]).to_bytes().unwrap();
+        let back = StoreSnapshot::from_bytes(&bytes).unwrap();
+        let got = back.into_entries().pop().unwrap();
+        assert_eq!(got.version, Some(9));
+        let c = got.refresh_claim.expect("claim survived");
+        assert_eq!(c.token, "abcdefghijklmnopqrstuv");
+        assert_eq!(c.claimed_at_epoch_ms, 1_700_000_000_000);
+        assert_eq!(c.expires_at_epoch_ms, 1_700_000_060_000);
+    }
+
+    /// A pre-DR-0034 payload has neither field; both must default to `None`
+    /// rather than failing to deserialize.
+    #[test]
+    fn an_entry_without_refresh_fields_deserializes_to_none() {
+        let json = r#"{"key":"K"}"#;
+        let entry: SnapshotEntry = serde_json::from_str(json).expect("old payload parses");
+        assert!(entry.version.is_none());
+        assert!(entry.refresh_claim.is_none());
     }
 
     #[test]

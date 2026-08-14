@@ -42,7 +42,7 @@
 //! println!("{}\n\n{}", code.render().as_str(), RECOVERY_STORAGE_GUIDANCE);
 //!
 //! // Every mutation is durable before it returns.
-//! vault.upsert(VaultEntry::new("llm/refresh-token", b"rt-...".to_vec()))?;
+//! vault.upsert(VaultEntry::new("llm/refresh-token", b"rt-...".to_vec()), None)?;
 //! drop(vault); // wipes the DEK
 //!
 //! // Later, in a fresh process: the header reads without any credential…
@@ -104,6 +104,7 @@
 #![deny(missing_docs)]
 
 mod body;
+mod claim;
 mod crypto;
 mod error;
 mod format;
@@ -114,6 +115,7 @@ mod vault;
 pub use body::{
     GuardRecordSlot, OwnerPrincipalSlot, VaultDefinition, VaultEntry, VaultSource, VaultValueMeta,
 };
+pub use claim::{Claim, ClaimToken};
 pub use error::VaultError;
 pub use format::{
     AeadAlg, FORMAT_VERSION, KdfAlg, MIN_SUPPORTED_VERSION, Slot, SlotId, SlotKind, VaultId,

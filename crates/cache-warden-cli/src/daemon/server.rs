@@ -3061,6 +3061,8 @@ mod tests {
                     soft_ttl_secs: None,
                     hard_ttl_secs: None,
                     guard_constraints: Vec::new(),
+                    expected_version: None,
+                    claim_token: None,
                 },
             )
             .is_ok()
@@ -3286,6 +3288,8 @@ mod tests {
                     soft_ttl_secs: None,
                     hard_ttl_secs: None,
                     guard_constraints: Vec::new(),
+                    expected_version: None,
+                    claim_token: None,
                 },
             )
             .is_ok()
@@ -3707,6 +3711,8 @@ mod tests {
             soft_ttl_secs: None,
             hard_ttl_secs: None,
             guard_constraints: Vec::new(),
+            expected_version: None,
+            claim_token: None,
         };
         assert!(run_request(&s, None, None, set).is_ok());
         let resp = run_request(

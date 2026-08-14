@@ -42,17 +42,19 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cache_warden::SecretBytes;
 use x25519_dalek::StaticSecret;
 use zeroize::Zeroizing;
 
 use crate::body::{VaultBody, VaultEntry};
+use crate::claim::{Claim, ClaimToken};
 use crate::crypto::{self, KEY_LEN};
 use crate::error::VaultError;
 use crate::format::{
     AeadAlg, FORMAT_VERSION, HeaderView, KdfAlg, SALT_LEN, Slot, SlotId, SlotKind, VaultFile,
-    VaultId, encode_file,
+    VaultId, encode_file, now_epoch_ms,
 };
 use crate::recovery::RecoveryCode;
 use crate::storage;
@@ -385,20 +387,207 @@ impl UnlockedVault {
         self.entries.is_empty()
     }
 
-    /// Insert or replace an entry, then commit durably.
+    /// Insert or replace an entry unconditionally, then commit durably.
     ///
     /// Returns only after `fsync`, so a caller that has been told this
     /// succeeded may report the value as saved (DR-0034 §3). On failure the
     /// vault is unchanged in memory as well as on disk.
-    pub fn upsert(&mut self, entry: VaultEntry) -> Result<(), VaultError> {
+    ///
+    /// "Unconditionally" covers the **version** only. The claim fence still
+    /// applies: if the entry has an active claim, `token` must be that claim's
+    /// token, exactly as for [`UnlockedVault::upsert_cas`]. Skipping the fence
+    /// here would make the entire protection optional by choosing the other
+    /// method — and since a plain `set` is the natural mapping for a caller
+    /// that did not ask for compare-and-swap, that is the door a refresh in
+    /// flight would actually be walked through. A successful write releases
+    /// the claim, as it does everywhere else.
+    pub fn upsert(
+        &mut self,
+        entry: VaultEntry,
+        token: Option<&ClaimToken>,
+    ) -> Result<u64, VaultError> {
+        let current = self.entries.get(&entry.key);
+        let next_version = current.map_or(0, |e| e.cas_version).saturating_add(1);
+        if let Some(existing) = current {
+            check_claim(existing, token, now_epoch_ms())?;
+        }
+        self.write_entry(entry, next_version)
+    }
+
+    /// Insert or replace an entry **only if** its current version is
+    /// `expected_version`, then commit durably (DR-0034 §4).
+    ///
+    /// Returns the entry's new version. Pass `0` as `expected_version` to mean
+    /// "I expect this key not to exist yet" — versions start at 1, so zero is
+    /// unambiguous and a create races safely against another create.
+    ///
+    /// On a version mismatch **nothing is written**: the check happens before
+    /// any encoding or filesystem work, so a losing racer costs one comparison
+    /// rather than a rewrite of the whole vault. [`VaultError::CasMismatch`]
+    /// carries the version actually found, which is what the caller needs to
+    /// re-read and decide.
+    ///
+    /// # Claims
+    ///
+    /// If the entry has an **active** claim, `token` must be that claim's
+    /// token. This is the fence described in [`crate::ClaimToken`]: without it,
+    /// a caller whose claim lapsed while another caller took over would still
+    /// pass the version check and write. A successful write **releases the
+    /// claim** — the refresh it was holding the entry for is done.
+    ///
+    /// A lapsed claim demands nothing: if nobody took over, the original
+    /// caller's late write is the only write, and there is nothing to protect
+    /// the entry from.
+    ///
+    /// The submitted entry's own `cas_version` and `refresh_claim` are ignored;
+    /// the vault assigns both.
+    pub fn upsert_cas(
+        &mut self,
+        entry: VaultEntry,
+        expected_version: u64,
+        token: Option<&ClaimToken>,
+    ) -> Result<u64, VaultError> {
+        let current = self.entries.get(&entry.key);
+        let current_version = current.map_or(0, |e| e.cas_version);
+        if current_version != expected_version {
+            // Deliberately before any encoding or IO: a CAS loser must not
+            // cost a vault rewrite (DR-0034 §4).
+            return Err(VaultError::CasMismatch {
+                current: current_version,
+            });
+        }
+        if let Some(existing) = current {
+            check_claim(existing, token, now_epoch_ms())?;
+        }
+        self.write_entry(entry, current_version + 1)
+    }
+
+    /// Take the refresh claim on `key`, returning the token that must be
+    /// presented to write while it holds (DR-0034 §4).
+    ///
+    /// Guarded by the same version check as [`UnlockedVault::upsert_cas`], so a
+    /// caller working from a stale read cannot claim. The claim itself does
+    /// **not** advance the version: the version counts value changes, and a
+    /// claim changes no value. Advancing it here would mean a claim taken and
+    /// released without a refresh had silently invalidated every other holder's
+    /// read.
+    ///
+    /// An already-claimed entry yields [`VaultError::AlreadyClaimed`] with the
+    /// holder's expiry — the signal to wait for the new value instead of
+    /// calling the provider. A **lapsed** claim is simply replaced; that is
+    /// what the expiry is for.
+    ///
+    /// A zero `ttl` produces a claim that has already lapsed. That is not a
+    /// special case in the code and is allowed on purpose: it makes the
+    /// lapsed-claim path reachable in a test without waiting for wall-clock
+    /// time to pass.
+    pub fn claim_refresh(
+        &mut self,
+        key: &str,
+        expected_version: u64,
+        ttl: Duration,
+    ) -> Result<ClaimToken, VaultError> {
+        let entry = self.entries.get(key).ok_or(VaultError::EntryNotFound)?;
+        if entry.cas_version != expected_version {
+            return Err(VaultError::CasMismatch {
+                current: entry.cas_version,
+            });
+        }
+        let now = now_epoch_ms();
+        if let Some(active) = entry.refresh_claim.as_ref().filter(|c| c.is_active_at(now)) {
+            return Err(VaultError::AlreadyClaimed {
+                expires_at_epoch_ms: active.expires_at_epoch_ms,
+            });
+        }
+
+        let token = ClaimToken::generate();
         let mut next = self.entries.clone();
-        next.insert(entry.key.clone(), entry);
+        next.get_mut(key).expect("looked up above").refresh_claim = Some(Claim {
+            token: token.clone(),
+            claimed_at_epoch_ms: now,
+            // Saturating: a caller passing a TTL that overflows the epoch gets
+            // a claim that never lapses rather than one that lapsed long ago.
+            expires_at_epoch_ms: now.saturating_add(ttl.as_millis().min(u64::MAX.into()) as u64),
+        });
+        self.commit(&self.slots, self.dek_generation, &next)?;
+        self.entries = next;
+        Ok(token)
+    }
+
+    /// Release the claim on `key` without writing a value.
+    ///
+    /// For the caller that claimed, called the provider, and got nothing worth
+    /// storing — an error, or a value identical to the one already held.
+    /// Releasing lets the next caller start immediately instead of waiting out
+    /// the expiry.
+    ///
+    /// Requires the active claim's token, for the same reason writing does: a
+    /// caller whose claim lapsed must not be able to cancel the claim that
+    /// replaced it. Releasing an entry with no active claim succeeds and does
+    /// nothing, so a caller retrying a release after a crash is not punished
+    /// for it.
+    pub fn release_claim(&mut self, key: &str, token: &ClaimToken) -> Result<(), VaultError> {
+        let entry = self.entries.get(key).ok_or(VaultError::EntryNotFound)?;
+        let now = now_epoch_ms();
+        match entry.refresh_claim.as_ref().filter(|c| c.is_active_at(now)) {
+            None => {
+                // Nothing holds the entry. If a lapsed record is still sitting
+                // there, clear it so `status` stops reporting a claim nobody
+                // holds; otherwise there is genuinely nothing to do.
+                if entry.refresh_claim.is_none() {
+                    return Ok(());
+                }
+            }
+            Some(active) if !active.token.matches(token) => {
+                return Err(VaultError::ClaimTokenMismatch);
+            }
+            Some(_) => {}
+        }
+        let mut next = self.entries.clone();
+        next.get_mut(key).expect("looked up above").refresh_claim = None;
         self.commit(&self.slots, self.dek_generation, &next)?;
         self.entries = next;
         Ok(())
     }
 
+    /// The active claim on `key`, or `None` when the entry is unclaimed, its
+    /// claim has lapsed, or it does not exist.
+    pub fn active_claim(&self, key: &str) -> Option<&Claim> {
+        self.entries
+            .get(key)?
+            .refresh_claim
+            .as_ref()
+            .filter(|c| c.is_active_at(now_epoch_ms()))
+    }
+
+    /// Install `entry` at `version`, clearing any claim, and commit.
+    ///
+    /// The single place a version is assigned, so "every write advances the
+    /// version by exactly one" is a property of one function rather than of
+    /// every caller remembering to do it.
+    fn write_entry(&mut self, mut entry: VaultEntry, version: u64) -> Result<u64, VaultError> {
+        entry.cas_version = version;
+        // A completed write ends the refresh the claim was held for.
+        entry.refresh_claim = None;
+        entry.updated_at_epoch_ms = now_epoch_ms();
+
+        let key = entry.key.clone();
+        let mut next = self.entries.clone();
+        next.insert(key, entry);
+        self.commit(&self.slots, self.dek_generation, &next)?;
+        self.entries = next;
+        Ok(version)
+    }
+
     /// Remove an entry, then commit durably. Returns whether it was there.
+    ///
+    /// This removes the entry outright — value, version and claim together.
+    /// It is therefore **not** the mapping for the in-memory store's
+    /// value-only `delete`, which deliberately keeps the key's version alive
+    /// so a stale writer cannot win a compare-and-swap against a re-created
+    /// key (DR-0034 §4). The vault has no counterpart to that "value gone,
+    /// counter retained" state, so phase 3 must map a value-only delete to
+    /// something other than this call rather than assuming they correspond.
     pub fn delete(&mut self, key: &str) -> Result<bool, VaultError> {
         if !self.entries.contains_key(key) {
             return Ok(false);
@@ -632,6 +821,31 @@ fn build_slot(
         credential_id,
         label,
     ))
+}
+
+/// Reject a write that does not satisfy the entry's active claim.
+///
+/// Split out so the rule reads in one place: an active claim demands its own
+/// token, and a lapsed one demands nothing.
+fn check_claim(
+    existing: &VaultEntry,
+    token: Option<&ClaimToken>,
+    now: u64,
+) -> Result<(), VaultError> {
+    let Some(active) = existing
+        .refresh_claim
+        .as_ref()
+        .filter(|c| c.is_active_at(now))
+    else {
+        return Ok(());
+    };
+    match token {
+        None => Err(VaultError::ClaimRequired {
+            expires_at_epoch_ms: active.expires_at_epoch_ms,
+        }),
+        Some(t) if !active.token.matches(t) => Err(VaultError::ClaimTokenMismatch),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Rebuild a `StaticSecret` from decrypted private key bytes.

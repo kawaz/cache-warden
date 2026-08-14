@@ -470,6 +470,14 @@ pub fn kv() -> HelpSpec {
                 name: "unpin",
                 desc: "Drop a pin, returning the value to normal TTL evaluation",
             },
+            Row {
+                name: "claim",
+                desc: "Take the refresh hold on a key before fetching a new value",
+            },
+            Row {
+                name: "unclaim",
+                desc: "Release a refresh hold without writing a value",
+            },
         ],
         options: &[],
         detail: "\
@@ -619,6 +627,17 @@ pub fn kv_set() -> HelpSpec {
                        (or full path if `/PATH`) NAME. WEAK: spoofable by\n\
                        dropping a same-name binary. (repeatable)",
             },
+            Row {
+                name: "--expected-version N",
+                desc: "Write only if the key is still at version N; otherwise\n\
+                       nothing is written. Use 0 to require that the key does\n\
+                       not exist yet",
+            },
+            Row {
+                name: "--claim-token TOKEN",
+                desc: "Finish the refresh held by `kv claim` (required while a\n\
+                       claim is active)",
+            },
         ],
         detail: "\
 `kv set` injects a literal, opaque value only. To register a regenerable
@@ -643,6 +662,13 @@ piping stdin for real secrets. A value containing NUL bytes (full binary) can
 only come via stdin (argv cannot carry NUL).
 
 Everything after `--` is positional, never an option: `kv set -- --weird-key v`.
+
+Concurrent writers (--expected-version / --claim-token): a plain `kv set`
+overwrites whatever is there. Pass --expected-version N to write only if the
+key is still at the version you read; if it moved, nothing is written and the
+error reports the version it is at now, to re-read and retry from. A set that
+completes a refresh started by `kv claim` must also carry that claim's
+--claim-token. A successful set prints the new version.
 
 Value types (otp) live on definitions, not on set values: a typed key must be
 regenerable, so register it with `kv define KEY --type otp ...`. `kv set`
@@ -884,6 +910,82 @@ pub fn kv_unpin() -> HelpSpec {
                        [cli].namespace > \"default\")",
         }],
         detail: "",
+        show_global: true,
+    }
+}
+
+/// `kv claim` leaf page (carries the refresh-coordination explanation).
+pub fn kv_claim() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " kv claim"),
+        summary: "Take the refresh hold on a key before fetching a new value.",
+        usage: concat!(
+            "cache-warden",
+            " kv claim [--namespace NS] <KEY> <DUR> --expected-version N"
+        ),
+        subcommands: &[],
+        options: &[
+            Row {
+                name: "--namespace NS",
+                desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\")",
+            },
+            Row {
+                name: "--expected-version N",
+                desc: "Claim only if the key is still at version N — the one\n\
+                       your last get / set reported. Required: claiming from a\n\
+                       stale read races an update you have not seen",
+            },
+        ],
+        detail: "\
+Take the hold before contacting the credential provider, so only one process
+does. On success the claim token is printed to stdout (the human-readable
+context goes to stderr, so `token=$(cache-warden kv claim ...)` captures just
+the token); pass it back to `kv set --claim-token` to store the new value, or
+to `kv unclaim` to release the hold having stored nothing.
+
+If the key is already claimed the command fails and reports how many seconds
+that hold has left: wait for the value the holder is fetching rather than
+fetching a second one — a double refresh is what the claim exists to prevent.
+If the version has moved, re-read the key and claim again from the version you
+saw.
+
+DUR uses the same grammar as the TTL flags (30s, 5m, 1h, or bare seconds) and
+only bounds how long the hold survives a process that dies mid-refresh; the
+token, not the deadline, is what keeps the write safe. Keep it a little longer
+than a slow provider call. It must be between 1 second and 1 hour: a hold that
+outlives its holder for longer than that stops being a backstop and starts
+being a way to wedge the key.",
+        show_global: true,
+    }
+}
+
+/// `kv unclaim` leaf page.
+pub fn kv_unclaim() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " kv unclaim"),
+        summary: "Release a refresh hold without writing a value.",
+        usage: concat!(
+            "cache-warden",
+            " kv unclaim [--namespace NS] <KEY> --claim-token TOKEN"
+        ),
+        subcommands: &[],
+        options: &[
+            Row {
+                name: "--namespace NS",
+                desc: "KV namespace (default: CACHE_WARDEN_NAMESPACE >\n\
+                       [cli].namespace > \"default\")",
+            },
+            Row {
+                name: "--claim-token TOKEN",
+                desc: "The token `kv claim` printed. Required: without it a\n\
+                       lapsed claim could cancel the one that replaced it",
+            },
+        ],
+        detail: "\
+For the caller that claimed a key, called the provider and got nothing worth
+storing. Releasing lets the next caller start at once instead of waiting the
+claim out.",
         show_global: true,
     }
 }
@@ -1135,9 +1237,10 @@ mod tests {
 
     #[test]
     fn rows_in_a_section_share_one_description_column() {
-        let h = kv().render();
+        let spec = kv();
+        let h = spec.render();
         // Within the Commands: section, all one-liner descriptions align to the
-        // same column (auto-fit to the widest short name, here `define`).
+        // same column, auto-fit to the section's widest name.
         let set_col = h
             .lines()
             .find(|l| l.trim_start().starts_with("set"))
@@ -1149,8 +1252,15 @@ mod tests {
             .and_then(|l| l.find("Register a regenerable"))
             .unwrap();
         assert_eq!(set_col, define_col);
-        // `define` is the widest name here, so its description sits right after it.
-        assert_eq!(define_col, INDENT.len() + "define".len() + NAME_GAP);
+        // The widest name sets the column (every name here is short enough to
+        // stay under MAX_DESC_COLUMN, so none drops to its own line).
+        let widest = spec
+            .subcommands
+            .iter()
+            .map(|r| r.name.len())
+            .max()
+            .expect("kv groups subcommands");
+        assert_eq!(define_col, INDENT.len() + widest + NAME_GAP);
     }
 
     #[test]

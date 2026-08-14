@@ -145,7 +145,10 @@ fn writing_the_same_state_twice_produces_identical_headers() {
     let first = std::fs::read(vault.path()).unwrap();
     // Rewrite without changing anything observable in the header.
     vault
-        .upsert(cache_warden_vault::VaultEntry::new("k", b"v".to_vec()))
+        .upsert(
+            cache_warden_vault::VaultEntry::new("k", b"v".to_vec()),
+            None,
+        )
         .expect("commits");
     let second = std::fs::read(vault.path()).unwrap();
 

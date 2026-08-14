@@ -38,7 +38,7 @@ fn an_entry_written_before_locking_comes_back_after_unlocking() {
     let path = vault.path().to_path_buf();
 
     vault
-        .upsert(entry("llm/refresh-token", "rt-abc123"))
+        .upsert(entry("llm/refresh-token", "rt-abc123"), None)
         .expect("commits");
     let locked = vault.lock().expect("locks");
     drop(locked);
@@ -50,31 +50,58 @@ fn an_entry_written_before_locking_comes_back_after_unlocking() {
 }
 
 /// DR-0034 §1d: a value must never come back without the authorization that
-/// governs it. Phase 1 cannot yet interpret the guard record, the owner
-/// principal or the CAS version — but it must already carry all three across a
+/// governs it. Phase 1 cannot yet interpret the guard record or the owner
+/// principal — but it must already carry them, and the CAS version, across a
 /// lock/unlock cycle intact, or vaults written now would reach phase 5 having
 /// silently dropped them.
+///
+/// The version is checked by writing twice and reopening: a durable version is
+/// only meaningful if it survives the restart, and asserting on a value the
+/// vault derived (2, from two writes) rather than one the test chose proves the
+/// stored number is the real counter.
 #[test]
 fn authorization_and_version_travel_with_the_value() {
     let (_dir, mut vault, code) = new_vault();
     let path = vault.path().to_path_buf();
 
     let mut e = entry("llm/refresh-token", "rt-abc123");
-    e.cas_version = 42;
     e.guard = Some(GuardRecordSlot(serde_json::json!({
         "constraints": [{"kind": "same-user"}]
     })));
     e.owner = Some(OwnerPrincipalSlot(serde_json::json!({
         "signed_by": "SHA256:deadbeef"
     })));
-    vault.upsert(e.clone()).expect("commits");
+    vault.upsert(e.clone(), None).expect("commits");
+    vault.upsert(e.clone(), None).expect("commits again");
     drop(vault);
 
     let vault = reopen(&path, &code).expect("unlocks");
     let got = vault.entry("llm/refresh-token").expect("entry survived");
-    assert_eq!(got.cas_version, 42);
+    assert_eq!(got.cas_version, 2, "two writes, and the count is durable");
     assert_eq!(got.guard, e.guard);
     assert_eq!(got.owner, e.owner);
+}
+
+/// The version belongs to the vault, not to whoever submits an entry.
+///
+/// A caller that could choose the version could set it backwards, and DR-0034
+/// §4 leans on monotonicity to keep a spent refresh token from looking current
+/// again. So a submitted version is overwritten rather than honoured — this
+/// pins that, because "the field round-trips verbatim" was true in phase 1 and
+/// is deliberately no longer true.
+#[test]
+fn a_caller_supplied_version_is_ignored_and_the_vault_assigns_its_own() {
+    let (_dir, mut vault, _code) = new_vault();
+
+    let mut e = entry("k", "v");
+    e.cas_version = 999;
+    vault.upsert(e, None).expect("commits");
+    assert_eq!(vault.entry("k").unwrap().cas_version, 1);
+
+    let mut e2 = entry("k", "v2");
+    e2.cas_version = 0;
+    vault.upsert(e2, None).expect("commits");
+    assert_eq!(vault.entry("k").unwrap().cas_version, 2);
 }
 
 #[test]
@@ -82,9 +109,11 @@ fn entries_can_be_replaced_and_deleted() {
     let (_dir, mut vault, code) = new_vault();
     let path = vault.path().to_path_buf();
 
-    vault.upsert(entry("a", "one")).expect("commits");
-    vault.upsert(entry("b", "two")).expect("commits");
-    vault.upsert(entry("a", "one-updated")).expect("commits");
+    vault.upsert(entry("a", "one"), None).expect("commits");
+    vault.upsert(entry("b", "two"), None).expect("commits");
+    vault
+        .upsert(entry("a", "one-updated"), None)
+        .expect("commits");
     assert_eq!(vault.len(), 2);
     assert_eq!(vault.keys().collect::<Vec<_>>(), vec!["a", "b"]);
 
@@ -105,7 +134,7 @@ fn entries_can_be_replaced_and_deleted() {
 fn a_locked_vault_shows_its_metadata_but_not_its_entries() {
     let (_dir, mut vault, _code) = new_vault();
     vault
-        .upsert(entry("secret-name", "value"))
+        .upsert(entry("secret-name", "value"), None)
         .expect("commits");
     let vault_id = vault.vault_id();
     let path = vault.path().to_path_buf();
@@ -196,7 +225,7 @@ fn open_expecting_rejects_a_different_vault_at_the_same_path() {
 #[test]
 fn rewriting_the_dek_generation_breaks_decryption() {
     let (_dir, mut vault, code) = new_vault();
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
     let path = vault.path().to_path_buf();
     drop(vault);
 
@@ -221,7 +250,7 @@ fn rewriting_the_dek_generation_breaks_decryption() {
 #[test]
 fn editing_a_slots_label_breaks_decryption() {
     let (_dir, mut vault, code) = new_vault();
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
     let path = vault.path().to_path_buf();
     drop(vault);
 
@@ -291,7 +320,7 @@ fn a_truncated_vault_file_is_an_error_not_a_panic() {
 #[test]
 fn a_second_recovery_slot_opens_the_same_vault_and_the_first_still_works() {
     let (_dir, mut vault, first_code) = new_vault();
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
     let path = vault.path().to_path_buf();
 
     let (second_id, second_code) = vault.add_recovery_slot("backup").expect("adds a slot");
@@ -320,7 +349,7 @@ fn a_second_recovery_slot_opens_the_same_vault_and_the_first_still_works() {
 #[test]
 fn removing_a_slot_rotates_the_dek_so_the_removed_code_stops_working() {
     let (_dir, mut vault, original_code) = new_vault();
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
     let path = vault.path().to_path_buf();
 
     let (_kept_id, kept_code) = vault.add_recovery_slot("kept").expect("adds a slot");
@@ -354,7 +383,7 @@ fn removing_a_slot_rotates_the_dek_so_the_removed_code_stops_working() {
 #[test]
 fn rotation_rewraps_for_slots_whose_credentials_were_never_supplied() {
     let (_dir, mut vault, code_a) = new_vault();
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
     let path = vault.path().to_path_buf();
 
     let (_b_id, code_b) = vault.add_recovery_slot("b").expect("adds b");
@@ -380,7 +409,7 @@ fn rotation_rewraps_for_slots_whose_credentials_were_never_supplied() {
 #[test]
 fn an_explicit_rotation_keeps_every_slot_working() {
     let (_dir, mut vault, code_a) = new_vault();
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
     let path = vault.path().to_path_buf();
     let (_id, code_b) = vault.add_recovery_slot("b").expect("adds b");
 
@@ -436,7 +465,7 @@ fn removing_an_unknown_slot_is_an_error_and_changes_nothing() {
 fn the_vault_file_is_created_and_kept_at_0600() {
     let (_dir, mut vault, _code) = new_vault();
     assert_eq!(mode_of(vault.path()), 0o600);
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
     assert_eq!(mode_of(vault.path()), 0o600, "a rewrite must not loosen it");
     assert_eq!(
         mode_of(vault.path().parent().unwrap()),
@@ -448,8 +477,8 @@ fn the_vault_file_is_created_and_kept_at_0600() {
 #[test]
 fn a_committed_vault_leaves_no_temporary_files() {
     let (dir, mut vault, _code) = new_vault();
-    vault.upsert(entry("a", "1")).expect("commits");
-    vault.upsert(entry("b", "2")).expect("commits");
+    vault.upsert(entry("a", "1"), None).expect("commits");
+    vault.upsert(entry("b", "2"), None).expect("commits");
     vault.rotate_dek().expect("rotates");
 
     let names: Vec<String> = fs::read_dir(dir.path())
@@ -470,7 +499,7 @@ fn a_committed_vault_leaves_no_temporary_files() {
 #[test]
 fn a_leftover_temporary_file_does_not_affect_the_vault() {
     let (dir, mut vault, code) = new_vault();
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
     let path = vault.path().to_path_buf();
     let before = fs::read(&path).unwrap();
     drop(vault);
@@ -484,7 +513,7 @@ fn a_leftover_temporary_file_does_not_affect_the_vault() {
     assert_eq!(vault.entry("k").unwrap().secret.as_slice(), b"v");
 
     // And a subsequent commit succeeds alongside the leftover.
-    vault.upsert(entry("k2", "v2")).expect("commits");
+    vault.upsert(entry("k2", "v2"), None).expect("commits");
     drop(vault);
     let vault = reopen(&path, &code).expect("opens");
     assert_eq!(vault.len(), 2);
@@ -517,7 +546,7 @@ fn separate_profiles_are_separate_vaults() {
 #[test]
 fn a_refused_initialize_leaves_the_existing_vault_fully_intact() {
     let (_dir, mut vault, code) = new_vault();
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
     let path = vault.path().to_path_buf();
     let vault_id = vault.vault_id();
     let before = fs::read(&path).unwrap();
@@ -578,14 +607,17 @@ fn an_implausibly_large_file_is_refused_without_being_read() {
 #[test]
 fn a_failed_commit_leaves_the_vault_unchanged_in_memory() {
     let (dir, mut vault, code) = new_vault();
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
     let path = vault.path().to_path_buf();
     let before = fs::read(&path).unwrap();
 
     // A read-only directory blocks the temporary file the commit needs.
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
 
-    assert!(vault.upsert(entry("k2", "v2")).is_err(), "the commit fails");
+    assert!(
+        vault.upsert(entry("k2", "v2"), None).is_err(),
+        "the commit fails"
+    );
     assert_eq!(vault.len(), 1, "the entry must not be in memory either");
     assert!(vault.entry("k2").is_none());
 
@@ -606,7 +638,7 @@ fn a_failed_commit_leaves_the_vault_unchanged_in_memory() {
 
     // The vault is still usable, and its in-memory DEK still matches the file.
     vault
-        .upsert(entry("k3", "v3"))
+        .upsert(entry("k3", "v3"), None)
         .expect("commits once writable again");
     drop(vault);
     let reopened = reopen(&path, &code).expect("opens");
@@ -622,7 +654,7 @@ fn a_failed_commit_leaves_the_vault_unchanged_in_memory() {
 fn a_failed_slot_removal_does_not_leave_a_rotation_in_memory() {
     let (dir, mut vault, code_a) = new_vault();
     let (b_id, code_b) = vault.add_recovery_slot("b").expect("adds b");
-    vault.upsert(entry("k", "v")).expect("commits");
+    vault.upsert(entry("k", "v"), None).expect("commits");
 
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
     assert!(vault.remove_slot(b_id).is_err(), "the commit fails");
@@ -631,7 +663,7 @@ fn a_failed_slot_removal_does_not_leave_a_rotation_in_memory() {
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
 
     let path = vault.path().to_path_buf();
-    vault.upsert(entry("k2", "v2")).expect("commits");
+    vault.upsert(entry("k2", "v2"), None).expect("commits");
     drop(vault);
 
     // B was never actually removed, so B's code must still work.

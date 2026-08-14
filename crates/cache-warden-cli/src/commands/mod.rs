@@ -292,6 +292,35 @@ fn duration_secs(m: &clap::ArgMatches, id: &str) -> Result<Option<u64>, String> 
     }
 }
 
+/// Read `--expected-version N` (DR-0034 §4) as a version number.
+///
+/// `Some(0)` is a real value, not "absent": versions start at 1, so zero is how
+/// a caller says "I expect this key not to exist yet" and wins a create race
+/// instead of overwriting someone else's create. Only a missing flag is `None`.
+fn expected_version(m: &clap::ArgMatches) -> Result<Option<u64>, String> {
+    match m.get_one::<String>("expected-version") {
+        None => Ok(None),
+        Some(v) => v.parse::<u64>().map(Some).map_err(|_| {
+            format!(
+                "--expected-version takes the version number reported by the last \
+                 `kv set` / `kv claim` on this key (got {v:?}). Use 0 to require that \
+                 the key does not exist yet"
+            )
+        }),
+    }
+}
+
+/// Read `--claim-token TOKEN` (DR-0034 §4).
+fn claim_token(m: &clap::ArgMatches) -> Result<Option<String>, String> {
+    match m.get_one::<String>("claim-token") {
+        None => Ok(None),
+        Some(t) if t.is_empty() => Err("--claim-token must not be empty; pass the token \
+             `kv claim` printed on stdout"
+            .to_string()),
+        Some(t) => Ok(Some(t.clone())),
+    }
+}
+
 /// Refuse a flag-shaped NAME given to `--require-same-ancestor` /
 /// `--require-command` in the **space-separated** form.
 ///
@@ -397,6 +426,10 @@ fn guard_constraints_in_argv_order(
 /// positional form. Command sources moved to `kv define` (see
 /// [`parse_kv_define`]); value types (`--type otp` / `--otp-*`) live on
 /// definitions too (DR-0016). `kv set` injects opaque bytes only.
+///
+/// `--expected-version N` makes the write conditional (DR-0034 §4) and
+/// `--claim-token TOKEN` finishes a refresh started by `kv claim`. Both are
+/// absent by default, which is an unconditional write.
 pub fn parse_kv_set(
     args: &[String],
     ns: &str,
@@ -446,6 +479,8 @@ pub fn parse_kv_set(
     let soft_ttl_secs = duration_secs(&m, "soft-ttl")?;
     let hard_ttl_secs = duration_secs(&m, "hard-ttl")?;
     let guard_constraints = guard_constraints_in_argv_order(head, &m)?;
+    let expected_version = expected_version(&m)?;
+    let claim_token = claim_token(&m)?;
 
     let key = m
         .get_one::<String>("KEY")
@@ -496,6 +531,8 @@ pub fn parse_kv_set(
         soft_ttl_secs,
         hard_ttl_secs,
         guard_constraints,
+        expected_version,
+        claim_token,
     })
 }
 
@@ -823,6 +860,64 @@ pub fn parse_kv_pin(args: &[String], ns: &str) -> Result<Request, String> {
     Ok(Request::KvPin {
         key: crate::namespace::compose(ns, key),
         duration_secs: parse_duration(dur).map_err(|e| e.to_string())?.as_secs(),
+    })
+}
+
+/// Parse `kv claim [--] <KEY> <DURATION> --expected-version N` into a
+/// [`Request::KvClaim`] (DR-0034 §4).
+///
+/// `DURATION` uses the TTL grammar (`30s` / `1h` / bare seconds) and bounds how
+/// long the hold survives a caller that dies mid-refresh.
+///
+/// `--expected-version` is spelled as an option rather than a third positional
+/// on purpose: it is the same flag, with the same meaning, that `kv set` takes
+/// to close the loop, and two adjacent bare numbers (a version and a duration)
+/// would be trivial to transpose unnoticed.
+///
+/// Like `pin` / `unpin`, this is a lifecycle verb that neither reveals nor
+/// writes a value, so it is not gated on the reserved namespace — the write it
+/// leads to is, at `kv set`.
+pub fn parse_kv_claim(args: &[String], ns: &str) -> Result<Request, String> {
+    let cmd = crate::cli::kv_claim();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "kv claim", e))?;
+    let missing = || {
+        "kv claim requires a KEY, a DURATION and --expected-version N \
+         (e.g. `kv claim DB 30s --expected-version 7`); the version is the one \
+         the last `kv get` / `kv set` on this key reported"
+    };
+    let key = m.get_one::<String>("KEY").ok_or_else(missing)?;
+    let dur = m.get_one::<String>("DUR").ok_or_else(missing)?;
+    let expected_version = expected_version(&m)?.ok_or_else(missing)?;
+    validate_cli_key(key, "claim")?;
+    Ok(Request::KvClaim {
+        key: crate::namespace::compose(ns, key),
+        expected_version,
+        duration_secs: parse_duration(dur).map_err(|e| e.to_string())?.as_secs(),
+    })
+}
+
+/// Parse `kv unclaim [--] <KEY> --claim-token TOKEN` into a
+/// [`Request::KvUnclaim`] (DR-0034 §4).
+pub fn parse_kv_unclaim(args: &[String], ns: &str) -> Result<Request, String> {
+    let cmd = crate::cli::kv_unclaim();
+    let m = cmd
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&cmd, "kv unclaim", e))?;
+    let missing = || {
+        "kv unclaim requires a KEY and --claim-token TOKEN \
+         (e.g. `kv unclaim DB --claim-token \"$token\"`); the token is what \
+         `kv claim` printed on stdout"
+    };
+    let key = m.get_one::<String>("KEY").ok_or_else(missing)?;
+    let claim_token = claim_token(&m)?.ok_or_else(missing)?;
+    validate_cli_key(key, "unclaim")?;
+    Ok(Request::KvUnclaim {
+        key: crate::namespace::compose(ns, key),
+        claim_token,
     })
 }
 
@@ -1808,6 +1903,184 @@ mod tests {
     #[test]
     fn kv_pin_rejects_options() {
         assert!(parse_kv_pin(&["DB".into(), "8h".into(), "--x".into()], "default").is_err());
+    }
+
+    // ---- DR-0034 §4: CAS + claim on the CLI ----
+
+    /// A plain `kv set` carries neither field, which is the wire's way of
+    /// saying "write unconditionally" — the behaviour every pre-DR-0034
+    /// invocation had.
+    #[test]
+    fn kv_set_without_cas_flags_is_an_unconditional_write() {
+        let req = parse_kv_set(&s(&["K", "v"]), "default", false, no_stdin).unwrap();
+        match req {
+            Request::KvSet {
+                expected_version,
+                claim_token,
+                ..
+            } => {
+                assert_eq!(expected_version, None);
+                assert_eq!(claim_token, None);
+            }
+            other => panic!("expected KvSet, got {other:?}"),
+        }
+    }
+
+    /// `--expected-version` and `--claim-token` reach the wire request.
+    #[test]
+    fn kv_set_carries_expected_version_and_claim_token() {
+        let req = parse_kv_set(
+            &s(&[
+                "--expected-version",
+                "7",
+                "--claim-token",
+                "tok-abc",
+                "K",
+                "v",
+            ]),
+            "default",
+            false,
+            no_stdin,
+        )
+        .unwrap();
+        match req {
+            Request::KvSet {
+                expected_version,
+                claim_token,
+                ..
+            } => {
+                assert_eq!(expected_version, Some(7));
+                assert_eq!(claim_token.as_deref(), Some("tok-abc"));
+            }
+            other => panic!("expected KvSet, got {other:?}"),
+        }
+    }
+
+    /// `--expected-version 0` is a *value*, not an absence: versions start at
+    /// 1, so zero means "this key must not exist yet". Collapsing it to `None`
+    /// would silently turn a create-only write into an unconditional one.
+    #[test]
+    fn kv_set_expected_version_zero_is_distinct_from_omitting_the_flag() {
+        let with_zero = parse_kv_set(
+            &s(&["--expected-version", "0", "K", "v"]),
+            "default",
+            false,
+            no_stdin,
+        )
+        .unwrap();
+        match with_zero {
+            Request::KvSet {
+                expected_version, ..
+            } => assert_eq!(expected_version, Some(0)),
+            other => panic!("expected KvSet, got {other:?}"),
+        }
+    }
+
+    /// A non-numeric version and an empty token are refused at the CLI, with a
+    /// message that says where the right value comes from.
+    #[test]
+    fn kv_set_rejects_malformed_cas_flag_values() {
+        let err = parse_kv_set(
+            &s(&["--expected-version", "latest", "K", "v"]),
+            "default",
+            false,
+            no_stdin,
+        )
+        .unwrap_err();
+        assert!(err.contains("--expected-version"), "{err}");
+        assert!(err.contains("0"), "explains what 0 means: {err}");
+
+        let err = parse_kv_set(
+            &s(&["--claim-token", "", "K", "v"]),
+            "default",
+            false,
+            no_stdin,
+        )
+        .unwrap_err();
+        assert!(err.contains("kv claim"), "{err}");
+    }
+
+    #[test]
+    fn kv_claim_parses_key_duration_and_version() {
+        assert_eq!(
+            parse_kv_claim(&s(&["DB", "30s", "--expected-version", "7"]), "default").unwrap(),
+            Request::KvClaim {
+                key: "default/DB".into(),
+                expected_version: 7,
+                duration_secs: 30,
+            }
+        );
+        // The flag may lead as well as trail, and bare seconds parse.
+        assert_eq!(
+            parse_kv_claim(&s(&["--expected-version=0", "K", "90"]), "default").unwrap(),
+            Request::KvClaim {
+                key: "default/K".into(),
+                expected_version: 0,
+                duration_secs: 90,
+            }
+        );
+    }
+
+    /// The version is not optional on `kv claim` (the wire field is a bare
+    /// `u64`), so its absence is a usage error naming all three inputs.
+    #[test]
+    fn kv_claim_requires_key_duration_and_version() {
+        let err = parse_kv_claim(&s(&["DB", "30s"]), "default").unwrap_err();
+        assert!(err.contains("--expected-version"), "{err}");
+        assert!(parse_kv_claim(&s(&["DB", "--expected-version", "1"]), "default").is_err());
+        assert!(parse_kv_claim(&s(&["--expected-version", "1"]), "default").is_err());
+        assert!(
+            parse_kv_claim(&s(&["DB", "8days", "--expected-version", "1"]), "default").is_err()
+        );
+        assert!(
+            parse_kv_claim(
+                &s(&["DB", "30s", "--expected-version", "1", "x"]),
+                "default"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kv_unclaim_parses_key_and_token() {
+        assert_eq!(
+            parse_kv_unclaim(&s(&["DB", "--claim-token", "tok-abc"]), "default").unwrap(),
+            Request::KvUnclaim {
+                key: "default/DB".into(),
+                claim_token: "tok-abc".into(),
+            }
+        );
+    }
+
+    /// Releasing without the token would let a caller whose claim lapsed cancel
+    /// the claim that replaced it, so the CLI insists on it.
+    #[test]
+    fn kv_unclaim_requires_the_token() {
+        let err = parse_kv_unclaim(&s(&["DB"]), "default").unwrap_err();
+        assert!(err.contains("--claim-token"), "{err}");
+        assert!(parse_kv_unclaim(&s(&["DB", "--claim-token", ""]), "default").is_err());
+    }
+
+    /// Both verbs compose the namespace onto the key like every other kv verb,
+    /// and reject a `ns/key` embedding in the KEY argument.
+    #[test]
+    fn kv_claim_and_unclaim_are_namespace_composed() {
+        match parse_kv_claim(&s(&["K", "30s", "--expected-version", "1"]), "projA").unwrap() {
+            Request::KvClaim { key, .. } => assert_eq!(key, "projA/K"),
+            other => panic!("expected KvClaim, got {other:?}"),
+        }
+        match parse_kv_unclaim(&s(&["K", "--claim-token", "t"]), "projA").unwrap() {
+            Request::KvUnclaim { key, .. } => assert_eq!(key, "projA/K"),
+            other => panic!("expected KvUnclaim, got {other:?}"),
+        }
+        assert!(
+            parse_kv_claim(
+                &s(&["projA/K", "30s", "--expected-version", "1"]),
+                "default"
+            )
+            .is_err()
+        );
+        assert!(parse_kv_unclaim(&s(&["projA/K", "--claim-token", "t"]), "default").is_err());
     }
 
     // ---- value-type flags (DR-0016) ----

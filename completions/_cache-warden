@@ -154,6 +154,8 @@ _cache-warden() {
             'list:List cached key names'
             'pin:Hold a value Active for DUR, ignoring its TTL (re-auth)'
             'unpin:Drop a pin, returning the value to normal TTL evaluation'
+            'claim:Take the refresh hold on a key before fetching a new value'
+            'unclaim:Release a refresh hold without writing a value'
           )
           _arguments -C \
             "$socket_opt" \
@@ -191,6 +193,8 @@ _cache-warden() {
                     '--require-same-shell[Pin the closest shell ancestor of the setter]' \
                     '*--require-same-ancestor[Pin the setter ancestor whose basename is NAME]:name' \
                     '*--require-command[Reader chain must contain NAME (WEAK, spoofable)]:name' \
+                    '--expected-version[Write only if the key is still at version N (0 = must not exist yet)]:version' \
+                    '--claim-token[Finish the refresh held by kv claim]:token' \
                     '1:key:_cw_keys' \
                     '2:value (omit to read stdin):'
                   ;;
@@ -231,6 +235,23 @@ _cache-warden() {
                     "$socket_opt" \
                     "$ns_opt" \
                     '--help[Show this help message]' \
+                    '1:key:_cw_keys'
+                  ;;
+                claim)
+                  _arguments \
+                    "$socket_opt" \
+                    "$ns_opt" \
+                    '--help[Show this help message]' \
+                    '--expected-version[Claim only if the key is still at version N (required)]:version' \
+                    '1:key:_cw_keys' \
+                    '2:duration:(30s 5m 1h)'
+                  ;;
+                unclaim)
+                  _arguments \
+                    "$socket_opt" \
+                    "$ns_opt" \
+                    '--help[Show this help message]' \
+                    '--claim-token[The token kv claim printed (required)]:token' \
                     '1:key:_cw_keys'
                   ;;
               esac

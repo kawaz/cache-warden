@@ -26,6 +26,7 @@ use crate::guard::GuardRecord;
 use crate::key::{InvalidKey, validate_key_syntax};
 use crate::meta::{SourceMeta, ValueMeta};
 use crate::process::ProcessInfo;
+use crate::refresh::RefreshClaim;
 use crate::secret::SecretBytes;
 use crate::snapshot::{
     self, ExportError, ImportError, SnapshotConstraint, SnapshotDeclaredAncestor,
@@ -127,6 +128,38 @@ pub struct Store {
     /// `set_guard`) or none (call `clear_guard`), so the core stays oblivious
     /// to per-adapter default policy (`default-require-same-user` etc.).
     access_guards: BTreeMap<String, GuardRecord>,
+    /// Per-key monotonic CAS versions (DR-0034 §4).
+    ///
+    /// A key absent from this map is at version 0, which the arbitration
+    /// protocol reads as "does not exist yet" — so a create can be expressed
+    /// as a compare-and-swap against 0 rather than needing a separate
+    /// operation.
+    ///
+    /// # Lifetime — deliberately the longest of the four side maps
+    ///
+    /// A version **survives a value-only [`Store::delete`]** and hard-TTL
+    /// expiry, and is dropped only when the key is removed outright
+    /// ([`Store::delete_with_definition`]). Resetting it on a value delete
+    /// would let a caller holding a stale version win a compare-and-swap
+    /// against a *re-created* key — the "a consumed refresh token still looks
+    /// current" failure DR-0034 §4 relies on monotonicity to prevent. The cost
+    /// is a `u64` per deleted-but-still-defined key, which is bounded by the
+    /// key count.
+    ///
+    /// The core only stores and advances this. Whether a caller's expected
+    /// version matches is the adapter's judgement (DR-0004), the same split
+    /// [`Store::access_guards`] uses.
+    versions: BTreeMap<String, u64>,
+    /// Per-key in-progress refresh claims (DR-0034 §4).
+    ///
+    /// Lifetime mirrors [`Store::access_guards`], not [`Store::versions`]: a
+    /// claim describes a refresh of *this* value, so removing the value ends
+    /// it. Keeping a claim past its value would leave an entry nobody can
+    /// claim and nobody can release.
+    ///
+    /// Expiry and token matching are the adapter's to evaluate; the core does
+    /// not read the clock on this map's behalf.
+    refresh_claims: BTreeMap<String, RefreshClaim>,
     /// How long to suppress re-fetch after a `runner.run` failure (DR-0022).
     ///
     /// Configured via [`StoreBuilder::failure_backoff`]. The default is
@@ -230,6 +263,8 @@ impl Store {
             definitions: BTreeMap::new(),
             failure_backoffs: BTreeMap::new(),
             access_guards: BTreeMap::new(),
+            versions: BTreeMap::new(),
+            refresh_claims: BTreeMap::new(),
             failure_backoff_duration,
             access_token: token,
         }
@@ -517,6 +552,8 @@ impl Store {
         // branch is defensive against future definition-side guards; the
         // cleanup is uniform across every path that replaces the value.
         self.access_guards.remove(key);
+        // A claim describes a refresh of the value that just went away.
+        self.refresh_claims.remove(key);
         self.entries
             .insert(key.to_string(), CacheEntry::new(source, value, ttl, clock));
         Ok(())
@@ -607,6 +644,8 @@ impl Store {
         // definition is still there to regenerate through) drops the guard —
         // the setter's declaration only ever applied to *this* injected value.
         self.access_guards.remove(key);
+        // A claim describes a refresh of the value that just went away.
+        self.refresh_claims.remove(key);
         Ok(self.entries.remove(key).is_some())
     }
 
@@ -966,6 +1005,8 @@ impl Store {
         // must be dropped rather than left to gate reads of a value the
         // setter never approved.
         self.access_guards.remove(key);
+        // A claim describes a refresh of the value that just went away.
+        self.refresh_claims.remove(key);
         self.entries
             .insert(key.to_string(), CacheEntry::new(source, value, ttl, clock));
         Ok(())
@@ -997,6 +1038,12 @@ impl Store {
         // DR-0030 §5: guard follows the value; forgetting the key entirely
         // subsumes value-only delete's guard cleanup.
         self.access_guards.remove(key);
+        // DR-0034 §4: the key is going away entirely, so its version goes
+        // with it. Every other removal path keeps the version (see the
+        // `versions` field doc) — only a full removal may reset it.
+        self.versions.remove(key);
+        // A claim describes a refresh of the value that just went away.
+        self.refresh_claims.remove(key);
         Ok(had_value || had_def)
     }
 
@@ -1023,6 +1070,8 @@ impl Store {
         // entries, but the cleanup is uniform across paths so a future
         // definition-side guard would inherit the same rule.)
         self.access_guards.remove(key);
+        // A claim describes a refresh of the value that just went away.
+        self.refresh_claims.remove(key);
         self.definitions.remove(key).is_some()
     }
 
@@ -1079,6 +1128,73 @@ impl Store {
     /// secret; DR-0030 §Security). The evaluator uses this on every `kv get`.
     pub fn guard_of(&self, key: &str) -> Option<&GuardRecord> {
         self.access_guards.get(key)
+    }
+
+    // ---- refresh arbitration (DR-0034 §4) ----
+
+    /// `key`'s current CAS version, or `0` when it has none.
+    ///
+    /// Value-free and not cap-gated, matching [`Store::guard_of`]: a version
+    /// is a change counter, never plaintext.
+    pub fn version_of(&self, key: &str) -> u64 {
+        self.versions.get(key).copied().unwrap_or(0)
+    }
+
+    /// Advance `key`'s version by one and return the new value.
+    ///
+    /// The only way a version moves, so monotonicity is a property of this
+    /// function rather than of every caller remembering to increment.
+    /// Saturating rather than wrapping: a `u64` counter cannot realistically
+    /// be exhausted, and wrapping to zero would silently turn "exists" into
+    /// "does not exist".
+    ///
+    /// Cap check (DR-0024) runs first; nothing is mutated on mismatch.
+    pub fn bump_version(
+        &mut self,
+        key: impl Into<String>,
+        cap: &Capability,
+    ) -> Result<u64, CapError> {
+        self.check_cap(cap)?;
+        let key = key.into();
+        let next = self.version_of(&key).saturating_add(1);
+        self.versions.insert(key, next);
+        Ok(next)
+    }
+
+    /// Record an in-progress refresh claim on `key`, replacing any existing
+    /// one.
+    ///
+    /// Replacement is unconditional here on purpose: deciding whether the
+    /// existing claim has lapsed, and whether this caller may take it over, is
+    /// the adapter's call (DR-0004). The core would have to read the clock to
+    /// judge, and it has no business doing so.
+    ///
+    /// Cap check (DR-0024) runs first.
+    pub fn set_refresh_claim(
+        &mut self,
+        key: impl Into<String>,
+        claim: RefreshClaim,
+        cap: &Capability,
+    ) -> Result<(), CapError> {
+        self.check_cap(cap)?;
+        self.refresh_claims.insert(key.into(), claim);
+        Ok(())
+    }
+
+    /// Borrow `key`'s refresh claim, if one is recorded.
+    ///
+    /// Returns a recorded claim whether or not it has lapsed — expiry is the
+    /// caller's to evaluate via [`RefreshClaim::is_active_at`].
+    pub fn refresh_claim_of(&self, key: &str) -> Option<&RefreshClaim> {
+        self.refresh_claims.get(key)
+    }
+
+    /// Drop `key`'s refresh claim, returning whether one was present.
+    ///
+    /// Cap check (DR-0024) runs first.
+    pub fn clear_refresh_claim(&mut self, key: &str, cap: &Capability) -> Result<bool, CapError> {
+        self.check_cap(cap)?;
+        Ok(self.refresh_claims.remove(key).is_some())
     }
 
     // ---- graceful-restart snapshot (DR-0029 §2, Phase 1 / bundle 1) ----
@@ -1184,7 +1300,25 @@ impl Store {
                 None
             };
 
-            if value.is_none() && definition.is_none() && failure.is_none() && guard.is_none() {
+            // DR-0034 §4. The claim follows the value (a claim on nothing is
+            // meaningless); the version does not, because resetting it across
+            // a restart is exactly the stale-writer hazard it guards against.
+            let refresh_claim = if value.is_some() {
+                self.refresh_claims.get(key).map(refresh_claim_to_snapshot)
+            } else {
+                None
+            };
+            let version = match self.versions.get(key) {
+                Some(&v) if v > 0 => Some(v),
+                _ => None,
+            };
+
+            if value.is_none()
+                && definition.is_none()
+                && failure.is_none()
+                && guard.is_none()
+                && version.is_none()
+            {
                 // Nothing meaningful survives for this key (e.g. a stale
                 // hard-expired husk with no definition and no failure record).
                 continue;
@@ -1196,6 +1330,8 @@ impl Store {
                 definition,
                 failure,
                 guard,
+                version,
+                refresh_claim,
             });
         }
 
@@ -1277,6 +1413,8 @@ impl Store {
                 value,
                 definition,
                 failure,
+                version,
+                refresh_claim,
                 guard,
             } = entry;
 
@@ -1361,10 +1499,39 @@ impl Store {
                     .access_guards
                     .insert(key.clone(), snapshot_to_guard_record(g));
             }
+
+            // DR-0034 §4: the version is installed unconditionally (it is not
+            // tied to a live value), the claim only alongside one — the same
+            // asymmetry `export_snapshot` applies, so a round trip is stable.
+            if let Some(v) = version.filter(|v| *v > 0) {
+                bundle.store.versions.insert(key.clone(), v);
+            }
+            if let Some(c) = refresh_claim
+                && bundle.store.entries.contains_key(&key)
+            {
+                bundle
+                    .store
+                    .refresh_claims
+                    .insert(key.clone(), snapshot_to_refresh_claim(c));
+            }
         }
 
         Ok(bundle)
     }
+}
+
+/// [`RefreshClaim`] -> wire mirror (DR-0034 §4).
+fn refresh_claim_to_snapshot(c: &RefreshClaim) -> crate::snapshot::SnapshotRefreshClaim {
+    crate::snapshot::SnapshotRefreshClaim {
+        token: c.token().to_string(),
+        claimed_at_epoch_ms: c.claimed_at_epoch_ms(),
+        expires_at_epoch_ms: c.expires_at_epoch_ms(),
+    }
+}
+
+/// Wire mirror -> [`RefreshClaim`].
+fn snapshot_to_refresh_claim(c: crate::snapshot::SnapshotRefreshClaim) -> RefreshClaim {
+    RefreshClaim::new(c.token, c.claimed_at_epoch_ms, c.expires_at_epoch_ms)
 }
 
 // ---- guard <-> snapshot converters ----
@@ -4060,6 +4227,8 @@ mod tests {
                 definition: None,
                 failure: None,
                 guard: None,
+                version: None,
+                refresh_claim: None,
             }]);
 
             // `StoreBundle` does not derive `Debug`, so `unwrap_err()` (which
@@ -4092,6 +4261,8 @@ mod tests {
                 definition: None,
                 failure: None,
                 guard: None,
+                version: None,
+                refresh_claim: None,
             };
             let snap = StoreSnapshot::new(vec![make_entry("first"), make_entry("second")]);
 
@@ -4131,6 +4302,8 @@ mod tests {
                 definition: None,
                 failure: None,
                 guard: None,
+                version: None,
+                refresh_claim: None,
             }]);
 
             // `StoreBundle` does not derive `Debug`, so `unwrap_err()` (which
@@ -4171,6 +4344,8 @@ mod tests {
                     retry_after_ms: 60_000, // 60s, well under the 90s of headroom
                 }),
                 guard: None,
+                version: None,
+                refresh_claim: None,
             }]);
 
             let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
@@ -4537,7 +4712,180 @@ mod tests {
             .unwrap();
             s.set_guard("default/K", sample_record(), &cap).unwrap();
             let snap = s.export_snapshot(&cap, &clock).unwrap();
-            assert_eq!(snap.format_version(), crate::snapshot::FORMAT_VERSION);
+            // One generation above pre-guard, not the newest: DR-0034 added a
+            // further step for refresh state, and a guard-only export must
+            // stay importable by a guards-but-no-claims build.
+            assert_eq!(snap.format_version(), crate::snapshot::VERSION_PRE_REFRESH);
+        }
+    }
+
+    // These fix the shape of the two DR-0034 §4 side maps (`versions`,
+    // `refresh_claims`). The core only stores them — every comparison and
+    // expiry judgement belongs to the adapter (DR-0004) — so what is tested
+    // here is storage, lifetime, and snapshot carriage, never policy.
+    mod refresh_state {
+        use super::*;
+
+        fn seeded() -> (Store, Capability, FakeClock) {
+            let clock = FakeClock::new();
+            let (mut s, cap) = crate::test_helpers::store_with_cap();
+            s.set(
+                "default/K",
+                ValueSource::Static,
+                SecretBytes::from("v"),
+                ttl(),
+                &cap,
+                &clock,
+            )
+            .unwrap();
+            (s, cap, clock)
+        }
+
+        #[test]
+        fn an_unknown_key_is_at_version_zero() {
+            let (s, _cap, _clock) = seeded();
+            assert_eq!(s.version_of("default/NOPE"), 0);
+            assert_eq!(s.version_of("default/K"), 0, "set does not assign one");
+        }
+
+        #[test]
+        fn bumping_advances_by_one_and_returns_the_new_value() {
+            let (mut s, cap, _clock) = seeded();
+            assert_eq!(s.bump_version("default/K", &cap).unwrap(), 1);
+            assert_eq!(s.bump_version("default/K", &cap).unwrap(), 2);
+            assert_eq!(s.version_of("default/K"), 2);
+        }
+
+        #[test]
+        fn bumping_is_rejected_without_a_matching_capability() {
+            let (mut s, _cap, _clock) = seeded();
+            let (_other, wrong) = crate::test_helpers::store_with_cap();
+            assert!(s.bump_version("default/K", &wrong).is_err());
+            assert_eq!(s.version_of("default/K"), 0, "nothing mutated on refusal");
+        }
+
+        /// The lifetime that differs from every other side map: a value-only
+        /// delete keeps the version. Resetting it would let a caller holding a
+        /// stale version win a compare-and-swap against a re-created key.
+        #[test]
+        fn a_value_only_delete_keeps_the_version() {
+            let (mut s, cap, _clock) = seeded();
+            s.bump_version("default/K", &cap).unwrap();
+            s.bump_version("default/K", &cap).unwrap();
+            s.delete("default/K", &cap).unwrap();
+            assert_eq!(s.version_of("default/K"), 2, "the counter must not reset");
+        }
+
+        #[test]
+        fn removing_the_key_outright_drops_the_version() {
+            let (mut s, cap, _clock) = seeded();
+            s.bump_version("default/K", &cap).unwrap();
+            s.delete_with_definition("default/K", &cap).unwrap();
+            assert_eq!(s.version_of("default/K"), 0);
+        }
+
+        #[test]
+        fn a_claim_is_stored_and_read_back_verbatim() {
+            let (mut s, cap, _clock) = seeded();
+            s.set_refresh_claim("default/K", RefreshClaim::new("tok", 10, 20), &cap)
+                .unwrap();
+            let c = s.refresh_claim_of("default/K").expect("stored");
+            assert_eq!(c.token(), "tok");
+            assert_eq!(c.claimed_at_epoch_ms(), 10);
+            assert_eq!(c.expires_at_epoch_ms(), 20);
+        }
+
+        /// The core hands back a lapsed claim rather than hiding it: deciding
+        /// whether it still holds needs a clock, and reading the clock on the
+        /// caller's behalf is the policy call the core does not make.
+        #[test]
+        fn a_lapsed_claim_is_still_returned() {
+            let (mut s, cap, _clock) = seeded();
+            s.set_refresh_claim("default/K", RefreshClaim::new("tok", 10, 20), &cap)
+                .unwrap();
+            let c = s.refresh_claim_of("default/K").expect("still stored");
+            assert!(!c.is_active_at(9_999), "the caller judges, not the store");
+        }
+
+        #[test]
+        fn clearing_reports_whether_a_claim_was_present() {
+            let (mut s, cap, _clock) = seeded();
+            assert!(!s.clear_refresh_claim("default/K", &cap).unwrap());
+            s.set_refresh_claim("default/K", RefreshClaim::new("t", 1, 2), &cap)
+                .unwrap();
+            assert!(s.clear_refresh_claim("default/K", &cap).unwrap());
+            assert!(s.refresh_claim_of("default/K").is_none());
+        }
+
+        /// A claim describes a refresh of the value; when the value goes, so
+        /// does the claim — otherwise the entry would be stuck holding a claim
+        /// nobody can complete or release.
+        #[test]
+        fn deleting_the_value_drops_the_claim() {
+            let (mut s, cap, _clock) = seeded();
+            s.set_refresh_claim("default/K", RefreshClaim::new("t", 1, 2), &cap)
+                .unwrap();
+            s.delete("default/K", &cap).unwrap();
+            assert!(s.refresh_claim_of("default/K").is_none());
+        }
+
+        #[test]
+        fn version_and_claim_survive_a_snapshot_round_trip() {
+            let (mut s, cap, clock) = seeded();
+            s.bump_version("default/K", &cap).unwrap();
+            s.bump_version("default/K", &cap).unwrap();
+            s.set_refresh_claim(
+                "default/K",
+                RefreshClaim::new("abcdefghijklmnopqrstuv", 1_000, 61_000),
+                &cap,
+            )
+            .unwrap();
+
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            assert_eq!(
+                snap.format_version(),
+                crate::snapshot::FORMAT_VERSION,
+                "refresh state forces the newest wire version"
+            );
+            let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
+            assert_eq!(bundle.store.version_of("default/K"), 2);
+            let c = bundle
+                .store
+                .refresh_claim_of("default/K")
+                .expect("the claim must outlive the restart");
+            assert_eq!(c.token(), "abcdefghijklmnopqrstuv");
+            assert_eq!(c.expires_at_epoch_ms(), 61_000);
+        }
+
+        /// The asymmetry between the two maps has to survive the round trip
+        /// too: a version outlives its value, so a snapshot taken after a
+        /// value-only delete still carries it.
+        #[test]
+        fn a_version_survives_the_snapshot_even_with_no_value_left() {
+            let (mut s, cap, clock) = seeded();
+            s.bump_version("default/K", &cap).unwrap();
+            s.define(
+                "default/K",
+                ValueSource::command(vec!["true".to_string()]),
+                ttl(),
+            )
+            .unwrap();
+            s.delete("default/K", &cap).unwrap();
+
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
+            assert_eq!(bundle.store.version_of("default/K"), 1);
+            assert!(bundle.store.refresh_claim_of("default/K").is_none());
+        }
+
+        /// A store with neither versions nor claims must keep emitting the
+        /// snapshot version an older build can import — the whole point of
+        /// stepping up by content rather than unconditionally.
+        #[test]
+        fn a_store_with_no_refresh_state_does_not_bump_the_wire_version() {
+            let (s, cap, clock) = seeded();
+            let snap = s.export_snapshot(&cap, &clock).unwrap();
+            assert_eq!(snap.format_version(), crate::snapshot::VERSION_PRE_GUARD);
         }
     }
 }

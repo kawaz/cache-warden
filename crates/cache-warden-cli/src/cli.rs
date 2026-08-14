@@ -243,6 +243,27 @@ fn mode_args() -> [Arg; 2] {
     ]
 }
 
+/// `--expected-version N` (DR-0034 §4), shared by `kv set` (optional there) and
+/// `kv claim` (where the wire field is not optional, so the parse insists on it).
+///
+/// The value stays a `String` here — like every other valued option at this
+/// layer — so a non-numeric argument is reported by
+/// [`crate::commands::parse_kv_set`]'s own wording rather than clap's.
+fn expected_version_arg() -> Arg {
+    Arg::new("expected-version")
+        .long("expected-version")
+        .value_name("N")
+        .num_args(1)
+}
+
+/// `--claim-token TOKEN` (DR-0034 §4), shared by `kv set` and `kv unclaim`.
+fn claim_token_arg() -> Arg {
+    Arg::new("claim-token")
+        .long("claim-token")
+        .value_name("TOKEN")
+        .num_args(1)
+}
+
 /// `--defs FILE`, repeatable, shared by `kv define` / `run` / `inject`.
 fn defs_arg() -> Arg {
     Arg::new("defs")
@@ -293,6 +314,8 @@ pub fn kv_set() -> Command {
                 .action(ArgAction::Append)
                 .allow_hyphen_values(true),
         )
+        .arg(expected_version_arg())
+        .arg(claim_token_arg())
         // Retired grammar, kept declared for the steer (see the doc above).
         .arg(Arg::new("value").long("value").num_args(1).hide(true))
         .arg(
@@ -392,6 +415,30 @@ pub fn kv_pin() -> Command {
     level("pin")
         .arg(Arg::new("KEY"))
         .arg(Arg::new("DUR"))
+        .arg(namespace_arg())
+        .arg(socket_arg())
+}
+
+/// `kv claim [--namespace NS] <KEY> <DUR> --expected-version N` (DR-0034 §4).
+///
+/// Same shape as `kv pin`: a KEY, a positional duration, and the hold is taken
+/// for that long. `--expected-version` is not marked `required` in the grammar
+/// so its absence is reported in the CLI's own words by
+/// [`crate::commands::parse_kv_claim`], the way a missing KEY / DUR already is.
+pub fn kv_claim() -> Command {
+    level("claim")
+        .arg(Arg::new("KEY"))
+        .arg(Arg::new("DUR"))
+        .arg(expected_version_arg())
+        .arg(namespace_arg())
+        .arg(socket_arg())
+}
+
+/// `kv unclaim [--namespace NS] <KEY> --claim-token TOKEN` (DR-0034 §4).
+pub fn kv_unclaim() -> Command {
+    level("unclaim")
+        .arg(Arg::new("KEY"))
+        .arg(claim_token_arg())
         .arg(namespace_arg())
         .arg(socket_arg())
 }

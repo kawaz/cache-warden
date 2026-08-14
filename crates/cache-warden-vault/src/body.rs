@@ -41,6 +41,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::claim::Claim;
 use crate::error::VaultError;
 
 /// Schema version of the body plaintext. See the module doc on why the
@@ -125,10 +126,24 @@ pub struct VaultEntry {
     /// being consumed does not leave plaintext behind.
     pub secret: Zeroizing<Vec<u8>>,
     /// The entry's CAS version (DR-0034 §4): monotonic, persisted, and the
-    /// basis of refresh arbitration. Phase 2 implements the compare-and-swap
-    /// transitions; the field is durable from the start because a version that
-    /// can roll back is worse than no version at all.
+    /// basis of refresh arbitration.
+    ///
+    /// **Assigned by the vault, not by the caller.** Every successful write
+    /// sets it to the previous value plus one, overwriting whatever the
+    /// submitted entry carried. A caller-chosen version could be set backwards,
+    /// and a version that can go backwards is worse than none at all: DR-0034
+    /// §4 relies on monotonicity to keep a consumed refresh token from being
+    /// treated as current again.
     pub cas_version: u64,
+    /// An in-progress refresh holding this entry (DR-0034 §4), or `None` when
+    /// no refresh is claimed.
+    ///
+    /// Persisted, so a claim survives the daemon restart it most needs to
+    /// survive — an upgrade in the middle of a refresh. `#[serde(default)]`
+    /// keeps a phase-1 body (written before claims existed) readable, which is
+    /// why adding this needed no `format_version` bump.
+    #[serde(default)]
+    pub refresh_claim: Option<Claim>,
     /// Value metadata, if any.
     #[serde(default)]
     pub value_meta: Option<VaultValueMeta>,
@@ -153,6 +168,7 @@ impl VaultEntry {
             key: key.into(),
             secret: Zeroizing::new(secret.into()),
             cas_version: 1,
+            refresh_claim: None,
             value_meta: None,
             definition: None,
             guard: None,
@@ -169,6 +185,7 @@ impl std::fmt::Debug for VaultEntry {
             .field("secret_len", &self.secret.len())
             .field("secret", &"[REDACTED]")
             .field("cas_version", &self.cas_version)
+            .field("claimed", &self.refresh_claim.is_some())
             .field("has_value_meta", &self.value_meta.is_some())
             .field("has_definition", &self.definition.is_some())
             .field("has_guard", &self.guard.is_some())
@@ -248,6 +265,7 @@ mod tests {
             key: "llm/refresh-token".to_string(),
             secret: Zeroizing::new(b"rt-abc123".to_vec()),
             cas_version: 7,
+            refresh_claim: None,
             value_meta: Some(VaultValueMeta {
                 type_name: Some("oauth-refresh-token".to_string()),
                 params: BTreeMap::from([("issuer".to_string(), "example".to_string())]),

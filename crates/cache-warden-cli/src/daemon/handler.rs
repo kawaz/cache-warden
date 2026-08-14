@@ -9,12 +9,14 @@
 //! This is the "wire the core into the daemon's center" mandate of DR-0008:
 //! every control-socket command maps onto a [`Store`] operation here.
 
+use cache_warden::RefreshClaim;
 use cache_warden::{
     Authenticator, CapError, Capability, Clock, DeclaredAncestor, DefineError, EntryState,
     ExtendAuthOutcome, GuardConstraint, GuardRecord, GuardSetter, PinAuthOutcome, PinnedProcess,
     ProcessInfo, RegenerateDefOutcome, RegenerateOutcome, SecretBytes, SourceRunner, Store, Ttl,
     ValueMeta, ValueSource,
 };
+use cache_warden_vault::ClaimToken;
 
 use crate::daemon::guard::{
     self as guard_eval, GetterAuditToken, GetterProcess, denied_kind_label,
@@ -187,15 +189,47 @@ where
             soft_ttl_secs,
             hard_ttl_secs,
             guard_constraints,
-        } => handle_set(
-            store,
-            ctx,
+            expected_version,
+            claim_token,
+        } => {
+            // DR-0034 §4 arbitration runs before the write, and both checks
+            // must reject without touching the store: a caller told "no" must
+            // be able to rely on nothing having happened.
+            //
+            // Phase 5 note: DR-0033 §3d fixes the composition order as owner
+            // authorization -> CAS check -> update. Owner authorization does
+            // not exist yet, so these two checks currently sit at the front by
+            // default rather than by arrangement. When it lands it must go
+            // *above* this block — deciding whether a caller may write at all
+            // has to precede telling them what version the key is at, or a
+            // caller with no authorization still learns the key's state from
+            // the mismatch reply.
+
+            if let Some(expected) = expected_version {
+                let current = store.version_of(&key);
+                if current != expected {
+                    return Response::cas_mismatch(current);
+                }
+            }
+            if let Err(resp) = check_claim_fence(store, &key, claim_token.as_deref()) {
+                return resp;
+            }
+            handle_set(
+                store,
+                ctx,
+                key,
+                source,
+                soft_ttl_secs,
+                hard_ttl_secs,
+                guard_constraints,
+            )
+        }
+        Request::KvClaim {
             key,
-            source,
-            soft_ttl_secs,
-            hard_ttl_secs,
-            guard_constraints,
-        ),
+            expected_version,
+            duration_secs,
+        } => handle_claim(store, ctx, key, expected_version, duration_secs),
+        Request::KvUnclaim { key, claim_token } => handle_unclaim(store, ctx, key, claim_token),
         Request::KvDefine {
             key,
             source,
@@ -279,6 +313,11 @@ fn collect_entry_infos<C: Clock>(store: &Store, clock: &C) -> Vec<EntryInfo> {
         .collect();
     let now = clock.now();
     let mut entries = Vec::with_capacity(names.len());
+    // One wall-clock reading for the whole pass, so two entries in the same
+    // reply cannot disagree about whether a claim is still active. Named
+    // apart from the monotonic `now` this function already uses for TTLs —
+    // the two are different clocks and must not be confused.
+    let wall_now = now_epoch_ms();
     for name in names {
         let has_value = store.has_value(&name);
         let defined = store.is_defined(&name);
@@ -309,6 +348,15 @@ fn collect_entry_infos<C: Clock>(store: &Store, clock: &C) -> Vec<EntryInfo> {
             .failure_backoff_remaining(&name, clock)
             .map(|d| d.as_secs());
         let guard_summary = store.guard_of(&name).map(summarize_guard_record);
+        // Read both before `name` moves into the struct below.
+        let version = match store.version_of(&name) {
+            0 => None,
+            v => Some(v),
+        };
+        let claim_expires_in_secs = store
+            .refresh_claim_of(&name)
+            .filter(|c| c.is_active_at(wall_now))
+            .map(|c| c.remaining_ms(wall_now).div_ceil(1_000));
         entries.push(EntryInfo {
             name,
             state,
@@ -320,6 +368,13 @@ fn collect_entry_infos<C: Clock>(store: &Store, clock: &C) -> Vec<EntryInfo> {
             source,
             backoff_until_secs,
             guard_summary,
+            // DR-0034 §4. Value-free: a change counter and a remaining
+            // duration. The claim *token* is deliberately absent — `status`
+            // and `kv list` are readable by anyone who can reach the socket,
+            // and publishing the token would let a bystander complete or
+            // cancel someone else's refresh.
+            version,
+            claim_expires_in_secs,
         });
     }
     entries
@@ -498,7 +553,21 @@ where
                     Vec::new()
                 }
             };
-            Response::set_ack_with_guard(guard_applied)
+            // Every write advances the version, whether or not this caller
+            // asked for a compare-and-swap. A write that left the counter
+            // alone would be invisible to the CAS callers racing it, which is
+            // precisely who the counter exists for.
+            let version = match store.bump_version(key.clone(), ctx.store_cap) {
+                Ok(v) => v,
+                Err(_) => return Response::error(ErrorKind::Internal, "capability mismatch"),
+            };
+            // A completed write ends the refresh its claim was held for. The
+            // fence above already established that this caller is entitled to
+            // release it.
+            if store.clear_refresh_claim(&key, ctx.store_cap).is_err() {
+                return Response::error(ErrorKind::Internal, "capability mismatch (claim)");
+            }
+            Response::set_ack_with_guard_and_version(guard_applied, version)
         }
         Err(cache_warden::SetError::InvalidKey(e)) => {
             Response::error(ErrorKind::BadRequest, e.to_string())
@@ -507,6 +576,160 @@ where
             Response::error(ErrorKind::Internal, "capability mismatch")
         }
     }
+}
+
+/// Longest refresh claim the daemon will grant, in seconds.
+///
+/// The expiry exists to reclaim a key from a caller that died mid-refresh, so
+/// a duration long enough to defeat that reclamation defeats the mechanism: a
+/// crashed holder would wedge the credential for as long as it asked for. An
+/// hour is far beyond any honest provider round trip while still bounding the
+/// damage, and a caller that genuinely needs longer can re-claim.
+const MAX_CLAIM_SECS: u64 = 3600;
+
+/// Wall-clock milliseconds since the Unix epoch.
+///
+/// Claims are compared against wall time, not the injected [`Clock`], because
+/// a claim outlives the process that took it (DR-0034 §4) and a monotonic
+/// reading taken by a dead process means nothing to its successor.
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether `supplied` is the token `held` by the active claim.
+///
+/// Both sides go through [`ClaimToken`] rather than being compared as raw
+/// strings, for two reasons. The comparison is constant-time, so a caller
+/// cannot narrow a token down byte by byte from response timing — the token is
+/// not a secret, but it is the only thing standing between a bystander and
+/// hijacking a credential refresh, and a variable-time `==` on it is the kind
+/// of detail that gets copied somewhere it matters more. And parsing the
+/// caller's string first means a malformed token is rejected as malformed
+/// instead of falling through to a comparison that could never have matched.
+fn claim_token_matches(held: &str, supplied: &str) -> bool {
+    match (ClaimToken::parse(held), ClaimToken::parse(supplied)) {
+        (Ok(a), Ok(b)) => a.matches(&b),
+        // A stored token that no longer parses is a token nothing can match;
+        // failing closed here beats falling back to a string compare.
+        _ => false,
+    }
+}
+
+/// Reject a write that does not satisfy an active claim (DR-0034 §4).
+///
+/// An **active** claim demands its own token; a lapsed one demands nothing,
+/// because if nobody took over then the original caller's late write is the
+/// only write and there is nothing to protect the key from.
+///
+/// Both refusals share one wire kind but carry different messages: "you did
+/// not bring a token" and "your token is no longer the right one" call for
+/// different next steps — wait or take the claim, versus re-read because
+/// someone took over mid-refresh.
+fn check_claim_fence(store: &Store, key: &str, token: Option<&str>) -> Result<(), Response> {
+    let now = now_epoch_ms();
+    let Some(active) = store.refresh_claim_of(key).filter(|c| c.is_active_at(now)) else {
+        return Ok(());
+    };
+    match token {
+        None => Err(Response::error(
+            ErrorKind::ClaimTokenMismatch,
+            "a refresh is already in progress for this key; wait for it to finish, or pass the token from your own `kv claim`",
+        )),
+        Some(t) if !claim_token_matches(active.token(), t) => Err(Response::error(
+            ErrorKind::ClaimTokenMismatch,
+            "this claim token is no longer the one holding the key: the claim lapsed and another caller took over. Re-read the key and claim again",
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Handle `kv.claim` (DR-0034 §4).
+fn handle_claim<A, R, C>(
+    store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: String,
+    expected_version: u64,
+    duration_secs: u64,
+) -> Response
+where
+    A: ?Sized,
+    R: SourceRunner,
+    C: Clock,
+{
+    if let Err(resp) = validate_protocol_key(&key) {
+        return resp;
+    }
+    // Claiming a key that holds nothing would record a claim nobody can ever
+    // complete — and the store drops claims when values go away, so it would
+    // simply vanish. Refuse plainly instead.
+    if !store.has_value(&key) {
+        return Response::error(ErrorKind::NotFound, "no value stored for this key");
+    }
+
+    if duration_secs == 0 || duration_secs > MAX_CLAIM_SECS {
+        return Response::error(
+            ErrorKind::BadRequest,
+            format!(
+                "claim duration must be between 1 and {MAX_CLAIM_SECS} seconds \
+                 (a claim that outlives the caller has to expire for the key to be reclaimed)"
+            ),
+        );
+    }
+
+    let current = store.version_of(&key);
+    if current != expected_version {
+        return Response::cas_mismatch(current);
+    }
+
+    let now = now_epoch_ms();
+    if let Some(active) = store.refresh_claim_of(&key).filter(|c| c.is_active_at(now)) {
+        return Response::already_claimed(active.remaining_ms(now).div_ceil(1_000));
+    }
+
+    let token = ClaimToken::generate();
+    let expires_at = now.saturating_add(duration_secs.saturating_mul(1_000));
+    let claim = RefreshClaim::new(token.as_str(), now, expires_at);
+    if store.set_refresh_claim(key, claim, ctx.store_cap).is_err() {
+        return Response::error(ErrorKind::Internal, "capability mismatch (claim)");
+    }
+    Response::claimed_ack(current, token.as_str().to_string(), duration_secs)
+}
+
+/// Handle `kv.unclaim` (DR-0034 §4).
+fn handle_unclaim<A, R, C>(
+    store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: String,
+    claim_token: String,
+) -> Response
+where
+    A: ?Sized,
+    R: SourceRunner,
+    C: Clock,
+{
+    if let Err(resp) = validate_protocol_key(&key) {
+        return resp;
+    }
+    let now = now_epoch_ms();
+    match store.refresh_claim_of(&key).filter(|c| c.is_active_at(now)) {
+        // Nothing holds the key. Releasing is a no-op rather than an error, so
+        // a caller retrying after a crash is not punished for it.
+        None => {}
+        Some(active) if !claim_token_matches(active.token(), &claim_token) => {
+            return Response::error(
+                ErrorKind::ClaimTokenMismatch,
+                "this claim token is no longer the one holding the key, so releasing it would cancel someone else's refresh",
+            );
+        }
+        Some(_) => {}
+    }
+    if store.clear_refresh_claim(&key, ctx.store_cap).is_err() {
+        return Response::error(ErrorKind::Internal, "capability mismatch (claim)");
+    }
+    Response::unclaimed_ack()
 }
 
 /// The wire kind label surfaced in `Set { guard_applied }` and in
@@ -1342,6 +1565,8 @@ mod tests {
             soft_ttl_secs: Some(SOFT),
             hard_ttl_secs: Some(HARD),
             guard_constraints: Vec::new(),
+            expected_version: None,
+            claim_token: None,
         }
     }
 
@@ -1606,6 +1831,8 @@ mod tests {
             soft_ttl_secs: Some(SOFT),
             hard_ttl_secs: Some(HARD),
             guard_constraints: vec![GuardConstraintWire::SameUser],
+            expected_version: None,
+            claim_token: None,
         };
         let resp = handle_request(&mut store, &c, req);
         assert_eq!(set_guard_applied(&resp), vec!["same-user".to_string()]);
@@ -1655,6 +1882,8 @@ mod tests {
             soft_ttl_secs: Some(SOFT),
             hard_ttl_secs: Some(HARD),
             guard_constraints: vec![GuardConstraintWire::SameUser],
+            expected_version: None,
+            claim_token: None,
         };
         assert!(handle_request(&mut store, &setter_ctx, set_req).is_ok());
 
@@ -1721,6 +1950,8 @@ mod tests {
                     soft_ttl_secs: Some(SOFT),
                     hard_ttl_secs: Some(HARD),
                     guard_constraints: vec![GuardConstraintWire::SameUser],
+                    expected_version: None,
+                    claim_token: None,
                 },
             )
             .is_ok()
@@ -1792,6 +2023,8 @@ mod tests {
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 guard_constraints: vec![GuardConstraintWire::SameShell],
+                expected_version: None,
+                claim_token: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
@@ -1827,6 +2060,8 @@ mod tests {
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 guard_constraints: vec![GuardConstraintWire::SameUser],
+                expected_version: None,
+                claim_token: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
@@ -1867,6 +2102,8 @@ mod tests {
                     soft_ttl_secs: None,
                     hard_ttl_secs: None,
                     guard_constraints: vec![GuardConstraintWire::SameUser],
+                    expected_version: None,
+                    claim_token: None,
                 },
             )
             .is_ok()
@@ -1929,6 +2166,8 @@ mod tests {
                     soft_ttl_secs: None,
                     hard_ttl_secs: None,
                     guard_constraints: vec![GuardConstraintWire::SameUser],
+                    expected_version: None,
+                    claim_token: None,
                 },
             )
             .is_ok()
@@ -1999,6 +2238,8 @@ mod tests {
                         GuardConstraintWire::Command { name: "git".into() },
                         GuardConstraintWire::SameUser,
                     ],
+                    expected_version: None,
+                    claim_token: None,
                 },
             )
             .is_ok()
@@ -2065,6 +2306,8 @@ mod tests {
                 soft_ttl_secs: Some(SOFT),
                 hard_ttl_secs: Some(HARD),
                 guard_constraints: vec![GuardConstraintWire::SameShell],
+                expected_version: None,
+                claim_token: None,
             },
         );
         // The set succeeds and the ack names the applied kind.
@@ -2121,6 +2364,8 @@ mod tests {
                     soft_ttl_secs: Some(SOFT),
                     hard_ttl_secs: Some(HARD),
                     guard_constraints: vec![GuardConstraintWire::SameShell],
+                    expected_version: None,
+                    claim_token: None,
                 },
             )
             .is_ok()
@@ -2193,6 +2438,8 @@ mod tests {
                 guard_constraints: vec![GuardConstraintWire::SameAncestor {
                     name: "/usr/bin/git".to_string(),
                 }],
+                expected_version: None,
+                claim_token: None,
             },
         );
         assert_eq!(set_guard_applied(&set), vec!["same-ancestor".to_string()]);
@@ -2279,6 +2526,8 @@ mod tests {
                     soft_ttl_secs: Some(SOFT),
                     hard_ttl_secs: Some(HARD),
                     guard_constraints: vec![GuardConstraintWire::SameUser],
+                    expected_version: None,
+                    claim_token: None,
                 },
             )
             .is_ok()
@@ -2303,6 +2552,8 @@ mod tests {
                 soft_ttl_secs: Some(1000),
                 hard_ttl_secs: Some(1),
                 guard_constraints: Vec::new(),
+                expected_version: None,
+                claim_token: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
@@ -2344,6 +2595,8 @@ mod tests {
                     soft_ttl_secs: Some(SOFT),
                     hard_ttl_secs: Some(HARD),
                     guard_constraints: vec![GuardConstraintWire::SameUser],
+                    expected_version: None,
+                    claim_token: None,
                 },
             )
             .is_ok()
@@ -2364,6 +2617,8 @@ mod tests {
                 soft_ttl_secs: None,
                 hard_ttl_secs: None,
                 guard_constraints: Vec::new(),
+                expected_version: None,
+                claim_token: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
@@ -2578,6 +2833,8 @@ mod tests {
             soft_ttl_secs: None,
             hard_ttl_secs: None,
             guard_constraints: Vec::new(),
+            expected_version: None,
+            claim_token: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -2626,6 +2883,8 @@ mod tests {
             soft_ttl_secs: None,
             hard_ttl_secs: None,
             guard_constraints: Vec::new(),
+            expected_version: None,
+            claim_token: None,
         };
         assert!(handle_request(&mut store, &c, req).is_ok());
         assert!(store.has_value("default/authsock"));
@@ -2836,6 +3095,8 @@ mod tests {
             soft_ttl_secs: None,
             hard_ttl_secs: None,
             guard_constraints: Vec::new(),
+            expected_version: None,
+            claim_token: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -2896,6 +3157,8 @@ mod tests {
             soft_ttl_secs: Some(100),
             hard_ttl_secs: Some(10),
             guard_constraints: Vec::new(),
+            expected_version: None,
+            claim_token: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -2917,6 +3180,8 @@ mod tests {
             soft_ttl_secs: None,
             hard_ttl_secs: None,
             guard_constraints: Vec::new(),
+            expected_version: None,
+            claim_token: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -3066,6 +3331,8 @@ mod tests {
                     soft_ttl_secs: None,
                     hard_ttl_secs: None,
                     guard_constraints: Vec::new(),
+                    expected_version: None,
+                    claim_token: None,
                 },
             );
         }
@@ -3855,6 +4122,487 @@ mod tests {
                 _ => panic!("not list"),
             },
             _ => panic!("expected ok"),
+        }
+    }
+
+    // ---- DR-0034 §4: CAS + refresh claims ----
+    //
+    // The daemon owns the *policy* here (the core only stores the version and
+    // the claim), so these drive `handle_request` end to end rather than
+    // poking the store.
+    mod refresh_arbitration {
+        use super::*;
+
+        fn set_req(key: &str, value: &[u8], expected: Option<u64>, token: Option<&str>) -> Request {
+            Request::KvSet {
+                key: key.into(),
+                source: SetSource::Static {
+                    value_b64: encode_b64(value),
+                },
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+                guard_constraints: Vec::new(),
+                expected_version: expected,
+                claim_token: token.map(str::to_string),
+            }
+        }
+
+        fn set_version(resp: &Response) -> Option<u64> {
+            match resp {
+                Response::Ok(ok) => match &ok.payload {
+                    OkPayload::Set { version, .. } => *version,
+                    other => panic!("expected a Set ack, got {other:?}"),
+                },
+                other => panic!("expected ok, got {other:?}"),
+            }
+        }
+
+        fn err_kind(resp: &Response) -> ErrorKind {
+            match resp {
+                Response::Err(e) => e.error.kind,
+                other => panic!("expected an error, got {other:?}"),
+            }
+        }
+
+        fn claim_token_of(resp: &Response) -> String {
+            match resp {
+                Response::Ok(ok) => match &ok.payload {
+                    OkPayload::Claimed { claim_token, .. } => claim_token.clone(),
+                    other => panic!("expected a Claimed ack, got {other:?}"),
+                },
+                other => panic!("expected ok, got {other:?}"),
+            }
+        }
+
+        /// Every write advances the version, including one that asked for no
+        /// compare-and-swap. A write invisible to the counter would be
+        /// invisible to the CAS callers racing it.
+        #[test]
+        fn an_unconditional_set_still_advances_the_version() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+
+            let r = handle_request(&mut store, &c, set_req("default/K", b"a", None, None));
+            assert_eq!(set_version(&r), Some(1));
+            let r = handle_request(&mut store, &c, set_req("default/K", b"b", None, None));
+            assert_eq!(set_version(&r), Some(2));
+        }
+
+        #[test]
+        fn a_create_expecting_version_zero_succeeds_then_collides() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+
+            let r = handle_request(&mut store, &c, set_req("default/K", b"a", Some(0), None));
+            assert_eq!(set_version(&r), Some(1));
+
+            // A second create against "must not exist" must lose.
+            let r = handle_request(&mut store, &c, set_req("default/K", b"b", Some(0), None));
+            assert_eq!(err_kind(&r), ErrorKind::CasMismatch);
+        }
+
+        /// The race the version exists for: two callers write from the same
+        /// read, one wins, the loser is told where to retry from.
+        #[test]
+        fn only_one_of_two_writers_from_the_same_read_wins() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v1", None, None));
+
+            let winner = handle_request(&mut store, &c, set_req("default/K", b"A", Some(1), None));
+            let loser = handle_request(&mut store, &c, set_req("default/K", b"B", Some(1), None));
+
+            assert_eq!(set_version(&winner), Some(2));
+            match &loser {
+                Response::Err(e) => {
+                    assert_eq!(e.error.kind, ErrorKind::CasMismatch);
+                    assert_eq!(
+                        e.error.current_version,
+                        Some(2),
+                        "the loser must learn the version to retry from"
+                    );
+                }
+                other => panic!("expected CasMismatch, got {other:?}"),
+            }
+        }
+
+        /// A refused compare-and-swap must not have written. Checking the
+        /// version rather than the value catches a partial apply too.
+        #[test]
+        fn a_refused_compare_and_swap_changes_nothing() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v1", None, None));
+
+            let r = handle_request(
+                &mut store,
+                &c,
+                set_req("default/K", b"loser", Some(99), None),
+            );
+            assert_eq!(err_kind(&r), ErrorKind::CasMismatch);
+            assert_eq!(store.version_of("default/K"), 1, "version untouched");
+        }
+
+        #[test]
+        fn claiming_reports_the_current_version_without_advancing_it() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v", None, None));
+
+            let r = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 1,
+                    duration_secs: 300,
+                },
+            );
+            assert!(!claim_token_of(&r).is_empty());
+            assert_eq!(
+                store.version_of("default/K"),
+                1,
+                "a claim alters no value, so it must not advance the version"
+            );
+        }
+
+        #[test]
+        fn a_second_claim_is_refused_while_the_first_holds() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v", None, None));
+            let claim = Request::KvClaim {
+                key: "default/K".into(),
+                expected_version: 1,
+                duration_secs: 300,
+            };
+            handle_request(&mut store, &c, claim.clone());
+
+            let r = handle_request(&mut store, &c, claim);
+            match &r {
+                Response::Err(e) => {
+                    assert_eq!(e.error.kind, ErrorKind::AlreadyClaimed);
+                    assert!(e.error.claim_expires_in_secs.is_some());
+                }
+                other => panic!("expected AlreadyClaimed, got {other:?}"),
+            }
+        }
+
+        /// A zero-second claim is born lapsed, which is how the lapsed path is
+        /// reached without waiting for wall-clock time.
+        #[test]
+        fn a_lapsed_claim_can_be_taken_over_and_does_not_fence_writes() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v", None, None));
+            let lapsed = Request::KvClaim {
+                key: "default/K".into(),
+                expected_version: 1,
+                duration_secs: 0,
+            };
+            handle_request(&mut store, &c, lapsed);
+
+            // Nobody holds it, so an untokened write goes through…
+            let r = handle_request(&mut store, &c, set_req("default/K", b"late", Some(1), None));
+            assert_eq!(set_version(&r), Some(2));
+            // …and a fresh claim can be taken.
+            let r = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 2,
+                    duration_secs: 300,
+                },
+            );
+            assert!(!claim_token_of(&r).is_empty());
+        }
+
+        #[test]
+        fn a_write_during_an_active_claim_needs_that_claims_token() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v", None, None));
+            let held = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 1,
+                    duration_secs: 300,
+                },
+            );
+            let token = claim_token_of(&held);
+
+            // No token at all.
+            let r = handle_request(&mut store, &c, set_req("default/K", b"x", Some(1), None));
+            assert_eq!(err_kind(&r), ErrorKind::ClaimTokenMismatch);
+            // Someone else's token.
+            let r = handle_request(
+                &mut store,
+                &c,
+                set_req("default/K", b"x", Some(1), Some("AAAAAAAAAAAAAAAAAAAAAA")),
+            );
+            assert_eq!(err_kind(&r), ErrorKind::ClaimTokenMismatch);
+            // The holder's token.
+            let r = handle_request(
+                &mut store,
+                &c,
+                set_req("default/K", b"fresh", Some(1), Some(&token)),
+            );
+            assert_eq!(set_version(&r), Some(2));
+            assert!(
+                store.refresh_claim_of("default/K").is_none(),
+                "a completed write ends the refresh its claim was held for"
+            );
+        }
+
+        #[test]
+        fn unclaiming_frees_the_key_and_rejects_a_stale_token() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v", None, None));
+            let held = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 1,
+                    duration_secs: 300,
+                },
+            );
+            let token = claim_token_of(&held);
+
+            let r = handle_request(
+                &mut store,
+                &c,
+                Request::KvUnclaim {
+                    key: "default/K".into(),
+                    claim_token: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+                },
+            );
+            assert_eq!(err_kind(&r), ErrorKind::ClaimTokenMismatch);
+
+            let r = handle_request(
+                &mut store,
+                &c,
+                Request::KvUnclaim {
+                    key: "default/K".into(),
+                    claim_token: token.clone(),
+                },
+            );
+            assert!(matches!(r, Response::Ok(_)));
+            assert!(store.refresh_claim_of("default/K").is_none());
+
+            // Releasing again is a no-op, so a retry after a crash is not
+            // punished.
+            let r = handle_request(
+                &mut store,
+                &c,
+                Request::KvUnclaim {
+                    key: "default/K".into(),
+                    claim_token: token,
+                },
+            );
+            assert!(matches!(r, Response::Ok(_)));
+        }
+
+        /// The expiry is what reclaims a key from a caller that died
+        /// mid-refresh, so a duration long enough to defeat that reclamation
+        /// defeats the mechanism. Zero is refused for the opposite reason: a
+        /// claim born lapsed grants nothing while looking like it did.
+        #[test]
+        fn an_out_of_range_claim_duration_is_refused() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v", None, None));
+
+            for bad in [0, MAX_CLAIM_SECS + 1, u64::MAX] {
+                let r = handle_request(
+                    &mut store,
+                    &c,
+                    Request::KvClaim {
+                        key: "default/K".into(),
+                        expected_version: 1,
+                        duration_secs: bad,
+                    },
+                );
+                assert_eq!(err_kind(&r), ErrorKind::BadRequest, "duration {bad}");
+                assert!(
+                    store.refresh_claim_of("default/K").is_none(),
+                    "a refused claim must not be recorded"
+                );
+            }
+
+            // The boundary itself is allowed.
+            let r = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 1,
+                    duration_secs: MAX_CLAIM_SECS,
+                },
+            );
+            assert!(!claim_token_of(&r).is_empty());
+        }
+
+        /// A malformed token must be refused as such rather than reaching a
+        /// comparison it could never have won — and must never be treated as
+        /// a match.
+        #[test]
+        fn a_malformed_claim_token_never_passes_the_fence() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v", None, None));
+            handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 1,
+                    duration_secs: 300,
+                },
+            );
+
+            for bad in ["", "short", "!!!!!!!!!!!!!!!!!!!!!!", &"A".repeat(64)] {
+                let r = handle_request(
+                    &mut store,
+                    &c,
+                    set_req("default/K", b"x", Some(1), Some(bad)),
+                );
+                assert_eq!(err_kind(&r), ErrorKind::ClaimTokenMismatch, "token {bad:?}");
+            }
+        }
+
+        /// The two refusals share a wire kind but must not share a message:
+        /// "bring a token" and "your token is stale" call for different next
+        /// steps.
+        #[test]
+        fn a_missing_token_and_a_wrong_token_are_explained_differently() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v", None, None));
+            handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 1,
+                    duration_secs: 300,
+                },
+            );
+
+            let msg = |resp: &Response| match resp {
+                Response::Err(e) => e.error.message.clone(),
+                other => panic!("expected an error, got {other:?}"),
+            };
+            let absent = msg(&handle_request(
+                &mut store,
+                &c,
+                set_req("default/K", b"x", Some(1), None),
+            ));
+            let wrong = msg(&handle_request(
+                &mut store,
+                &c,
+                set_req("default/K", b"x", Some(1), Some("AAAAAAAAAAAAAAAAAAAAAA")),
+            ));
+            assert_ne!(absent, wrong);
+            assert!(absent.contains("wait"), "{absent}");
+            assert!(wrong.contains("took over"), "{wrong}");
+        }
+
+        #[test]
+        fn claiming_a_key_with_no_value_is_refused() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            let r = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/NOPE".into(),
+                    expected_version: 0,
+                    duration_secs: 60,
+                },
+            );
+            assert_eq!(err_kind(&r), ErrorKind::NotFound);
+        }
+
+        #[test]
+        fn claiming_from_a_stale_read_is_refused() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"a", None, None));
+            handle_request(&mut store, &c, set_req("default/K", b"b", None, None));
+
+            let r = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 1,
+                    duration_secs: 60,
+                },
+            );
+            assert_eq!(err_kind(&r), ErrorKind::CasMismatch);
+        }
+
+        /// `status` reports the version and remaining claim time, and never
+        /// the token — anyone who can reach the socket can read this reply.
+        #[test]
+        fn status_reports_version_and_claim_but_never_the_token() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+            handle_request(&mut store, &c, set_req("default/K", b"v", None, None));
+            let held = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 1,
+                    duration_secs: 300,
+                },
+            );
+            let token = claim_token_of(&held);
+
+            let resp = handle_request(&mut store, &c, Request::Status);
+            let line = serde_json::to_string(&resp).unwrap();
+            assert!(line.contains(r#""version":1"#), "{line}");
+            assert!(line.contains("claim_expires_in_secs"), "{line}");
+            assert!(
+                !line.contains(&token),
+                "the claim token must never appear in a status reply"
+            );
         }
     }
 }

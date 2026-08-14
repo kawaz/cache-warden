@@ -71,6 +71,7 @@ mod guard;
 mod key;
 mod meta;
 mod process;
+mod refresh;
 mod secret;
 mod snapshot;
 mod source;
@@ -91,6 +92,7 @@ pub use guard::{DeclaredAncestor, GuardConstraint, GuardRecord, GuardSetter, Pin
 pub use key::{InvalidKey, validate_key_syntax};
 pub use meta::{SourceMeta, ValueMeta};
 pub use process::{FakeInspector, InspectError, ProcessInfo, ProcessInspector, SystemInspector};
+pub use refresh::RefreshClaim;
 pub use secret::SecretBytes;
 pub use snapshot::{ExportError, ImportError, StoreSnapshot};
 pub use source::{CommandRunner, RunError, SourceRunner, TrailingNewline, ValueSource};

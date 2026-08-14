@@ -29,6 +29,11 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time", "process"] }
 # base64 encoding of secret bytes on the control-socket wire (DR-0009).
 base64 = "0.22"
+# DR-0034 §4 claim tokens. Reuses the vault crate's `ClaimToken` (minting,
+# shape validation, constant-time compare) rather than growing a second
+# implementation of the same primitive in this crate; phase 3 needs the
+# dependency for the vault itself regardless.
+cache-warden-vault = { path = "../cache-warden-vault" }
 # TOML configuration file parsing (DR-0010). Kept on the CLI side only; the
 # library stays dependency-minimal (DR-0002).
 toml = "0.8"
