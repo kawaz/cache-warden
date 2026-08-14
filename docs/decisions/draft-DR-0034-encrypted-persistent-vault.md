@@ -177,6 +177,20 @@ kawaz 裁定 8 (CAS 採用) + 裁定 17 (着手時 claim) により:
 - **CAS だけでは provider 呼び出しは直列化できない**ことが、そもそも着手時 claim を足す
   理由である (CAS は書き戻しの勝者を決めるだけで、敗者も既に provider を叩いている)。
   claim を先に置くことで provider 呼び出し自体が 1 本に絞られる。
+- **claim token (fencing)**: claim 取得時に daemon が不透明 token (16byte CSPRNG、
+  base64url) を発行し、**claim が有効な間の書き戻し (`kv.set`) は正しい token の提示を
+  要求する** (実装フェーズ 2 で追加、2026-08-14)。expiry + CAS だけでは「A が claim →
+  停止 → expiry 経過 → B が claim」の後に**復活した A の書き戻しを弾けない** (その間
+  version が動いていなければ expected_version が一致してしまう) ため。token は
+  「現在有効な claim の保持者である」という **capability** であって requester の識別では
+  なく、「requester 識別に依存しない」という本節の裁定と衝突しない。token は推測不能で
+  ある必要がある (他プロセスによる claim の横取り・解放の防止) が秘密ではない。
+- wire は `kv.claim` / `kv.unclaim` (pin/unpin と対称の命名)、`kv.set` に
+  `expected_version` / `claim_token` を additive 追加、CAS 不一致は
+  `cas_mismatch` + `current_version`、二重 claim は `already_claimed` +
+  `claim_expires_in_secs`。
+- **将来 TODO**: cw-owned entry の `kv.del` (§5 の「クレデンシャルを捨てる」重い操作)
+  にも `expected_version` を要求する拡張。フェーズ 2 スコープ外として先送り。
 - 認可との合成順序は **owner 認可 → CAS 検証 → 更新** (DR-0033 §3d)。
 
 ### 5. persist = cw-owned の一本化
