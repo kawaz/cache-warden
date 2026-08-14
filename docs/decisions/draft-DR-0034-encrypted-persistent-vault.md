@@ -209,8 +209,10 @@ kawaz 裁定 8 (CAS 採用) + 裁定 17 (着手時 claim) により:
   llm-gateway が再認可フローに落ちて**重複 grant を作る**事故が起きるため、
   「鍵が閉まっているだけ (unlock すれば読める)」と「認可がない (読めない)」を明確に分ける。
   §3a の「旧 RT が失効した」もこれらとは別の種別として扱う。
-- **lock 契機**: 明示 `cw vault lock` / idle timeout (config、既定値は実装時に決める) /
-  システム sleep。unlock 後の DEK は **mlock されたバッファに常駐**し (DR-0007)、lock 時に
+- **lock 契機**: 明示 `cw vault lock` / プロセス終了。idle timeout は **既定オフ**
+  (config で有効化可。kawaz 裁定 2026-08-14: passkey の役目は起動時の鍵の取り出しと登録で
+  あって存在確認ではない — llm-gateway 用途では unlock は起動直後の 1 回で以後無期限が正)。
+  システム sleep での自動 lock も同理由で既定オフ。unlock 後の DEK は **mlock されたバッファに常駐**し (DR-0007)、lock 時に
   **zeroize** する (DR-0028 の `with_exposed` 経由でのみ触る)。
 - **DEK の常駐期間そのものが v1 の弱点**であることを明記する。unlock 中は、cw プロセスの
   メモリを読める攻撃者に対して vault の暗号化は無力になる (これは全ての「開いている
@@ -294,13 +296,13 @@ DR-0029 の handoff snapshot と vault はどちらも「再起動を越えて�
 役割の重なりを整理する必要がある。本 DR の方針は:
 
 - **vault は cw-owned entry の正本、snapshot は「開いている状態」の引き継ぎ**。
-- graceful restart で **DEK を handoff に含めれば再起動後も unlocked を維持でき、含めなければ
-  再起動のたびに unlock ceremony が要る**。前者は UX が良く、後者は「秘密の生存期間を
-  プロセス生存期間に縛る」という cw の既存思想に忠実である。
-- **どちらを採るかは Open Q1 とする** (裁定が無いため。判断材料: handoff channel は匿名
-  socketpair で構造的に private であり DR-0029 が既に秘密を運んでいるので、DEK を足すこと
-  自体に新しい信頼前提は生じない。一方で「再起動を跨いで vault が開きっぱなし」は
-  §6 の lock 契機の設計と整合を取る必要がある)。
+- **graceful restart の handoff には DEK を含め、再起動後も unlocked を維持する** (kawaz
+  裁定 2026-08-14: 「当然含める。そのための graceful restart。upgrade で大量の TouchID を
+  求められるのが嫌というところから来ている」)。handoff channel は匿名 socketpair で構造的に
+  private であり、DR-0029 が既に秘密を運んでいるので DEK を足しても新しい信頼前提は
+  生じない。
+- **非 graceful な再起動 (PC 再起動 / crash)** では DEK は残らず、初回の unlock ceremony
+  (passkey) が必要になる (同裁定)。
 
 ## セキュリティ整理
 
@@ -365,31 +367,40 @@ DR-0029 の handoff snapshot と vault はどちらも「再起動を越えて�
 
 ## Open Questions
 
-1. **graceful restart handoff に DEK を含めるか** (§11): 含めれば再起動後も unlocked を
-   維持でき UX が良い。含めなければ「秘密の生存期間 = プロセス生存期間」という既存思想に
-   忠実。DR-0029 の handoff channel は既に秘密を運んでいるので新しい信頼前提は生じないが、
-   §6 の lock 契機との整合を取る必要がある。**裁定が無いため未決**。
+1. ~~graceful restart handoff に DEK を含めるか~~ — **裁定済み (2026-08-14): 含める**。
+   §11 に反映済み。
 2. **vault rollback 脅威の扱い** (tri-review §2、sol C3): AEAD は「正当だが古い vault
-   ファイル」への丸ごと差し戻しを検出できない。差し戻されると旧 RT や削除済みスロットが
-   復活する。二択を提示する:
-   - **(a) 単調カウンタを外部の信頼アンカーに置く** (Keychain または Secure Enclave に
-     `dek_generation` / CAS version の高水位を記録し、vault の値がそれを下回れば拒否)。
-     検出できるようになるが、cw が Keychain / SE への依存を持つことになり、
-     「TouchID / SE と縁を切る」方針 (裁定 6) と緊張関係に入る。またその外部アンカー
-     自体の破損時の復旧設計が要る。
-   - **(b) 防御対象外と明記する** (真の失効は OAuth 側 revoke に委ねる)。実装コストゼロ、
-     方針とも衝突しないが、「ファイルを書き戻せる攻撃者」に対して削除済みスロットの復活を
-     許す。
-   **裁定が無いため発明せず、この二択のまま kawaz 判断を仰ぐ**。
-3. **idle lock timeout の既定値**: §6 の lock 契機のうち idle timeout の既定秒数。
-   llm-gateway が常時 refresh する用途では長め (または無効) が実用的だが、短いほど
-   DEK 常駐時間が減る。dogfood の実測で決めるのが妥当と考えられる。
+   ファイル」への丸ごと差し戻しを検出できない。統括分析 (2026-08-14): rollback 可能な
+   攻撃者 (same-uid でディスクに書ける) は旧ファイルのコピーを旧スロット秘密でオフライン
+   復号する方が早く、**開示面で rollback 固有の新規攻撃は無い** (§7 の「過去コピーには
+   失効が効かない」に包含される)。実害の本体は整合性/可用性 — CAS version の巻き戻りで
+   消費済み RT を再利用しファミリー失効 (ただし §3a の回復契約 = 再認証で自己検出・回復
+   する)。外部単調カウンタ (下記 a) が買えるのは fail-loud の検出能力のみで機密性は
+   上がらない。二択:
+   - **(a) 単調カウンタを外部の信頼アンカーに置く** (Keychain / SE に `dek_generation` /
+     CAS version の高水位を記録)。検出可能になるが Keychain/SE 依存 (裁定 6 と緊張) +
+     アンカー破損時の復旧設計が要る。
+   - **(b) 防御対象外と明記する** (真の失効は OAuth 側 revoke に委ねる)。**統括推奨** —
+     rollback 攻撃者はオフライン復号で同等以上が既に可能で、実害側は既存の回復契約で
+     受け止まるため。
+3. ~~idle lock timeout の既定値~~ — **裁定済み (2026-08-14): 既定は idle lock なし**
+   (unlock は明示 `cw vault lock` かプロセス終了まで持続、config で有効化可)。passkey の
+   役目は「起動時の鍵の取り出しと登録」であって存在確認ではない (kawaz)。§6 の lock 契機
+   から idle timeout を既定オフに変更。
 4. **Time Machine / Spotlight 除外の実施可否** (§7): 除外設定が実際に効くか、
    ユーザ環境で勝手に設定してよいか (システム設定の書き換えになるなら案内に留めるべき)。
    実装時に実機確認。
 5. **`objc2-authentication-services` / webauthn-rs のカバレッジ**: ブラウザ経路を採るので
    native PRF API への依存は無い見込みだが、daemon 側の assertion 検証で PRF 拡張の出力を
    扱えるか (webauthn-rs の PRF 拡張サポート状況) は実装前に compile PoC で確認する。
+   **試験経路の補足** (kawaz 問い 2026-08-14 への回答): OS の platform authenticator に
+   試験用鍵ペアを注入する口は無いが、試験は authenticator をソフトウェアで代替する 2 段で
+   成立する — (a) 単体: WebAuthn assertion / PRF (= CTAP2 hmac-secret、HMAC-SHA256) は
+   公開仕様どおり生鍵ペアから構築できるため、software authenticator (webauthn-rs の
+   softtoken 等) で RP 検証・HKDF・unlock を TouchID ゼロで回す。(b) ブラウザ e2e:
+   Chrome CDP の virtual authenticator (`WebAuthn.addVirtualAuthenticator`、hmac-secret
+   対応) を注入する。1Password 拡張の passkey も本質は同じ「拡張自身が software
+   authenticator として自前保管鍵で署名する」構造。
 
 ## 実装フェーズ想定 (accept 後)
 
