@@ -186,9 +186,24 @@ pub(crate) fn handle_request(shared: &Shared) -> Response {
             store.export_snapshot(&shared.control_cap, &shared.clock)
         };
 
+        // DR-0034 §11. Taken after the store guard above has been dropped, so
+        // this keeps to the store → vault lock order.
+        let dek = shared.vault.as_ref().and_then(|v| {
+            v.lock()
+                .ok()
+                .and_then(|g| g.unlocked().map(|u| u.export_dek()))
+        });
+
         let prepared = snapshot
             .map_err(|e| format!("cannot export store snapshot: {e}"))
-            .and_then(|snapshot| handoff::prepare(snapshot, &shared.exe_path, &shared.argv));
+            .and_then(|snapshot| {
+                handoff::prepare(
+                    snapshot,
+                    dek.as_ref().map(|k| k.as_slice()),
+                    &shared.exe_path,
+                    &shared.argv,
+                )
+            });
 
         match prepared {
             Ok(p) => {

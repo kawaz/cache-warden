@@ -40,6 +40,13 @@ const HANDOFF_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) struct IncomingHandoff {
     pub(crate) stream: UnixStream,
     pub(crate) snapshot: StoreSnapshot,
+    /// The vault data key the predecessor was holding (DR-0034 §11), or `None`
+    /// when it had none — or when this build could not read the frame.
+    ///
+    /// `None` means the successor starts with the vault **locked**, which is
+    /// the safe direction: the user unlocks once, rather than a handoff that
+    /// went wrong leaving a vault open.
+    pub(crate) dek: Option<Zeroizing<Vec<u8>>>,
 }
 
 /// If `CACHE_WARDEN_HANDOFF_FD` is set, take it (unsetting the env var
@@ -105,7 +112,11 @@ pub(crate) fn try_receive() -> Option<IncomingHandoff> {
     }
 
     match read_snapshot(&mut stream) {
-        Ok(snapshot) => Some(IncomingHandoff { stream, snapshot }),
+        Ok((snapshot, dek)) => Some(IncomingHandoff {
+            stream,
+            snapshot,
+            dek,
+        }),
         Err(e) => {
             eprintln!(
                 "cache-warden: warning: graceful-restart handoff failed ({e}); falling back to \
@@ -190,7 +201,9 @@ fn read_exact_into(
 /// `len(4B) + payload`. Reading stops exactly there (never depends on EOF —
 /// matching [`StoreSnapshot::from_bytes`]'s own contract), which leaves any
 /// later frame (a future two-phase-commit variant) unread and untouched.
-fn read_snapshot(stream: &mut UnixStream) -> std::io::Result<StoreSnapshot> {
+fn read_snapshot(
+    stream: &mut UnixStream,
+) -> std::io::Result<(StoreSnapshot, Option<Zeroizing<Vec<u8>>>)> {
     let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
 
     // magic(8) + format_version(4) + entry_count(4).
@@ -205,8 +218,26 @@ fn read_snapshot(stream: &mut UnixStream) -> std::io::Result<StoreSnapshot> {
         read_exact_into(stream, &mut buf, len)?;
     }
 
-    StoreSnapshot::from_bytes(&buf)
-        .map_err(|e| std::io::Error::other(format!("malformed snapshot: {e}")))
+    let snapshot = StoreSnapshot::from_bytes(&buf)
+        .map_err(|e| std::io::Error::other(format!("malformed snapshot: {e}")))?;
+
+    // DR-0034 §11. Whether a data-key frame follows is decided by the
+    // snapshot's version, not by probing the socket: "no frame" and "the frame
+    // has not arrived yet" are indistinguishable from the reading end, and a
+    // guess that fired early would silently turn a graceful restart into a
+    // locked one. A sender that declares the frame always writes it, so this
+    // read is a wait for bytes known to be coming rather than a gamble.
+    let dek = if snapshot.declares_dek_frame() {
+        read_exact_into(stream, &mut buf, StoreSnapshot::DEK_FRAME_LEN)?;
+        // A declared-but-unreadable frame degrades to a locked start rather
+        // than failing the handoff: the entries are already in hand, and the
+        // user unlocks once.
+        StoreSnapshot::read_dek_frame(&buf)
+    } else {
+        None
+    };
+
+    Ok((snapshot, dek))
 }
 
 /// Send the `COMMIT` frame (DR-0029 §5) once this process has fully bound its
@@ -279,8 +310,39 @@ mod tests {
         std::thread::spawn(move || {
             a.write_all(&bytes).unwrap();
         });
-        let back = read_snapshot(&mut b).unwrap();
+        let (back, dek) = read_snapshot(&mut b).unwrap();
         assert!(back.is_empty());
+        assert!(
+            dek.is_none(),
+            "a snapshot that declares no data-key frame must not yield one"
+        );
+    }
+
+    /// DR-0034 §11: a sender that declares the frame always writes it, so the
+    /// receiver's blocking read is a wait for bytes known to be coming. Both
+    /// halves are exercised here — declare *and* append — because a mismatch
+    /// between them is what would stall a real handoff.
+    #[test]
+    fn read_snapshot_recovers_a_declared_data_key_frame() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let (store, cap) = cache_warden::test_helpers::store_with_cap();
+        let clock = cache_warden::FakeClock::new();
+        let mut snap = store.export_snapshot(&cap, &clock).unwrap();
+        snap.declare_dek_frame();
+        let mut bytes = snap.to_bytes().unwrap();
+        let key = [9u8; 32];
+        StoreSnapshot::append_dek_frame(&mut bytes, &key);
+
+        std::thread::spawn(move || {
+            a.write_all(&bytes).unwrap();
+        });
+        let (back, dek) = read_snapshot(&mut b).unwrap();
+        assert!(back.is_empty());
+        assert_eq!(
+            dek.map(|k| k.to_vec()),
+            Some(key.to_vec()),
+            "the successor must inherit the key so an upgrade costs no unlock"
+        );
     }
 
     #[test]

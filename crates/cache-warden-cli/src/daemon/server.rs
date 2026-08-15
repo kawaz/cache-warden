@@ -173,6 +173,15 @@ pub(crate) struct Shared {
     /// `kv.get` gate, and the authsock listener shares the same `Shared` so a
     /// SIGN_REQUEST resolving a KV key consults the same table.
     pub(crate) kv_process_policies: std::collections::BTreeMap<String, Vec<String>>,
+    /// The encrypted vault (DR-0034), or `None` when the config declares none.
+    ///
+    /// See `HandlerCtx::vault` for the lock-order rule: this mutex is only
+    /// ever taken while `store` is already held.
+    pub(crate) vault: Option<Mutex<crate::daemon::vault_state::VaultState>>,
+    /// Keys the config declares `persist = true` (DR-0034 §5). Entry names
+    /// live in the vault's sealed body, so while the vault is closed these
+    /// declarations are the only way to report a persisted entry at all.
+    pub(crate) persisted_keys: std::collections::BTreeSet<String>,
     /// DR-0030 daemon-wide guard policy resolved from `[kv-policy]` at
     /// startup (default-require-same-user, shell-names). Held here so
     /// `run_request` can hand it into every [`HandlerCtx`] without
@@ -767,6 +776,8 @@ impl Shared {
             socket_path: String::new(),
             pid: std::process::id(),
             kv_process_policies: std::collections::BTreeMap::new(),
+            vault: None,
+            persisted_keys: std::collections::BTreeSet::new(),
             kv_policy: crate::config::ResolvedKvPolicy {
                 default_require_same_user: false,
                 shell_names: crate::config::default_shell_names(),
@@ -900,14 +911,18 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
             .failure_backoff(config.fetch_failure_backoff())
             .build()
     };
-    let (handoff_stream, bundle) = match incoming {
-        Some(graceful_restart::receive::IncomingHandoff { stream, snapshot }) => {
+    let (handoff_stream, bundle, inherited_dek) = match incoming {
+        Some(graceful_restart::receive::IncomingHandoff {
+            stream,
+            snapshot,
+            dek: handoff_dek,
+        }) => {
             match Store::import_snapshot(
                 StoreBuilder::new().failure_backoff(config.fetch_failure_backoff()),
                 snapshot,
                 &clock,
             ) {
-                Ok(bundle) => (Some(stream), bundle),
+                Ok(bundle) => (Some(stream), bundle, handoff_dek),
                 Err(e) => {
                     eprintln!(
                         "cache-warden: warning: graceful-restart handoff snapshot was rejected \
@@ -915,12 +930,14 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
                     );
                     // `stream` drops here (closes our end) — the ABORT
                     // signal the old process's state-holder is waiting on
-                    // (DR-0029 §5).
-                    (None, cold_bundle())
+                    // (DR-0029 §5). The inherited data key is dropped with it:
+                    // a cold start has no imported entries for it to open, and
+                    // starting locked is the safe end of a failed handoff.
+                    (None, cold_bundle(), None)
                 }
             }
         }
-        None => (None, cold_bundle()),
+        None => (None, cold_bundle(), None),
     };
 
     // Build `Shared` with the (possibly graceful-restart-imported) Store and
@@ -936,6 +953,93 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
     let fda_applicable = crate::fda::has_op_sources(&config);
     #[cfg(not(target_os = "macos"))]
     let fda_applicable = false;
+    // DR-0034 §5/§7. A vault is configured whenever the config names one or
+    // declares a persisted entry; there is no separate on/off switch (see
+    // `VaultConfig`). Opening it here — before the listener binds — means a
+    // corrupt vault stops startup rather than surfacing on the first read.
+    let vault = {
+        let declared = !config.persisted_keys().is_empty();
+        let configured = config.vault.path.is_some() || config.vault.profile.is_some();
+        match (declared || configured)
+            .then(|| {
+                crate::daemon::vault_state::resolve_path(
+                    config.vault.path.as_deref(),
+                    config.vault.profile.as_deref(),
+                )
+            })
+            .flatten()
+        {
+            None => None,
+            Some(path) => {
+                let vault_path = path.clone();
+                // A vault file that exists but will not parse stops startup:
+                // serving a daemon whose user believes their credentials are
+                // protected by something unreadable is worse than not serving.
+                let state = crate::daemon::vault_state::VaultState::open_at(path)
+                    .map_err(|e| ServerError::Io(std::io::Error::other(format!("vault: {e}"))))?;
+                // DR-0034 §11: a data key inherited from the predecessor reopens
+                // the vault, so a graceful restart does not cost the user an
+                // unlock. A key that does not fit leaves the vault locked rather
+                // than failing startup — the entries are intact on disk and one
+                // `vault unlock` recovers.
+                let state = match (state, inherited_dek.as_ref()) {
+                    (crate::daemon::vault_state::VaultState::Locked { vault }, Some(key)) => {
+                        match vault.unlock_with_dek(key) {
+                            Ok(open) => crate::daemon::vault_state::VaultState::Unlocked {
+                                vault: Box::new(open),
+                            },
+                            Err(e) => {
+                                eprintln!(
+                                    "cache-warden: warning: the vault key handed over by the \
+                                     previous process did not open the vault ({e}); it starts \
+                                     locked. Run `cache-warden vault unlock`."
+                                );
+                                // `unlock_with_dek` consumed the handle, so the
+                                // locked state is rebuilt by re-reading the file.
+                                crate::daemon::vault_state::VaultState::open_at(&vault_path)
+                                    .map_err(|e| {
+                                        ServerError::Io(std::io::Error::other(format!(
+                                            "vault: {e}"
+                                        )))
+                                    })?
+                            }
+                        }
+                    }
+                    (state, _) => state,
+                };
+                // DR-0034 §7: a vault opens for *any* of its slots, so one slot
+                // registered against a development RP sets the strength of the
+                // whole vault. Say so at startup, where it is still cheap to act on.
+                if state.has_dev_rp_slot() {
+                    eprintln!(
+                        "cache-warden: warning: this vault has a slot registered against a \
+                         development origin (localhost). Any such slot can open the whole \
+                         vault — remove it before treating this vault as production."
+                    );
+                }
+                if declared
+                    && matches!(
+                        state,
+                        crate::daemon::vault_state::VaultState::NotInitialized { .. }
+                    )
+                {
+                    eprintln!(
+                        "cache-warden: warning: {} entr{} declared `persist = true` but no vault \
+                         exists yet. Run `cache-warden vault init`; until then those entries \
+                         fail closed.",
+                        config.persisted_keys().len(),
+                        if config.persisted_keys().len() == 1 {
+                            "y is"
+                        } else {
+                            "ies are"
+                        }
+                    );
+                }
+                Some(Mutex::new(state))
+            }
+        }
+    };
+
     let shared = Arc::new(Shared {
         store: Mutex::new(bundle.store),
         control_cap: bundle.control_cap,
@@ -948,6 +1052,8 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         socket_path: socket_path.display().to_string(),
         pid: std::process::id(),
         kv_process_policies: config.kv_process_policies(),
+        vault,
+        persisted_keys: config.persisted_keys(),
         kv_policy: config.kv_policy(),
         exe_path,
         argv,
@@ -1789,6 +1895,8 @@ fn run_request(
         },
         requester: requester.as_deref(),
         kv_process_policies: &shared.kv_process_policies,
+        vault: shared.vault.as_ref(),
+        persisted_keys: &shared.persisted_keys,
         guard_chain: guard_chain.as_deref(),
         guard_audit_token: peer_token,
         kv_policy: &shared.kv_policy,
@@ -2104,6 +2212,8 @@ fn guarded_get_first_pass(
             full_disk_access: None,
             requester: requester.as_deref(),
             kv_process_policies: &shared.kv_process_policies,
+            vault: shared.vault.as_ref(),
+            persisted_keys: &shared.persisted_keys,
             guard_chain: guard_chain.as_deref(),
             guard_audit_token: peer_token,
             kv_policy: &shared.kv_policy,
@@ -2244,6 +2354,8 @@ fn guarded_get_finalize_after_approval(
         full_disk_access: None,
         requester: requester.as_deref(),
         kv_process_policies: &shared.kv_process_policies,
+        vault: shared.vault.as_ref(),
+        persisted_keys: &shared.persisted_keys,
         guard_chain: guard_chain.as_deref(),
         guard_audit_token: peer_token,
         kv_policy: &shared.kv_policy,
@@ -2621,6 +2733,8 @@ mod tests {
             socket_path: "/tmp/test.sock".into(),
             pid: std::process::id(),
             kv_process_policies: std::collections::BTreeMap::new(),
+            vault: None,
+            persisted_keys: std::collections::BTreeSet::new(),
             kv_policy: crate::config::ResolvedKvPolicy {
                 default_require_same_user: false,
                 shell_names: crate::config::default_shell_names(),
@@ -3063,6 +3177,7 @@ mod tests {
                     guard_constraints: Vec::new(),
                     expected_version: None,
                     claim_token: None,
+                    persist: None,
                 },
             )
             .is_ok()
@@ -3290,6 +3405,7 @@ mod tests {
                     guard_constraints: Vec::new(),
                     expected_version: None,
                     claim_token: None,
+                    persist: None,
                 },
             )
             .is_ok()
@@ -3713,6 +3829,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         assert!(run_request(&s, None, None, set).is_ok());
         let resp = run_request(

@@ -239,6 +239,22 @@ pub fn top() -> HelpSpec {
                 desc: "Drop a pin, returning the value to normal TTL evaluation",
             },
             Row {
+                name: "vault init",
+                desc: "Create the encrypted vault (prints its recovery code once)",
+            },
+            Row {
+                name: "vault unlock",
+                desc: "Open the vault so persisted values become readable",
+            },
+            Row {
+                name: "vault lock",
+                desc: "Close the vault, wiping its key from memory",
+            },
+            Row {
+                name: "vault status",
+                desc: "Show whether the vault is open, and what can open it",
+            },
+            Row {
                 name: "run -- CMD ...",
                 desc: "Resolve env references then exec CMD (--dry-run to verify)",
             },
@@ -638,6 +654,11 @@ pub fn kv_set() -> HelpSpec {
                 desc: "Finish the refresh held by `kv claim` (required while a\n\
                        claim is active)",
             },
+            Row {
+                name: "--persist",
+                desc: "Keep this value in the encrypted vault so it survives a\n\
+                       daemon restart, with cache-warden as its source of truth",
+            },
         ],
         detail: "\
 `kv set` injects a literal, opaque value only. To register a regenerable
@@ -672,7 +693,15 @@ completes a refresh started by `kv claim` must also carry that claim's
 
 Value types (otp) live on definitions, not on set values: a typed key must be
 regenerable, so register it with `kv define KEY --type otp ...`. `kv set`
-rejects `--type` / `--otp-*` and points you there.",
+rejects `--type` / `--otp-*` and points you there.
+
+--persist stores the value in the encrypted vault (`cache-warden vault init`
+creates it), so it outlives a daemon restart. Persisting makes cache-warden
+the source of truth for that key: nothing upstream is consulted for it again,
+and `kv del` discards it for good. It needs the vault open — while the vault
+is locked the value is not readable, and `cache-warden vault unlock` opens it.
+A key whose value comes from an op source cannot be persisted (1Password would
+still hold the authoritative copy).",
         show_global: true,
     }
 }
@@ -990,6 +1019,128 @@ claim out.",
     }
 }
 
+/// The `vault` group page (DR-0034 §6/§9).
+pub fn vault() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " vault"),
+        summary: "Manage the encrypted vault that keeps values across restarts.",
+        usage: concat!("cache-warden", " vault <COMMAND> [OPTIONS]"),
+        subcommands: &[
+            Row {
+                name: "init",
+                desc: "Create the vault (prints its recovery code once)",
+            },
+            Row {
+                name: "unlock",
+                desc: "Open the vault so persisted values become readable",
+            },
+            Row {
+                name: "lock",
+                desc: "Close the vault, wiping its key from memory",
+            },
+            Row {
+                name: "status",
+                desc: "Show whether the vault is open, and what can open it",
+            },
+        ],
+        options: &[],
+        detail: "\
+Only values written with `kv set --persist` live in the vault, encrypted on
+disk; everything else is held in memory and is gone when the daemon stops.
+
+The daemon never opens the vault on its own, so an unattended start stays
+unattended: `vault unlock` is always something you run. While the vault is
+closed the daemon still works — persisted entries stay listed by `status` and
+`kv list`, and only reading their values fails, with the value intact.",
+        show_global: true,
+    }
+}
+
+/// `vault init` leaf page (DR-0034 §9).
+pub fn vault_init() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " vault init"),
+        summary: "Create the encrypted vault and mint its recovery code.",
+        usage: concat!("cache-warden", " vault init"),
+        subcommands: &[],
+        options: &[],
+        detail: "\
+Creates the vault and its recovery code in one step; there is no way to skip
+the code. THE CODE IS SHOWN ONCE: the daemon keeps no copy, so if it is not
+written down now, losing every other way in loses the vault with it. Store it
+somewhere other than your passkeys — a password manager holding both turns one
+lost account into a lost vault.
+
+The code is printed on stdout and everything else on stderr, so
+`cache-warden vault init > recovery.txt` captures exactly the code.
+
+If a vault already exists this refuses rather than replacing it, since
+replacing it would discard everything it holds.",
+        show_global: true,
+    }
+}
+
+/// `vault unlock` leaf page (DR-0034 §6).
+pub fn vault_unlock() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " vault unlock"),
+        summary: "Open the vault so persisted values become readable.",
+        usage: concat!("cache-warden", " vault unlock"),
+        subcommands: &[],
+        options: &[],
+        detail: "\
+The recovery code is read from stdin, never from the command line: an argument
+would be visible in `ps` and would stay in your shell history. Run the command
+and paste the code, or pipe it in (`pbpaste | cache-warden vault unlock`).
+Spaces, hyphens, line breaks and letter case are ignored, so a code copied off
+paper normally works as written.
+
+The vault stays open until `vault lock` or until the daemon exits — unlocking
+is per daemon process, not per command. On success this reports how many
+persisted entries became readable. A code that opens nothing is reported as a
+failed unlock, without saying whether it was mistyped or belongs to another
+vault.",
+        show_global: true,
+    }
+}
+
+/// `vault lock` leaf page (DR-0034 §6).
+pub fn vault_lock() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " vault lock"),
+        summary: "Close the vault, wiping its key from memory.",
+        usage: concat!("cache-warden", " vault lock"),
+        subcommands: &[],
+        options: &[],
+        detail: "\
+Nothing is deleted: persisted entries stay listed and their values stay on
+disk, encrypted, until the next `vault unlock`. Stopping the daemon has the
+same effect.",
+        show_global: true,
+    }
+}
+
+/// `vault status` leaf page (DR-0034 §6/§7).
+pub fn vault_status() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " vault status"),
+        summary: "Show whether the vault is open, and what can open it.",
+        usage: concat!("cache-warden", " vault status"),
+        subcommands: &[],
+        options: &[],
+        detail: "\
+Reports the state (unlocked / locked / not created yet), the vault's id, how
+many keys can open it, and how many times its data key has been rotated. Entry
+names and values are never part of this — `cache-warden status` lists the
+entries themselves.
+
+Any single key opens the whole vault, so a key registered for development use
+sets the strength of the whole vault: when one is present this says so as a
+warning, and the answer is a separate vault for development.",
+        show_global: true,
+    }
+}
+
 /// The `config` group page.
 pub fn config() -> HelpSpec {
     HelpSpec {
@@ -1225,6 +1376,74 @@ mod tests {
         assert!(h.contains("daemon register"));
         assert!(h.contains("daemon unregister"));
         assert!(h.contains("daemon status"));
+    }
+
+    /// DR-0034 §5: `--persist` is discoverable on `kv set`, and the help says
+    /// what persisting costs (cw becomes the source of truth, the vault has to
+    /// be open) rather than only that the flag exists.
+    #[test]
+    fn kv_set_help_carries_persist_and_its_consequences() {
+        let h = kv_set().render();
+        assert!(h.contains("--persist"), "{h}");
+        assert!(h.contains("source of truth"), "{h}");
+        assert!(h.contains("vault unlock"), "{h}");
+        assert!(h.contains("vault init"), "{h}");
+    }
+
+    #[test]
+    fn vault_group_help_lists_its_subcommands() {
+        let h = vault().render();
+        assert!(h.contains("cache-warden vault\n"));
+        assert!(h.contains("Commands:"));
+        for sub in ["init", "unlock", "lock", "status"] {
+            assert!(h.contains(sub), "missing {sub} in: {h}");
+        }
+        // The degraded-but-working contract while locked is stated once, here.
+        assert!(h.contains("kv set --persist"), "{h}");
+        assert!(h.contains("intact"), "{h}");
+    }
+
+    /// The recovery code is shown once and never re-derivable, so `vault init`
+    /// must say so on its own page — a user who misses it loses the vault.
+    #[test]
+    fn vault_init_help_says_the_code_is_shown_once() {
+        let h = vault_init().render();
+        assert!(h.contains("SHOWN ONCE"), "{h}");
+        assert!(h.contains("keeps no copy"), "{h}");
+        // And where to store it / how to capture it.
+        assert!(h.contains("other than your passkeys"), "{h}");
+        assert!(h.contains("recovery.txt"), "{h}");
+    }
+
+    #[test]
+    fn vault_unlock_help_documents_the_stdin_only_recovery_code() {
+        let h = vault_unlock().render();
+        assert!(h.contains("read from stdin"), "{h}");
+        assert!(h.contains("shell history"), "{h}");
+        assert!(h.contains("pbpaste"), "{h}");
+        // Unlock is per daemon process, not per command.
+        assert!(h.contains("vault lock"), "{h}");
+    }
+
+    #[test]
+    fn vault_lock_and_status_help_carry_their_own_detail() {
+        let lock = vault_lock().render();
+        assert!(lock.contains("Nothing is deleted"), "{lock}");
+
+        let status = vault_status().render();
+        assert!(status.contains("not created yet"), "{status}");
+        // The dev-key warning is explained where it is rendered.
+        assert!(status.contains("development"), "{status}");
+        // And the boundary against the entry-listing `status`.
+        assert!(status.contains("cache-warden status"), "{status}");
+    }
+
+    #[test]
+    fn top_help_lists_the_vault_verbs() {
+        let h = top().render();
+        for row in ["vault init", "vault unlock", "vault lock", "vault status"] {
+            assert!(h.contains(row), "missing {row} in: {h}");
+        }
     }
 
     #[test]

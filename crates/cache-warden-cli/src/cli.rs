@@ -316,6 +316,7 @@ pub fn kv_set() -> Command {
         )
         .arg(expected_version_arg())
         .arg(claim_token_arg())
+        .arg(Arg::new("persist").long("persist").action(ArgAction::Count))
         // Retired grammar, kept declared for the steer (see the doc above).
         .arg(Arg::new("value").long("value").num_args(1).hide(true))
         .arg(
@@ -457,6 +458,35 @@ pub fn status() -> Command {
         .arg(Arg::new("all").long("all").action(ArgAction::Count))
         .arg(namespace_arg())
         .arg(socket_arg())
+}
+
+// ---- vault leaves ------------------------------------------------------
+//
+// None of the four takes a positional. That is load-bearing on `vault unlock`:
+// the recovery code travels on stdin precisely so it cannot reach argv, where
+// `ps` and the shell history would both keep a copy
+// ([`crate::commands::vault_cmd::parse_vault_unlock`] says so in its own words
+// before this grammar reports a surplus argument).
+
+/// `vault init` (DR-0034 §9).
+pub fn vault_init() -> Command {
+    level("init").arg(socket_arg())
+}
+
+/// `vault unlock` (DR-0034 §6) — the recovery code is read from stdin.
+pub fn vault_unlock() -> Command {
+    level("unlock").arg(socket_arg())
+}
+
+/// `vault lock` (DR-0034 §6).
+pub fn vault_lock() -> Command {
+    level("lock").arg(socket_arg())
+}
+
+/// `vault status` (DR-0034 §6/§7) — a view of the `status` reply, not a
+/// request of its own.
+pub fn vault_status() -> Command {
+    level("status").arg(socket_arg())
 }
 
 // ---- run / inject ------------------------------------------------------

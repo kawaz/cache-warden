@@ -9,6 +9,7 @@
 //! This is the "wire the core into the daemon's center" mandate of DR-0008:
 //! every control-socket command maps onto a [`Store`] operation here.
 
+use crate::daemon::vault_state::{VaultState, VaultUnlockError};
 use cache_warden::RefreshClaim;
 use cache_warden::{
     Authenticator, CapError, Capability, Clock, DeclaredAncestor, DefineError, EntryState,
@@ -82,6 +83,28 @@ pub struct HandlerCtx<'a, A: ?Sized, R, C> {
     /// requester). Policy interpretation lives here in the handler/adapter layer,
     /// never in the core [`Store`] (DR-0004).
     pub kv_process_policies: &'a std::collections::BTreeMap<String, Vec<String>>,
+    /// The encrypted vault (DR-0034), or `None` on a daemon with none
+    /// configured.
+    ///
+    /// Carried on the context rather than threaded beside `&mut Store`
+    /// because the two play different roles: every request path touches the
+    /// store, while the vault is reached by a handful of them and may not
+    /// exist at all — the same shape as `otp_adapter` and `store_cap`.
+    ///
+    /// # Lock order
+    ///
+    /// This mutex is only ever taken **while the store lock is already
+    /// held**, and nothing takes the store lock while holding this one. The
+    /// order is therefore fixed at store → vault, with no cycle to deadlock
+    /// on. Any future code that reaches for the store from inside a vault
+    /// critical section breaks that, and must not.
+    pub vault: Option<&'a std::sync::Mutex<VaultState>>,
+    /// Keys the configuration declares as `persist = true` (DR-0034 §5).
+    ///
+    /// Needed because entry names live in the vault's *sealed body*: while the
+    /// vault is closed the daemon cannot enumerate it, so these declarations
+    /// are the only way to report a persisted entry as "present but locked".
+    pub persisted_keys: &'a std::collections::BTreeSet<String>,
     /// DR-0030 evaluator material for the current request (get) / setter
     /// snapshot (set): the requester's ancestry entries enriched with
     /// `unique_id` when the private macOS API succeeded. `None` on any
@@ -173,16 +196,7 @@ where
         // parallel value-free metadata (DR-0022 §3 / DR-0009 minor extension)
         // so a client can show backoff / pin / state hints alongside each name.
         Request::KvList => handle_list(store, ctx),
-        Request::KvDel { key, with_define } => {
-            let removed = if with_define {
-                store
-                    .delete_with_definition(&key, ctx.store_cap)
-                    .unwrap_or(false)
-            } else {
-                store.delete(&key, ctx.store_cap).unwrap_or(false)
-            };
-            Response::deleted(removed)
-        }
+        Request::KvDel { key, with_define } => handle_del(store, ctx, &key, with_define),
         Request::KvSet {
             key,
             source,
@@ -191,7 +205,38 @@ where
             guard_constraints,
             expected_version,
             claim_token,
+            persist,
         } => {
+            // DR-0034 §5: an entry the configuration declares persistent is
+            // persistent, whether or not this particular caller said so. The
+            // declaration is the operator's statement about where the value
+            // lives; the wire flag is how a caller declares it for a key the
+            // configuration never mentioned. Letting a plain `kv set` write a
+            // declared key to memory only would leave the operator with an
+            // entry they were told is durable and that a restart loses.
+            let persist = persist.unwrap_or(false) || ctx.persisted_keys.contains(&key);
+            if persist {
+                // DR-0034 §1d requires a persisted entry to carry its guard
+                // record with it, and the vault format does not hold one yet.
+                // Accepting the set would either drop the guard on the next
+                // unlock — an entry silently losing its access control — or
+                // fail to restore, which §1d says must take the value with it.
+                // Refusing now is the only outcome that surprises nobody.
+                if !guard_constraints.is_empty() {
+                    return Response::error(
+                        ErrorKind::BadRequest,
+                        "a guard cannot yet be attached to a persisted entry: the vault does not \
+                         carry guard records, so the guard would not survive a restart. Support \
+                         arrives with the owner-principal work (DR-0033 / DR-0034 §1d). Until \
+                         then, set it without a guard or without persistence",
+                    );
+                }
+                // A persisted entry needs somewhere durable to live before the
+                // write is acknowledged.
+                if let Some(resp) = require_unlocked_vault(ctx) {
+                    return resp;
+                }
+            }
             // DR-0034 §4 arbitration runs before the write, and both checks
             // must reject without touching the store: a caller told "no" must
             // be able to rely on nothing having happened.
@@ -211,19 +256,36 @@ where
                     return Response::cas_mismatch(current);
                 }
             }
-            if let Err(resp) = check_claim_fence(store, &key, claim_token.as_deref()) {
+            if let Some(resp) = check_claim_fence(store, &key, claim_token.as_deref()) {
                 return resp;
             }
-            handle_set(
+            let resp = handle_set(
                 store,
                 ctx,
-                key,
-                source,
+                key.clone(),
+                source.clone(),
+                // DR-0034 §5: a cw-owned value has no absolute lifetime. An
+                // expiry here would destroy the only copy of a live credential
+                // on a timer.
                 soft_ttl_secs,
-                hard_ttl_secs,
+                if persist { None } else { hard_ttl_secs },
                 guard_constraints,
-            )
+            );
+            if persist && matches!(resp, Response::Ok(_)) {
+                // The ack must not claim durability the disk has not accepted,
+                // so the vault write happens before the reply leaves and its
+                // failure replaces the success (DR-0034 §3).
+                if let Some(e) =
+                    write_through_to_vault(store, ctx, &key, &source, claim_token.as_deref())
+                {
+                    return e;
+                }
+            }
+            resp
         }
+        Request::VaultInit => handle_vault_init(ctx),
+        Request::VaultUnlock { recovery_code } => handle_vault_unlock(store, ctx, &recovery_code),
+        Request::VaultLock => handle_vault_lock(store, ctx),
         Request::KvClaim {
             key,
             expected_version,
@@ -272,13 +334,17 @@ where
     A: ?Sized,
     C: Clock,
 {
-    let entries = collect_entry_infos(store, ctx.clock);
+    let entries = collect_entry_infos(store, ctx.clock, &locked_keys(ctx));
+    let vault = ctx
+        .vault
+        .and_then(|v| v.lock().ok().map(|g| g.status_wire()));
     Response::status(
         ctx.pid,
         ctx.version.to_string(),
         ctx.socket.to_string(),
         entries,
         ctx.full_disk_access,
+        vault,
     )
 }
 
@@ -291,7 +357,7 @@ where
     A: ?Sized,
     C: Clock,
 {
-    let entries = collect_entry_infos(store, ctx.clock);
+    let entries = collect_entry_infos(store, ctx.clock, &locked_keys(ctx));
     let keys: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
     Response::list_with_entries(keys, entries)
 }
@@ -305,7 +371,11 @@ where
 /// the immutable `Store` accessors (no zeroize side effect — DR-0025 §Impl).
 /// A key whose entry+definition both vanish between the union call and the
 /// per-key probe is dropped defensively.
-fn collect_entry_infos<C: Clock>(store: &Store, clock: &C) -> Vec<EntryInfo> {
+fn collect_entry_infos<C: Clock>(
+    store: &Store,
+    clock: &C,
+    locked_keys: &std::collections::BTreeSet<String>,
+) -> Vec<EntryInfo> {
     let names: Vec<String> = store
         .list_filtered(|_| true)
         .into_iter()
@@ -353,6 +423,7 @@ fn collect_entry_infos<C: Clock>(store: &Store, clock: &C) -> Vec<EntryInfo> {
             0 => None,
             v => Some(v),
         };
+        let locked = locked_keys.contains(&name);
         let claim_expires_in_secs = store
             .refresh_claim_of(&name)
             .filter(|c| c.is_active_at(wall_now))
@@ -375,6 +446,8 @@ fn collect_entry_infos<C: Clock>(store: &Store, clock: &C) -> Vec<EntryInfo> {
             // cancel someone else's refresh.
             version,
             claim_expires_in_secs,
+            // DR-0034 §6: declared, present, and unreadable until unlock.
+            locked,
         });
     }
     entries
@@ -587,6 +660,540 @@ where
 /// damage, and a caller that genuinely needs longer can re-claim.
 const MAX_CLAIM_SECS: u64 = 3600;
 
+/// Persist a value that was just written to the store (DR-0034 §5).
+///
+/// Ordering matters: the store write happens first so the in-memory and
+/// on-disk copies cannot disagree about the value, and this returns only after
+/// the vault's `fsync`. A caller told the set succeeded can therefore rely on
+/// it having survived a crash (DR-0034 §3) — which for a rotated refresh token
+/// is the whole reason the vault exists.
+fn write_through_to_vault<A: ?Sized, R, C: Clock>(
+    store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: &str,
+    source: &SetSource,
+    claim_token: Option<&str>,
+) -> Option<Response> {
+    let SetSource::Static { value_b64 } = source;
+    let Ok(bytes) = decode_b64(value_b64) else {
+        return Some(Response::error(
+            ErrorKind::BadRequest,
+            "value is not valid base64",
+        ));
+    };
+    let Some(vault) = ctx.vault else {
+        return Some(Response::error(
+            ErrorKind::VaultNotInitialized,
+            "this daemon has no vault configured",
+        ));
+    };
+    let Ok(mut guard) = vault.lock() else {
+        return Some(Response::error(ErrorKind::Internal, "vault lock poisoned"));
+    };
+    let Some(unlocked) = guard.unlocked_mut() else {
+        return Some(Response::error(
+            ErrorKind::VaultLocked,
+            "the vault is locked; run `cache-warden vault unlock`",
+        ));
+    };
+
+    let mut entry = cache_warden_vault::VaultEntry::new(key, bytes);
+    // The store already assigned the authoritative version for this write;
+    // carrying it into the vault keeps the two copies of the counter in step
+    // across a restart.
+    entry.cas_version = store.version_of(key);
+    // The vault keeps its own copy of the claim (DR-0034 §4), so its fence has
+    // to be satisfied with the same token the store's was, and a successful
+    // write retires the claim on both sides together.
+    let token = claim_token.and_then(|t| ClaimToken::parse(t).ok());
+    match unlocked.upsert(entry, token.as_ref()) {
+        Ok(_) => None,
+        Err(e) => {
+            // The value reached memory but not the disk, and it stays in
+            // memory: it is the newest value anyone has, and dropping it would
+            // turn a durability failure into an outage on top of it. What must
+            // not happen is the caller believing it was saved, so the reply is
+            // the failure (DR-0034 §3).
+            //
+            // For a rotated credential this is the recoverable side of §3a's
+            // window: the caller knows the write did not land and can retry
+            // once the cause is fixed, or re-authenticate. The unrecoverable
+            // side — a crash between the provider issuing a value and this
+            // returning — cannot be reported at all, which is why it resolves
+            // through re-authentication rather than through a reply.
+            Some(Response::error(
+                ErrorKind::Internal,
+                format!("value was not persisted: {e}"),
+            ))
+        }
+    }
+}
+
+/// Load an open vault's entries into the store (DR-0034 §5).
+///
+/// Returns how many became readable. An entry the vault cannot fully restore
+/// is **not** restored at all (DR-0034 §1d): a value that came back without
+/// the version that governs it would let a stale writer win a
+/// compare-and-swap it should have lost.
+///
+/// `cw-owned` entries carry **no hard TTL** (DR-0034 §5). An absolute lifetime
+/// on a refresh token would destroy the only copy of a live credential on a
+/// timer, so the exemption is structural here rather than a policy a caller
+/// could forget to apply.
+fn install_vault_entries<A: ?Sized, R, C: Clock>(
+    store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+    vault: &cache_warden_vault::UnlockedVault,
+) -> usize {
+    let mut restored = 0usize;
+    for key in vault.keys().map(str::to_string).collect::<Vec<_>>() {
+        let Some(entry) = vault.entry(&key) else {
+            continue;
+        };
+        let ttl = match cache_warden::Ttl::new(
+            entry
+                .definition
+                .as_ref()
+                .and_then(|d| d.soft_ttl_ms)
+                .map(std::time::Duration::from_millis),
+            // Deliberately none: see the note above on cw-owned entries.
+            None,
+        ) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let secret = cache_warden::SecretBytes::new(entry.secret.to_vec());
+        if store
+            .set(
+                key.clone(),
+                cache_warden::ValueSource::Static,
+                secret,
+                ttl,
+                ctx.store_cap,
+                ctx.clock,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        // The version travels with the value or the entry does not come back.
+        if store
+            .restore_version(&key, entry.cas_version, ctx.store_cap)
+            .is_err()
+        {
+            let _ = store.delete(&key, ctx.store_cap);
+            continue;
+        }
+        // A claim outlives the process that took it (DR-0034 §4): the whole
+        // reason it is written to disk is that a caller which crashed
+        // mid-refresh must not have its in-flight provider call forgotten by
+        // the successor, which would then start a second one. A lapsed claim
+        // is left behind — its expiry has already answered for it.
+        if let Some(claim) = vault.active_claim(&key) {
+            let restored_claim = RefreshClaim::new(
+                claim.token.as_str(),
+                claim.claimed_at_epoch_ms,
+                claim.expires_at_epoch_ms,
+            );
+            let _ = store.set_refresh_claim(key.clone(), restored_claim, ctx.store_cap);
+        }
+        restored += 1;
+    }
+    restored
+}
+
+/// Take the claim in the vault, for an entry the vault owns (DR-0034 §4).
+///
+/// A claim's whole purpose is to stop a second caller from contacting the
+/// provider while a first one is mid-refresh — and the crash that loses the
+/// first caller is exactly when that matters most. A claim held only in memory
+/// would vanish in that crash and let the successor start the refresh the
+/// dead caller may already have completed, which for a rotating credential is
+/// how a token family gets revoked.
+///
+/// The **vault issues the token** for an owned entry, and the store records
+/// what the vault issued. One token, written durably before it is handed out,
+/// so the fence a successor process applies is the fence this one applied.
+///
+/// `Ok(None)` means the key is not the vault's, and the caller mints its own
+/// token as before.
+fn take_claim_in_vault<A: ?Sized, R, C>(
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: &str,
+    expected_version: u64,
+    duration_secs: u64,
+) -> Result<Option<ClaimToken>, Response> {
+    let Some(vault) = ctx.vault else {
+        return Ok(None);
+    };
+    let Ok(mut guard) = vault.lock() else {
+        return Err(Response::error(ErrorKind::Internal, "vault lock poisoned"));
+    };
+    let Some(unlocked) = guard.unlocked_mut() else {
+        return Ok(None);
+    };
+    if unlocked.entry(key).is_none() {
+        // Not a persisted entry: the store's copy is the only copy, which is
+        // all a cached value ever had.
+        return Ok(None);
+    }
+    match unlocked.claim_refresh(
+        key,
+        expected_version,
+        std::time::Duration::from_secs(duration_secs),
+    ) {
+        Ok(token) => Ok(Some(token)),
+        // The vault's own view disagrees with the store's. It is the durable
+        // one, so it wins, and both disagreements have a wire answer that
+        // tells the caller what to do next rather than looking like a fault.
+        Err(cache_warden_vault::VaultError::CasMismatch { current }) => {
+            Err(Response::cas_mismatch(current))
+        }
+        Err(cache_warden_vault::VaultError::AlreadyClaimed {
+            expires_at_epoch_ms,
+        }) => Err(Response::already_claimed(
+            expires_at_epoch_ms
+                .saturating_sub(now_epoch_ms())
+                .div_ceil(1_000),
+        )),
+        Err(e) => Err(Response::error(
+            ErrorKind::Internal,
+            format!("the claim was not recorded durably: {e}"),
+        )),
+    }
+}
+
+/// Release the claim in the vault, for an entry the vault owns.
+///
+/// The mirror of [`take_claim_in_vault`]: a release that only cleared memory
+/// would leave the successor of a crash fencing against a claim nobody holds
+/// until its expiry ran out — the delay the release exists to avoid.
+fn release_claim_in_vault<A: ?Sized, R, C>(
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: &str,
+    token: &str,
+) -> Option<Response> {
+    let vault = ctx.vault?;
+    let Ok(mut guard) = vault.lock() else {
+        return Some(Response::error(ErrorKind::Internal, "vault lock poisoned"));
+    };
+    let unlocked = guard.unlocked_mut()?;
+    // Not a persisted entry: the store's copy is the only copy.
+    unlocked.entry(key)?;
+    let Ok(parsed) = ClaimToken::parse(token) else {
+        // The store side already accepted this token, so an unparseable one
+        // here would mean the two disagree about what a token is.
+        return Some(Response::error(
+            ErrorKind::Internal,
+            "malformed claim token",
+        ));
+    };
+    match unlocked.release_claim(key, &parsed) {
+        Ok(()) => None,
+        Err(e) => Some(Response::error(
+            ErrorKind::Internal,
+            format!("the claim was not released durably: {e}"),
+        )),
+    }
+}
+
+/// The keys whose values are behind a closed vault (DR-0034 §6).
+///
+/// Empty whenever the vault is open, or absent. Computed once per reply rather
+/// than per entry: asking the vault for each key would take and release the
+/// lock in a loop, and could describe two entries in one reply against
+/// different vault states.
+fn locked_keys<A: ?Sized, R, C>(
+    ctx: &HandlerCtx<'_, A, R, C>,
+) -> std::collections::BTreeSet<String> {
+    if vault_is_unlocked(ctx) {
+        std::collections::BTreeSet::new()
+    } else {
+        ctx.persisted_keys.clone()
+    }
+}
+
+/// Whether the daemon's vault is currently open.
+///
+/// A daemon with no vault configured reports `true`: nothing is behind a lock,
+/// so nothing is locked. Reporting `false` would mark every entry locked on a
+/// daemon that has no vault at all.
+fn vault_is_unlocked<A: ?Sized, R, C>(ctx: &HandlerCtx<'_, A, R, C>) -> bool {
+    match ctx.vault {
+        None => true,
+        Some(v) => v.lock().map(|g| g.is_unlocked()).unwrap_or(false),
+    }
+}
+
+/// What the vault has to say about one key, right now.
+enum VaultOwnership {
+    /// The vault holds no claim on this key — either there is no vault, or the
+    /// key is an ordinary cached entry. The caller proceeds as it always has.
+    Unrelated,
+    /// The open vault holds it: cache-warden is the source of truth for this
+    /// value (DR-0034 §5), so any change to it has to reach the disk.
+    Owned,
+    /// The configuration declares it persistent but the vault is not open, so
+    /// the value can be neither read nor written. Carries the reply that says
+    /// which command fixes that.
+    Unavailable(Box<Response>),
+}
+
+/// Classify `key` against the vault (DR-0034 §5).
+///
+/// While the vault is open the answer comes from the vault itself, which is
+/// exact. While it is closed the entries are ciphertext, so the only knowable
+/// persistent names are the `persist = true` declarations in the configuration
+/// — the same asymmetry `locked_keys` reports, and the reason an entry
+/// persisted at runtime is invisible until unlock (DR-0034 §6).
+fn vault_ownership<A: ?Sized, R, C>(ctx: &HandlerCtx<'_, A, R, C>, key: &str) -> VaultOwnership {
+    let Some(vault) = ctx.vault else {
+        return VaultOwnership::Unrelated;
+    };
+    let Ok(guard) = vault.lock() else {
+        return VaultOwnership::Unavailable(Box::new(Response::error(
+            ErrorKind::Internal,
+            "vault lock poisoned",
+        )));
+    };
+    match &*guard {
+        VaultState::Unlocked { vault } => {
+            if vault.entry(key).is_some() {
+                VaultOwnership::Owned
+            } else {
+                VaultOwnership::Unrelated
+            }
+        }
+        _ if !ctx.persisted_keys.contains(key) => VaultOwnership::Unrelated,
+        VaultState::Locked { .. } => VaultOwnership::Unavailable(Box::new(Response::error(
+            ErrorKind::VaultLocked,
+            "the vault is locked; run `cache-warden vault unlock` — the value is intact",
+        ))),
+        VaultState::NotInitialized { .. } => {
+            VaultOwnership::Unavailable(Box::new(Response::error(
+                ErrorKind::VaultNotInitialized,
+                "this entry is declared `persist = true` but no vault has been created yet; \
+                 run `cache-warden vault init`",
+            )))
+        }
+    }
+}
+
+/// Handle `kv.del` (DR-0034 §5).
+///
+/// For an ordinary cached entry this is unchanged: the value goes, and the
+/// definition decides whether a later get regenerates it.
+///
+/// A cache-warden-owned entry is different in kind. Its value has no upstream
+/// to be fetched from again — cache-warden *is* the upstream — so deleting one
+/// is discarding the credential itself, and a later get must not quietly
+/// manufacture a replacement. The definition therefore goes with the value
+/// whatever `with_define` asked for, and the removal reaches the disk before
+/// the reply: an acknowledged delete that a restart undoes would resurrect a
+/// credential its owner believes they discarded.
+///
+/// # What a closed vault costs this
+///
+/// An entry the configuration declares persistent is refused here while the
+/// vault is closed, because deleting it would be exactly that half-delete.
+/// An entry persisted only at runtime cannot be refused, because while the
+/// vault is closed the daemon cannot know it exists — entry names live in the
+/// sealed body (DR-0034 §6/§7). Deleting one while locked therefore removes
+/// nothing (the store holds no copy either) and the value returns on the next
+/// unlock. The alternative would be recording pending deletions outside the
+/// ciphertext, which leaks the names §7 keeps inside it; the honest shape is
+/// that a delete needs the vault open, and `vault_locked` is what the
+/// knowable half of that already says.
+fn handle_del<A: ?Sized, R, C>(
+    store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: &str,
+    with_define: bool,
+) -> Response {
+    match vault_ownership(ctx, key) {
+        VaultOwnership::Unavailable(resp) => *resp,
+        VaultOwnership::Unrelated => {
+            let removed = if with_define {
+                store
+                    .delete_with_definition(key, ctx.store_cap)
+                    .unwrap_or(false)
+            } else {
+                store.delete(key, ctx.store_cap).unwrap_or(false)
+            };
+            Response::deleted(removed)
+        }
+        VaultOwnership::Owned => {
+            // Disk first. If this fails nothing has been removed anywhere, so
+            // the caller retries against a state they can still reason about;
+            // clearing memory first would leave a value the next unlock brings
+            // back.
+            if let Some(resp) = delete_from_vault(ctx, key) {
+                return resp;
+            }
+            let _ = store.delete_with_definition(key, ctx.store_cap);
+            // The vault held it, so the entry existed — whether or not the
+            // store had anything resident for it.
+            Response::deleted(true)
+        }
+    }
+}
+
+/// Remove one entry from the open vault, durably. `None` on success.
+fn delete_from_vault<A: ?Sized, R, C>(
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: &str,
+) -> Option<Response> {
+    let vault = ctx.vault?;
+    let Ok(mut guard) = vault.lock() else {
+        return Some(Response::error(ErrorKind::Internal, "vault lock poisoned"));
+    };
+    let Some(unlocked) = guard.unlocked_mut() else {
+        return Some(Response::error(
+            ErrorKind::VaultLocked,
+            "the vault is locked; run `cache-warden vault unlock`",
+        ));
+    };
+    match unlocked.delete(key) {
+        Ok(_) => None,
+        Err(e) => Some(Response::error(
+            ErrorKind::Internal,
+            format!("the entry was not removed from the vault: {e}"),
+        )),
+    }
+}
+
+/// Refuse an operation that needs an open vault, naming the command that fixes
+/// it (DR-0034 §6).
+fn require_unlocked_vault<A: ?Sized, R, C>(ctx: &HandlerCtx<'_, A, R, C>) -> Option<Response> {
+    let Some(vault) = ctx.vault else {
+        return Some(Response::error(
+            ErrorKind::VaultNotInitialized,
+            "this daemon has no vault configured, so it cannot persist entries; \
+             set [vault] in the config and run `cache-warden vault init`",
+        ));
+    };
+    let Ok(guard) = vault.lock() else {
+        return Some(Response::error(ErrorKind::Internal, "vault lock poisoned"));
+    };
+    match &*guard {
+        VaultState::Unlocked { .. } => None,
+        VaultState::Locked { .. } => Some(Response::error(
+            ErrorKind::VaultLocked,
+            "the vault is locked; run `cache-warden vault unlock` — the value is intact",
+        )),
+        VaultState::NotInitialized { .. } => Some(Response::error(
+            ErrorKind::VaultNotInitialized,
+            "no vault has been created yet; run `cache-warden vault init` \
+             (it prints a recovery code you must keep)",
+        )),
+    }
+}
+
+/// Handle `vault.init` (DR-0034 §9).
+fn handle_vault_init<A: ?Sized, R, C>(ctx: &HandlerCtx<'_, A, R, C>) -> Response {
+    let Some(vault) = ctx.vault else {
+        return Response::error(
+            ErrorKind::VaultNotInitialized,
+            "this daemon has no vault configured; set [vault] in the config first",
+        );
+    };
+    let Ok(mut guard) = vault.lock() else {
+        return Response::error(ErrorKind::Internal, "vault lock poisoned");
+    };
+    match guard.init() {
+        // The recovery code leaves the daemon exactly once, here. Nothing logs
+        // it and the daemon keeps no copy — a client that drops this reply has
+        // destroyed the vault's only recovery path (DR-0034 §9).
+        Ok((id, code)) => Response::vault_initialized(id.to_string(), code.render().to_string()),
+        Err(e) => Response::error(ErrorKind::BadRequest, e.to_string()),
+    }
+}
+
+/// Handle `vault.unlock` (DR-0034 §6).
+fn handle_vault_unlock<A: ?Sized, R, C: Clock>(
+    store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+    recovery_code: &str,
+) -> Response {
+    let Some(vault) = ctx.vault else {
+        return Response::error(
+            ErrorKind::VaultNotInitialized,
+            "this daemon has no vault configured",
+        );
+    };
+    let code = match cache_warden_vault::RecoveryCode::parse(recovery_code) {
+        Ok(c) => c,
+        Err(e) => return Response::error(ErrorKind::BadRequest, e.to_string()),
+    };
+    let Ok(mut guard) = vault.lock() else {
+        return Response::error(ErrorKind::Internal, "vault lock poisoned");
+    };
+    match guard.unlock(&code) {
+        Ok(()) => {
+            // DR-0034 §5: the vault is the source of truth for these, so its
+            // contents replace whatever the store holds under the same names
+            // rather than merging with it.
+            let restored = match guard.unlocked() {
+                None => 0,
+                Some(vault) => install_vault_entries(store, ctx, vault),
+            };
+            Response::vault_unlocked(restored)
+        }
+        Err(VaultUnlockError::NotInitialized) => Response::error(
+            ErrorKind::VaultNotInitialized,
+            "no vault has been created yet; run `cache-warden vault init`",
+        ),
+        // The message deliberately does not distinguish "wrong code" from
+        // "no slot matched": to anyone probing, they are the same fact.
+        Err(VaultUnlockError::Vault(_)) => Response::error(
+            ErrorKind::AuthFailed,
+            "that recovery code does not open this vault",
+        ),
+    }
+}
+
+/// Handle `vault.lock` (DR-0034 §6).
+///
+/// Closing the vault has to take the values with it. Zeroizing the data key
+/// while the plaintext it protected stays resident in the store would leave
+/// `vault lock` looking like it worked while every `kv get` still answered —
+/// the entries are evicted here so "locked" means the same thing after an
+/// explicit lock as it does on a cold start.
+///
+/// Only the values go: definitions and versions stay, so a configuration-
+/// declared entry remains visible as present-but-locked, and the version the
+/// vault restores on unlock lands on a counter that never went backwards.
+fn handle_vault_lock<A: ?Sized, R, C>(
+    store: &mut Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+) -> Response {
+    let Some(vault) = ctx.vault else {
+        return Response::error(
+            ErrorKind::VaultNotInitialized,
+            "this daemon has no vault configured",
+        );
+    };
+    let Ok(mut guard) = vault.lock() else {
+        return Response::error(ErrorKind::Internal, "vault lock poisoned");
+    };
+    // Read the names before closing: once the data key is gone the entries are
+    // ciphertext and there is nothing left to enumerate.
+    let keys: Vec<String> = match guard.unlocked() {
+        Some(v) => v.keys().map(str::to_string).collect(),
+        // Already closed. Nothing resident, nothing to evict.
+        None => return Response::vault_locked_ack(),
+    };
+    match guard.lock() {
+        Ok(()) => {
+            for key in keys {
+                let _ = store.delete(&key, ctx.store_cap);
+            }
+            Response::vault_locked_ack()
+        }
+        Err(e) => Response::error(ErrorKind::Internal, e.to_string()),
+    }
+}
+
 /// Wall-clock milliseconds since the Unix epoch.
 ///
 /// Claims are compared against wall time, not the injected [`Clock`], because
@@ -628,21 +1235,21 @@ fn claim_token_matches(held: &str, supplied: &str) -> bool {
 /// not bring a token" and "your token is no longer the right one" call for
 /// different next steps — wait or take the claim, versus re-read because
 /// someone took over mid-refresh.
-fn check_claim_fence(store: &Store, key: &str, token: Option<&str>) -> Result<(), Response> {
+fn check_claim_fence(store: &Store, key: &str, token: Option<&str>) -> Option<Response> {
     let now = now_epoch_ms();
-    let Some(active) = store.refresh_claim_of(key).filter(|c| c.is_active_at(now)) else {
-        return Ok(());
-    };
+    let active = store
+        .refresh_claim_of(key)
+        .filter(|c| c.is_active_at(now))?;
     match token {
-        None => Err(Response::error(
+        None => Some(Response::error(
             ErrorKind::ClaimTokenMismatch,
             "a refresh is already in progress for this key; wait for it to finish, or pass the token from your own `kv claim`",
         )),
-        Some(t) if !claim_token_matches(active.token(), t) => Err(Response::error(
+        Some(t) if !claim_token_matches(active.token(), t) => Some(Response::error(
             ErrorKind::ClaimTokenMismatch,
             "this claim token is no longer the one holding the key: the claim lapsed and another caller took over. Re-read the key and claim again",
         )),
-        Some(_) => Ok(()),
+        Some(_) => None,
     }
 }
 
@@ -689,7 +1296,14 @@ where
         return Response::already_claimed(active.remaining_ms(now).div_ceil(1_000));
     }
 
-    let token = ClaimToken::generate();
+    // Durable side first, and it issues the token when it owns the entry: a
+    // token handed out before it was written down could be honoured by this
+    // process and unknown to its successor.
+    let token = match take_claim_in_vault(ctx, &key, current, duration_secs) {
+        Err(resp) => return resp,
+        Ok(Some(from_vault)) => from_vault,
+        Ok(None) => ClaimToken::generate(),
+    };
     let expires_at = now.saturating_add(duration_secs.saturating_mul(1_000));
     let claim = RefreshClaim::new(token.as_str(), now, expires_at);
     if store.set_refresh_claim(key, claim, ctx.store_cap).is_err() {
@@ -725,6 +1339,9 @@ where
             );
         }
         Some(_) => {}
+    }
+    if let Some(resp) = release_claim_in_vault(ctx, &key, &claim_token) {
+        return resp;
     }
     if store.clear_refresh_claim(&key, ctx.store_cap).is_err() {
         return Response::error(ErrorKind::Internal, "capability mismatch (claim)");
@@ -1144,8 +1761,30 @@ where
         // the regenerate path (re-auth gated inside get_or_regenerate); else the
         // key truly does not exist (DR-0014 §1).
         None => {
+            // A persistent entry with nothing resident means the vault is
+            // closed, not that the value is gone (DR-0034 §6). Answering
+            // before the definition is consulted matters twice over: the
+            // caller learns the value is intact and one command away, and a
+            // `persist = true` entry that also carries a command definition
+            // does not get a freshly generated value standing in for the one
+            // in the vault.
+            if let VaultOwnership::Unavailable(resp) = vault_ownership(ctx, &key) {
+                return *resp;
+            }
             if store.is_defined(&key) {
                 lazy_generate(store, ctx, &key, dry_run)
+            } else if ctx.persisted_keys.contains(&key) {
+                // Declared persistent, the vault is open, and it holds
+                // nothing: either it was discarded with `kv del` or it has
+                // never been set. Both need the same thing from the caller and
+                // neither can be served by regenerating (DR-0034 §5) — there
+                // is no upstream to regenerate from, which is what being the
+                // source of truth means.
+                Response::error(
+                    ErrorKind::NotRegenerable,
+                    "this entry is cache-warden's to keep and it holds no value for it; \
+                     it cannot be re-fetched, so set it again explicitly",
+                )
             } else {
                 Response::error(ErrorKind::NotFound, "no such key")
             }
@@ -1495,6 +2134,11 @@ mod tests {
         })
     }
 
+    /// An empty declaration set the test contexts can borrow for `'static`.
+    /// `BTreeSet::new` is a const fn, so this needs no lazy initialization.
+    static NO_PERSISTED_KEYS: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
     fn ctx<'a, A, R>(
         auth: &'a A,
         runner: &'a R,
@@ -1520,6 +2164,8 @@ mod tests {
             full_disk_access: None,
             requester: None,
             kv_process_policies: empty_policies(),
+            vault: None,
+            persisted_keys: &NO_PERSISTED_KEYS,
             guard_chain: None,
             guard_audit_token: None,
             kv_policy: default_policy(),
@@ -1567,6 +2213,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: None,
             claim_token: None,
+            persist: None,
         }
     }
 
@@ -1833,6 +2480,7 @@ mod tests {
             guard_constraints: vec![GuardConstraintWire::SameUser],
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         let resp = handle_request(&mut store, &c, req);
         assert_eq!(set_guard_applied(&resp), vec!["same-user".to_string()]);
@@ -1884,6 +2532,7 @@ mod tests {
             guard_constraints: vec![GuardConstraintWire::SameUser],
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         assert!(handle_request(&mut store, &setter_ctx, set_req).is_ok());
 
@@ -1952,6 +2601,7 @@ mod tests {
                     guard_constraints: vec![GuardConstraintWire::SameUser],
                     expected_version: None,
                     claim_token: None,
+                    persist: None,
                 },
             )
             .is_ok()
@@ -2025,6 +2675,7 @@ mod tests {
                 guard_constraints: vec![GuardConstraintWire::SameShell],
                 expected_version: None,
                 claim_token: None,
+                persist: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
@@ -2062,6 +2713,7 @@ mod tests {
                 guard_constraints: vec![GuardConstraintWire::SameUser],
                 expected_version: None,
                 claim_token: None,
+                persist: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
@@ -2104,6 +2756,7 @@ mod tests {
                     guard_constraints: vec![GuardConstraintWire::SameUser],
                     expected_version: None,
                     claim_token: None,
+                    persist: None,
                 },
             )
             .is_ok()
@@ -2168,6 +2821,7 @@ mod tests {
                     guard_constraints: vec![GuardConstraintWire::SameUser],
                     expected_version: None,
                     claim_token: None,
+                    persist: None,
                 },
             )
             .is_ok()
@@ -2240,6 +2894,7 @@ mod tests {
                     ],
                     expected_version: None,
                     claim_token: None,
+                    persist: None,
                 },
             )
             .is_ok()
@@ -2308,6 +2963,7 @@ mod tests {
                 guard_constraints: vec![GuardConstraintWire::SameShell],
                 expected_version: None,
                 claim_token: None,
+                persist: None,
             },
         );
         // The set succeeds and the ack names the applied kind.
@@ -2366,6 +3022,7 @@ mod tests {
                     guard_constraints: vec![GuardConstraintWire::SameShell],
                     expected_version: None,
                     claim_token: None,
+                    persist: None,
                 },
             )
             .is_ok()
@@ -2440,6 +3097,7 @@ mod tests {
                 }],
                 expected_version: None,
                 claim_token: None,
+                persist: None,
             },
         );
         assert_eq!(set_guard_applied(&set), vec!["same-ancestor".to_string()]);
@@ -2528,6 +3186,7 @@ mod tests {
                     guard_constraints: vec![GuardConstraintWire::SameUser],
                     expected_version: None,
                     claim_token: None,
+                    persist: None,
                 },
             )
             .is_ok()
@@ -2554,6 +3213,7 @@ mod tests {
                 guard_constraints: Vec::new(),
                 expected_version: None,
                 claim_token: None,
+                persist: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
@@ -2597,6 +3257,7 @@ mod tests {
                     guard_constraints: vec![GuardConstraintWire::SameUser],
                     expected_version: None,
                     claim_token: None,
+                    persist: None,
                 },
             )
             .is_ok()
@@ -2619,6 +3280,7 @@ mod tests {
                 guard_constraints: Vec::new(),
                 expected_version: None,
                 claim_token: None,
+                persist: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
@@ -2835,6 +3497,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -2885,6 +3548,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         assert!(handle_request(&mut store, &c, req).is_ok());
         assert!(store.has_value("default/authsock"));
@@ -3097,6 +3761,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -3159,6 +3824,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -3182,6 +3848,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -3333,6 +4000,7 @@ mod tests {
                     guard_constraints: Vec::new(),
                     expected_version: None,
                     claim_token: None,
+                    persist: None,
                 },
             );
         }
@@ -3820,6 +4488,8 @@ mod tests {
             full_disk_access: None,
             requester,
             kv_process_policies: policies,
+            vault: None,
+            persisted_keys: &NO_PERSISTED_KEYS,
             guard_chain: None,
             guard_audit_token: None,
             kv_policy: default_policy(),
@@ -4144,6 +4814,7 @@ mod tests {
                 guard_constraints: Vec::new(),
                 expected_version: expected,
                 claim_token: token.map(str::to_string),
+                persist: None,
             }
         }
 
@@ -4603,6 +5274,478 @@ mod tests {
                 !line.contains(&token),
                 "the claim token must never appear in a status reply"
             );
+        }
+    }
+
+    /// The vault-backed half of the handler (DR-0034 §5/§6): what it means for
+    /// cache-warden to be the source of truth for a value, and what a closed
+    /// vault does to the operations that touch one.
+    mod vault_backed {
+        use super::*;
+        use crate::daemon::vault_state::VaultState;
+
+        /// An open vault in a temp directory, plus the declaration set the
+        /// configuration would have contributed for `key`.
+        ///
+        /// The `TempDir` is returned so the caller keeps it alive: dropping it
+        /// deletes the vault file out from under the daemon state.
+        fn open_vault(key: &str) -> (tempfile::TempDir, std::sync::Mutex<VaultState>, Declared) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = VaultState::open_at(dir.path().join("v.cwv")).unwrap();
+            let (_id, code) = state.init().expect("initializes");
+            let mut declared = std::collections::BTreeSet::new();
+            declared.insert(key.to_string());
+            (
+                dir,
+                std::sync::Mutex::new(state),
+                Declared { declared, code },
+            )
+        }
+
+        struct Declared {
+            declared: std::collections::BTreeSet<String>,
+            code: cache_warden_vault::RecoveryCode,
+        }
+
+        fn persist_req(key: &str, value: &[u8]) -> Request {
+            Request::KvSet {
+                key: key.into(),
+                source: SetSource::Static {
+                    value_b64: encode_b64(value),
+                },
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+                guard_constraints: Vec::new(),
+                expected_version: None,
+                claim_token: None,
+                persist: Some(true),
+            }
+        }
+
+        /// An ordinary set: no `persist` flag, nothing else unusual. Whether
+        /// it lands in the vault is then decided entirely by the configuration.
+        fn set_static_req(key: &str, value: &[u8]) -> Request {
+            Request::KvSet {
+                key: key.into(),
+                source: SetSource::Static {
+                    value_b64: encode_b64(value),
+                },
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+                guard_constraints: Vec::new(),
+                expected_version: None,
+                claim_token: None,
+                persist: None,
+            }
+        }
+
+        fn get_req(key: &str) -> Request {
+            Request::KvGet {
+                key: key.into(),
+                dry_run: false,
+            }
+        }
+
+        /// Discarding a cache-warden-owned credential has to reach the disk.
+        /// If it only cleared memory, the next unlock would hand the value
+        /// back to a caller who believes they threw it away.
+        #[test]
+        fn deleting_an_owned_entry_removes_it_from_the_vault_too() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            handle_request(&mut store, &c, persist_req("default/RT", b"rt-1"));
+            assert!(
+                vault
+                    .lock()
+                    .unwrap()
+                    .unlocked()
+                    .unwrap()
+                    .entry("default/RT")
+                    .is_some(),
+                "the set should have written through"
+            );
+
+            let resp = handle_request(
+                &mut store,
+                &c,
+                Request::KvDel {
+                    key: "default/RT".into(),
+                    with_define: false,
+                },
+            );
+            assert!(matches!(resp, Response::Ok(_)), "{resp:?}");
+            assert!(
+                vault
+                    .lock()
+                    .unwrap()
+                    .unlocked()
+                    .unwrap()
+                    .entry("default/RT")
+                    .is_none(),
+                "the entry must be gone from the vault, not just from memory"
+            );
+        }
+
+        /// DR-0034 §5: an owned entry has no upstream, so a delete must not
+        /// leave a definition behind that quietly manufactures a replacement
+        /// on the next get — even when `with_define` was false, which for an
+        /// ordinary cached entry means "keep regenerating".
+        #[test]
+        fn a_deleted_owned_entry_is_not_regenerated() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"regenerated");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            handle_request(
+                &mut store,
+                &c,
+                define_with("default/RT", cmd_spec(&["printf", "regenerated"])),
+            );
+            handle_request(&mut store, &c, persist_req("default/RT", b"rt-1"));
+            handle_request(
+                &mut store,
+                &c,
+                Request::KvDel {
+                    key: "default/RT".into(),
+                    with_define: false,
+                },
+            );
+
+            let resp = handle_request(&mut store, &c, get_req("default/RT"));
+            assert_eq!(
+                err_kind(&resp),
+                ErrorKind::NotRegenerable,
+                "a discarded credential must ask to be set again, not be re-made"
+            );
+            assert_eq!(runner.runs.get(), 0, "the source command must not have run");
+        }
+
+        /// A delete that cannot reach the disk must not happen in memory
+        /// either: half a delete is a value that comes back on unlock.
+        #[test]
+        fn deleting_while_the_vault_is_closed_is_refused_rather_than_half_done() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            handle_request(&mut store, &c, persist_req("default/RT", b"rt-1"));
+            handle_request(&mut store, &c, Request::VaultLock);
+
+            let resp = handle_request(
+                &mut store,
+                &c,
+                Request::KvDel {
+                    key: "default/RT".into(),
+                    with_define: false,
+                },
+            );
+            assert_eq!(err_kind(&resp), ErrorKind::VaultLocked);
+
+            handle_request(
+                &mut store,
+                &c,
+                Request::VaultUnlock {
+                    recovery_code: d.code.render().to_string(),
+                },
+            );
+            assert_eq!(
+                get_value(&handle_request(&mut store, &c, get_req("default/RT"))),
+                b"rt-1",
+                "the refused delete must have left the value untouched"
+            );
+        }
+
+        /// Zeroizing the data key while the plaintext stays resident would
+        /// make `vault lock` a no-op with a reassuring reply.
+        #[test]
+        fn locking_takes_the_values_with_it() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            handle_request(&mut store, &c, persist_req("default/RT", b"rt-1"));
+            handle_request(&mut store, &c, Request::VaultLock);
+
+            let resp = handle_request(&mut store, &c, get_req("default/RT"));
+            assert_eq!(
+                err_kind(&resp),
+                ErrorKind::VaultLocked,
+                "a closed vault must not keep answering with what it was protecting"
+            );
+
+            handle_request(
+                &mut store,
+                &c,
+                Request::VaultUnlock {
+                    recovery_code: d.code.render().to_string(),
+                },
+            );
+            assert_eq!(
+                get_value(&handle_request(&mut store, &c, get_req("default/RT"))),
+                b"rt-1",
+                "unlocking brings the value back"
+            );
+        }
+
+        /// DR-0034 §1d: a persisted entry has to carry its authorization with
+        /// it, and the vault format does not hold one yet. Accepting the pair
+        /// would mean an entry that silently loses its guard the first time the
+        /// vault is reopened, which is the failure §1d exists to forbid.
+        #[test]
+        fn a_guard_cannot_be_attached_to_a_persisted_entry_yet() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            let mut req = persist_req("default/RT", b"rt-1");
+            if let Request::KvSet {
+                guard_constraints, ..
+            } = &mut req
+            {
+                *guard_constraints = vec![GuardConstraintWire::SameUser];
+            }
+            let resp = handle_request(&mut store, &c, req);
+            assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+            assert!(
+                vault
+                    .lock()
+                    .unwrap()
+                    .unlocked()
+                    .unwrap()
+                    .entry("default/RT")
+                    .is_none(),
+                "a refused set must not have written anything"
+            );
+            assert!(!store.has_value("default/RT"), "nor to memory");
+        }
+
+        /// The configuration's `persist = true` is a statement about where the
+        /// value lives, not a default a caller can drop by not repeating it. A
+        /// plain `kv set` on a declared key that only reached memory would hand
+        /// the operator an entry they were told is durable and a restart loses.
+        #[test]
+        fn a_declared_entry_is_persisted_even_when_the_caller_does_not_ask() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            let resp = handle_request(&mut store, &c, set_static_req("default/RT", b"rt-1"));
+            assert!(matches!(resp, Response::Ok(_)), "{resp:?}");
+            assert!(
+                vault
+                    .lock()
+                    .unwrap()
+                    .unlocked()
+                    .unwrap()
+                    .entry("default/RT")
+                    .is_some(),
+                "the declaration alone must have sent it to the vault"
+            );
+
+            // And an undeclared key is untouched by any of this.
+            handle_request(&mut store, &c, set_static_req("default/OTHER", b"o"));
+            assert!(
+                vault
+                    .lock()
+                    .unwrap()
+                    .unlocked()
+                    .unwrap()
+                    .entry("default/OTHER")
+                    .is_none()
+            );
+        }
+
+        /// The same declaration means a set cannot succeed while the vault is
+        /// closed: there is nowhere durable to put it, and memory-only is the
+        /// outcome the declaration rules out.
+        #[test]
+        fn setting_a_declared_entry_while_locked_is_refused() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            vault.lock().unwrap().lock().expect("closes");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            let resp = handle_request(&mut store, &c, set_static_req("default/RT", b"rt-1"));
+            assert_eq!(err_kind(&resp), ErrorKind::VaultLocked);
+            assert!(!store.has_value("default/RT"), "and nothing was written");
+        }
+
+        /// DR-0034 §4: a claim exists to keep a second caller away from the
+        /// provider while the first one is mid-refresh. The crash that loses
+        /// the first caller is precisely when that matters, so the claim has to
+        /// be on disk — a memory-only claim would vanish in that crash and the
+        /// successor would start the refresh the dead caller may have already
+        /// completed.
+        #[test]
+        fn a_claim_on_a_persisted_entry_survives_the_crash_it_guards_against() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            handle_request(&mut store, &c, persist_req("default/RT", b"rt-1"));
+            let held = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/RT".into(),
+                    expected_version: 1,
+                    duration_secs: 300,
+                },
+            );
+            let token = match &held {
+                Response::Ok(ok) => match &ok.payload {
+                    OkPayload::Claimed { claim_token, .. } => claim_token.clone(),
+                    other => panic!("expected a Claimed ack, got {other:?}"),
+                },
+                other => panic!("expected ok, got {other:?}"),
+            };
+
+            // Everything in memory is lost, as it would be in a crash.
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+            vault.lock().unwrap().lock().expect("closes");
+            handle_request(
+                &mut store,
+                &c,
+                Request::VaultUnlock {
+                    recovery_code: d.code.render().to_string(),
+                },
+            );
+
+            // The successor fences against the same claim: a writer with no
+            // token is turned away.
+            let resp = handle_request(&mut store, &c, persist_req("default/RT", b"rt-2"));
+            assert_eq!(err_kind(&resp), ErrorKind::ClaimTokenMismatch);
+
+            // And the caller that took it can still finish, with the token it
+            // was given before the crash.
+            let mut req = persist_req("default/RT", b"rt-2");
+            if let Request::KvSet { claim_token, .. } = &mut req {
+                *claim_token = Some(token);
+            }
+            let resp = handle_request(&mut store, &c, req);
+            assert!(matches!(resp, Response::Ok(_)), "{resp:?}");
+            assert!(
+                vault
+                    .lock()
+                    .unwrap()
+                    .unlocked()
+                    .unwrap()
+                    .entry("default/RT")
+                    .is_some()
+            );
+        }
+
+        /// Releasing has to reach the disk for the same reason taking does:
+        /// otherwise a successor keeps fencing against a claim nobody holds
+        /// until its expiry runs out — the wait the release exists to skip.
+        #[test]
+        fn releasing_a_claim_on_a_persisted_entry_reaches_the_disk() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            handle_request(&mut store, &c, persist_req("default/RT", b"rt-1"));
+            let held = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/RT".into(),
+                    expected_version: 1,
+                    duration_secs: 300,
+                },
+            );
+            let token = match &held {
+                Response::Ok(ok) => match &ok.payload {
+                    OkPayload::Claimed { claim_token, .. } => claim_token.clone(),
+                    other => panic!("expected a Claimed ack, got {other:?}"),
+                },
+                other => panic!("expected ok, got {other:?}"),
+            };
+            handle_request(
+                &mut store,
+                &c,
+                Request::KvUnclaim {
+                    key: "default/RT".into(),
+                    claim_token: token,
+                },
+            );
+
+            assert!(
+                vault
+                    .lock()
+                    .unwrap()
+                    .unlocked()
+                    .unwrap()
+                    .active_claim("default/RT")
+                    .is_none(),
+                "the release must have been recorded durably"
+            );
+        }
+
+        /// The locked reply has to be `vault_locked` specifically. An OAuth
+        /// consumer that read a closed vault as an authorization failure would
+        /// mint a duplicate grant for a credential it already owns
+        /// (DR-0034 §6).
+        #[test]
+        fn a_declared_entry_reports_the_lock_rather_than_a_miss() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            vault.lock().unwrap().lock().expect("closes");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            // Never set in this process: a cold start looks exactly like this.
+            let resp = handle_request(&mut store, &c, get_req("default/RT"));
+            assert_eq!(err_kind(&resp), ErrorKind::VaultLocked);
+
+            // An undeclared key is still an ordinary miss — the locked answer
+            // is about persistent entries, not about the daemon as a whole.
+            let resp = handle_request(&mut store, &c, get_req("default/OTHER"));
+            assert_eq!(err_kind(&resp), ErrorKind::NotFound);
         }
     }
 }

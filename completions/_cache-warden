@@ -78,6 +78,7 @@ _cache-warden() {
     'ping:Check that the daemon is alive'
     'status:Show daemon info and the (value-free) entry list'
     'kv:Manage cached key/value secrets'
+    'vault:Manage the encrypted vault that keeps values across restarts'
     'run:Resolve env references then exec a command'
     'inject:Substitute references in a template stream'
     'config:Inspect and edit the configuration'
@@ -195,6 +196,7 @@ _cache-warden() {
                     '*--require-command[Reader chain must contain NAME (WEAK, spoofable)]:name' \
                     '--expected-version[Write only if the key is still at version N (0 = must not exist yet)]:version' \
                     '--claim-token[Finish the refresh held by kv claim]:token' \
+                    '--persist[Keep the value in the encrypted vault across daemon restarts]' \
                     '1:key:_cw_keys' \
                     '2:value (omit to read stdin):'
                   ;;
@@ -256,6 +258,28 @@ _cache-warden() {
                   ;;
               esac
               ;;
+          esac
+          ;;
+
+        vault)
+          # vault の 4 動詞はいずれも位置引数を取らない。特に unlock の
+          # recovery code は stdin 専用 (argv に置くと ps / 履歴に残る) なので、
+          # 補完でも値スロットを一切出さない。
+          local -a vault_commands
+          vault_commands=(
+            'init:Create the vault (prints its recovery code once)'
+            'unlock:Open the vault so persisted values become readable'
+            'lock:Close the vault, wiping its key from memory'
+            'status:Show whether the vault is open, and what can open it'
+          )
+          _arguments -C \
+            "$socket_opt" \
+            '--help[Show this help message]' \
+            '1: :->vcmd' \
+            '*::varg:->vargs'
+          case "$state" in
+            vcmd) _describe -t commands 'vault subcommand' vault_commands ;;
+            vargs) _arguments "$socket_opt" '--help[Show this help message]' ;;
           esac
           ;;
 

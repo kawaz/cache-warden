@@ -59,6 +59,23 @@ fn render_response(resp: Response) -> Result<(), String> {
                     println!("{claim_token}");
                 }
                 OkPayload::Unclaimed { .. } => println!("unclaimed"),
+                OkPayload::VaultInitialized {
+                    vault_id,
+                    recovery_code,
+                    ..
+                } => {
+                    // The code goes to stdout on its own line so it can be
+                    // redirected to a file or a password manager; everything
+                    // else — including the warning that it is shown once — is
+                    // context and goes to stderr.
+                    eprintln!("vault {vault_id} created.");
+                    println!("{recovery_code}");
+                    eprintln!("\n{}", cache_warden_vault::RECOVERY_STORAGE_GUIDANCE);
+                }
+                OkPayload::VaultUnlocked {
+                    entries_restored, ..
+                } => println!("unlocked ({entries_restored} entries available)"),
+                OkPayload::VaultLocked { .. } => println!("locked"),
                 OkPayload::Defined { .. } => println!("defined"),
                 OkPayload::Deleted { deleted } => {
                     println!("{}", if deleted { "deleted" } else { "not found" })
@@ -98,6 +115,7 @@ fn render_response(resp: Response) -> Result<(), String> {
                     println!("restart accepted");
                 }
                 OkPayload::Status {
+                    vault: _,
                     pid,
                     version,
                     socket,
@@ -143,6 +161,8 @@ fn error_kind_str(kind: &protocol::wire::ErrorKind) -> &'static str {
         CasMismatch => "version conflict",
         AlreadyClaimed => "already being refreshed",
         ClaimTokenMismatch => "claim token mismatch",
+        VaultLocked => "vault locked",
+        VaultNotInitialized => "no vault",
     }
 }
 
@@ -354,6 +374,7 @@ fn run() -> Result<(), CliError> {
         "ping" => Ok(run_client(&socket, &protocol::wire::Request::Ping)?),
         "status" => dispatch_status(&rest, &socket, &loaded.config),
         "kv" => dispatch_kv(&rest, &socket, &loaded.config),
+        "vault" => dispatch_vault(&rest, &socket),
         "run" => dispatch_run(&rest, &socket, &loaded.config),
         "inject" => dispatch_inject(&rest, &socket, &loaded.config),
         "--help" | "--version" => unreachable!("handled above"),
@@ -658,6 +679,84 @@ fn dispatch_kv(
         return Ok(run_client_expect_guard_ack(socket, &req)?);
     }
     Ok(run_client(socket, &req)?)
+}
+
+/// Dispatch the `vault` group (DR-0034 §6/§9).
+///
+/// No namespace and no config of its own: a vault belongs to the daemon, not
+/// to a KV namespace.
+fn dispatch_vault(rest: &[String], socket: &std::path::Path) -> Result<(), CliError> {
+    if rest.is_empty() || rest[0] == "--help" {
+        println!("{}", help::vault().render());
+        return Ok(());
+    }
+    let sub = rest[0].as_str();
+    let tail = &rest[1..];
+    let leaf_help: fn() -> help::HelpSpec = match sub {
+        "init" => help::vault_init,
+        "unlock" => help::vault_unlock,
+        "lock" => help::vault_lock,
+        "status" => help::vault_status,
+        other => {
+            return Err(CliError::Message(format!(
+                "unknown vault subcommand: {other} (try `{NAME} vault --help`)"
+            )));
+        }
+    };
+    if help::wants_help(tail) {
+        println!("{}", leaf_help().render());
+        return Ok(());
+    }
+
+    // `status` renders a view of the ordinary `status` reply (there is no
+    // `vault.status` request), so it is dispatched on its own.
+    if sub == "status" {
+        return dispatch_vault_status(tail, socket);
+    }
+
+    let req = match sub {
+        "init" => or_usage(commands::vault_cmd::parse_vault_init(tail), leaf_help)?,
+        "lock" => or_usage(commands::vault_cmd::parse_vault_lock(tail), leaf_help)?,
+        "unlock" => or_usage(
+            commands::vault_cmd::parse_vault_unlock(
+                tail,
+                std::io::IsTerminal::is_terminal(&std::io::stdin()),
+                || {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    Ok(line)
+                },
+            ),
+            leaf_help,
+        )?,
+        _ => unreachable!("leaf_help match covers all known subcommands"),
+    };
+    Ok(run_client(socket, &req)?)
+}
+
+/// Dispatch `vault status` (DR-0034 §6): ask for the daemon status and render
+/// only its vault section.
+fn dispatch_vault_status(tail: &[String], socket: &std::path::Path) -> Result<(), CliError> {
+    or_usage(
+        commands::vault_cmd::parse_vault_status(tail),
+        help::vault_status,
+    )?;
+    let resp = client::round_trip(socket, &protocol::wire::Request::Status)?;
+    match resp {
+        Response::Ok(ok) => match ok.payload {
+            OkPayload::Status { vault, .. } => {
+                print!(
+                    "{}",
+                    commands::vault_cmd::render_vault_status(vault.as_deref())
+                );
+                Ok(())
+            }
+            other => Err(CliError::Message(format!(
+                "unexpected response payload for status: {other:?}"
+            ))),
+        },
+        resp @ Response::Err(_) => Ok(render_response(resp)?),
+    }
 }
 
 /// Dispatch `kv list [--all]` (DR-0017 §2).
@@ -1143,6 +1242,7 @@ mod tests {
             guard_summary: None,
             version: None,
             claim_expires_in_secs: None,
+            locked: false,
         }
     }
 
@@ -1332,6 +1432,7 @@ mod tests {
             guard_constraints: vec![protocol::wire::GuardConstraintWire::SameUser],
             expected_version: None,
             claim_token: None,
+            persist: None,
         }
     }
 

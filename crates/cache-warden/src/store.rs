@@ -1161,6 +1161,36 @@ impl Store {
         Ok(next)
     }
 
+    /// Reinstate a version that was persisted elsewhere (DR-0034 §5).
+    ///
+    /// Distinct from [`Store::bump_version`] because it is not a write: it is
+    /// how a counter that already exists on durable storage comes back into a
+    /// fresh process. Loading a vault entry has to restore its version
+    /// alongside its value, or a restart would silently reset the counter and
+    /// hand a stale writer a compare-and-swap it should have lost.
+    ///
+    /// **Never moves a version backwards.** If the store is already at or past
+    /// `version` the call is a no-op, so a later durable state cannot be
+    /// overwritten by an earlier one — monotonicity survives even a restore
+    /// from a stale copy of the vault.
+    ///
+    /// Cap check (DR-0024) runs first.
+    pub fn restore_version(
+        &mut self,
+        key: impl Into<String>,
+        version: u64,
+        cap: &Capability,
+    ) -> Result<u64, CapError> {
+        self.check_cap(cap)?;
+        let key = key.into();
+        let current = self.version_of(&key);
+        let installed = current.max(version);
+        if installed > 0 {
+            self.versions.insert(key, installed);
+        }
+        Ok(installed)
+    }
+
     /// Record an in-progress refresh claim on `key`, replacing any existing
     /// one.
     ///
@@ -4784,6 +4814,35 @@ mod tests {
             assert_eq!(s.version_of("default/K"), 0);
         }
 
+        /// Restoring is how a persisted counter re-enters a fresh process, so
+        /// it must install the durable value exactly.
+        #[test]
+        fn restoring_installs_a_persisted_version() {
+            let (mut s, cap, _clock) = seeded();
+            assert_eq!(s.restore_version("default/K", 7, &cap).unwrap(), 7);
+            assert_eq!(s.version_of("default/K"), 7);
+            // And the counter carries on from there rather than restarting.
+            assert_eq!(s.bump_version("default/K", &cap).unwrap(), 8);
+        }
+
+        /// A restore from an older copy of durable state must not undo a newer
+        /// version already in memory — monotonicity is the property the whole
+        /// compare-and-swap scheme rests on.
+        #[test]
+        fn restoring_never_moves_a_version_backwards() {
+            let (mut s, cap, _clock) = seeded();
+            s.restore_version("default/K", 9, &cap).unwrap();
+            assert_eq!(s.restore_version("default/K", 3, &cap).unwrap(), 9);
+            assert_eq!(s.version_of("default/K"), 9);
+        }
+
+        #[test]
+        fn restoring_version_zero_records_nothing() {
+            let (mut s, cap, _clock) = seeded();
+            assert_eq!(s.restore_version("default/K", 0, &cap).unwrap(), 0);
+            assert_eq!(s.version_of("default/K"), 0);
+        }
+
         #[test]
         fn a_claim_is_stored_and_read_back_verbatim() {
             let (mut s, cap, _clock) = seeded();
@@ -4844,8 +4903,9 @@ mod tests {
             let snap = s.export_snapshot(&cap, &clock).unwrap();
             assert_eq!(
                 snap.format_version(),
-                crate::snapshot::FORMAT_VERSION,
-                "refresh state forces the newest wire version"
+                crate::snapshot::VERSION_PRE_DEK,
+                "refresh state steps the version up, but not to the one that \
+                 declares a data-key frame this snapshot does not carry"
             );
             let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
             assert_eq!(bundle.store.version_of("default/K"), 2);

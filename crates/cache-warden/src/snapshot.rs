@@ -70,7 +70,20 @@ use crate::source::ValueSource;
 /// accept any version in `[MIN_SUPPORTED_VERSION, FORMAT_VERSION]` (see the
 /// module doc's "Wire format compatibility" section) and reject anything
 /// outside that range rather than guess.
-pub(crate) const FORMAT_VERSION: u32 = 3;
+pub(crate) const FORMAT_VERSION: u32 = 4;
+
+/// Wire version that carries refresh state but **no trailing data-key frame**
+/// (DR-0034 §11). Anything at or below this is a stream that ends with the
+/// entry frames.
+///
+/// The distinction is what makes the trailing frame safe to read. A reader
+/// cannot tell "there is no frame" from "the frame has not arrived yet" by
+/// looking at the socket — both look like no bytes available — so presence is
+/// decided by the version instead: [`FORMAT_VERSION`] means a frame follows
+/// and the reader blocks for it, anything lower means the stream is over.
+/// Guessing with a timeout would be the alternative, and a guess that fires
+/// early silently downgrades a graceful restart to a locked one.
+pub(crate) const VERSION_PRE_DEK: u32 = 3;
 
 /// The oldest `format_version` this build still knows how to read. Only
 /// moves forward if a future format change is *breaking* (at which point the
@@ -112,6 +125,11 @@ fn version_is_supported(v: u32) -> bool {
 /// Not a security boundary (the DR-0029 channel is a private socketpair) —
 /// just a cheap "is this even the right kind of stream" sanity check.
 const MAGIC: [u8; 8] = *b"CWSNAP01";
+
+/// Marks the optional trailing data-key frame (DR-0034 §11). Distinct from
+/// [`MAGIC`] so a reader scanning for it cannot mistake the stream header for
+/// a frame.
+const DEK_FRAME_MAGIC: [u8; 8] = *b"CWVDEK01";
 
 /// Upper bound on `entry_count` used to size the initial `Vec::with_capacity`
 /// allocation in [`StoreSnapshot::from_bytes`]. `entry_count` is attacker-
@@ -375,6 +393,16 @@ impl StoreSnapshot {
     /// [`FORMAT_VERSION`] so an older build refuses to import (rather than
     /// silently dropping the guard); otherwise the snapshot stays on
     /// [`VERSION_PRE_GUARD`] to keep guard-free downgrade paths working.
+    /// Declare that a trailing data-key frame will follow the entry frames
+    /// (DR-0034 §11), by stepping the version up to the one that means it.
+    ///
+    /// Call this only when the frame is actually going to be written: the
+    /// reader trusts the version and **blocks** for the frame, so a snapshot
+    /// that declares one and does not send it stalls the handoff.
+    pub fn declare_dek_frame(&mut self) {
+        self.format_version = FORMAT_VERSION;
+    }
+
     pub(crate) fn from_entries(entries: Vec<SnapshotEntry>) -> Self {
         let any_refresh = entries
             .iter()
@@ -383,7 +411,7 @@ impl StoreSnapshot {
         // Step up only as far as the content requires, so a workload that uses
         // none of these keeps producing snapshots an older build can import.
         let format_version = if any_refresh {
-            FORMAT_VERSION
+            VERSION_PRE_DEK
         } else if any_guarded {
             VERSION_PRE_REFRESH
         } else {
@@ -428,6 +456,64 @@ impl StoreSnapshot {
     /// `magic(8B) + format_version(u32, big-endian) + entry_count(u32,
     /// big-endian)`, followed by `entry_count` frames of
     /// `len(u32, big-endian) + serde_json(SnapshotEntry)`.
+    /// Append a trailing data-key frame to an already-serialized snapshot
+    /// (DR-0034 §11).
+    ///
+    /// Sits *after* the entry frames on purpose. [`StoreSnapshot::from_bytes`]
+    /// stops once it has read `entry_count` frames and never looks further, so
+    /// a build that predates this frame simply does not see it — and a
+    /// successor that does not learn the data key starts with the vault
+    /// **locked**. That is the safe direction: the user runs `vault unlock`
+    /// once, rather than a stale reader silently gaining access it should not
+    /// have. It is the mirror image of the format-version rule, where dropping
+    /// a field would lose authorization and so must be refused instead.
+    ///
+    /// The key travels the same private socketpair the entry secrets already
+    /// do (DR-0029), so carrying it adds no new trust assumption.
+    pub fn append_dek_frame(buf: &mut Zeroizing<Vec<u8>>, dek: &[u8]) {
+        buf.extend_from_slice(&DEK_FRAME_MAGIC);
+        buf.extend_from_slice(&(dek.len() as u32).to_be_bytes());
+        buf.extend_from_slice(dek);
+    }
+
+    /// Whether this snapshot's version says a data-key frame follows the entry
+    /// frames (DR-0034 §11). See [`VERSION_PRE_DEK`] for why presence is
+    /// carried by the version rather than discovered from the stream.
+    pub fn declares_dek_frame(&self) -> bool {
+        self.format_version >= FORMAT_VERSION
+    }
+
+    /// Bytes a declared data-key frame occupies: magic, length, and a key.
+    pub const DEK_FRAME_LEN: usize = DEK_FRAME_MAGIC.len() + 4 + 32;
+
+    /// Read back a data-key frame appended by [`StoreSnapshot::append_dek_frame`].
+    ///
+    /// `bytes` is the whole handoff buffer. Returns `None` when no frame is
+    /// present, when it is truncated, or when it is malformed — every one of
+    /// which lands on "start locked", the fail-closed outcome.
+    ///
+    /// The frame is read at one fixed offset from the end, never searched for.
+    /// Searching would let the magic be *found* inside the data preceding it —
+    /// and that data is entry secrets, which an attacker who can get a chosen
+    /// value into the store controls byte for byte. A planted `CWVDEK01`
+    /// followed by 32 bytes of their choosing would then be read as the data
+    /// key by the successor process. At a fixed offset there is nothing to
+    /// plant: either the real frame is there or no frame is.
+    pub fn read_dek_frame(bytes: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+        let start = bytes.len().checked_sub(Self::DEK_FRAME_LEN)?;
+        if bytes[start..start + DEK_FRAME_MAGIC.len()] != DEK_FRAME_MAGIC {
+            return None;
+        }
+        let len_at = start + DEK_FRAME_MAGIC.len();
+        let len = u32::from_be_bytes(bytes.get(len_at..len_at + 4)?.try_into().ok()?) as usize;
+        // A key is 32 bytes; anything else is not one this build can use.
+        if len != 32 {
+            return None;
+        }
+        let body = bytes.get(len_at + 4..len_at + 4 + len)?;
+        Some(Zeroizing::new(body.to_vec()))
+    }
+
     pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, ExportError> {
         let entry_count: u32 =
             self.entries
@@ -723,11 +809,15 @@ mod tests {
     use super::*;
 
     fn sample_entry(key: &str) -> SnapshotEntry {
+        sample_entry_with_value(key, b"hunter2")
+    }
+
+    fn sample_entry_with_value(key: &str, secret: &[u8]) -> SnapshotEntry {
         SnapshotEntry {
             key: key.to_string(),
             value: Some(SnapshotValue {
                 source: SnapshotSource::Static,
-                secret: Zeroizing::new(b"hunter2".to_vec()),
+                secret: Zeroizing::new(secret.to_vec()),
                 soft_ttl_ms: Some(10_000),
                 hard_ttl_ms: Some(30_000),
                 loaded_at_epoch_ms: 1_000,
@@ -869,6 +959,93 @@ mod tests {
             StoreSnapshot::from_bytes(&[]),
             Err(ImportError::Truncated)
         ));
+    }
+
+    // ---- DR-0034 §11 data-key frame ----
+
+    #[test]
+    fn a_dek_frame_round_trips_on_the_end_of_a_snapshot() {
+        let snap = StoreSnapshot::new(vec![sample_entry("A")]);
+        let mut bytes = snap.to_bytes().unwrap();
+        let dek = [7u8; 32];
+        StoreSnapshot::append_dek_frame(&mut bytes, &dek);
+
+        // The entries still parse: the reader stops at entry_count and never
+        // sees the frame.
+        let back = StoreSnapshot::from_bytes(&bytes).expect("entries still parse");
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            StoreSnapshot::read_dek_frame(&bytes).map(|k| k.to_vec()),
+            Some(dek.to_vec())
+        );
+    }
+
+    /// The fail-closed direction: a snapshot with no frame yields no key, and
+    /// the successor starts with the vault locked rather than open.
+    #[test]
+    fn a_snapshot_without_a_dek_frame_yields_no_key() {
+        let bytes = StoreSnapshot::new(vec![sample_entry("A")])
+            .to_bytes()
+            .unwrap();
+        assert!(StoreSnapshot::read_dek_frame(&bytes).is_none());
+    }
+
+    #[test]
+    fn a_truncated_or_malformed_dek_frame_yields_no_key() {
+        let snap = StoreSnapshot::new(vec![sample_entry("A")]);
+        let mut full = snap.to_bytes().unwrap();
+        StoreSnapshot::append_dek_frame(&mut full, &[7u8; 32]);
+
+        // Every truncation of the frame must decline rather than hand back a
+        // partial key.
+        for cut in 1..=32 {
+            let short = &full[..full.len() - cut];
+            assert!(
+                StoreSnapshot::read_dek_frame(short).is_none(),
+                "a frame short by {cut} bytes must not yield a key"
+            );
+        }
+        // A frame declaring a length no key has.
+        let mut wrong = snap.to_bytes().unwrap();
+        StoreSnapshot::append_dek_frame(&mut wrong, &[1u8; 16]);
+        assert!(StoreSnapshot::read_dek_frame(&wrong).is_none());
+    }
+
+    /// A secret's bytes are chosen by whoever set it. If the frame were
+    /// searched for rather than read at a fixed offset, a value shaped like a
+    /// frame would be picked up as the data key by the process being handed
+    /// to — a caller feeding cache-warden a crafted value would be choosing
+    /// the key that decrypts the vault.
+    #[test]
+    fn a_frame_planted_inside_a_secret_is_not_mistaken_for_the_real_one() {
+        let mut planted = Vec::new();
+        planted.extend_from_slice(b"CWVDEK01");
+        planted.extend_from_slice(&32u32.to_be_bytes());
+        planted.extend_from_slice(&[0xAAu8; 32]);
+        let snap = StoreSnapshot::new(vec![sample_entry_with_value("A", &planted)]);
+
+        let no_frame = snap.to_bytes().unwrap();
+        assert!(
+            StoreSnapshot::read_dek_frame(&no_frame).is_none(),
+            "a snapshot with no data-key frame must start locked, whatever its entries contain"
+        );
+
+        // And with a real frame appended, the real one is what comes back.
+        let mut with_frame = snap.to_bytes().unwrap();
+        StoreSnapshot::append_dek_frame(&mut with_frame, &[7u8; 32]);
+        assert_eq!(
+            StoreSnapshot::read_dek_frame(&with_frame)
+                .unwrap()
+                .as_slice(),
+            &[7u8; 32],
+            "the trailing frame is the key, not the one hidden in the value"
+        );
+    }
+
+    #[test]
+    fn an_empty_buffer_does_not_panic_looking_for_a_frame() {
+        assert!(StoreSnapshot::read_dek_frame(&[]).is_none());
+        assert!(StoreSnapshot::read_dek_frame(b"short").is_none());
     }
 
     // ---- SnapshotSource conversion ----
@@ -1020,16 +1197,21 @@ mod tests {
         assert_eq!(guarded.format_version(), VERSION_PRE_REFRESH);
     }
 
-    /// The DR-0034 generation of the same rule: refresh state forces the
-    /// current version, so a build that predates claims refuses the snapshot
-    /// rather than importing it and dropping them.
+    /// The DR-0034 generation of the same rule: refresh state steps the
+    /// version up, so a build that predates claims refuses the snapshot rather
+    /// than importing it and dropping them.
+    ///
+    /// It lands on `VERSION_PRE_DEK`, one below the newest, for the same
+    /// reason guards land one below that: the newest version means "a data-key
+    /// frame follows", and a snapshot carrying no key must not claim one — a
+    /// reader would block waiting for bytes nobody is going to send.
     #[test]
     fn from_entries_steps_up_again_for_refresh_state() {
         let mut versioned = sample_entry("A");
         versioned.version = Some(7);
         assert_eq!(
             StoreSnapshot::from_entries(vec![versioned]).format_version(),
-            FORMAT_VERSION
+            VERSION_PRE_DEK
         );
 
         let mut claimed = sample_entry("B");
@@ -1040,8 +1222,21 @@ mod tests {
         });
         assert_eq!(
             StoreSnapshot::from_entries(vec![claimed]).format_version(),
-            FORMAT_VERSION
+            VERSION_PRE_DEK
         );
+    }
+
+    /// Only a snapshot that will actually carry a key declares one, and the
+    /// declaration is what the reader trusts.
+    #[test]
+    fn only_a_snapshot_carrying_a_key_declares_a_dek_frame() {
+        let plain = StoreSnapshot::from_entries(vec![sample_entry("A")]);
+        assert!(!plain.declares_dek_frame());
+
+        let mut with_key = StoreSnapshot::from_entries(vec![sample_entry("A")]);
+        with_key.declare_dek_frame();
+        assert!(with_key.declares_dek_frame());
+        assert_eq!(with_key.format_version(), FORMAT_VERSION);
     }
 
     /// A version and a claim must survive the wire round trip: the version is

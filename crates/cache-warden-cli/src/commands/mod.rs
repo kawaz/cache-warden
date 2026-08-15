@@ -14,6 +14,7 @@ pub mod internal_cmd;
 pub mod op_private_key;
 pub mod run_cmd;
 pub mod service;
+pub mod vault_cmd;
 
 use std::path::PathBuf;
 
@@ -429,7 +430,8 @@ fn guard_constraints_in_argv_order(
 ///
 /// `--expected-version N` makes the write conditional (DR-0034 §4) and
 /// `--claim-token TOKEN` finishes a refresh started by `kv claim`. Both are
-/// absent by default, which is an unconditional write.
+/// absent by default, which is an unconditional write. `--persist` asks for
+/// the value to be kept in the encrypted vault (DR-0034 §5).
 pub fn parse_kv_set(
     args: &[String],
     ns: &str,
@@ -481,6 +483,11 @@ pub fn parse_kv_set(
     let guard_constraints = guard_constraints_in_argv_order(head, &m)?;
     let expected_version = expected_version(&m)?;
     let claim_token = claim_token(&m)?;
+    // DR-0034 §5: `--persist` is a request, so it travels as `Some(true)`;
+    // its absence stays `None` (= "said nothing") rather than `Some(false)`,
+    // because an entry's existing storage is not changed by a set that never
+    // mentioned it, and an older daemon must see the field missing.
+    let persist = (m.get_count("persist") > 0).then_some(true);
 
     let key = m
         .get_one::<String>("KEY")
@@ -533,6 +540,7 @@ pub fn parse_kv_set(
         guard_constraints,
         expected_version,
         claim_token,
+        persist,
     })
 }
 
@@ -1972,6 +1980,26 @@ mod tests {
             Request::KvSet {
                 expected_version, ..
             } => assert_eq!(expected_version, Some(0)),
+            other => panic!("expected KvSet, got {other:?}"),
+        }
+    }
+
+    // ---- DR-0034 §5: --persist on the CLI ----
+
+    /// `--persist` asks the daemon to keep the value in the vault; omitting it
+    /// says nothing at all (`None`), so an older daemon sees no field and a
+    /// set that never mentioned storage does not change it.
+    #[test]
+    fn kv_set_persist_flag_travels_as_some_true_and_its_absence_as_none() {
+        let with = parse_kv_set(&s(&["--persist", "K", "v"]), "default", false, no_stdin).unwrap();
+        match with {
+            Request::KvSet { persist, .. } => assert_eq!(persist, Some(true)),
+            other => panic!("expected KvSet, got {other:?}"),
+        }
+
+        let without = parse_kv_set(&s(&["K", "v"]), "default", false, no_stdin).unwrap();
+        match without {
+            Request::KvSet { persist, .. } => assert_eq!(persist, None),
             other => panic!("expected KvSet, got {other:?}"),
         }
     }

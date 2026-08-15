@@ -108,6 +108,30 @@ pub struct Config {
     /// pre-DR-0030 shape (guard disabled unless the client asked).
     #[serde(default, rename = "kv-policy")]
     pub kv_policy: KvPolicyConfig,
+    /// `[vault]` section (DR-0034): where the encrypted vault lives.
+    ///
+    /// There is deliberately no `enabled` flag. Declaring `persist = true` on
+    /// an entry is already an explicit statement of intent, and the one truly
+    /// irreversible step — creating the file and minting a recovery code — is
+    /// gated by the separate `vault init` command. A third switch would only
+    /// add a state where an entry is declared persistent and silently is not.
+    #[serde(default)]
+    pub vault: VaultConfig,
+}
+
+/// `[vault]` — where the encrypted vault file lives (DR-0034 §7).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultConfig {
+    /// Names the vault file within the state directory, so a development
+    /// vault and a production one are separate files rather than separate
+    /// intentions (DR-0034 §7). Defaults to `"default"`.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Absolute path to the vault file, overriding `profile` entirely. For
+    /// tests and for setups that keep state somewhere non-standard.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// `[kv-policy]` section (DR-0030): daemon-wide guard knobs.
@@ -609,6 +633,15 @@ pub struct KvEntryConfig {
     /// The `op` kind table (used when `source = "op"`).
     #[serde(default)]
     pub op: Option<OpTable>,
+    /// Store this entry in the encrypted vault, making cache-warden the
+    /// source of truth for it (DR-0034 §5).
+    ///
+    /// Rejected together with `source = "op"`: those say opposite things about
+    /// where the newest value lives, and honouring both would leave
+    /// cache-warden serving a stale copy of a value 1Password still considers
+    /// authoritative.
+    #[serde(default)]
+    pub persist: bool,
     /// Soft TTL string (e.g. `"1h"`). Parsed via [`parse_duration`].
     #[serde(default, rename = "soft-ttl")]
     pub soft_ttl: Option<String>,
@@ -936,6 +969,20 @@ impl KvEntryConfig {
             )));
         }
 
+        // DR-0034 §5: persist and cw-owned are one property. An `op` source
+        // says 1Password holds the newest value; persist says cache-warden
+        // does. Accepting both would leave the daemon serving a copy it can
+        // never learn is stale, so this is a config error rather than a
+        // precedence rule.
+        if self.persist && self.source.as_deref() == Some("op") {
+            return Err(ConfigError::new(format!(
+                "[kv.{name}]: `persist = true` cannot be combined with `source = \"op\"` — \
+                 persist makes cache-warden the source of truth for the value, while an op \
+                 source makes 1Password the source of truth. Pick one: drop `persist` to keep \
+                 re-fetching from op, or drop the op source to let cache-warden own the value"
+            )));
+        }
+
         let source = build_kv_source(name, &self.source, &self.command, &self.op)?;
 
         let parse = |label: &str, s: &Option<String>| -> Result<Option<u64>, ConfigError> {
@@ -1247,6 +1294,24 @@ impl Config {
     /// shared state; the core [`cache_warden::Store`] never sees it (policy
     /// interpretation is an adapter/handler concern, DR-0004). `BTreeMap` keeps a
     /// deterministic order for tests / diagnostics.
+    /// The composed store keys the config declares as `persist = true`
+    /// (DR-0034 §5).
+    ///
+    /// These are the only persisted entries the daemon can name while the
+    /// vault is closed: entry names live in the vault's sealed body, so
+    /// nothing outside the ciphertext knows about an entry persisted at
+    /// runtime with no declaration here.
+    pub fn persisted_keys(&self) -> std::collections::BTreeSet<String> {
+        self.kv
+            .iter()
+            .filter(|(_, entry)| entry.persist)
+            .filter_map(|(name, entry)| {
+                let def = entry.validate(name).ok()?;
+                Some(def.full_key(crate::namespace::DEFAULT_NAMESPACE))
+            })
+            .collect()
+    }
+
     pub fn kv_process_policies(&self) -> BTreeMap<String, Vec<String>> {
         self.kv
             .iter()

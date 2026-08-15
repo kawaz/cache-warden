@@ -37,3 +37,4 @@ pub mod otp_adapter;
 pub mod peer;
 pub mod server;
 pub mod upstream_path;
+pub mod vault_state;

@@ -335,6 +335,16 @@ pub enum Request {
         /// cannot catch that, because nothing has written in between.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claim_token: Option<String>,
+        /// Store this entry in the encrypted vault, making cache-warden the
+        /// source of truth for it (DR-0034 §5).
+        ///
+        /// `persist` and "cw-owned" are one property, not two: a persisted
+        /// entry is one whose newest value exists only here, which is the
+        /// whole reason it has to survive a restart. Combining it with an
+        /// `op` source is rejected — that would leave cache-warden holding a
+        /// stale copy of a value 1Password still considers authoritative.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persist: Option<bool>,
     },
     /// Register a *typed source* definition for a key (DR-0014 §1 / DR-0018 §1).
     ///
@@ -443,6 +453,34 @@ pub enum Request {
         /// caller whose claim lapsed cannot cancel the claim that replaced it.
         claim_token: String,
     },
+    /// Create the encrypted vault and mint its recovery code (DR-0034 §9).
+    ///
+    /// The recovery slot is created here and cannot be skipped: with
+    /// cache-warden as the sole source of truth for what it holds, a vault
+    /// with no recovery path is one lost passkey away from being gone.
+    ///
+    /// The reply carries the only copy of the recovery code. Refuses if a
+    /// vault already exists rather than replacing it.
+    #[serde(rename = "vault.init")]
+    VaultInit,
+    /// Open the vault so its entries become readable (DR-0034 §6).
+    ///
+    /// Explicit by design: the daemon never unlocks on its own, so an
+    /// unattended start stays unattended and a `kv.get` cannot trigger a
+    /// prompt storm.
+    #[serde(rename = "vault.unlock")]
+    VaultUnlock {
+        /// The recovery code, as typed by the user.
+        ///
+        /// Plain text rather than the `_b64` treatment secrets get elsewhere:
+        /// that convention exists for binary safety, and a recovery code is
+        /// already ASCII. It is still credential material — the CLI reads it
+        /// from stdin, never from argv, and no layer logs it.
+        recovery_code: String,
+    },
+    /// Close the vault, wiping the data key (DR-0034 §6).
+    #[serde(rename = "vault.lock")]
+    VaultLock,
     /// Trigger a graceful restart (DR-0029): serialize the store's full state,
     /// verify the current binary's on-disk image, and hand the state to a
     /// freshly exec'd copy of this same process over a private socketpair —
@@ -592,6 +630,21 @@ pub enum OkPayload {
         /// rather than as a verdict.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         full_disk_access: Option<FdaStatusWire>,
+        /// Encrypted vault state (DR-0034 §6), or absent when this daemon has
+        /// no vault configured — which an older daemon also produces, and a
+        /// client renders the same way: nothing at all.
+        ///
+        /// Reported here rather than behind a `vault.status` request so there
+        /// is one place a client asks "what is this daemon doing", the same
+        /// reasoning that put `full_disk_access` here.
+        ///
+        /// Boxed to keep [`Response`] small. `Status` is the largest payload
+        /// by far, and `Response` is carried in the `Err` arm of several
+        /// internal helpers — an unboxed field here makes every one of those
+        /// results pay for a variant they never construct. `Box` is
+        /// serde-transparent, so the wire format is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vault: Option<Box<VaultStatusWire>>,
     },
     /// Reply to [`Request::KvGet`].
     Get {
@@ -702,6 +755,30 @@ pub enum OkPayload {
         /// Always `true`; lets `untagged` disambiguate the reply.
         unclaimed: bool,
     },
+    /// Reply to [`Request::VaultInit`] (DR-0034 §9).
+    VaultInitialized {
+        /// Always `true`; lets `untagged` disambiguate the reply.
+        initialized: bool,
+        /// The new vault's permanent id, as lowercase hex.
+        vault_id: String,
+        /// The recovery code, in its grouped display form. **The only copy** —
+        /// the daemon keeps no record of it, so a client that discards this
+        /// without showing the user has destroyed the vault's only recovery
+        /// path.
+        recovery_code: String,
+    },
+    /// Reply to [`Request::VaultUnlock`].
+    VaultUnlocked {
+        /// Always `true`; lets `untagged` disambiguate the reply.
+        unlocked: bool,
+        /// How many persisted entries became readable.
+        entries_restored: usize,
+    },
+    /// Reply to [`Request::VaultLock`].
+    VaultLocked {
+        /// Always `true`; lets `untagged` disambiguate the reply.
+        locked: bool,
+    },
     /// Reply to an *accepted* [`Request::RestartGraceful`] (DR-0029). See that
     /// variant's doc for why a client should not expect a second response.
     Restarting {
@@ -727,6 +804,46 @@ pub enum FdaStatusWire {
     /// today, a daemon running outside `CacheWarden.app`, which has no bundle
     /// identity for the permission to be granted to.
     Unknown,
+}
+
+/// Whether the vault is open, for [`OkPayload::Status`] (DR-0034 §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VaultStateWire {
+    /// Present on disk and open: persisted entries are readable.
+    Unlocked,
+    /// Present on disk but closed. Entries are listed but their values are
+    /// not available until `vault.unlock`.
+    Locked,
+    /// Configured for, but not created yet — `vault.init` has not been run.
+    NotInitialized,
+}
+
+/// Value-free vault state reported by `status` (DR-0034 §6/§7).
+///
+/// Everything here is already plaintext in the vault file's header (DR-0034
+/// §7 draws that line deliberately): which vault this is, how many recipients
+/// can open it, how many times its key has rotated. Entry names and values are
+/// not — those live in [`EntryInfo`] and the sealed body respectively.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultStatusWire {
+    /// Open, closed, or not created yet.
+    pub state: VaultStateWire,
+    /// The vault's permanent id as lowercase hex, absent before it exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_id: Option<String>,
+    /// How many recipients can open the vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<usize>,
+    /// How many times the data key has been rotated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dek_generation: Option<u64>,
+    /// Whether any slot was registered against a development-only WebAuthn RP
+    /// (DR-0034 §7). A vault opens for *any* of its slots, so one such slot
+    /// sets the strength of the whole vault; a client surfaces this as a
+    /// warning rather than as a neutral fact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev_rp_slot: bool,
 }
 
 /// Value-free description of a stored entry, for `status`.
@@ -796,6 +913,17 @@ pub struct EntryInfo {
     /// someone else's refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_expires_in_secs: Option<u64>,
+    /// Whether this entry lives in the vault and the vault is closed
+    /// (DR-0034 §6): it exists and is declared, but its value cannot be read
+    /// until `vault.unlock`.
+    ///
+    /// A field of its own rather than another [`Self::state`] value, because
+    /// the two are independent axes: `state` is the TTL lifecycle, and this is
+    /// whether the value is reachable at all. Folding them together would
+    /// force one enum to answer two questions and mean adding a variant to
+    /// every combination later.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
 }
 
 /// A structured error returned in a failed [`Response`].
@@ -862,6 +990,22 @@ pub enum ErrorKind {
     /// one (DR-0034 §4). The usual cause is a claim that lapsed and was taken
     /// over while this caller was still working.
     ClaimTokenMismatch,
+    /// The entry lives in the encrypted vault and the vault is closed
+    /// (DR-0034 §6). Run `cw vault unlock`; the value is intact.
+    ///
+    /// **Deliberately distinct from `auth_failed`.** They mean opposite
+    /// things: this is "the key is in a locked drawer", that is "you are not
+    /// allowed to have it". A client that conflated them would respond to a
+    /// locked vault by re-running its authorization flow — which for an OAuth
+    /// consumer means minting a **duplicate grant** for a credential it
+    /// already holds.
+    VaultLocked,
+    /// The operation needs a vault and none exists yet (DR-0034 §9). Run
+    /// `cw vault init`.
+    ///
+    /// Separate from `bad_request` so a client can name the one command that
+    /// fixes it instead of reporting a malformed call.
+    VaultNotInitialized,
     /// A `daemon.restart_graceful` request was rejected before touching any
     /// listener or socket (DR-0029): exec-target verification failed, a
     /// restart is already in progress, or graceful restart is unsupported on
@@ -923,6 +1067,37 @@ impl Response {
                 claim_token,
                 claim_expires_in_secs,
             },
+        })
+    }
+
+    /// Construct a `vault.init` success response (DR-0034 §9).
+    pub fn vault_initialized(vault_id: String, recovery_code: String) -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::VaultInitialized {
+                initialized: true,
+                vault_id,
+                recovery_code,
+            },
+        })
+    }
+
+    /// Construct a `vault.unlock` success response.
+    pub fn vault_unlocked(entries_restored: usize) -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::VaultUnlocked {
+                unlocked: true,
+                entries_restored,
+            },
+        })
+    }
+
+    /// Construct a `vault.lock` success response.
+    pub fn vault_locked_ack() -> Self {
+        Response::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::VaultLocked { locked: true },
         })
     }
 
@@ -1081,6 +1256,7 @@ impl Response {
         socket: String,
         entries: Vec<EntryInfo>,
         full_disk_access: Option<FdaStatusWire>,
+        vault: Option<VaultStatusWire>,
     ) -> Self {
         Response::Ok(OkResponse {
             ok: true,
@@ -1090,6 +1266,7 @@ impl Response {
                 socket,
                 entries,
                 full_disk_access,
+                vault: vault.map(Box::new),
             },
         })
     }
@@ -1175,6 +1352,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(!line.contains("expected_version"), "{line}");
@@ -1193,6 +1371,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: Some(7),
             claim_token: Some("abcdefghijklmnopqrstuv".into()),
+            persist: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""expected_version":7"#), "{line}");
@@ -1217,6 +1396,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: Some(0),
             claim_token: None,
+            persist: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""expected_version":0"#), "{line}");
@@ -1363,6 +1543,7 @@ mod tests {
             guard_constraints: Vec::new(),
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""cmd":"kv.set""#));
@@ -1529,6 +1710,7 @@ mod tests {
             ],
             expected_version: None,
             claim_token: None,
+            persist: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         // Encoding shape (kebab-case tag, spelled kinds).
@@ -1709,6 +1891,7 @@ mod tests {
             guard_summary: None,
             version: None,
             claim_expires_in_secs: None,
+            locked: false,
         };
         let resp = Response::list_with_entries(vec!["default/K".into()], vec![info.clone()]);
         let line = serde_json::to_string(&resp).unwrap();
@@ -1755,6 +1938,7 @@ mod tests {
                     guard_summary: None,
                     version: None,
                     claim_expires_in_secs: None,
+                    locked: false,
                 },
                 EntryInfo {
                     name: "P".into(),
@@ -1769,9 +1953,11 @@ mod tests {
                     guard_summary: None,
                     version: None,
                     claim_expires_in_secs: None,
+                    locked: false,
                 },
             ],
             Some(FdaStatusWire::NotGranted),
+            None,
         );
         roundtrip_response(&resp);
     }
@@ -1783,7 +1969,7 @@ mod tests {
     /// them rather than trusting a round-trip with itself.
     #[test]
     fn status_full_disk_access_is_optional_and_its_strings_are_pinned() {
-        let without = Response::status(1, "v".into(), "/s".into(), vec![], None);
+        let without = Response::status(1, "v".into(), "/s".into(), vec![], None, None);
         let line = serde_json::to_string(&without).expect("encode");
         assert!(!line.contains("full_disk_access"), "{line}");
         assert_eq!(
@@ -1797,7 +1983,7 @@ mod tests {
             (FdaStatusWire::NotApplicable, "not-applicable"),
             (FdaStatusWire::Unknown, "unknown"),
         ] {
-            let resp = Response::status(1, "v".into(), "/s".into(), vec![], Some(state));
+            let resp = Response::status(1, "v".into(), "/s".into(), vec![], Some(state), None);
             let line = serde_json::to_string(&resp).expect("encode");
             assert!(
                 line.contains(&format!("\"full_disk_access\":\"{expected}\"")),
@@ -1826,6 +2012,7 @@ mod tests {
             guard_summary: None,
             version: None,
             claim_expires_in_secs: None,
+            locked: false,
         };
         let line = serde_json::to_string(&info).unwrap();
         assert!(!line.contains("pin_remaining_secs"), "{line}");

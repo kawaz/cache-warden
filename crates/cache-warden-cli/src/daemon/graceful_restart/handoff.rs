@@ -75,13 +75,28 @@ pub(crate) struct PreparedHandoff {
 /// socketpair setup below all run with the store unlocked, letting other
 /// in-flight requests proceed instead of queuing behind this preparation.
 pub(crate) fn prepare(
-    snapshot: cache_warden::StoreSnapshot,
+    mut snapshot: cache_warden::StoreSnapshot,
+    dek: Option<&[u8]>,
     exe_path: &std::path::Path,
     argv: &[String],
 ) -> Result<PreparedHandoff, String> {
-    let snapshot_bytes = snapshot
+    // Declared before serializing, so the version the successor reads and the
+    // frame it then waits for are decided by the same `dek` argument.
+    if dek.is_some() {
+        snapshot.declare_dek_frame();
+    }
+    let mut snapshot_bytes = snapshot
         .to_bytes()
         .map_err(|e| format!("cannot serialize store snapshot: {e}"))?;
+
+    // DR-0034 §11: hand the vault's data key to the successor so an upgrade
+    // does not make the user unlock again. The snapshot's version already
+    // declares whether this frame follows (see `VERSION_PRE_DEK`), so writing
+    // it here and declaring it there must agree — which is why both are driven
+    // by the same `dek` argument.
+    if let Some(key) = dek {
+        cache_warden::StoreSnapshot::append_dek_frame(&mut snapshot_bytes, key);
+    }
 
     // Step ②: verify the exec target (DR-0029 §3).
     let verified =

@@ -60,6 +60,11 @@ fn help_flag_goes_to_stdout_exit_zero_at_every_level() {
         &["kv", "pin", "--help"][..],
         &["kv", "claim", "--help"][..],
         &["kv", "unclaim", "--help"][..],
+        &["vault", "--help"][..],
+        &["vault", "init", "--help"][..],
+        &["vault", "unlock", "--help"][..],
+        &["vault", "lock", "--help"][..],
+        &["vault", "status", "--help"][..],
         &["run", "--help"][..],
         &["inject", "--help"][..],
         &["config", "--help"][..],
@@ -221,12 +226,66 @@ fn dry_run_is_visible_in_every_value_verb_help() {
     }
 }
 
+// ---- DR-0034 §5/§6/§9: the vault surface ------------------------------
+
+/// The vault verbs and `kv set --persist` have to be discoverable from help
+/// alone: nothing else tells a user that values can outlive a restart.
+#[test]
+fn vault_surface_is_discoverable_from_help() {
+    let top = stdout(&cw(&["--help"]));
+    for row in ["vault init", "vault unlock", "vault lock", "vault status"] {
+        assert!(top.contains(row), "top help lists {row}: {top}");
+    }
+
+    let group = stdout(&cw(&["vault"]));
+    assert!(group.contains("cache-warden vault"), "{group}");
+    assert!(group.contains("Commands:"), "{group}");
+
+    let set_help = stdout(&cw(&["kv", "set", "--help"]));
+    assert!(set_help.contains("--persist"), "{set_help}");
+
+    // The two facts a user cannot recover from if help omits them: the
+    // recovery code is shown once, and it is typed on stdin, never in argv.
+    let init_help = stdout(&cw(&["vault", "init", "--help"]));
+    assert!(init_help.contains("SHOWN ONCE"), "{init_help}");
+    let unlock_help = stdout(&cw(&["vault", "unlock", "--help"]));
+    assert!(unlock_help.contains("read from stdin"), "{unlock_help}");
+    assert!(unlock_help.contains("shell history"), "{unlock_help}");
+}
+
+/// A recovery code passed as an argument is refused before any connection is
+/// attempted — accepting it would mean a credential in `ps` and in the shell
+/// history.
+#[test]
+fn vault_unlock_refuses_a_recovery_code_in_argv() {
+    let o = cw(&["vault", "unlock", "0123456789ABCDEFGHJK"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stdout(&o).is_empty(), "no help on stdout for a usage error");
+    let err = stderr(&o);
+    assert!(err.contains("takes no arguments"), "{err}");
+    assert!(err.contains("shell history"), "{err}");
+    assert!(
+        err.contains("cache-warden vault unlock"),
+        "leaf help: {err}"
+    );
+}
+
+#[test]
+fn unknown_vault_subcommand_is_a_one_line_error() {
+    let o = cw(&["vault", "bogus"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = stderr(&o);
+    assert!(err.contains("unknown vault subcommand: bogus"), "{err}");
+    assert!(!err.contains("Usage:"), "no help dump for a typo: {err}");
+}
+
 // ---- group with no subcommand: stdout, exit 0 ---------------------------
 
 #[test]
 fn group_without_subcommand_prints_help_to_stdout_exit_zero() {
     for (args, marker) in [
         (&["kv"][..], "cache-warden kv"),
+        (&["vault"][..], "cache-warden vault"),
         (&["config"][..], "cache-warden config"),
         (&["daemon"][..], "cache-warden daemon"),
     ] {
