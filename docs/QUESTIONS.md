@@ -20,8 +20,23 @@
 
 ## 裁定待ち
 
-(なし)
+### 👺VLT-Q2: vault/signed-by 実装完了分の push タイミング
+
+DR-0033/0034 の実装フェーズ 1-5 が全て commit 済み (各フェーズ fable5-high レビュー +
+delta 承認、workspace 1620 tests green)。未 push は v0.28.0 以降の全 commit。
+
+- [ ] a: 即 push して v0.29.0 リリース、実機確認はリリース版で (v0.28.0 の前例)
+- [ ] b: 下の VLT-C2 (実機確認) を先にやってから push
 
 ## 確認待ち
 
-(なし)
+### 👺VLT-C2: vault の実機確認 (kawaz 在席時、ブラウザ/TouchID 必須分)
+
+dev build (`cargo build --release`) + 隔離 config で。手順詳細は依頼があれば整備します:
+
+- [ ] a: `cw vault init` → recovery code 表示・保管案内が出る
+- [ ] b: `cw vault add-passkey` → **TouchID ダイアログ (approver 経由) が出る**
+- [ ] c: 発行 URL をブラウザで開き **1Password 管理 passkey で登録完走 + `prf.enabled` が true** (最重要 — PRF 実動作)
+- [ ] d: `cw vault lock` → unlock の URL をブラウザで開き **実 passkey で解錠できる** (最重要)
+- [ ] e: 解錠後 `kv get` が値を返す / graceful restart で unlocked 維持
+- [ ] f: 別 team/identifier 署名バイナリからの get が種別のみのエラーで拒否される (signed-by、手順整備可)
