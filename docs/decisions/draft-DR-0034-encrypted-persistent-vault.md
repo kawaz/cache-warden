@@ -420,7 +420,20 @@ DR-0029 の handoff snapshot と vault はどちらも「再起動を越えて�
 4. **Time Machine / Spotlight 除外の実施可否** (§7): 除外設定が実際に効くか、
    ユーザ環境で勝手に設定してよいか (システム設定の書き換えになるなら案内に留めるべき)。
    実装時に実機確認。
-5. **`objc2-authentication-services` / webauthn-rs のカバレッジ**: ブラウザ経路を採るので
+5'. **実装フェーズ 4 での確定 (2026-08-16)**: (a) **webauthn-rs は不採用** — 同 crate は
+   ブラウザ PRF 拡張をモデル化しておらず (CTAP hmac-secret のみ、出力も別物)、PRF 出力は
+   assertion の外 (JS の getClientExtensionResults) を通るため RP ライブラリの PRF 対応は
+   そもそも不要。使うのは assertion 検証 5% のために OpenSSL C リンク + MPL-2.0 +
+   61 crate を受けるのは不釣り合いで、**検証は自前実装** (cache-warden-webauthn crate、
+   W3C 節番号紐づけ、新規依存は ciborium のみ)。機密性は PRF 出力の所持に乗っており
+   assertion 検証はローカル ceremony 成立のゲート、という責務整理による。
+   (b) **登録は 2 段** (create → assertion で PRF 評価 → finish) — 登録時に PRF 値を
+   返さないブラウザがあるため。副次効果として「この credential で実際に開ける」ことを
+   登録時に確認でき、到達不能 slot を作らない。(c) **format v2** — slot に検証用
+   credential_public_key を追加 (どの credential で開くかは §7 の公開側)。v1 は未リリースに
+   つき明確拒否で切り捨て。(d) 登録ゲートは approver helper (DR-0031) の TouchID dialog を
+   流用、不達は fail-closed、回避は明示フラグのみ (DR-0032 の登録 TouchID 必須裁定の実装点)。
+6. **`objc2-authentication-services` / webauthn-rs のカバレッジ**: ブラウザ経路を採るので
    native PRF API への依存は無い見込みだが、daemon 側の assertion 検証で PRF 拡張の出力を
    扱えるか (webauthn-rs の PRF 拡張サポート状況) は実装前に compile PoC で確認する。
    **試験経路の補足** (kawaz 問い 2026-08-14 への回答): OS の platform authenticator に
