@@ -129,12 +129,18 @@ entries = AEAD-open(DEK, body, aad = header)
 - PRF 出力を直接 AEAD 鍵に固定せず HKDF を挟み、`vault_id` / `format_version` / `slot_id` /
   用途 label を info に含めて**鍵分離**する (findings の推奨をそのまま採用)。
 - salt は公開値でよいが **vault ごと・スロットごとにランダム生成**し header に保存する。
+- **KEK 導出の入力 (PRF salt / HKDF info) に `dek_generation` は含めない** (実装フェーズ 4
+  で確定、2026-08-16)。含めると DEK ローテのたびに KEK が変わり、各スロットの
+  `wrapped_privkey` 再ラップに ceremony が要ることになって **§1b/§1c の「ローテは公開鍵
+  操作のみで完結」が崩壊する**ため。generation への束縛は下記 purpose (challenge レコード
+  側) が担う。複数スロットの salt は WebAuthn の `prf.evalByCredential` で credential ID
+  ごとに渡す。
 - **ceremony purpose の domain separation**: DR-0032 の challenge lifecycle は流用するが、
   承認 (approve/deny の bool を返す操作) と unlock (鍵素材を返す操作) は別種の操作である。
-  purpose 文字列 `vault-unlock(vault_id, slot_id, dek_generation)` を domain separation に
-  含め、承認セッションの assertion を unlock に流用できないようにする。DR-0032 の
-  **first-response-wins (deny で全体確定) は unlock に流用しない** (unlock は「誰か 1 人が
-  拒否したら確定」という意味論を持たない)。
+  purpose 文字列 `vault-unlock(vault_id, slot_id, dek_generation)` は **challenge レコードに
+  束縛**し (KEK 導出には入れない)、承認セッションの assertion を unlock に流用できないように
+  する。DR-0032 の **first-response-wins (deny で全体確定) は unlock に流用しない** (unlock
+  は「誰か 1 人が拒否したら確定」という意味論を持たない)。
 
 ### 3. atomic commit と durability 契約
 
