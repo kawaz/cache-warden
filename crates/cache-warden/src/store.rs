@@ -25,6 +25,7 @@ use crate::entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl};
 use crate::guard::GuardRecord;
 use crate::key::{InvalidKey, validate_key_syntax};
 use crate::meta::{SourceMeta, ValueMeta};
+use crate::owner::OwnerPrincipal;
 use crate::process::ProcessInfo;
 use crate::refresh::RefreshClaim;
 use crate::secret::SecretBytes;
@@ -128,6 +129,27 @@ pub struct Store {
     /// `set_guard`) or none (call `clear_guard`), so the core stays oblivious
     /// to per-adapter default policy (`default-require-same-user` etc.).
     access_guards: BTreeMap<String, GuardRecord>,
+    /// Per-key owner principal (draft-DR-0033 §3).
+    ///
+    /// # Why this outlives the value, unlike a guard record
+    ///
+    /// A guard record describes the context one `set` happened in, so it goes
+    /// when that value goes. An owner describes **who the entry belongs to**,
+    /// which is not a fact about any particular value — and a credential that
+    /// is refreshed every hour would lose its owner on the first refresh if
+    /// the two had the same lifetime (DR-0033 §3c: "not declaring" means
+    /// "unchanged", never "release").
+    ///
+    /// So this map is only written by an explicit declaration and only
+    /// cleared by an explicit release. A value-only delete leaves it standing,
+    /// for the same reason `versions` survives one: whoever owned the key
+    /// still owns it, and letting a delete strip ownership would hand an
+    /// attacker a way to take a key over by first emptying it.
+    ///
+    /// It is dropped with the key itself ([`Store::delete_with_definition`]),
+    /// which is the operation that says the entry is gone rather than empty —
+    /// and which the adapter only permits to the owner in the first place.
+    owners: BTreeMap<String, OwnerPrincipal>,
     /// Per-key monotonic CAS versions (DR-0034 §4).
     ///
     /// A key absent from this map is at version 0, which the arbitration
@@ -263,6 +285,7 @@ impl Store {
             definitions: BTreeMap::new(),
             failure_backoffs: BTreeMap::new(),
             access_guards: BTreeMap::new(),
+            owners: BTreeMap::new(),
             versions: BTreeMap::new(),
             refresh_claims: BTreeMap::new(),
             failure_backoff_duration,
@@ -1042,6 +1065,10 @@ impl Store {
         // with it. Every other removal path keeps the version (see the
         // `versions` field doc) — only a full removal may reset it.
         self.versions.remove(key);
+        // DR-0033 §3: ownership describes the entry, so it ends when the
+        // entry does — and only then. A value-only delete leaves it standing
+        // (see the `owners` field doc).
+        self.owners.remove(key);
         // A claim describes a refresh of the value that just went away.
         self.refresh_claims.remove(key);
         Ok(had_value || had_def)
@@ -1118,6 +1145,53 @@ impl Store {
     pub fn clear_guard(&mut self, key: &str, cap: &Capability) -> Result<bool, CapError> {
         self.check_cap(cap)?;
         Ok(self.access_guards.remove(key).is_some())
+    }
+
+    /// Record `key`'s owner principal (DR-0033 §3a).
+    ///
+    /// Whether this caller is *allowed* to is the adapter's judgement — the
+    /// core stores what it is told, exactly as it does for guard records
+    /// (DR-0004). The authorization that decides it lives in the daemon,
+    /// where the peer's code signature can be evaluated.
+    ///
+    /// Cap check runs first (DR-0024).
+    pub fn set_owner(
+        &mut self,
+        key: impl Into<String>,
+        owner: OwnerPrincipal,
+        cap: &Capability,
+    ) -> Result<(), CapError> {
+        self.check_cap(cap)?;
+        self.owners.insert(key.into(), owner);
+        Ok(())
+    }
+
+    /// Release `key`'s ownership, returning whether it had one.
+    ///
+    /// Only ever called for an explicit release (DR-0033 §3c). There is
+    /// deliberately no path that clears an owner as a side effect of writing
+    /// or deleting a value: every such path would be a way to strip a key's
+    /// protection without saying so.
+    ///
+    /// Cap check runs first (DR-0024).
+    pub fn clear_owner(&mut self, key: &str, cap: &Capability) -> Result<bool, CapError> {
+        self.check_cap(cap)?;
+        Ok(self.owners.remove(key).is_some())
+    }
+
+    /// Borrow `key`'s owner principal, if one is recorded.
+    ///
+    /// No cap check: the principal is public policy — it names which signed
+    /// identity may act, and carries no secret. The adapter evaluates every
+    /// `get`, `set` and `del` against it.
+    pub fn owner_of(&self, key: &str) -> Option<&OwnerPrincipal> {
+        self.owners.get(key)
+    }
+
+    /// Every key that has an owner, sorted. For snapshot and vault carriage
+    /// (DR-0033 §7), which must not lose an owner a value survives.
+    pub fn owned_keys(&self) -> Vec<&str> {
+        self.owners.keys().map(String::as_str).collect()
     }
 
     /// Borrow the [`GuardRecord`] attached to `key`, or `None` if unguarded.
@@ -1360,6 +1434,9 @@ impl Store {
                 definition,
                 failure,
                 guard,
+                // draft-DR-0033 §7: the owner travels with the entry, or the
+                // entry comes back unprotected on the other side.
+                owner: self.owners.get(key).cloned(),
                 version,
                 refresh_claim,
             });
@@ -1446,6 +1523,7 @@ impl Store {
                 version,
                 refresh_claim,
                 guard,
+                owner,
             } = entry;
 
             // DR-0029 review HIGH-5: `Store::set` / `Store::define` always
@@ -1530,6 +1608,16 @@ impl Store {
                     .insert(key.clone(), snapshot_to_guard_record(g));
             }
 
+            // draft-DR-0033 §7: an owner is installed unconditionally, like a
+            // version and unlike a guard. It describes the entry rather than
+            // the value that happened to be in it, so an entry whose value did
+            // not survive import still belongs to whoever owned it — and
+            // dropping the owner here would make import a way to take a key
+            // over by sending it with an empty value.
+            if let Some(o) = owner {
+                bundle.store.owners.insert(key.clone(), o);
+            }
+
             // DR-0034 §4: the version is installed unconditionally (it is not
             // tied to a live value), the claim only alongside one — the same
             // asymmetry `export_snapshot` applies, so a round trip is stable.
@@ -1571,7 +1659,7 @@ fn snapshot_to_refresh_claim(c: crate::snapshot::SnapshotRefreshClaim) -> Refres
 // converters: the mirror lives in `snapshot.rs` behind a `pub(crate)` API and
 // the mapping is a one-file concern of `Store::{export,import}_snapshot`.
 
-fn guard_record_to_snapshot(record: &crate::guard::GuardRecord) -> SnapshotGuard {
+pub fn guard_record_to_snapshot(record: &crate::guard::GuardRecord) -> SnapshotGuard {
     use crate::guard::{DeclaredAncestor, GuardConstraint};
     let constraints = record
         .constraints
@@ -1617,7 +1705,7 @@ fn guard_record_to_snapshot(record: &crate::guard::GuardRecord) -> SnapshotGuard
     }
 }
 
-fn snapshot_to_guard_record(s: SnapshotGuard) -> crate::guard::GuardRecord {
+pub fn snapshot_to_guard_record(s: SnapshotGuard) -> crate::guard::GuardRecord {
     use crate::guard::{
         DeclaredAncestor, GuardConstraint, GuardRecord, GuardSetter, PinnedProcess,
     };
@@ -4259,6 +4347,7 @@ mod tests {
                 guard: None,
                 version: None,
                 refresh_claim: None,
+                owner: None,
             }]);
 
             // `StoreBundle` does not derive `Debug`, so `unwrap_err()` (which
@@ -4293,6 +4382,7 @@ mod tests {
                 guard: None,
                 version: None,
                 refresh_claim: None,
+                owner: None,
             };
             let snap = StoreSnapshot::new(vec![make_entry("first"), make_entry("second")]);
 
@@ -4334,6 +4424,7 @@ mod tests {
                 guard: None,
                 version: None,
                 refresh_claim: None,
+                owner: None,
             }]);
 
             // `StoreBundle` does not derive `Debug`, so `unwrap_err()` (which
@@ -4376,6 +4467,7 @@ mod tests {
                 guard: None,
                 version: None,
                 refresh_claim: None,
+                owner: None,
             }]);
 
             let bundle = Store::import_snapshot(Store::builder(), snap, &clock).unwrap();
@@ -4804,6 +4896,103 @@ mod tests {
             s.bump_version("default/K", &cap).unwrap();
             s.delete("default/K", &cap).unwrap();
             assert_eq!(s.version_of("default/K"), 2, "the counter must not reset");
+        }
+
+        /// draft-DR-0033 §7: an owner survives the graceful-restart handoff.
+        /// A value that came back without the identity that governed it would
+        /// be a credential that became readable by anything, at the one moment
+        /// nobody is watching.
+        #[test]
+        fn ownership_survives_a_snapshot_round_trip() {
+            let (mut store, cap) = crate::test_helpers::store_with_cap();
+            let owner =
+                crate::OwnerPrincipal::declare("apple-generic", "3QMEVK549R", "com.example.gw")
+                    .unwrap();
+            let clock = crate::clock::SystemClock::new();
+            store
+                .set(
+                    "default/K".to_string(),
+                    crate::ValueSource::Static,
+                    crate::SecretBytes::new(b"v".to_vec()),
+                    crate::Ttl::new(None, None).unwrap(),
+                    &cap,
+                    &clock,
+                )
+                .unwrap();
+            store.set_owner("default/K", owner.clone(), &cap).unwrap();
+
+            let snapshot = store.export_snapshot(&cap, &clock).expect("exports");
+            assert_eq!(
+                snapshot.format_version(),
+                crate::snapshot::VERSION_WITH_OWNER,
+                "an owner-carrying snapshot must declare the version that says so, or an older \
+                 build would either drop the owner or block waiting for a frame that is not \
+                 coming"
+            );
+
+            let bundle =
+                Store::import_snapshot(StoreBuilder::new(), snapshot, &clock).expect("imports");
+            assert_eq!(
+                bundle.store.owner_of("default/K"),
+                Some(&owner),
+                "the owner came back with the value"
+            );
+        }
+
+        /// DR-0033 §3c: a credential that is refreshed loses nothing. A
+        /// value-only delete is the same case one step further — the entry is
+        /// empty, not gone, and whoever owned it still does. Clearing
+        /// ownership here would let an attacker take a key over by emptying
+        /// it first.
+        #[test]
+        fn ownership_survives_a_value_only_delete_and_ends_with_the_key() {
+            let (mut store, cap) = crate::test_helpers::store_with_cap();
+            let owner =
+                crate::OwnerPrincipal::declare("apple-generic", "3QMEVK549R", "com.example.gw")
+                    .unwrap();
+            let clock = crate::clock::SystemClock::new();
+            store
+                .set(
+                    "default/K".to_string(),
+                    crate::ValueSource::Static,
+                    crate::SecretBytes::new(b"v".to_vec()),
+                    crate::Ttl::new(None, None).unwrap(),
+                    &cap,
+                    &clock,
+                )
+                .unwrap();
+            store.set_owner("default/K", owner.clone(), &cap).unwrap();
+
+            store.delete("default/K", &cap).unwrap();
+            assert_eq!(
+                store.owner_of("default/K"),
+                Some(&owner),
+                "an emptied entry is still owned"
+            );
+
+            store.delete_with_definition("default/K", &cap).unwrap();
+            assert_eq!(
+                store.owner_of("default/K"),
+                None,
+                "forgetting the key forgets who owned it"
+            );
+        }
+
+        /// Releasing is explicit and nothing else does it.
+        #[test]
+        fn ownership_is_released_only_by_asking() {
+            let (mut store, cap) = crate::test_helpers::store_with_cap();
+            let owner =
+                crate::OwnerPrincipal::declare("apple-generic", "3QMEVK549R", "com.example.gw")
+                    .unwrap();
+            store.set_owner("default/K", owner, &cap).unwrap();
+            assert_eq!(store.owned_keys(), vec!["default/K"]);
+            assert!(store.clear_owner("default/K", &cap).unwrap());
+            assert!(store.owner_of("default/K").is_none());
+            assert!(
+                !store.clear_owner("default/K", &cap).unwrap(),
+                "releasing twice is not an error, it is just already released"
+            );
         }
 
         #[test]

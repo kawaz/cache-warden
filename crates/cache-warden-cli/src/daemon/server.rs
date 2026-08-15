@@ -189,6 +189,10 @@ pub(crate) struct Shared {
     /// user by the command that opens a ceremony, which is the only way they
     /// learn the port when the configuration asked for an arbitrary one.
     pub(crate) ceremony_addr: std::sync::OnceLock<std::net::SocketAddr>,
+    /// Decides whether a caller satisfies an entry's owner principal
+    /// (draft-DR-0033). Held here so tests can substitute a deterministic
+    /// verifier for the kernel's answer.
+    pub(crate) owner_verifier: Arc<dyn crate::daemon::owner_eval::OwnerVerifier + Send + Sync>,
     /// Keys the config declares `persist = true` (DR-0034 §5). Entry names
     /// live in the vault's sealed body, so while the vault is closed these
     /// declarations are the only way to report a persisted entry at all.
@@ -979,6 +983,7 @@ impl Shared {
             otp_adapter,
             ceremony: None,
             ceremony_addr: std::sync::OnceLock::new(),
+            owner_verifier: Arc::new(crate::daemon::owner_eval::CodeSignatureVerifier),
             runner: CommandRunner::new(),
             auth,
             clock,
@@ -1275,6 +1280,7 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         vault,
         ceremony: ceremony.clone(),
         ceremony_addr: std::sync::OnceLock::new(),
+        owner_verifier: Arc::new(crate::daemon::owner_eval::CodeSignatureVerifier),
         persisted_keys: config.persisted_keys(),
         kv_policy: config.kv_policy(),
         exe_path,
@@ -2053,7 +2059,7 @@ fn dispatch(
             return Response::error(ErrorKind::BadRequest, format!("malformed request: {e}"));
         }
     };
-    run_request(shared, peer, peer_token, req)
+    run_request(shared, peer, peer_token, None, req)
 }
 
 /// Run a parsed request against the store under lock.
@@ -2063,6 +2069,7 @@ fn run_request(
     shared: &Arc<Shared>,
     peer: Option<u32>,
     peer_token: Option<GetterAuditToken>,
+    peer_token_full: Option<macos_process_inspect::AuditToken>,
     req: Request,
 ) -> Response {
     // `ping` needs neither the store lock nor the requester ancestry (it just
@@ -2147,6 +2154,8 @@ fn run_request(
         requester: requester.as_deref(),
         kv_process_policies: &shared.kv_process_policies,
         vault: shared.vault.as_deref(),
+        peer_token: peer_token_full.as_ref(),
+        owner_verifier: shared.owner_verifier.as_ref(),
         persisted_keys: &shared.persisted_keys,
         guard_chain: guard_chain.as_deref(),
         guard_audit_token: peer_token,
@@ -2311,7 +2320,7 @@ pub(crate) async fn run_request_async(
         _ => {
             let shared_c = Arc::clone(shared);
             return tokio::task::spawn_blocking(move || {
-                run_request(&shared_c, peer, peer_token, req)
+                run_request(&shared_c, peer, peer_token, peer_token_full, req)
             })
             .await
             .unwrap_or_else(|e| {
@@ -2342,6 +2351,7 @@ pub(crate) async fn run_request_async(
     });
 
     let shared_first = Arc::clone(shared);
+    let token_first = peer_token_full;
     let key_first = key.clone();
     let chain_first = guard_chain.clone();
     let requester_first = requester.clone();
@@ -2350,6 +2360,7 @@ pub(crate) async fn run_request_async(
             &shared_first,
             peer,
             peer_token,
+            token_first,
             requester_first,
             chain_first,
             key_first,
@@ -2409,6 +2420,7 @@ pub(crate) async fn run_request_async(
                 }
             }
             let shared_second = Arc::clone(shared);
+            let token_second = peer_token_full;
             let key_second = key.clone();
             let chain_second = pass_chain.clone();
             let requester_second = pass_requester.clone();
@@ -2417,6 +2429,7 @@ pub(crate) async fn run_request_async(
                     &shared_second,
                     peer,
                     peer_token,
+                    token_second,
                     requester_second,
                     chain_second,
                     key_second,
@@ -2446,10 +2459,12 @@ pub(crate) async fn run_request_async(
 /// dialog without keeping the store lock held: a multi-second human
 /// approval must never sit behind the store lock, or every other
 /// request on this daemon would queue behind it.
+#[allow(clippy::too_many_arguments)]
 fn guarded_get_first_pass(
     shared: &Arc<Shared>,
     _peer: Option<u32>,
     peer_token: Option<GetterAuditToken>,
+    peer_token_full: Option<macos_process_inspect::AuditToken>,
     requester: Option<Vec<ProcessInfo>>,
     guard_chain: Option<Vec<GetterProcess>>,
     key: String,
@@ -2485,6 +2500,8 @@ fn guarded_get_first_pass(
             requester: requester.as_deref(),
             kv_process_policies: &shared.kv_process_policies,
             vault: shared.vault.as_deref(),
+            peer_token: peer_token_full.as_ref(),
+            owner_verifier: shared.owner_verifier.as_ref(),
             persisted_keys: &shared.persisted_keys,
             guard_chain: guard_chain.as_deref(),
             guard_audit_token: peer_token,
@@ -2575,10 +2592,12 @@ fn guarded_get_first_pass(
 /// first record does not authorize a get against the second. If the guard
 /// record disappeared (concurrent unguarded `kv.set`), the entry is now
 /// unguarded and a plain get is safe — the handler handles that case.
+#[allow(clippy::too_many_arguments)]
 fn guarded_get_finalize_after_approval(
     shared: &Arc<Shared>,
     _peer: Option<u32>,
     peer_token: Option<GetterAuditToken>,
+    peer_token_full: Option<macos_process_inspect::AuditToken>,
     requester: Option<Vec<ProcessInfo>>,
     guard_chain: Option<Vec<GetterProcess>>,
     key: String,
@@ -2627,6 +2646,8 @@ fn guarded_get_finalize_after_approval(
         requester: requester.as_deref(),
         kv_process_policies: &shared.kv_process_policies,
         vault: shared.vault.as_deref(),
+        peer_token: peer_token_full.as_ref(),
+        owner_verifier: shared.owner_verifier.as_ref(),
         persisted_keys: &shared.persisted_keys,
         guard_chain: guard_chain.as_deref(),
         guard_audit_token: peer_token,
@@ -3000,6 +3021,7 @@ mod tests {
             otp_adapter,
             ceremony: None,
             ceremony_addr: std::sync::OnceLock::new(),
+            owner_verifier: Arc::new(crate::daemon::owner_eval::CodeSignatureVerifier),
             runner: CommandRunner::new(),
             auth: Box::new(AllowAll),
             clock: SystemClock::new(),
@@ -3441,6 +3463,7 @@ mod tests {
                 &s,
                 None,
                 None,
+                None,
                 Request::KvSet {
                     key: "default/K".into(),
                     source: SetSource::Static {
@@ -3452,11 +3475,13 @@ mod tests {
                     expected_version: None,
                     claim_token: None,
                     persist: None,
+                    signed_by: None,
                 },
             )
             .is_ok()
         );
-        let result = guarded_get_first_pass(&s, None, None, None, None, "default/K".to_string());
+        let result =
+            guarded_get_first_pass(&s, None, None, None, None, None, "default/K".to_string());
         match result {
             GuardedGetFirstPass::Direct(Response::Ok(ok)) => match ok.payload {
                 OkPayload::Get { value_b64 } => {
@@ -3480,6 +3505,7 @@ mod tests {
             &s,
             None,
             same_user_token(),
+            None,
             None,
             zsh_chain(),
             "default/K".to_string(),
@@ -3510,6 +3536,7 @@ mod tests {
             None,
             wrong_uid_token,
             None,
+            None,
             zsh_chain(),
             "default/K".to_string(),
         );
@@ -3534,6 +3561,7 @@ mod tests {
             same_user_token(),
             None,
             None,
+            None,
             "default/K".to_string(),
         );
         match result {
@@ -3556,6 +3584,7 @@ mod tests {
             &s,
             None,
             same_user_token(),
+            None,
             None,
             zsh_chain(),
             "default/K".to_string(),
@@ -3587,6 +3616,7 @@ mod tests {
         }
         let resp = guarded_get_finalize_after_approval(
             &s,
+            None,
             None,
             None, // no token needed once guard is gone
             None,
@@ -3642,6 +3672,7 @@ mod tests {
             None,
             same_user_token(),
             None,
+            None,
             zsh_chain(),
             "default/K".to_string(),
         );
@@ -3669,6 +3700,7 @@ mod tests {
                 &s,
                 None,
                 None,
+                None,
                 Request::KvSet {
                     key: "default/K".into(),
                     source: SetSource::Static {
@@ -3680,6 +3712,7 @@ mod tests {
                     expected_version: None,
                     claim_token: None,
                     persist: None,
+                    signed_by: None,
                 },
             )
             .is_ok()
@@ -4104,10 +4137,12 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
-        assert!(run_request(&s, None, None, set).is_ok());
+        assert!(run_request(&s, None, None, None, set).is_ok());
         let resp = run_request(
             &s,
+            None,
             None,
             None,
             Request::KvGet {
@@ -4146,7 +4181,7 @@ mod tests {
         // every other platform `graceful_restart::handle_request`'s
         // early guard rejects it before touching the store at all.
         let s = shared();
-        let resp = run_request(&s, None, None, Request::RestartGraceful);
+        let resp = run_request(&s, None, None, None, Request::RestartGraceful);
         match resp {
             Response::Err(e) => assert_eq!(e.error.kind, ErrorKind::RestartAborted),
             other => panic!("expected RestartAborted, got {other:?}"),

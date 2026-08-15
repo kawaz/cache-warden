@@ -24,8 +24,8 @@ use crate::daemon::guard::{
 };
 use crate::otp_type;
 use crate::protocol::wire::{
-    EntryInfo, ErrorKind, GuardConstraintWire, Request, Response, SetSource, SourceSpecWire,
-    ValueMetaWire,
+    EntryInfo, ErrorKind, GuardConstraintWire, Request, Response, SetSource, SignedByWire,
+    SourceSpecWire, ValueMetaWire,
 };
 use crate::protocol::{decode_b64, encode_b64};
 
@@ -106,6 +106,16 @@ pub struct HandlerCtx<'a, A: ?Sized, R, C> {
     /// blocked in `kv.get` while the user completes an unlock in the browser —
     /// not an exotic race.
     pub vault: Option<&'a std::sync::Mutex<VaultState>>,
+    /// The audit token captured when this connection was accepted, used to
+    /// identify the caller's code signature (draft-DR-0033 §1).
+    ///
+    /// The token rather than the pid: a pid is a name the kernel may hand to
+    /// a different process between the moment it is read and the moment it is
+    /// checked, and that gap is the whole attack. `None` when the peer could
+    /// not be identified, which every owner check reads as a refusal.
+    pub peer_token: Option<&'a macos_process_inspect::AuditToken>,
+    /// Decides whether the caller satisfies an entry's owner principal.
+    pub owner_verifier: &'a dyn crate::daemon::owner_eval::OwnerVerifier,
     /// Keys the configuration declares as `persist = true` (DR-0034 §5).
     ///
     /// Needed because entry names live in the vault's *sealed body*: while the
@@ -203,7 +213,15 @@ where
         // parallel value-free metadata (DR-0022 §3 / DR-0009 minor extension)
         // so a client can show backoff / pin / state hints alongside each name.
         Request::KvList => handle_list(store, ctx),
-        Request::KvDel { key, with_define } => handle_del(store, ctx, &key, with_define),
+        Request::KvDel { key, with_define } => {
+            // DR-0033 §3b: deleting is as much a write as writing is. An
+            // entry anyone could delete is an entry anyone could take over,
+            // by emptying it and setting it again as themselves.
+            if let Some(resp) = require_owner(store, ctx, &key, "del") {
+                return resp;
+            }
+            handle_del(store, ctx, &key, with_define)
+        }
         Request::KvSet {
             key,
             source,
@@ -213,7 +231,38 @@ where
             expected_version,
             claim_token,
             persist,
+            signed_by,
         } => {
+            // Key syntax first, as everywhere else: a malformed key names no
+            // entry, so there is no owner to ask about and nothing an
+            // authorization answer could mean.
+            if let Err(resp) = validate_protocol_key(&key) {
+                return resp;
+            }
+            // DR-0033 §3d fixes the order: **owner authorization, then
+            // compare-and-swap, then the write**. It is not a preference. A
+            // CAS mismatch reply carries the entry's current version, so
+            // checking CAS first would tell an unauthorized caller how often
+            // a credential it cannot read is being refreshed.
+            if let Some(resp) = require_owner(store, ctx, &key, "set") {
+                return resp;
+            }
+            let declared_owner = match signed_by.as_ref().map(parse_signed_by) {
+                Some(Err(resp)) => return resp,
+                Some(Ok(principal)) => Some(principal),
+                None => None,
+            };
+            // DR-0033 §5 / Open Q1: warn, never refuse. The premises under
+            // which an owner requirement means anything are the declaring
+            // process's own hardening; which legitimate programs run without
+            // them is not yet known, so this is advisory.
+            if declared_owner.is_some()
+                && let Some(hardening) =
+                    crate::daemon::owner_eval::Hardening::of(ctx.owner_verifier, ctx.peer_token)
+                && let Some(warning) = hardening.warning()
+            {
+                eprintln!("cache-warden: warning: signed-by declared for {key:?}: {warning}");
+            }
             // DR-0034 §5: an entry the configuration declares persistent is
             // persistent, whether or not this particular caller said so. The
             // declaration is the operator's statement about where the value
@@ -223,21 +272,6 @@ where
             // entry they were told is durable and that a restart loses.
             let persist = persist.unwrap_or(false) || ctx.persisted_keys.contains(&key);
             if persist {
-                // DR-0034 §1d requires a persisted entry to carry its guard
-                // record with it, and the vault format does not hold one yet.
-                // Accepting the set would either drop the guard on the next
-                // unlock — an entry silently losing its access control — or
-                // fail to restore, which §1d says must take the value with it.
-                // Refusing now is the only outcome that surprises nobody.
-                if !guard_constraints.is_empty() {
-                    return Response::error(
-                        ErrorKind::BadRequest,
-                        "a guard cannot yet be attached to a persisted entry: the vault does not \
-                         carry guard records, so the guard would not survive a restart. Support \
-                         arrives with the owner-principal work (DR-0033 / DR-0034 §1d). Until \
-                         then, set it without a guard or without persistence",
-                    );
-                }
                 // DR-0034 §5 exempts a cache-warden-owned entry from hard
                 // TTL: an absolute lifetime would destroy the only copy of a
                 // live credential on a timer. Silently dropping the caller's
@@ -293,6 +327,33 @@ where
                 if persist { None } else { hard_ttl_secs },
                 guard_constraints,
             );
+            let mut resp = resp;
+            if matches!(resp, Response::Ok(_)) {
+                // Ownership is settled only once the write it accompanies has
+                // succeeded, so a failed set never changes who owns the key.
+                if let Some(principal) = declared_owner {
+                    // First use establishes; a re-declaration by the current
+                    // owner replaces (the authorization above already ran).
+                    let _ = store.set_owner(key.clone(), principal, ctx.store_cap);
+                }
+                // Absent declaration means unchanged, never released: that is
+                // `kv.owner_clear`, and nothing else (DR-0033 §3c).
+
+                // The ack reports the owner **now in force**, whether this
+                // request set it or inherited it. A caller that declared one
+                // and sees nothing here knows its declaration was dropped by
+                // a daemon too old to understand it, and that it has just
+                // written a credential with no protection (DR-0033 §6).
+                if let Some(owner) = store.owner_of(&key) {
+                    let summary = owner.summary();
+                    if let Response::Ok(ok) = &mut resp
+                        && let crate::protocol::wire::OkPayload::Set { owner_applied, .. } =
+                            &mut ok.payload
+                    {
+                        *owner_applied = Some(summary);
+                    }
+                }
+            }
             if persist && matches!(resp, Response::Ok(_)) {
                 // The ack must not claim durability the disk has not accepted,
                 // so the vault write happens before the reply leaves and its
@@ -316,6 +377,18 @@ where
                 "a passkey unlock must be dispatched by run_request_async",
             ),
         },
+        Request::KvOwnerClear { key } => {
+            // The same authorization as any other change to an owned entry:
+            // only its owner may hand it over (DR-0033 §3b).
+            if let Some(resp) = require_owner(store, ctx, &key, "owner_clear") {
+                return resp;
+            }
+            match store.clear_owner(&key, ctx.store_cap) {
+                Ok(true) => Response::owner_cleared(),
+                Ok(false) => Response::error(ErrorKind::NotFound, "this entry has no owner"),
+                Err(_) => Response::error(ErrorKind::Internal, "capability mismatch"),
+            }
+        }
         Request::VaultLock => handle_vault_lock(store, ctx),
         // DR-0034 §1c: opening a registration window needs the local approval
         // dialog, which is async and lives in the server layer. `run_request_async`
@@ -325,28 +398,69 @@ where
             ErrorKind::Internal,
             "vault.add_passkey must be dispatched by run_request_async",
         ),
+        // DR-0033 §3b names read, write, delete and owner changes, and the
+        // point of naming them is that the list is not meant to be argued
+        // over operation by operation: **everything that touches an owned
+        // entry needs its owner's authorization**. The ones below are the
+        // rest of that list.
+        //
+        // A claim is a write in every sense that matters — it decides who
+        // gets to refresh the credential next, and holding one blocks the
+        // owner from writing. A definition decides what a later get produces,
+        // so an unauthorized redefinition is a way to make the entry serve an
+        // attacker's value without ever writing it. A pin changes how long
+        // the value lives. None of them is a read, and none of them was
+        // covered by gating reads.
         Request::KvClaim {
             key,
             expected_version,
             duration_secs,
-        } => handle_claim(store, ctx, key, expected_version, duration_secs),
-        Request::KvUnclaim { key, claim_token } => handle_unclaim(store, ctx, key, claim_token),
+        } => {
+            // Before the compare-and-swap inside `handle_claim`, for the same
+            // reason as `kv.set` (DR-0033 §3d): a mismatch reply carries the
+            // current version.
+            if let Some(resp) = require_owner(store, ctx, &key, "claim") {
+                return resp;
+            }
+            handle_claim(store, ctx, key, expected_version, duration_secs)
+        }
+        Request::KvUnclaim { key, claim_token } => {
+            if let Some(resp) = require_owner(store, ctx, &key, "unclaim") {
+                return resp;
+            }
+            handle_unclaim(store, ctx, key, claim_token)
+        }
         Request::KvDefine {
             key,
             source,
             soft_ttl_secs,
             hard_ttl_secs,
             meta,
-        } => handle_define(store, key, source, soft_ttl_secs, hard_ttl_secs, meta),
-        Request::KvGet { key, dry_run } => handle_get(store, ctx, key, dry_run),
-        Request::KvPin { key, duration_secs } => handle_pin(store, ctx, key, duration_secs),
-        Request::KvUnpin { key } => match store.unpin(&key, ctx.store_cap) {
-            Ok(true) => Response::unpinned(true),
-            Ok(false) => Response::error(ErrorKind::NotFound, "no such key"),
-            Err(CapError::KeyMismatch) | Err(CapError::Unknown) => {
-                Response::error(ErrorKind::Internal, "capability mismatch")
+        } => {
+            if let Some(resp) = require_owner(store, ctx, &key, "define") {
+                return resp;
             }
-        },
+            handle_define(store, key, source, soft_ttl_secs, hard_ttl_secs, meta)
+        }
+        Request::KvGet { key, dry_run } => handle_get(store, ctx, key, dry_run),
+        Request::KvPin { key, duration_secs } => {
+            if let Some(resp) = require_owner(store, ctx, &key, "pin") {
+                return resp;
+            }
+            handle_pin(store, ctx, key, duration_secs)
+        }
+        Request::KvUnpin { key } => {
+            if let Some(resp) = require_owner(store, ctx, &key, "unpin") {
+                return resp;
+            }
+            match store.unpin(&key, ctx.store_cap) {
+                Ok(true) => Response::unpinned(true),
+                Ok(false) => Response::error(ErrorKind::NotFound, "no such key"),
+                Err(CapError::KeyMismatch) | Err(CapError::Unknown) => {
+                    Response::error(ErrorKind::Internal, "capability mismatch")
+                }
+            }
+        }
         // DR-0029: `server::run_request` always intercepts this variant
         // itself (dispatching to `graceful_restart::handle_request`, which
         // needs `Shared` — not available here) before this function is ever
@@ -457,6 +571,9 @@ fn collect_entry_infos<C: Clock>(
             .failure_backoff_remaining(&name, clock)
             .map(|d| d.as_secs());
         let guard_summary = store.guard_of(&name).map(summarize_guard_record);
+        let owner_summary = store
+            .owner_of(&name)
+            .map(cache_warden::OwnerPrincipal::summary);
         // Read both before `name` moves into the struct below.
         let version = match store.version_of(&name) {
             0 => None,
@@ -478,6 +595,7 @@ fn collect_entry_infos<C: Clock>(
             source,
             backoff_until_secs,
             guard_summary,
+            owner_summary,
             // DR-0034 §4. Value-free: a change counter and a remaining
             // duration. The claim *token* is deliberately absent — `status`
             // and `kv list` are readable by anyone who can reach the socket,
@@ -741,6 +859,32 @@ fn write_through_to_vault<A: ?Sized, R, C: Clock>(
     // carrying it into the vault keeps the two copies of the counter in step
     // across a restart.
     entry.cas_version = store.version_of(key);
+    // DR-0034 §1d / DR-0033 §7: authorization travels with the value it
+    // authorizes. A value that came back from disk without its guard and its
+    // owner would be a credential that silently lost its protection at the
+    // one moment nobody is watching — a restart.
+    if let Some(record) = store.guard_of(key) {
+        match serde_json::to_value(cache_warden::guard_record_to_snapshot(record)) {
+            Ok(v) => entry.guard = Some(cache_warden_vault::GuardRecordSlot(v)),
+            Err(e) => {
+                return Some(Response::error(
+                    ErrorKind::Internal,
+                    format!("the entry's guard could not be persisted, so the value was not: {e}"),
+                ));
+            }
+        }
+    }
+    if let Some(owner) = store.owner_of(key) {
+        match serde_json::to_value(owner) {
+            Ok(v) => entry.owner = Some(cache_warden_vault::OwnerPrincipalSlot(v)),
+            Err(e) => {
+                return Some(Response::error(
+                    ErrorKind::Internal,
+                    format!("the entry's owner could not be persisted, so the value was not: {e}"),
+                ));
+            }
+        }
+    }
     // The vault keeps its own copy of the claim (DR-0034 §4), so its fence has
     // to be satisfied with the same token the store's was, and a successful
     // write retires the claim on both sides together.
@@ -802,6 +946,41 @@ pub fn install_vault_entries<C: Clock>(
             Ok(t) => t,
             Err(_) => continue,
         };
+        // DR-0034 §1d: an entry whose authorization cannot be restored is not
+        // restored at all. Bringing the value back without its guard or its
+        // owner would turn a corrupted record into an unprotected credential,
+        // which is the one outcome worse than the value being unavailable.
+        let guard = match entry
+            .guard
+            .as_ref()
+            .map(|g| serde_json::from_value::<cache_warden::SnapshotGuard>(g.0.clone()))
+        {
+            Some(Err(e)) => {
+                eprintln!(
+                    "cache-warden: vault: {key:?} was not restored: its guard record could not \
+                     be read ({e})"
+                );
+                continue;
+            }
+            Some(Ok(record)) => Some(cache_warden::snapshot_to_guard_record(record)),
+            None => None,
+        };
+        let owner = match entry
+            .owner
+            .as_ref()
+            .map(|o| serde_json::from_value::<cache_warden::OwnerPrincipal>(o.0.clone()))
+        {
+            Some(Err(e)) => {
+                eprintln!(
+                    "cache-warden: vault: {key:?} was not restored: its owner principal could \
+                     not be read ({e})"
+                );
+                continue;
+            }
+            Some(Ok(principal)) => Some(principal),
+            None => None,
+        };
+
         let secret = cache_warden::SecretBytes::new(entry.secret.to_vec());
         if store
             .set(
@@ -818,6 +997,22 @@ pub fn install_vault_entries<C: Clock>(
         }
         // The version travels with the value or the entry does not come back.
         if store.restore_version(&key, entry.cas_version, cap).is_err() {
+            let _ = store.delete(&key, cap);
+            continue;
+        }
+        // Authorization goes back on before the entry counts as restored. The
+        // store's `set` above cleared any guard (DR-0030 §5: a guard belongs
+        // to the value that was set), so this is where the persisted one
+        // returns.
+        if let Some(record) = guard
+            && store.set_guard(key.clone(), record, cap).is_err()
+        {
+            let _ = store.delete(&key, cap);
+            continue;
+        }
+        if let Some(principal) = owner
+            && store.set_owner(key.clone(), principal, cap).is_err()
+        {
             let _ = store.delete(&key, cap);
             continue;
         }
@@ -960,6 +1155,59 @@ fn vault_is_unlocked<A: ?Sized, R, C>(ctx: &HandlerCtx<'_, A, R, C>) -> bool {
         None => true,
         Some(v) => v.lock().map(|g| g.is_unlocked()).unwrap_or(false),
     }
+}
+
+/// Refuse an operation on an owned entry when the caller is not its owner
+/// (draft-DR-0033 §3b).
+///
+/// Applied to reads, writes and deletes alike. Gating only reads would leave
+/// the entry takeable: whoever wrote it first could be overwritten by anyone,
+/// and the new writer's principal would become the one in force.
+///
+/// The refusal names the kind and nothing else — not which principal owns the
+/// entry, not why this caller missed. A caller able to tell "wrong team" from
+/// "unsigned" from "no owner at all" could map out what a key is protected by
+/// without ever satisfying it (DR-0030 §4).
+fn require_owner<A: ?Sized, R, C>(
+    store: &Store,
+    ctx: &HandlerCtx<'_, A, R, C>,
+    key: &str,
+    operation: &str,
+) -> Option<Response> {
+    let owner = store.owner_of(key)?;
+    match ctx.owner_verifier.satisfies(ctx.peer_token, owner) {
+        Ok(()) => None,
+        Err(denied) => {
+            // The distinction goes in the daemon's log, where an operator can
+            // act on it, and nowhere else.
+            eprintln!("cache-warden: kv.{operation} denied for {key:?}: {denied}");
+            Some(Response::error(
+                ErrorKind::AuthFailed,
+                "access denied by entry owner (kind: signed-by)",
+            ))
+        }
+    }
+}
+
+/// Turn a wire declaration into a principal, refusing anything malformed.
+///
+/// On a platform with no code signing this refuses outright rather than
+/// storing the declaration: an entry whose owner can never be satisfied is an
+/// entry nobody can ever read again, and writing one is not a service to the
+/// caller (DR-0033 §6).
+fn parse_signed_by(decl: &SignedByWire) -> Result<cache_warden::OwnerPrincipal, Response> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = decl;
+        return Err(Response::error(
+            ErrorKind::BadRequest,
+            "signed-by needs code-signature evaluation, which this platform does not have: an \
+             entry declared here could never be read again",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    cache_warden::OwnerPrincipal::declare(&decl.anchor, &decl.team_id, &decl.identifier)
+        .map_err(|e| Response::error(ErrorKind::BadRequest, e.to_string()))
 }
 
 /// What the vault has to say about one key, right now.
@@ -1722,6 +1970,14 @@ where
         return resp;
     }
 
+    // Owner authorization (draft-DR-0033 §3b), ahead of every other gate and
+    // of the retrieval chain. A caller that is not the owner learns nothing
+    // and costs nothing: no source command runs, no re-auth prompt appears,
+    // no backoff is recorded.
+    if let Some(resp) = require_owner(store, ctx, &key, "get") {
+        return resp;
+    }
+
     // Key-level process-access gate (DR-0012 key layer). Applied *before* the
     // retrieval chain so a denied requester never triggers the source command or
     // a re-auth prompt. A key with no policy entry is unrestricted (the common
@@ -2213,6 +2469,8 @@ mod tests {
             requester: None,
             kv_process_policies: empty_policies(),
             vault: None,
+            peer_token: None,
+            owner_verifier: &crate::daemon::owner_eval::testing::AlwaysOwner,
             persisted_keys: &NO_PERSISTED_KEYS,
             guard_chain: None,
             guard_audit_token: None,
@@ -2262,6 +2520,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         }
     }
 
@@ -2529,6 +2788,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         let resp = handle_request(&mut store, &c, req);
         assert_eq!(set_guard_applied(&resp), vec!["same-user".to_string()]);
@@ -2581,6 +2841,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         assert!(handle_request(&mut store, &setter_ctx, set_req).is_ok());
 
@@ -2650,6 +2911,7 @@ mod tests {
                     expected_version: None,
                     claim_token: None,
                     persist: None,
+                    signed_by: None,
                 },
             )
             .is_ok()
@@ -2724,6 +2986,7 @@ mod tests {
                 expected_version: None,
                 claim_token: None,
                 persist: None,
+                signed_by: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
@@ -2762,6 +3025,7 @@ mod tests {
                 expected_version: None,
                 claim_token: None,
                 persist: None,
+                signed_by: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
@@ -2805,6 +3069,7 @@ mod tests {
                     expected_version: None,
                     claim_token: None,
                     persist: None,
+                    signed_by: None,
                 },
             )
             .is_ok()
@@ -2870,6 +3135,7 @@ mod tests {
                     expected_version: None,
                     claim_token: None,
                     persist: None,
+                    signed_by: None,
                 },
             )
             .is_ok()
@@ -2943,6 +3209,7 @@ mod tests {
                     expected_version: None,
                     claim_token: None,
                     persist: None,
+                    signed_by: None,
                 },
             )
             .is_ok()
@@ -3012,6 +3279,7 @@ mod tests {
                 expected_version: None,
                 claim_token: None,
                 persist: None,
+                signed_by: None,
             },
         );
         // The set succeeds and the ack names the applied kind.
@@ -3071,6 +3339,7 @@ mod tests {
                     expected_version: None,
                     claim_token: None,
                     persist: None,
+                    signed_by: None,
                 },
             )
             .is_ok()
@@ -3146,6 +3415,7 @@ mod tests {
                 expected_version: None,
                 claim_token: None,
                 persist: None,
+                signed_by: None,
             },
         );
         assert_eq!(set_guard_applied(&set), vec!["same-ancestor".to_string()]);
@@ -3235,6 +3505,7 @@ mod tests {
                     expected_version: None,
                     claim_token: None,
                     persist: None,
+                    signed_by: None,
                 },
             )
             .is_ok()
@@ -3262,6 +3533,7 @@ mod tests {
                 expected_version: None,
                 claim_token: None,
                 persist: None,
+                signed_by: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
@@ -3306,6 +3578,7 @@ mod tests {
                     expected_version: None,
                     claim_token: None,
                     persist: None,
+                    signed_by: None,
                 },
             )
             .is_ok()
@@ -3329,6 +3602,7 @@ mod tests {
                 expected_version: None,
                 claim_token: None,
                 persist: None,
+                signed_by: None,
             },
         );
         assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
@@ -3546,6 +3820,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -3597,6 +3872,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         assert!(handle_request(&mut store, &c, req).is_ok());
         assert!(store.has_value("default/authsock"));
@@ -3810,6 +4086,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -3873,6 +4150,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -3897,6 +4175,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         assert_eq!(
             err_kind(&handle_request(&mut store, &c, req)),
@@ -4049,6 +4328,7 @@ mod tests {
                     expected_version: None,
                     claim_token: None,
                     persist: None,
+                    signed_by: None,
                 },
             );
         }
@@ -4537,6 +4817,8 @@ mod tests {
             requester,
             kv_process_policies: policies,
             vault: None,
+            peer_token: None,
+            owner_verifier: &crate::daemon::owner_eval::testing::AlwaysOwner,
             persisted_keys: &NO_PERSISTED_KEYS,
             guard_chain: None,
             guard_audit_token: None,
@@ -4863,6 +5145,7 @@ mod tests {
                 expected_version: expected,
                 claim_token: token.map(str::to_string),
                 persist: None,
+                signed_by: None,
             }
         }
 
@@ -5325,6 +5608,533 @@ mod tests {
         }
     }
 
+    /// Ownership by code-signing identity (draft-DR-0033).
+    ///
+    /// The verifier is replaced with one whose answer is fixed, because what
+    /// is under test is everything built *on* the decision — first use
+    /// establishing it, updates inheriting it, the order authorization runs
+    /// in — and none of that should need two differently-signed binaries and
+    /// a socket between them to exercise. The decision itself is tested
+    /// against the kernel in `owner_eval`.
+    mod owned {
+        use super::*;
+        use crate::daemon::owner_eval::testing::{AlwaysOwner, NeverOwner};
+        use crate::protocol::wire::SignedByWire;
+
+        fn decl() -> SignedByWire {
+            SignedByWire {
+                anchor: "apple-generic".into(),
+                team_id: "3QMEVK549R".into(),
+                identifier: "com.example.gateway".into(),
+            }
+        }
+
+        fn set_req(key: &str, value: &[u8], signed_by: Option<SignedByWire>) -> Request {
+            Request::KvSet {
+                key: key.into(),
+                source: SetSource::Static {
+                    value_b64: encode_b64(value),
+                },
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+                guard_constraints: Vec::new(),
+                expected_version: None,
+                claim_token: None,
+                persist: None,
+                signed_by,
+            }
+        }
+
+        fn get_req(key: &str) -> Request {
+            Request::KvGet {
+                key: key.into(),
+                dry_run: false,
+            }
+        }
+
+        fn owner_summary(resp: &Response) -> Option<String> {
+            match resp {
+                Response::Ok(ok) => match &ok.payload {
+                    OkPayload::Set { owner_applied, .. } => owner_applied.clone(),
+                    other => panic!("expected a Set ack, got {other:?}"),
+                },
+                other => panic!("expected ok, got {other:?}"),
+            }
+        }
+
+        /// DR-0033 §3a: the first declaration establishes ownership, and the
+        /// ack reports it. Without the ack a caller cannot tell a daemon that
+        /// applied the declaration from one too old to know the field — and
+        /// the difference is whether its credential is protected at all.
+        #[test]
+        fn a_first_declaration_establishes_ownership_and_is_acknowledged() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+
+            let resp = handle_request(&mut store, &c, set_req("default/K", b"v", Some(decl())));
+            let summary = owner_summary(&resp).expect("the ack must report the owner");
+            assert!(summary.contains("com.example.gateway"), "{summary}");
+            assert!(store.owner_of("default/K").is_some());
+        }
+
+        /// DR-0033 §3c: not declaring means unchanged. A credential rewritten
+        /// on every refresh would otherwise lose its protection the first
+        /// time a caller forgot to repeat itself — silently, and for good.
+        #[test]
+        fn an_update_without_a_declaration_inherits_the_owner() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+
+            handle_request(&mut store, &c, set_req("default/K", b"v1", Some(decl())));
+            let resp = handle_request(&mut store, &c, set_req("default/K", b"v2", None));
+            assert!(
+                owner_summary(&resp).is_some(),
+                "a plain update must keep — and report — the owner it inherited"
+            );
+            assert!(store.owner_of("default/K").is_some());
+        }
+
+        /// Releasing happens only when asked, through the one request that
+        /// asks for it — and it leaves the value alone.
+        ///
+        /// That last part is why releasing is not a flag on `set`: a set
+        /// writes a value, so routing a release through one would make giving
+        /// up ownership require supplying a value, and supplying the wrong one
+        /// would destroy the credential being handed over.
+        #[test]
+        fn ownership_is_released_by_its_own_request_without_touching_the_value() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+
+            handle_request(&mut store, &c, set_req("default/K", b"v", Some(decl())));
+            let resp = handle_request(
+                &mut store,
+                &c,
+                Request::KvOwnerClear {
+                    key: "default/K".into(),
+                },
+            );
+            assert!(matches!(resp, Response::Ok(_)), "{resp:?}");
+            assert!(store.owner_of("default/K").is_none());
+            assert_eq!(
+                get_value(&handle_request(&mut store, &c, get_req("default/K"))),
+                b"v",
+                "the value the entry held is still there"
+            );
+        }
+
+        /// Releasing is a change to an owned entry, so it needs the same
+        /// authorization every other change does.
+        #[test]
+        fn a_non_owner_cannot_release_ownership() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            {
+                let owner_ctx = ctx(&AllowAll, &runner, &clock, &cap);
+                handle_request(
+                    &mut store,
+                    &owner_ctx,
+                    set_req("default/K", b"v", Some(decl())),
+                );
+            }
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.owner_verifier = &NeverOwner;
+            assert_eq!(
+                err_kind(&handle_request(
+                    &mut store,
+                    &c,
+                    Request::KvOwnerClear {
+                        key: "default/K".into(),
+                    }
+                )),
+                ErrorKind::AuthFailed
+            );
+            assert!(store.owner_of("default/K").is_some());
+        }
+
+        /// DR-0033 §3b: an owned entry is closed to everyone else for reads,
+        /// writes **and** deletes. Gating only reads would leave it takeable —
+        /// overwrite it, and the new writer's principal becomes the one in
+        /// force.
+        #[test]
+        fn a_non_owner_can_neither_read_nor_write_nor_delete() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+
+            {
+                let owner_ctx = ctx(&AllowAll, &runner, &clock, &cap);
+                handle_request(
+                    &mut store,
+                    &owner_ctx,
+                    set_req("default/K", b"v", Some(decl())),
+                );
+            }
+
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.owner_verifier = &NeverOwner;
+
+            assert_eq!(
+                err_kind(&handle_request(&mut store, &c, get_req("default/K"))),
+                ErrorKind::AuthFailed
+            );
+            assert_eq!(
+                err_kind(&handle_request(
+                    &mut store,
+                    &c,
+                    set_req("default/K", b"stolen", None)
+                )),
+                ErrorKind::AuthFailed
+            );
+            assert_eq!(
+                err_kind(&handle_request(
+                    &mut store,
+                    &c,
+                    Request::KvDel {
+                        key: "default/K".into(),
+                        with_define: false,
+                    }
+                )),
+                ErrorKind::AuthFailed
+            );
+
+            // And nothing happened: the value is untouched and still owned.
+            let owner_ctx = ctx(&AllowAll, &runner, &clock, &cap);
+            assert_eq!(
+                get_value(&handle_request(
+                    &mut store,
+                    &owner_ctx,
+                    get_req("default/K")
+                )),
+                b"v"
+            );
+        }
+
+        /// A non-owner cannot take an entry over by declaring itself the
+        /// owner — the write is refused before the declaration is looked at.
+        #[test]
+        fn a_non_owner_cannot_redeclare_ownership_to_itself() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            {
+                let owner_ctx = ctx(&AllowAll, &runner, &clock, &cap);
+                handle_request(
+                    &mut store,
+                    &owner_ctx,
+                    set_req("default/K", b"v", Some(decl())),
+                );
+            }
+            let before = store.owner_of("default/K").cloned();
+
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.owner_verifier = &NeverOwner;
+            let attacker = SignedByWire {
+                anchor: "apple-generic".into(),
+                team_id: "ATTACKER00".into(),
+                identifier: "com.attacker.tool".into(),
+            };
+            assert_eq!(
+                err_kind(&handle_request(
+                    &mut store,
+                    &c,
+                    set_req("default/K", b"v", Some(attacker))
+                )),
+                ErrorKind::AuthFailed
+            );
+            assert_eq!(store.owner_of("default/K").cloned(), before);
+        }
+
+        /// DR-0033 §3d: owner authorization runs **before** the
+        /// compare-and-swap check. A mismatch reply carries the entry's
+        /// current version, so checking CAS first would tell a caller who
+        /// cannot read the credential how often it is being refreshed.
+        #[test]
+        fn a_refused_caller_learns_nothing_about_the_version() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            {
+                let owner_ctx = ctx(&AllowAll, &runner, &clock, &cap);
+                handle_request(
+                    &mut store,
+                    &owner_ctx,
+                    set_req("default/K", b"v1", Some(decl())),
+                );
+                handle_request(&mut store, &owner_ctx, set_req("default/K", b"v2", None));
+            }
+
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.owner_verifier = &NeverOwner;
+            let mut req = set_req("default/K", b"v", None);
+            if let Request::KvSet {
+                expected_version, ..
+            } = &mut req
+            {
+                *expected_version = Some(1); // deliberately stale
+            }
+            let resp = handle_request(&mut store, &c, req);
+
+            assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+            match &resp {
+                Response::Err(e) => assert_eq!(
+                    e.error.current_version, None,
+                    "an authorization refusal must not carry the entry's version"
+                ),
+                other => panic!("expected an error, got {other:?}"),
+            }
+        }
+
+        /// DR-0033 §3b covers every operation on an owned entry, not the
+        /// three that were easiest to think of. A claim decides who refreshes
+        /// the credential next and blocks the owner's own writes while it is
+        /// held; a definition decides what a later get produces, so an
+        /// unauthorized redefinition serves an attacker's value without ever
+        /// writing one; a pin changes how long the value lives.
+        #[test]
+        fn every_operation_on_an_owned_entry_needs_its_owner() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            {
+                let owner_ctx = ctx(&AllowAll, &runner, &clock, &cap);
+                handle_request(
+                    &mut store,
+                    &owner_ctx,
+                    set_req("default/K", b"v", Some(decl())),
+                );
+            }
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.owner_verifier = &NeverOwner;
+
+            let refused = [
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 1,
+                    duration_secs: 300,
+                },
+                Request::KvUnclaim {
+                    key: "default/K".into(),
+                    claim_token: "whatever".into(),
+                },
+                Request::KvPin {
+                    key: "default/K".into(),
+                    duration_secs: 300,
+                },
+                Request::KvUnpin {
+                    key: "default/K".into(),
+                },
+                Request::KvOwnerClear {
+                    key: "default/K".into(),
+                },
+            ];
+            for req in refused {
+                let label = format!("{req:?}");
+                assert_eq!(
+                    err_kind(&handle_request(&mut store, &c, req)),
+                    ErrorKind::AuthFailed,
+                    "must be refused: {label}"
+                );
+            }
+        }
+
+        /// The redefinition path specifically: a definition is what a later
+        /// get regenerates from, so being able to replace one is being able
+        /// to choose what the entry serves. Poisoning it must be refused, and
+        /// the definition left as it was.
+        #[test]
+        fn a_non_owner_cannot_replace_the_definition() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            {
+                let owner_ctx = ctx(&AllowAll, &runner, &clock, &cap);
+                handle_request(
+                    &mut store,
+                    &owner_ctx,
+                    define_with("default/K", cmd_spec(&["printf", "honest"])),
+                );
+                handle_request(
+                    &mut store,
+                    &owner_ctx,
+                    set_req("default/K", b"v", Some(decl())),
+                );
+            }
+
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.owner_verifier = &NeverOwner;
+            let resp = handle_request(
+                &mut store,
+                &c,
+                define_with("default/K", cmd_spec(&["printf", "poisoned"])),
+            );
+            assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+
+            // The definition is the one its owner registered. Asserted on the
+            // stored argv rather than on a regenerated value, because the test
+            // runner answers every command with the same bytes — which would
+            // make a poisoned definition and an honest one look identical.
+            let source = format!(
+                "{:?}",
+                store
+                    .definition_of("default/K")
+                    .expect("the definition is still there")
+                    .source()
+            );
+            assert!(
+                source.contains("honest") && !source.contains("poisoned"),
+                "the owner's definition must be untouched, got {source}"
+            );
+        }
+
+        /// The order rule again, on the claim path: a claim runs a
+        /// compare-and-swap, and its mismatch reply carries the current
+        /// version. Authorization has to come first there too, or an
+        /// unauthorized caller reads the credential's refresh count off a
+        /// claim it was never allowed to take.
+        #[test]
+        fn a_refused_caller_learns_nothing_about_the_version_from_a_claim() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            {
+                let owner_ctx = ctx(&AllowAll, &runner, &clock, &cap);
+                handle_request(
+                    &mut store,
+                    &owner_ctx,
+                    set_req("default/K", b"v1", Some(decl())),
+                );
+                handle_request(&mut store, &owner_ctx, set_req("default/K", b"v2", None));
+            }
+
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.owner_verifier = &NeverOwner;
+            let resp = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/K".into(),
+                    expected_version: 1, // deliberately stale
+                    duration_secs: 300,
+                },
+            );
+            assert_eq!(err_kind(&resp), ErrorKind::AuthFailed);
+            match &resp {
+                Response::Err(e) => assert_eq!(
+                    e.error.current_version, None,
+                    "a refused claim must not carry the entry's version"
+                ),
+                other => panic!("expected an error, got {other:?}"),
+            }
+        }
+
+        /// DR-0033 §3a: an entry that has no owner yet can be claimed, even
+        /// one that already holds a value. Refusing would let an attacker
+        /// block a legitimate owner forever by writing the key first.
+        #[test]
+        fn an_existing_unowned_entry_can_still_be_claimed() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+
+            handle_request(&mut store, &c, set_req("default/K", b"v", None));
+            assert!(store.owner_of("default/K").is_none());
+
+            let resp = handle_request(&mut store, &c, set_req("default/K", b"v2", Some(decl())));
+            assert!(
+                owner_summary(&resp).is_some(),
+                "an unowned entry accepts an owner"
+            );
+        }
+
+        /// A malformed declaration is refused, and refused *before* anything
+        /// is written: a rejected policy must not leave a value behind with
+        /// no policy on it.
+        #[test]
+        fn a_malformed_declaration_is_refused_without_writing() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let c = ctx(&AllowAll, &runner, &clock, &cap);
+
+            let bad = SignedByWire {
+                anchor: "apple generic".into(), // misspelled
+                team_id: "3QMEVK549R".into(),
+                identifier: "com.example.gateway".into(),
+            };
+            let resp = handle_request(&mut store, &c, set_req("default/K", b"v", Some(bad)));
+            assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+            assert!(!store.has_value("default/K"), "nothing may be written");
+        }
+
+        /// The refusal names the kind and nothing else. A caller able to tell
+        /// "wrong team" from "unsigned" could map out what a key is protected
+        /// by without ever satisfying it (DR-0030 §4).
+        #[test]
+        fn the_refusal_names_the_kind_and_not_the_principal() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            {
+                let owner_ctx = ctx(&AllowAll, &runner, &clock, &cap);
+                handle_request(
+                    &mut store,
+                    &owner_ctx,
+                    set_req("default/K", b"v", Some(decl())),
+                );
+            }
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.owner_verifier = &NeverOwner;
+            let msg = err_msg(&handle_request(&mut store, &c, get_req("default/K")));
+            assert!(msg.contains("signed-by"), "{msg}");
+            assert!(!msg.contains("3QMEVK549R"), "the team must not leak: {msg}");
+            assert!(
+                !msg.contains("com.example.gateway"),
+                "nor the identifier: {msg}"
+            );
+        }
+
+        /// An unowned entry is unaffected by any of this.
+        #[test]
+        fn an_unowned_entry_is_readable_by_anyone_as_before() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.owner_verifier = &NeverOwner;
+
+            handle_request(&mut store, &c, set_req("default/K", b"v", None));
+            assert_eq!(
+                get_value(&handle_request(&mut store, &c, get_req("default/K"))),
+                b"v"
+            );
+        }
+
+        /// A verifier that admits everyone is still subject to the same
+        /// rules — the test double is not a bypass of the logic under test.
+        #[test]
+        fn an_admitted_caller_goes_through_the_ordinary_path() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.owner_verifier = &AlwaysOwner;
+            handle_request(&mut store, &c, set_req("default/K", b"v", Some(decl())));
+            assert_eq!(
+                get_value(&handle_request(&mut store, &c, get_req("default/K"))),
+                b"v"
+            );
+        }
+    }
+
     /// The vault-backed half of the handler (DR-0034 §5/§6): what it means for
     /// cache-warden to be the source of truth for a value, and what a closed
     /// vault does to the operations that touch one.
@@ -5367,6 +6177,7 @@ mod tests {
                 expected_version: None,
                 claim_token: None,
                 persist: Some(true),
+                signed_by: None,
             }
         }
 
@@ -5384,6 +6195,7 @@ mod tests {
                 expected_version: None,
                 claim_token: None,
                 persist: None,
+                signed_by: None,
             }
         }
 
@@ -5553,12 +6365,13 @@ mod tests {
             );
         }
 
-        /// DR-0034 §1d: a persisted entry has to carry its authorization with
-        /// it, and the vault format does not hold one yet. Accepting the pair
-        /// would mean an entry that silently loses its guard the first time the
-        /// vault is reopened, which is the failure §1d exists to forbid.
+        /// DR-0034 §1d / DR-0033 §7: a persisted entry's authorization is
+        /// persisted with it, so a guard and an owner both survive being
+        /// locked away and brought back. Until phase 5 this pair was refused
+        /// outright — the vault had nowhere to put them, and a value that came
+        /// back unprotected is worse than one that does not come back at all.
         #[test]
-        fn a_guard_cannot_be_attached_to_a_persisted_entry_yet() {
+        fn a_guard_and_an_owner_survive_the_vault() {
             let clock = FakeClock::new();
             let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
             let runner = CountingRunner::new(b"x");
@@ -5567,26 +6380,125 @@ mod tests {
             c.vault = Some(&vault);
             c.persisted_keys = &d.declared;
 
+            // A guard needs the setter's identity, which comes from the
+            // connection; without it there is no record to build.
+            c.guard_audit_token = Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            });
+
             let mut req = persist_req("default/RT", b"rt-1");
             if let Request::KvSet {
-                guard_constraints, ..
+                guard_constraints,
+                signed_by,
+                ..
             } = &mut req
             {
                 *guard_constraints = vec![GuardConstraintWire::SameUser];
+                *signed_by = Some(crate::protocol::wire::SignedByWire {
+                    anchor: "apple-generic".into(),
+                    team_id: "3QMEVK549R".into(),
+                    identifier: "com.example.gateway".into(),
+                });
             }
             let resp = handle_request(&mut store, &c, req);
-            assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
-            assert!(
-                vault
-                    .lock()
-                    .unwrap()
-                    .unlocked()
-                    .unwrap()
-                    .entry("default/RT")
-                    .is_none(),
-                "a refused set must not have written anything"
+            assert!(matches!(resp, Response::Ok(_)), "{resp:?}");
+            assert!(store.guard_of("default/RT").is_some());
+            assert!(store.owner_of("default/RT").is_some());
+
+            // Everything in memory is lost, as a restart would lose it.
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let chain = vec![gp(proc(100, "zsh"), None)];
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+            c.guard_audit_token = Some(GetterAuditToken {
+                euid: 501,
+                ruid: 501,
+            });
+            c.guard_chain = Some(&chain);
+            vault.lock().unwrap().lock().expect("closes");
+            handle_request(
+                &mut store,
+                &c,
+                Request::VaultUnlock {
+                    recovery_code: Some(d.code.render().to_string()),
+                },
             );
-            assert!(!store.has_value("default/RT"), "nor to memory");
+
+            // The value is readable by a caller the restored guard admits...
+            assert_eq!(
+                get_value(&handle_request(&mut store, &c, get_req("default/RT"))),
+                b"rt-1"
+            );
+            // ...and refused for one it does not. The guard did not merely
+            // survive as a record, it is being enforced.
+            let mut denied = ctx(&AllowAll, &runner, &clock, &cap);
+            denied.vault = Some(&vault);
+            denied.persisted_keys = &d.declared;
+            denied.guard_audit_token = Some(GetterAuditToken {
+                euid: 999,
+                ruid: 999,
+            });
+            denied.guard_chain = Some(&chain);
+            assert_eq!(
+                err_kind(&handle_request(&mut store, &denied, get_req("default/RT"))),
+                ErrorKind::AuthFailed
+            );
+            assert!(
+                store.guard_of("default/RT").is_some(),
+                "the guard came back with the value"
+            );
+            assert_eq!(
+                store.owner_of("default/RT").map(|o| o.identifier.clone()),
+                Some("com.example.gateway".to_string()),
+                "and so did the owner"
+            );
+        }
+
+        /// The other half of §1d: an entry whose authorization cannot be read
+        /// back is not restored at all. A corrupted record must not become an
+        /// unprotected credential.
+        #[test]
+        fn an_entry_whose_authorization_cannot_be_read_is_not_restored() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            handle_request(&mut store, &c, persist_req("default/RT", b"rt-1"));
+            // The shape is right; the contents are not something an owner
+            // principal can be read from.
+            {
+                let mut guard = vault.lock().unwrap();
+                let unlocked = guard.unlocked_mut().unwrap();
+                let mut entry = unlocked.entry("default/RT").unwrap().clone();
+                entry.owner = Some(cache_warden_vault::OwnerPrincipalSlot(
+                    serde_json::json!({ "anchor": "not-an-anchor" }),
+                ));
+                unlocked.upsert(entry, None).expect("stores");
+            }
+
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+            vault.lock().unwrap().lock().expect("closes");
+            handle_request(
+                &mut store,
+                &c,
+                Request::VaultUnlock {
+                    recovery_code: Some(d.code.render().to_string()),
+                },
+            );
+            assert!(
+                !store.has_value("default/RT"),
+                "a value whose owner cannot be read must stay unavailable rather than come back \
+                 unprotected"
+            );
         }
 
         /// The configuration's `persist = true` is a statement about where the

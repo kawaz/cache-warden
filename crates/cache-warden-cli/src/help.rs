@@ -491,6 +491,10 @@ pub fn kv() -> HelpSpec {
                 desc: "Take the refresh hold on a key before fetching a new value",
             },
             Row {
+                name: "owner",
+                desc: "Inspect and release an entry's owner",
+            },
+            Row {
                 name: "unclaim",
                 desc: "Release a refresh hold without writing a value",
             },
@@ -1056,6 +1060,78 @@ The daemon never opens the vault on its own, so an unattended start stays
 unattended: `vault unlock` is always something you run. While the vault is
 closed the daemon still works — persisted entries stay listed by `status` and
 `kv list`, and only reading their values fails, with the value intact.",
+        show_global: true,
+    }
+}
+
+/// `kv owner` group page (draft-DR-0033 §6).
+pub fn kv_owner() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " kv owner"),
+        summary: "Inspect and release an entry's owner.",
+        usage: concat!("cache-warden", " kv owner <COMMAND> KEY"),
+        subcommands: &[
+            Row {
+                name: "show",
+                desc: "Show which signed identity owns an entry",
+            },
+            Row {
+                name: "clear",
+                desc: "Release an entry's owner (only its owner may)",
+            },
+        ],
+        options: &[],
+        detail: "\
+An owner is a code-signing identity — an anchor, a Developer Team Identifier
+and a signing identifier — declared with `kv set --require-signed-by-*`. Once
+an entry has one, only a process whose signature satisfies it may read, write
+or delete that entry.
+
+Ownership is a property of the entry rather than of any particular value: a
+later `kv set` that does not repeat the declaration keeps it, so a credential
+that is refreshed does not quietly lose its protection. Releasing it is this
+command, and nothing else does it.
+
+Ownership is checked against the process on the other end of this socket, and
+only that process. Running `cache-warden kv get` against an owned entry checks
+the CLI's own signature, not that of whatever started it — which is why an
+entry meant to be read by a program should be read by that program directly.",
+        show_global: true,
+    }
+}
+
+/// `kv owner show` leaf page.
+pub fn kv_owner_show() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " kv owner show"),
+        summary: "Show which signed identity owns an entry.",
+        usage: concat!("cache-warden", " kv owner show KEY"),
+        subcommands: &[],
+        options: &[],
+        detail: "\
+Prints the owner's anchor, team and identifier, or `(no owner)` when the entry
+has none. Nothing about the value, and nothing about who declared the owner.
+
+An entry with no owner is readable and writable by anything running as you.",
+        show_global: true,
+    }
+}
+
+/// `kv owner clear` leaf page (draft-DR-0033 §3c).
+pub fn kv_owner_clear() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " kv owner clear"),
+        summary: "Release an entry's owner.",
+        usage: concat!("cache-warden", " kv owner clear KEY"),
+        subcommands: &[],
+        options: &[],
+        detail: "\
+Leaves the value in place and removes the requirement that guarded it, so the
+entry becomes readable and writable by anything running as you.
+
+Only the current owner may do this — which, since ownership is checked against
+the calling process's own signature, means running it from the CLI succeeds
+only for an entry the CLI itself owns.",
         show_global: true,
     }
 }

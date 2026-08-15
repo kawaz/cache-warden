@@ -40,6 +40,7 @@ fn render_response(resp: Response) -> Result<(), String> {
         Response::Ok(ok) => {
             match ok.payload {
                 OkPayload::Pong { .. } => println!("pong"),
+                OkPayload::OwnerCleared { .. } => println!("owner released"),
                 OkPayload::CeremonyOpened {
                     url,
                     expires_in_secs,
@@ -204,6 +205,38 @@ fn run_client_expect_guard_ack(
     expect_guard_ack_with_sender(req, &mut send)
 }
 
+/// Best-effort removal of a value that was stored without the protection its
+/// caller asked for, and a sentence saying whether it worked.
+///
+/// The value is on the daemon either way: it was accepted before the missing
+/// acknowledgement revealed that the protection was not. Reporting the error
+/// alone would leave a credential sitting there unprotected, so the delete is
+/// attempted first and its outcome reported — an operator who has to run
+/// `kv del` by hand needs to be told, not left to infer it.
+fn cleanup_unprotected_value<F>(key: &str, send: &mut F) -> String
+where
+    F: FnMut(&protocol::wire::Request) -> Result<protocol::wire::Response, String>,
+{
+    use protocol::wire::{Request, Response};
+    let del_req = Request::KvDel {
+        key: key.to_string(),
+        with_define: false,
+    };
+    match send(&del_req) {
+        Ok(Response::Ok(_)) => format!("the unprotected value at {key:?} was auto-deleted"),
+        Ok(Response::Err(e)) => format!(
+            "the unprotected value at {key:?} could NOT be auto-deleted ({}: {}); run \
+             `cache-warden kv del {key}` immediately",
+            error_kind_str(&e.error.kind),
+            e.error.message
+        ),
+        Err(e) => format!(
+            "the unprotected value at {key:?} could NOT be auto-deleted ({e}); run \
+             `cache-warden kv del {key}` immediately"
+        ),
+    }
+}
+
 /// Testable core of [`run_client_expect_guard_ack`]. Same contract
 /// (a `kv.set` whose ack must carry a non-empty `guard_applied`),
 /// but with the transport factored out as a callable so a unit test
@@ -231,8 +264,36 @@ where
     let resp = send(req)?;
     match resp {
         Response::Ok(ok) => match ok.payload {
-            OkPayload::Set { guard_applied, .. } => {
-                if guard_applied.is_empty() {
+            OkPayload::Set {
+                guard_applied,
+                owner_applied,
+                ..
+            } => {
+                // draft-DR-0033 §6: an owner declaration has the same
+                // positive-ack contract, and the same consequence when it is
+                // missing — a daemon too old to understand the field stored
+                // the credential with no owner on it.
+                let declared_owner = matches!(
+                    req,
+                    Request::KvSet {
+                        signed_by: Some(_),
+                        ..
+                    }
+                );
+                if declared_owner && owner_applied.is_none() {
+                    let key = match req {
+                        Request::KvSet { key, .. } => key.clone(),
+                        _ => unreachable!("matched a KvSet above"),
+                    };
+                    let cleanup = cleanup_unprotected_value(&key, send);
+                    return Err(format!(
+                        "the daemon accepted the set but did not report an owner, so it is an \
+                         older build that does not enforce signed-by — the credential was \
+                         stored with NO owner. {cleanup}. Restart the daemon with a matching \
+                         version before relying on --require-signed-by-* flags."
+                    ));
+                }
+                if guard_applied.is_empty() && !declared_owner {
                     // Extract the key from the original request so the
                     // auto-delete targets exactly what we just wrote.
                     let key = match req {
@@ -244,25 +305,7 @@ where
                             );
                         }
                     };
-                    let del_req = Request::KvDel {
-                        key: key.clone(),
-                        with_define: false,
-                    };
-                    let cleanup = match send(&del_req) {
-                        Ok(Response::Ok(_)) => {
-                            format!("the unguarded value at {key:?} was auto-deleted")
-                        }
-                        Ok(Response::Err(e)) => format!(
-                            "the unguarded value at {key:?} could NOT be auto-deleted \
-                             ({}: {}); run `cache-warden kv del {key}` immediately",
-                            error_kind_str(&e.error.kind),
-                            e.error.message
-                        ),
-                        Err(e) => format!(
-                            "the unguarded value at {key:?} could NOT be auto-deleted \
-                             ({e}); run `cache-warden kv del {key}` immediately"
-                        ),
-                    };
+                    let cleanup = cleanup_unprotected_value(&key, send);
                     return Err(format!(
                         "daemon accepted the set but did not report any applied guard \
                          constraints; you likely have an old cache-warden daemon that \
@@ -273,7 +316,13 @@ where
                          before relying on --require-* flags."
                     ));
                 }
-                println!("ok (guard: {})", guard_applied.join(", "));
+                if !guard_applied.is_empty() {
+                    println!("ok (guard: {})", guard_applied.join(", "));
+                } else if let Some(owner) = owner_applied {
+                    println!("ok (owner: {owner})");
+                } else {
+                    println!("ok");
+                }
                 Ok(())
             }
             other => Err(format!("unexpected daemon response for kv.set: {other:?}")),
@@ -613,6 +662,7 @@ fn dispatch_kv(
         "unpin" => help::kv_unpin,
         "claim" => help::kv_claim,
         "unclaim" => help::kv_unclaim,
+        "owner" => help::kv_owner,
         other => {
             return Err(CliError::Message(format!(
                 "unknown kv subcommand: {other} (try `{NAME} kv --help`)"
@@ -675,6 +725,7 @@ fn dispatch_kv(
             leaf_help,
         )?,
         "pin" => or_usage(commands::parse_kv_pin(kv_args, &ns), leaf_help)?,
+        "owner" => return dispatch_kv_owner(kv_args, &ns, socket),
         "claim" => or_usage(commands::parse_kv_claim(kv_args, &ns), leaf_help)?,
         "unclaim" => or_usage(commands::parse_kv_unclaim(kv_args, &ns), leaf_help)?,
         _ => unreachable!("leaf_help match covers all known subcommands"),
@@ -685,13 +736,86 @@ fn dispatch_kv(
     // field, `#[serde(default)]` decodes to `Vec::new()`, and the client
     // must treat that as an error (never as a successful unguarded write).
     if let protocol::wire::Request::KvSet {
-        guard_constraints, ..
+        guard_constraints,
+        signed_by,
+        ..
     } = &req
-        && !guard_constraints.is_empty()
+        && (!guard_constraints.is_empty() || signed_by.is_some())
     {
         return Ok(run_client_expect_guard_ack(socket, &req)?);
     }
     Ok(run_client(socket, &req)?)
+}
+
+/// Dispatch `kv owner` (draft-DR-0033 §6).
+///
+/// A group of its own because ownership is a lifecycle of its own: it outlives
+/// any particular value, it is changed by different rules than a value is, and
+/// only its holder may change it.
+fn dispatch_kv_owner(args: &[String], ns: &str, socket: &std::path::Path) -> Result<(), CliError> {
+    if args.is_empty() || args[0] == "--help" {
+        println!("{}", help::kv_owner().render());
+        return Ok(());
+    }
+    let sub = args[0].as_str();
+    let tail = &args[1..];
+    match sub {
+        "clear" => {
+            if help::wants_help(tail) {
+                println!("{}", help::kv_owner_clear().render());
+                return Ok(());
+            }
+            let req = or_usage(
+                commands::parse_kv_owner_clear(tail, ns),
+                help::kv_owner_clear,
+            )?;
+            Ok(run_client(socket, &req)?)
+        }
+        "show" => {
+            if help::wants_help(tail) {
+                println!("{}", help::kv_owner_show().render());
+                return Ok(());
+            }
+            let key = or_usage(commands::parse_kv_owner_show(tail, ns), help::kv_owner_show)?;
+            dispatch_kv_owner_show(&key, socket)
+        }
+        other => Err(CliError::Message(format!(
+            "unknown kv owner subcommand: {other} (try `{NAME} kv owner --help`)"
+        ))),
+    }
+}
+
+/// Show one entry's owner, read out of the ordinary `kv.list` reply — there is
+/// no request that asks for just this.
+fn dispatch_kv_owner_show(key: &str, socket: &std::path::Path) -> Result<(), CliError> {
+    let resp = client::round_trip(socket, &protocol::wire::Request::KvList)?;
+    match resp {
+        Response::Ok(ok) => match ok.payload {
+            OkPayload::List { entries, .. } => {
+                match entries.iter().find(|e| e.name == key) {
+                    None => Err(CliError::Message(format!("no such key: {key}"))),
+                    Some(entry) => {
+                        match &entry.owner_summary {
+                            Some(owner) => println!("{owner}"),
+                            // Not an error: "nobody owns this" is a real
+                            // answer to the question, and the one an operator
+                            // checking whether a key is protected needs most.
+                            None => println!("(no owner)"),
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            other => Err(CliError::Message(format!(
+                "unexpected daemon response for kv.list: {other:?}"
+            ))),
+        },
+        Response::Err(e) => Err(CliError::Message(format!(
+            "{}: {}",
+            error_kind_str(&e.error.kind),
+            e.error.message
+        ))),
+    }
 }
 
 /// Dispatch the `vault` group (DR-0034 §6/§9).
@@ -1258,6 +1382,7 @@ mod tests {
             source: None,
             backoff_until_secs: None,
             guard_summary: None,
+            owner_summary: None,
             version: None,
             claim_expires_in_secs: None,
             locked: false,
@@ -1451,6 +1576,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         }
     }
 

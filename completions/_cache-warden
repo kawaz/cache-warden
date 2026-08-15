@@ -157,6 +157,7 @@ _cache-warden() {
             'unpin:Drop a pin, returning the value to normal TTL evaluation'
             'claim:Take the refresh hold on a key before fetching a new value'
             'unclaim:Release a refresh hold without writing a value'
+            'owner:Inspect and release an entry owner'
           )
           _arguments -C \
             "$socket_opt" \
@@ -197,6 +198,9 @@ _cache-warden() {
                     '--expected-version[Write only if the key is still at version N (0 = must not exist yet)]:version' \
                     '--claim-token[Finish the refresh held by kv claim]:token' \
                     '--persist[Keep the value in the encrypted vault across daemon restarts]' \
+            '--require-signed-by-anchor[Owner trust anchor: apple-generic or apple]:anchor:(apple-generic apple)' \
+            '--require-signed-by-team[Owner Apple Developer Team Identifier]:team:' \
+            '--require-signed-by-identifier[Owner code-signing identifier]:identifier:' \
                     '1:key:_cw_keys' \
                     '2:value (omit to read stdin):'
                   ;;

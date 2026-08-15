@@ -124,11 +124,33 @@ pub enum CodesignError {
         self_team: String,
         peer_team: String,
     },
+    /// A caller-supplied requirement string is not valid Requirement
+    /// Language.
+    ///
+    /// Distinct from [`CodesignError::PeerRequirementUnsatisfied`] on
+    /// purpose: one says the policy is malformed, the other says the peer
+    /// does not meet it, and treating a malformed policy as a failed match
+    /// would report an attacker where there is a typo.
+    RequirementUnparseable { status: i32 },
+    /// The signing-information dictionary carried no readable flags word.
+    SigningFlagsUnavailable,
+    /// This platform has no code-signing evaluation to offer.
+    Unsupported,
 }
 
 impl std::fmt::Display for CodesignError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CodesignError::RequirementUnparseable { status } => write!(
+                f,
+                "the code-signing requirement could not be parsed (OSStatus {status})"
+            ),
+            CodesignError::SigningFlagsUnavailable => {
+                f.write_str("the peer's signature carries no readable flags word")
+            }
+            CodesignError::Unsupported => {
+                f.write_str("code-signing evaluation is only available on macOS")
+            }
             CodesignError::SelfUnsigned => f.write_str(
                 "this process has no Team Identifier (ad-hoc / unsigned); peer verification \
                  cannot succeed by design (see module doc)",
@@ -195,9 +217,11 @@ impl std::error::Error for CodesignError {}
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{CodesignError, SigningIdentity};
+    use core_foundation::base::CFType;
     use core_foundation::base::TCFType;
     use core_foundation::data::CFData;
     use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
     use core_foundation::string::CFString;
     use core_foundation_sys::dictionary::CFDictionaryRef;
     use security_framework::os::macos::code_signing::{
@@ -225,6 +249,11 @@ mod imp {
             /// `CFDictionary` key for a code object's Team Identifier, as a
             /// `CFString`, or absent for unsigned / non-Developer-ID code.
             pub(super) static kSecCodeInfoTeamIdentifier: CFStringRef;
+            /// `CFDictionary` key for a code object's `CodeDirectory` flags,
+            /// as a `CFNumber` — the word `codesign -dvv` prints as
+            /// `flags=0x…`. Carries the hardened-runtime and
+            /// library-validation bits (draft-DR-0033 §5 / Open Q1).
+            pub(super) static kSecCodeInfoFlags: CFStringRef;
 
             /// `OSStatus SecCodeCopySigningInformation(SecStaticCodeRef code,
             /// SecCSFlags flags, CFDictionaryRef *information)`. The header
@@ -306,6 +335,67 @@ mod imp {
         let peer_code = SecCode::copy_guest_with_attribues(None, &attrs, Flags::NONE)
             .map_err(|e| CodesignError::PeerCodeObject { status: e.code() })?;
         signing_info(&peer_code).map_err(|status| CodesignError::PeerSigningInfo { status })
+    }
+
+    /// Resolve an audit token to a live peer `SecCode`.
+    ///
+    /// Shared by every token-keyed entry point: the token is the race-free
+    /// handle on the connection's peer, and the kernel — the code-signing
+    /// root of trust — is what turns it into a code object. A peer that has
+    /// already exited fails here rather than resolving to a stale disk read.
+    fn peer_code_from_token(token: &super::super::AuditToken) -> Result<SecCode, CodesignError> {
+        let token_bytes = token.raw_bytes();
+        let data = CFData::from_buffer(&token_bytes);
+        let mut attrs = GuestAttributes::new();
+        attrs.set_audit_token(data.as_concrete_TypeRef());
+        SecCode::copy_guest_with_attribues(None, &attrs, Flags::NONE)
+            .map_err(|e| CodesignError::PeerCodeObject { status: e.code() })
+    }
+
+    pub(super) fn verify_audit_token_against(
+        token: &super::super::AuditToken,
+        requirement: &str,
+    ) -> Result<(), CodesignError> {
+        let peer_code = peer_code_from_token(token)?;
+        let requirement = SecRequirement::from_str(requirement)
+            .map_err(|e| CodesignError::RequirementUnparseable { status: e.code() })?;
+        peer_code
+            .check_validity(Flags::NONE, &requirement)
+            .map_err(|e| CodesignError::PeerRequirementUnsatisfied { status: e.code() })
+    }
+
+    pub(super) fn signing_flags(token: &super::super::AuditToken) -> Result<u32, CodesignError> {
+        let peer_code = peer_code_from_token(token)?;
+        // SAFETY: same contract as `signing_info` — a live retained
+        // `SecCodeRef`, and a +1-retained dictionary written into the out
+        // slot on success.
+        let dict_ref = unsafe {
+            let mut dict_ref: CFDictionaryRef = std::ptr::null();
+            let status = extra_ffi::SecCodeCopySigningInformation(
+                peer_code.as_concrete_TypeRef() as *mut core::ffi::c_void,
+                K_SEC_CS_SIGNING_INFORMATION,
+                &mut dict_ref,
+            );
+            if status != 0 {
+                return Err(CodesignError::PeerSigningInfo { status });
+            }
+            dict_ref
+        };
+        // SAFETY: taking ownership of the +1 retain under the create rule.
+        let dict: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_create_rule(dict_ref) };
+        // SAFETY: process-lifetime key constant owned by Security.framework.
+        let key = unsafe { CFString::wrap_under_get_rule(extra_ffi::kSecCodeInfoFlags) };
+        let value = dict
+            .find(key)
+            .ok_or(CodesignError::SigningFlagsUnavailable)?;
+        let number = value
+            .downcast::<CFNumber>()
+            .ok_or(CodesignError::SigningFlagsUnavailable)?;
+        number
+            .to_i64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(CodesignError::SigningFlagsUnavailable)
     }
 
     pub(super) fn verify_peer(
@@ -426,6 +516,19 @@ mod imp {
         Err(CodesignError::PeerTokenUnavailable)
     }
 
+    pub(super) fn verify_audit_token_against(
+        _token: &super::super::AuditToken,
+        _requirement: &str,
+    ) -> Result<(), CodesignError> {
+        // No Security.framework: there is no way to evaluate a requirement,
+        // and reporting success would be the one answer that is never safe.
+        Err(CodesignError::Unsupported)
+    }
+
+    pub(super) fn signing_flags(_token: &super::super::AuditToken) -> Result<u32, CodesignError> {
+        Err(CodesignError::Unsupported)
+    }
+
     pub(super) fn verify_peer(
         _fd: RawFd,
         _required_identifier_prefix: &str,
@@ -476,6 +579,61 @@ pub fn verify_peer(fd: RawFd, required_identifier_prefix: &str) -> Result<(), Co
     imp::verify_peer(fd, required_identifier_prefix)
 }
 
+/// Check the process identified by `token` against a **caller-supplied**
+/// code-signing requirement.
+///
+/// The generic counterpart of [`verify_peer`], which can only ask "is this
+/// peer one of us". A caller that has its own idea of which signed identity
+/// may act — an entry that records the principal allowed to read it, say —
+/// builds the requirement itself and passes it here.
+///
+/// Requirement *construction* is deliberately not this crate's job. A
+/// requirement is a security policy written in Apple's Code Signing
+/// Requirement Language, where a misspelling reads as a valid, weaker rule
+/// rather than an error; deciding what a given policy should look like
+/// belongs with whoever owns the policy, not with a general-purpose process
+/// inspector (draft-DR-0033 §2).
+///
+/// Takes an [`AuditToken`](crate::AuditToken) rather than a file descriptor
+/// so the caller can evaluate against the token it captured when the
+/// connection arrived. That is the race-free artifact: it identifies one
+/// specific process for as long as it exists, where a pid could be reused by
+/// another process between capture and evaluation.
+///
+/// Fails on every platform but macOS, and on a peer that has exited, an
+/// unparseable requirement, or a signature that does not satisfy it.
+pub fn verify_audit_token_against(
+    token: &crate::AuditToken,
+    requirement: &str,
+) -> Result<(), CodesignError> {
+    imp::verify_audit_token_against(token, requirement)
+}
+
+/// The `CodeDirectory` flags of the process identified by `token` — the word
+/// `codesign -dvv` prints as `flags=0x…`.
+///
+/// Carries, among others, the hardened-runtime bit
+/// ([`CS_RUNTIME`](crate::codesign::CS_RUNTIME)) and the library-validation
+/// bit ([`CS_REQUIRE_LV`](crate::codesign::CS_REQUIRE_LV)). A caller whose
+/// threat model depends on those being on (code injected into a peer inherits
+/// that peer's signature, so the peer's own hardening is what stands between
+/// them) can read them here and say so.
+pub fn signing_flags(token: &crate::AuditToken) -> Result<u32, CodesignError> {
+    imp::signing_flags(token)
+}
+
+/// Hardened runtime is enabled (`CS_RUNTIME`).
+///
+/// Without it, `DYLD_INSERT_LIBRARIES` and friends can load code into a
+/// process, and that code runs under the process's own signature — so any
+/// check of *which* signed identity is connecting says nothing about what is
+/// running inside it.
+pub const CS_RUNTIME: u32 = 0x0001_0000;
+
+/// Library validation is enforced (`CS_REQUIRE_LV`): the process loads only
+/// libraries signed by its own team or by Apple.
+pub const CS_REQUIRE_LV: u32 = 0x0000_2000;
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -483,6 +641,69 @@ pub fn verify_peer(fd: RawFd, required_identifier_prefix: &str) -> Result<(), Co
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// draft-DR-0033 Open Q1: can cache-warden read the hardened-runtime and
+    /// library-validation bits of a peer at runtime?
+    ///
+    /// Answered against this process, which is the one whose audit token a
+    /// test can obtain without a second signed binary to talk to. On an
+    /// unsigned `cargo test` binary the flags word is legitimately zero or
+    /// absent; what this pins is that the *read* works and returns something
+    /// interpretable, so a signed peer's bits can be reported on.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_signing_flags_of_a_live_process_are_readable() {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        let token = crate::peer_audit_token(a.as_raw_fd()).expect("a socketpair has a peer token");
+
+        match signing_flags(&token) {
+            Ok(flags) => {
+                // An ad-hoc test binary has neither bit; a Developer-ID build
+                // with hardened runtime has CS_RUNTIME. Both are valid
+                // answers — the point is that the word came back.
+                eprintln!(
+                    "signing flags = {flags:#x} (runtime={}, library-validation={})",
+                    flags & CS_RUNTIME != 0,
+                    flags & CS_REQUIRE_LV != 0
+                );
+            }
+            // An unsigned binary may carry no flags entry at all, which is
+            // not a failure of the read.
+            Err(CodesignError::SigningFlagsUnavailable) => {}
+            Err(e) => panic!("reading signing flags failed unexpectedly: {e}"),
+        }
+    }
+
+    /// A requirement the peer does not satisfy must be refused, and a
+    /// malformed one must be refused *as malformed* — a typo in a security
+    /// policy must never read as an attacker.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_requirement_is_evaluated_and_a_malformed_one_is_told_apart() {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        let token = crate::peer_audit_token(a.as_raw_fd()).expect("a socketpair has a peer token");
+
+        // The test binary is ad-hoc, so an Apple-anchored requirement cannot
+        // hold. Whatever else happens, it must not succeed.
+        let result = verify_audit_token_against(
+            &token,
+            "anchor apple generic and certificate leaf[subject.OU] = \"NOTATEAMID\"",
+        );
+        assert!(
+            result.is_err(),
+            "an ad-hoc binary must not satisfy an Apple-anchored requirement"
+        );
+
+        let malformed = verify_audit_token_against(&token, "this is not requirement language((");
+        assert!(
+            matches!(malformed, Err(CodesignError::RequirementUnparseable { .. })),
+            "a malformed requirement must be reported as malformed, got {malformed:?}"
+        );
+    }
 
     /// `self_identity` on the `cargo test` binary — which is unsigned in
     /// dev/CI — must return `Ok` with `team_id: None`. The graceful-restart

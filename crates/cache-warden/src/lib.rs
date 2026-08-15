@@ -70,6 +70,7 @@ mod entry;
 mod guard;
 mod key;
 mod meta;
+mod owner;
 mod process;
 mod refresh;
 mod secret;
@@ -91,12 +92,17 @@ pub use entry::{CacheEntry, EntryState, ExtendError, PinError, Ttl, TtlError};
 pub use guard::{DeclaredAncestor, GuardConstraint, GuardRecord, GuardSetter, PinnedProcess};
 pub use key::{InvalidKey, validate_key_syntax};
 pub use meta::{SourceMeta, ValueMeta};
+pub use owner::{OwnerDeclError, OwnerPrincipal, SigningAnchor};
 pub use process::{FakeInspector, InspectError, ProcessInfo, ProcessInspector, SystemInspector};
 pub use refresh::RefreshClaim;
 pub use secret::SecretBytes;
-pub use snapshot::{ExportError, ImportError, StoreSnapshot};
+pub use snapshot::{
+    ExportError, ImportError, SnapshotConstraint, SnapshotGuard, SnapshotPinnedProcess,
+    StoreSnapshot,
+};
 pub use source::{CommandRunner, RunError, SourceRunner, TrailingNewline, ValueSource};
 pub use store::{
     ExtendAuthOutcome, ExtendOutcome, FailureRecord, ItemRef, PinAuthOutcome, RegenerateDefOutcome,
-    RegenerateOutcome, SetError, Store, StoreBuilder, StoreBundle,
+    RegenerateOutcome, SetError, Store, StoreBuilder, StoreBundle, guard_record_to_snapshot,
+    snapshot_to_guard_record,
 };

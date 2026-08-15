@@ -70,7 +70,7 @@ use crate::source::ValueSource;
 /// accept any version in `[MIN_SUPPORTED_VERSION, FORMAT_VERSION]` (see the
 /// module doc's "Wire format compatibility" section) and reject anything
 /// outside that range rather than guess.
-pub(crate) const FORMAT_VERSION: u32 = 4;
+pub(crate) const FORMAT_VERSION: u32 = 6;
 
 /// Wire version that carries refresh state but **no trailing data-key frame**
 /// (DR-0034 §11). Anything at or below this is a stream that ends with the
@@ -84,6 +84,39 @@ pub(crate) const FORMAT_VERSION: u32 = 4;
 /// Guessing with a timeout would be the alternative, and a guess that fires
 /// early silently downgrades a graceful restart to a locked one.
 pub(crate) const VERSION_PRE_DEK: u32 = 3;
+
+/// Wire version emitted when an entry carries an owner principal but no
+/// data-key frame follows (draft-DR-0033 §7).
+///
+/// # Why this is 5 and not 4
+///
+/// Four is the number a build from the previous generation writes to mean
+/// "a data-key frame follows", and its reader *blocks* for that frame. An
+/// owner-carrying snapshot emitted as 4 would therefore be read by such a
+/// build as a promise of bytes that never arrive — a handoff that hangs
+/// rather than fails. Emitting 5 puts it outside that build's accepted range
+/// (`[1..=4]`), so it is refused outright and the successor cold-starts,
+/// which is what §7 asks for: an owner that cannot be carried takes the value
+/// with it.
+///
+/// The reverse pairing is safe by the same arithmetic. A version 4 snapshot
+/// from an older build, read here, is *not* treated as carrying a frame
+/// ([`StoreSnapshot::declares_dek_frame`] compares against
+/// [`FORMAT_VERSION`]), so this build does not block for one either; it
+/// simply does not pick up the data key, and the vault starts locked. Locked
+/// is recoverable, hanging is not.
+///
+/// # A structural note for whoever touches this next
+///
+/// One number is carrying two independent facts — which content generation
+/// the entries belong to, and whether a trailing frame follows — and that is
+/// what made this collision possible. Every future content bump has to be
+/// checked against every past frame-presence meaning by hand. Separating the
+/// two (a content version plus an explicit frame flag in the header) is the
+/// fix; it is deliberately not being done here, because changing the header
+/// shape in the same change that renumbers the versions would leave no
+/// version of this file that is easy to reason about.
+pub(crate) const VERSION_WITH_OWNER: u32 = 5;
 
 /// The oldest `format_version` this build still knows how to read. Only
 /// moves forward if a future format change is *breaking* (at which point the
@@ -249,7 +282,7 @@ pub(crate) struct SnapshotFailure {
 /// a parallel display hint on every entry.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub(crate) enum SnapshotDeclaredAncestor {
+pub enum SnapshotDeclaredAncestor {
     /// Declared via `--require-same-shell` (sugar). Carries the pinned
     /// shell's basename purely for display.
     SameShell { shell_name: String },
@@ -272,7 +305,7 @@ pub(crate) enum SnapshotDeclaredAncestor {
 /// `unique_id` are `#[serde(default)]` so a future field addition on the
 /// same wire version stays additive.
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct SnapshotPinnedProcess {
+pub struct SnapshotPinnedProcess {
     pub(crate) pid: u32,
     #[serde(default)]
     pub(crate) start_time_us: Option<u64>,
@@ -289,7 +322,7 @@ pub(crate) struct SnapshotPinnedProcess {
 /// `#[serde(other)]` for a security-sensitive record.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub(crate) enum SnapshotConstraint {
+pub enum SnapshotConstraint {
     SameUser,
     SameAncestor {
         declared: SnapshotDeclaredAncestor,
@@ -306,11 +339,19 @@ pub(crate) enum SnapshotConstraint {
 /// `serde(default)` on the core's [`crate::GuardRecord`] to keep the core's
 /// public API free of a wire-format concern (same pattern as
 /// [`SnapshotSource`] for [`crate::ValueSource`]).
+/// Public because it is the **one** serializable form of a guard record, and
+/// both persistence paths need it: the graceful-restart snapshot and the
+/// encrypted vault (DR-0034 §1d). A second mirror for the vault would be a
+/// second place for the two to drift, and drift here means a guard that comes
+/// back subtly different from the one that was stored.
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct SnapshotGuard {
-    pub(crate) constraints: Vec<SnapshotConstraint>,
-    pub(crate) setter_euid: u32,
-    pub(crate) setter_ruid: u32,
+pub struct SnapshotGuard {
+    /// The constraints, in declaration order.
+    pub constraints: Vec<SnapshotConstraint>,
+    /// The setter's effective uid.
+    pub setter_euid: u32,
+    /// The setter's real uid.
+    pub setter_ruid: u32,
 }
 
 /// One key's full snapshotted state: its value, its definition, its
@@ -334,6 +375,13 @@ pub(crate) struct SnapshotEntry {
     /// `None`, matching the additive-compat template.
     #[serde(default)]
     pub(crate) guard: Option<SnapshotGuard>,
+    /// draft-DR-0033 owner principal.
+    ///
+    /// Carried like the guard and for the same reason: a value that survives a
+    /// restart without the authorization that governed it is a value that
+    /// quietly became public.
+    #[serde(default)]
+    pub(crate) owner: Option<crate::owner::OwnerPrincipal>,
     /// DR-0034 §4 CAS version. `None` means the key has no version (and is
     /// what an older snapshot, which never wrote the field, deserializes to).
     ///
@@ -408,9 +456,12 @@ impl StoreSnapshot {
             .iter()
             .any(|e| e.version.is_some() || e.refresh_claim.is_some());
         let any_guarded = entries.iter().any(|e| e.guard.is_some());
+        let any_owned = entries.iter().any(|e| e.owner.is_some());
         // Step up only as far as the content requires, so a workload that uses
         // none of these keeps producing snapshots an older build can import.
-        let format_version = if any_refresh {
+        let format_version = if any_owned {
+            VERSION_WITH_OWNER
+        } else if any_refresh {
             VERSION_PRE_DEK
         } else if any_guarded {
             VERSION_PRE_REFRESH
@@ -827,6 +878,7 @@ mod tests {
             definition: None,
             failure: None,
             guard: None,
+            owner: None,
             version: None,
             refresh_claim: None,
         }
@@ -1016,6 +1068,69 @@ mod tests {
     /// frame would be picked up as the data key by the process being handed
     /// to — a caller feeding cache-warden a crafted value would be choosing
     /// the key that decrypts the vault.
+    /// The version a build of the previous generation writes to mean "a
+    /// data-key frame follows", and the top of the range it accepts.
+    #[cfg(test)]
+    const PREVIOUS_GENERATION_FRAME_VERSION: u32 = 4;
+
+    /// Compile-time half of `the_owner_version_cannot_be_mistaken_for_a_frame_declaration`:
+    /// an owner-carrying snapshot must not be emitted at a number the previous
+    /// generation reads as a frame promise (it would block for bytes that
+    /// never come), and must fall outside the range it accepts at all (so it
+    /// is refused and the successor cold-starts, rather than imported with the
+    /// owner silently dropped).
+    #[cfg(test)]
+    const _: () = assert!(VERSION_WITH_OWNER > PREVIOUS_GENERATION_FRAME_VERSION);
+
+    /// The version collision this numbering exists to avoid, from both sides.
+    ///
+    /// Version 4 means "a data-key frame follows" to a build of the previous
+    /// generation, whose reader blocks for it. So:
+    ///
+    /// - an owner-carrying snapshot must not be emitted as 4, or that build
+    ///   hangs waiting for bytes that never come;
+    /// - a version 4 snapshot read *here* must not be treated as carrying a
+    ///   frame, or this build hangs on one written by that build.
+    ///
+    /// The outgoing direction is arithmetic on constants, so it is checked at
+    /// compile time just above this; the incoming one needs a snapshot to ask,
+    /// so it is checked here.
+    #[test]
+    fn the_owner_version_cannot_be_mistaken_for_a_frame_declaration() {
+        // And a snapshot at the old frame version is read here as frameless,
+        // so this build does not block for a frame either. The vault simply
+        // starts locked — recoverable, where a hang is not.
+        let mut old = StoreSnapshot::new(vec![sample_entry("A")]);
+        old.format_version = PREVIOUS_GENERATION_FRAME_VERSION;
+        assert!(
+            !old.declares_dek_frame(),
+            "a version this build does not know as its own frame version must not make it wait"
+        );
+    }
+
+    /// An owner-free snapshot must not be pushed up to the owner version: a
+    /// workload that uses none of this keeps producing snapshots older builds
+    /// can still import.
+    #[test]
+    fn only_an_owner_carrying_snapshot_reaches_the_owner_version() {
+        let plain = StoreSnapshot::from_entries(vec![sample_entry("A")]);
+        assert!(
+            plain.format_version() < VERSION_WITH_OWNER,
+            "{}",
+            plain.format_version()
+        );
+
+        let mut owned = sample_entry("A");
+        owned.owner = Some(
+            crate::OwnerPrincipal::declare("apple-generic", "3QMEVK549R", "com.example.gw")
+                .unwrap(),
+        );
+        assert_eq!(
+            StoreSnapshot::from_entries(vec![owned]).format_version(),
+            VERSION_WITH_OWNER
+        );
+    }
+
     #[test]
     fn a_frame_planted_inside_a_secret_is_not_mistaken_for_the_real_one() {
         let mut planted = Vec::new();
@@ -1128,6 +1243,7 @@ mod tests {
             definition: None,
             failure: None,
             guard: Some(guard),
+            owner: None,
             version: None,
             refresh_claim: None,
         };

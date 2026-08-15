@@ -345,6 +345,15 @@ pub enum Request {
         /// stale copy of a value 1Password still considers authoritative.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persist: Option<bool>,
+        /// Declare (or re-declare) the entry's owner principal
+        /// (draft-DR-0033 §3a).
+        ///
+        /// Absent means **unchanged**, never "release": a credential written
+        /// on every refresh would otherwise lose its protection the first
+        /// time a caller forgot to repeat the declaration, silently and
+        /// permanently (DR-0033 §3c). Releasing is [`Request::KvOwnerClear`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_by: Option<SignedByWire>,
     },
     /// Register a *typed source* definition for a key (DR-0014 §1 / DR-0018 §1).
     ///
@@ -485,6 +494,20 @@ pub enum Request {
         #[serde(default)]
         recovery_code: Option<String>,
     },
+    /// Release an entry's owner principal (draft-DR-0033 §3c).
+    ///
+    /// Its own request rather than a flag on `kv.set`, which is where the
+    /// declaration lives. A set always writes a value, and releasing
+    /// ownership is not a write — routing it through one would force a caller
+    /// who only wants to give up ownership to supply a value, and supplying
+    /// the wrong one would destroy the credential they were trying to hand
+    /// over. Permitted only to the current owner, like every other change to
+    /// an owned entry.
+    #[serde(rename = "kv.owner_clear")]
+    KvOwnerClear {
+        /// The entry to release.
+        key: String,
+    },
     /// Close the vault, wiping the data key (DR-0034 §6).
     #[serde(rename = "vault.lock")]
     VaultLock,
@@ -590,6 +613,26 @@ pub enum SetSource {
         /// The secret value, base64-encoded (binary safe).
         value_b64: String,
     },
+}
+
+/// A `signed-by` declaration on the wire (draft-DR-0033 §6).
+///
+/// All three fields together, never a subset. "Any binary from this team" and
+/// "any binary called this" are both far looser than a reader of the
+/// declaration would assume, so the wire cannot express them.
+///
+/// Deliberately **not** part of `guard_constraints`: a guard is replaced
+/// wholesale by each set, while an owner is inherited by one (DR-0033 §3c).
+/// Two different lifetimes in one list would leave every reader to remember
+/// which rule applies to which element.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedByWire {
+    /// Trust anchor: `apple-generic` or `apple`.
+    pub anchor: String,
+    /// Apple Developer Team Identifier.
+    pub team_id: String,
+    /// Signing identifier.
+    pub identifier: String,
 }
 
 /// A response from the daemon to the management client.
@@ -745,6 +788,17 @@ pub enum OkPayload {
         /// sentinel pretending to be a value.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<u64>,
+        /// The owner principal now on the entry, as an assembled requirement
+        /// summary (draft-DR-0033 §6). Value-free.
+        ///
+        /// A **positive ack**, for the same reason `guard_applied` is one: a
+        /// daemon too old to know this field drops it silently, and a caller
+        /// that declared an owner and got no acknowledgement has just written
+        /// a credential with none of the protection it asked for. Seeing the
+        /// field absent is how the CLI knows to delete the value it just
+        /// wrote rather than leave it exposed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_applied: Option<String>,
     },
     /// Reply to [`Request::KvDefine`] (acknowledgement, no payload).
     Defined {
@@ -803,6 +857,11 @@ pub enum OkPayload {
         url: String,
         /// How long the window stays open, in seconds.
         expires_in_secs: u64,
+    },
+    /// Reply to [`Request::KvOwnerClear`].
+    OwnerCleared {
+        /// Always `true`; lets `untagged` disambiguate the reply.
+        owner_cleared: bool,
     },
     /// Reply to [`Request::VaultUnlock`].
     VaultUnlocked {
@@ -938,6 +997,15 @@ pub struct EntryInfo {
     /// the field (`#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_summary: Option<Vec<String>>,
+    /// The entry's owner principal, as an assembled requirement summary
+    /// (draft-DR-0033 §6), or `None` when it has none.
+    ///
+    /// Value-free, and setter-free: it names which signed identity may act on
+    /// the entry, never who declared that. Shown so an operator can see at a
+    /// glance which entries are owned and by what — the alternative being to
+    /// discover it by being refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_summary: Option<String>,
     /// The entry's DR-0034 §4 CAS version, or `None` for an entry that has no
     /// version (and from a daemon that predates them). Value-free: a counter
     /// of how many times the value changed, never the value.
@@ -1077,6 +1145,7 @@ impl Response {
                 set: true,
                 guard_applied,
                 version: None,
+                owner_applied: None,
             },
         })
     }
@@ -1084,12 +1153,23 @@ impl Response {
     /// [`Self::set_ack_with_guard`] plus the entry's new CAS version
     /// (DR-0034 §4).
     pub fn set_ack_with_guard_and_version(guard_applied: Vec<String>, version: u64) -> Self {
+        Self::set_ack_full(guard_applied, version, None)
+    }
+
+    /// The full `set` acknowledgement: guard kinds, new version, and the
+    /// owner principal now in force (draft-DR-0033 §6).
+    pub fn set_ack_full(
+        guard_applied: Vec<String>,
+        version: u64,
+        owner_applied: Option<String>,
+    ) -> Self {
         Response::Ok(OkResponse {
             ok: true,
             payload: OkPayload::Set {
                 set: true,
                 guard_applied,
                 version: Some(version),
+                owner_applied,
             },
         })
     }
@@ -1138,6 +1218,16 @@ impl Response {
                 ceremony: true,
                 url,
                 expires_in_secs,
+            },
+        })
+    }
+
+    /// Construct a `kv.owner_clear` success response (draft-DR-0033 §3c).
+    pub fn owner_cleared() -> Self {
+        Self::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::OwnerCleared {
+                owner_cleared: true,
             },
         })
     }
@@ -1402,6 +1492,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(!line.contains("expected_version"), "{line}");
@@ -1421,6 +1512,7 @@ mod tests {
             expected_version: Some(7),
             claim_token: Some("abcdefghijklmnopqrstuv".into()),
             persist: None,
+            signed_by: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""expected_version":7"#), "{line}");
@@ -1446,6 +1538,7 @@ mod tests {
             expected_version: Some(0),
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""expected_version":0"#), "{line}");
@@ -1593,6 +1686,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains(r#""cmd":"kv.set""#));
@@ -1760,6 +1854,7 @@ mod tests {
             expected_version: None,
             claim_token: None,
             persist: None,
+            signed_by: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         // Encoding shape (kebab-case tag, spelled kinds).
@@ -1938,6 +2033,7 @@ mod tests {
             source: None,
             backoff_until_secs: Some(3),
             guard_summary: None,
+            owner_summary: None,
             version: None,
             claim_expires_in_secs: None,
             locked: false,
@@ -1985,6 +2081,7 @@ mod tests {
                     source: None,
                     backoff_until_secs: None,
                     guard_summary: None,
+                    owner_summary: None,
                     version: None,
                     claim_expires_in_secs: None,
                     locked: false,
@@ -2000,6 +2097,7 @@ mod tests {
                     source: None,
                     backoff_until_secs: None,
                     guard_summary: None,
+                    owner_summary: None,
                     version: None,
                     claim_expires_in_secs: None,
                     locked: false,
@@ -2059,6 +2157,7 @@ mod tests {
             source: None,
             backoff_until_secs: None,
             guard_summary: None,
+            owner_summary: None,
             version: None,
             claim_expires_in_secs: None,
             locked: false,

@@ -317,6 +317,28 @@ pub fn kv_set() -> Command {
         .arg(expected_version_arg())
         .arg(claim_token_arg())
         .arg(Arg::new("persist").long("persist").action(ArgAction::Count))
+        // draft-DR-0033 §6: three fields, always together. Declared as
+        // separate flags rather than one packed value so a shell completion
+        // can offer each, and so a partial declaration is a legible error
+        // rather than a parse failure on an opaque string.
+        .arg(
+            Arg::new("require-signed-by-anchor")
+                .long("require-signed-by-anchor")
+                .value_name("ANCHOR")
+                .help("Owner's trust anchor: apple-generic or apple"),
+        )
+        .arg(
+            Arg::new("require-signed-by-team")
+                .long("require-signed-by-team")
+                .value_name("TEAM_ID")
+                .help("Owner's Apple Developer Team Identifier"),
+        )
+        .arg(
+            Arg::new("require-signed-by-identifier")
+                .long("require-signed-by-identifier")
+                .value_name("IDENTIFIER")
+                .help("Owner's code-signing identifier"),
+        )
         // Retired grammar, kept declared for the steer (see the doc above).
         .arg(Arg::new("value").long("value").num_args(1).hide(true))
         .arg(
@@ -391,6 +413,22 @@ pub fn kv_get() -> Command {
 }
 
 /// `kv unpin [--namespace NS] <KEY>`.
+/// `kv owner show KEY` (draft-DR-0033 §6).
+pub fn kv_owner_show() -> Command {
+    level("show")
+        .arg(Arg::new("KEY"))
+        .arg(namespace_arg())
+        .arg(socket_arg())
+}
+
+/// `kv owner clear KEY` (draft-DR-0033 §3c).
+pub fn kv_owner_clear() -> Command {
+    level("clear")
+        .arg(Arg::new("KEY"))
+        .arg(namespace_arg())
+        .arg(socket_arg())
+}
+
 pub fn kv_unpin() -> Command {
     level("unpin")
         .arg(Arg::new("KEY"))

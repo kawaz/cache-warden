@@ -18,9 +18,42 @@ pub mod vault_cmd;
 
 use std::path::PathBuf;
 
-use crate::protocol::wire::{GuardConstraintWire, Request, SetSource, ValueMetaWire};
+use crate::protocol::wire::{GuardConstraintWire, Request, SetSource, SignedByWire, ValueMetaWire};
 use crate::protocol::{decode_b64, encode_b64, parse_duration};
 use crate::totp::OtpAlgorithm;
+
+/// Parse `kv owner clear KEY` (draft-DR-0033 §3c).
+///
+/// Releasing is its own operation rather than a flag on `set` because
+/// ownership is a property of the entry, not of any particular value: making
+/// a caller supply a value in order to give up ownership would tie two
+/// unrelated decisions together, and one of them is an authorization change.
+pub fn parse_kv_owner_clear(args: &[String], ns: &str) -> Result<Request, String> {
+    let m = crate::cli::kv_owner_clear()
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&crate::cli::kv_owner_clear(), "kv owner clear", e))?;
+    let key = m
+        .get_one::<String>("KEY")
+        .ok_or_else(|| "kv owner clear needs a KEY".to_string())?;
+    let ns = m.get_one::<String>("namespace").map_or(ns, String::as_str);
+    Ok(Request::KvOwnerClear {
+        key: crate::namespace::compose(ns, key),
+    })
+}
+
+/// Parse `kv owner show KEY`, returning the composed key.
+pub fn parse_kv_owner_show(args: &[String], ns: &str) -> Result<String, String> {
+    let m = crate::cli::kv_owner_show()
+        .clone()
+        .try_get_matches_from(args)
+        .map_err(|e| crate::cli::parse_error(&crate::cli::kv_owner_show(), "kv owner show", e))?;
+    let key = m
+        .get_one::<String>("KEY")
+        .ok_or_else(|| "kv owner show needs a KEY".to_string())?;
+    let ns = m.get_one::<String>("namespace").map_or(ns, String::as_str);
+    Ok(crate::namespace::compose(ns, key))
+}
 
 /// Extract the value-type flags (`--type` and the `--otp-*` parameters) from
 /// `args`, returning the resulting [`ValueMetaWire`] and the remaining args with
@@ -489,6 +522,29 @@ pub fn parse_kv_set(
     // mentioned it, and an older daemon must see the field missing.
     let persist = (m.get_count("persist") > 0).then_some(true);
 
+    // draft-DR-0033 §6: the three signed-by fields are one declaration, and a
+    // partial one is refused here rather than completed with a default. Every
+    // possible default would be looser than what the caller wrote, and a
+    // security declaration that quietly widens is the failure this whole
+    // structured form exists to prevent.
+    let anchor = m.get_one::<String>("require-signed-by-anchor");
+    let team = m.get_one::<String>("require-signed-by-team");
+    let identifier = m.get_one::<String>("require-signed-by-identifier");
+    let signed_by = match (anchor, team, identifier) {
+        (None, None, None) => None,
+        (Some(anchor), Some(team_id), Some(identifier)) => Some(SignedByWire {
+            anchor: anchor.clone(),
+            team_id: team_id.clone(),
+            identifier: identifier.clone(),
+        }),
+        _ => {
+            return Err("--require-signed-by-anchor, --require-signed-by-team and \
+                 --require-signed-by-identifier go together: an owner is one signed identity, \
+                 and naming only part of it would admit more programs than you named"
+                .to_string());
+        }
+    };
+
     let key = m
         .get_one::<String>("KEY")
         .cloned()
@@ -541,6 +597,7 @@ pub fn parse_kv_set(
         expected_version,
         claim_token,
         persist,
+        signed_by,
     })
 }
 
