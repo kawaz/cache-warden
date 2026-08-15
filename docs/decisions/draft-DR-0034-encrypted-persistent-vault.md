@@ -205,6 +205,15 @@ kawaz 裁定 8 (CAS 採用) + 裁定 17 (着手時 claim) により:
   definition 経由で op に取りに行くが、cw-owned は正本が cw 自身なので取りに行く先が無い。
   del は「このクレデンシャルを捨てる」操作であり、以後の get は明示的な再取得 (再認証
   フロー) を要求するエラーになる。これは裁定 6 の「op との縁切り」の直接の帰結である。
+  - 実装フェーズ 3 での確定 (2026-08-16): エラーは既存 `not_regenerable` を流用
+    (tombstone の新規 store 状態は作らない)。**config で宣言された persist entry は
+    daemon 再起動で config の取得コマンドが再走する** — 捨てた値そのものは復活しないが、
+    operator の config 宣言は「取得せよ」という現行の意思なので、宣言された取得経路が
+    生きるのは正しい挙動 (tombstone で config と喧嘩しない、統括裁定)。del の完全な
+    恒久化が要る場合は config 宣言側を消すのが正。
+  - **guard constraint 付き entry への persist はフェーズ 3 時点では BadRequest**
+    (vault が guard record を運ぶのは DR-0033 の owner principal 結合フェーズで実装、
+    それまで「値だけ復活して guard が消える」§1d 違反を作らないための fail-loud)。
 - 昇格 (op-cached → cw-owned): **初回 fetch 時に persist 指定があれば、その値が cw-owned
   として vault に入り、以後 op を見ない**。降格 (cw-owned → op-cached) は値の正本性が
   変わる不可逆な操作なので、v1 では提供しない (必要なら del してから定義し直す)。
