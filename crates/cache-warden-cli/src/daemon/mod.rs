@@ -29,6 +29,7 @@
 pub mod approver;
 pub mod approver_wire;
 pub mod authsock;
+pub mod ceremony;
 mod graceful_restart;
 pub mod guard;
 pub mod handler;

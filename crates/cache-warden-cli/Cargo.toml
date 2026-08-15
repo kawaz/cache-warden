@@ -24,6 +24,10 @@ cache-warden-approver = { path = "../cache-warden-approver" }
 macos-process-inspect = { path = "../macos-process-inspect" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Challenge and CSP-nonce randomness for the vault ceremony (DR-0034 §2/§10).
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Verifies the WebAuthn responses the ceremony collects (DR-0034 §10).
+cache-warden-webauthn = { path = "../cache-warden-webauthn" }
 # Async runtime + Unix socket I/O for the daemon (DR-0008 single-process host).
 # `process`: spawning the cache-warden-approver helper (draft-DR-0031 §3/§4).
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time", "process"] }

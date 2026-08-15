@@ -132,7 +132,47 @@ pub struct VaultConfig {
     /// tests and for setups that keep state somewhere non-standard.
     #[serde(default)]
     pub path: Option<String>,
+    /// The WebAuthn relying-party id the ceremony registers against
+    /// (DR-0034 §10).
+    ///
+    /// This is the value used for **new** registrations. Existing slots record
+    /// the id they were registered with and keep opening the vault with it, so
+    /// changing this never orphans a passkey — moving to a new id is the
+    /// ordinary "add a slot, remove the old one" operation.
+    ///
+    /// Absent means no ceremony: the daemon serves no page and passkey unlock
+    /// is unavailable, leaving the recovery code as the way in.
+    #[serde(default, rename = "rp-id")]
+    pub rp_id: Option<String>,
+    /// Every origin the ceremony page may be served from.
+    ///
+    /// A list rather than one value because the same daemon is legitimately
+    /// reached at more than one address — a loopback port directly, and a
+    /// name a TLS terminator answers on (DR-0032). Matched exactly; a wildcard
+    /// would defeat the check, since the whole point of an origin is that a
+    /// lookalike is not it.
+    ///
+    /// Empty is not a default that quietly allows everything: a ceremony with
+    /// no allowed origin refuses every response it gets.
+    #[serde(default, rename = "expected-origins")]
+    pub expected_origins: Vec<String>,
+    /// Address the ceremony page is served on. Loopback only.
+    ///
+    /// TLS is terminated in front of this, never here (DR-0032): a reverse
+    /// proxy holds the certificate and forwards to this port. Binding
+    /// somewhere other than loopback would put the ceremony on the network
+    /// with no transport security at all, so a non-loopback address is
+    /// refused at startup rather than honoured.
+    #[serde(default, rename = "ceremony-listen")]
+    pub ceremony_listen: Option<String>,
 }
+
+/// Where the ceremony listener binds when `[vault] ceremony-listen` is absent.
+///
+/// Port 0 is deliberate: the daemon reports the port it was given, and nothing
+/// needs a fixed one — the user is handed a URL by the command that opens the
+/// ceremony. A fixed default would be one more thing to collide with.
+pub const DEFAULT_CEREMONY_LISTEN: &str = "127.0.0.1:0";
 
 /// `[kv-policy]` section (DR-0030): daemon-wide guard knobs.
 ///

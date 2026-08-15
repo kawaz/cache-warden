@@ -29,6 +29,7 @@
 //!   rp_id               4+n UTF-8, empty unless kind = passkey-prf
 //!   credential_id       4+n bytes, empty unless kind = passkey-prf
 //!   label               4+n UTF-8, may be empty
+//!   credential_pubkey   4+n bytes, empty unless kind = passkey-prf
 //! ```
 //!
 //! # Why every header byte is the body's AAD
@@ -67,10 +68,18 @@ pub(crate) const MAGIC: [u8; 8] = *b"CWVAULT\0";
 /// Monotonically increasing. Reading a file that declares a **higher** version
 /// is refused (DR-0034 §1a): this build would drop the fields it does not know
 /// about on the next write, silently deleting authorization records.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The oldest format version this build can still read.
-pub const MIN_SUPPORTED_VERSION: u32 = 1;
+///
+/// Equal to [`FORMAT_VERSION`]: version 1 is not read. It existed only before
+/// the vault shipped, and the one thing that could have been in a version 1
+/// file — a recovery slot — could not have been carrying anything, because
+/// nothing had been released to write entries with. Carrying compatibility
+/// code for a file that does not exist would be a permanent cost against a
+/// hypothetical; a file declaring version 1 is refused with the same clear
+/// message any unsupported version gets.
+pub const MIN_SUPPORTED_VERSION: u32 = 2;
 
 /// Length of the salt stored per slot.
 pub(crate) const SALT_LEN: usize = 32;
@@ -263,6 +272,17 @@ pub struct Slot {
     rp_id: String,
     credential_id: Vec<u8>,
     label: String,
+    /// The WebAuthn credential's public key, in this build's stored encoding
+    /// (`cache_warden_webauthn::CredentialPublicKey::to_stored_bytes`). Empty
+    /// for a recovery slot, and for any slot read from a version 1 file —
+    /// which can only be a recovery slot, since passkey slots could not be
+    /// created before this field existed.
+    ///
+    /// Public metadata by the same reasoning as `credential_id`: it says which
+    /// credential opens the vault, never what is inside it (DR-0034 §7). It
+    /// has to be here rather than in the sealed body because it is needed to
+    /// verify the assertion that opens the body.
+    credential_public_key: Vec<u8>,
 }
 
 impl Slot {
@@ -276,6 +296,7 @@ impl Slot {
         wrapped_dek: WrappedDek,
         rp_id: String,
         credential_id: Vec<u8>,
+        credential_public_key: Vec<u8>,
         label: String,
     ) -> Self {
         Self {
@@ -289,6 +310,7 @@ impl Slot {
             rp_id,
             credential_id,
             label,
+            credential_public_key,
         }
     }
 
@@ -317,6 +339,21 @@ impl Slot {
     /// The WebAuthn credential id, empty for a recovery slot.
     pub fn credential_id(&self) -> &[u8] {
         &self.credential_id
+    }
+
+    /// The WebAuthn credential's public key, empty for a recovery slot.
+    pub fn credential_public_key(&self) -> &[u8] {
+        &self.credential_public_key
+    }
+
+    /// The salt this slot's ceremony must evaluate to reproduce its key
+    /// material (DR-0034 §2).
+    ///
+    /// Public by design — it is one input to a derivation whose secret input
+    /// is the authenticator's PRF output, and it has to be public because the
+    /// page has to be told what to evaluate before anything is unlocked.
+    pub fn prf_salt(&self) -> &[u8] {
+        &self.salt
     }
 
     /// When this slot was created, in milliseconds since the Unix epoch.
@@ -404,6 +441,7 @@ impl Slot {
         put_blob(out, self.rp_id.as_bytes());
         put_blob(out, &self.credential_id);
         put_blob(out, self.label.as_bytes());
+        put_blob(out, &self.credential_public_key);
     }
 
     fn decode(cursor: &mut &[u8]) -> Result<Self, VaultError> {
@@ -418,6 +456,7 @@ impl Slot {
         let rp_id = take_utf8(cursor, "rp_id")?;
         let credential_id = take_blob(cursor, "credential_id")?.to_vec();
         let label = take_utf8(cursor, "label")?;
+        let credential_public_key = take_blob(cursor, "credential_public_key")?.to_vec();
 
         Ok(Self {
             id,
@@ -433,6 +472,7 @@ impl Slot {
             rp_id,
             credential_id,
             label,
+            credential_public_key,
         })
     }
 }
@@ -690,6 +730,7 @@ mod tests {
             },
             rp_id.to_string(),
             vec![7, 8, 9],
+            vec![1, 0xAB, 0xCD],
             "laptop".to_string(),
         )
     }
@@ -859,11 +900,14 @@ mod tests {
     fn decode_rejects_a_non_utf8_text_field() {
         let mut file = sample_file();
         // Build a slot whose label bytes are invalid UTF-8 by patching the
-        // encoded form: the label is the last field of the slot.
+        // encoded form. The label is followed by the credential public key
+        // blob, so skip back over that blob and its length prefix too.
         let mut bytes = file.encode();
-        let label_len = file.slots.pop().unwrap().label().len();
+        let slot = file.slots.pop().unwrap();
+        let label_len = slot.label().len();
+        let credential_key_field = 4 + slot.credential_public_key().len();
         let body_tail = 8 + file.sealed_body.len();
-        let label_start = bytes.len() - body_tail - label_len;
+        let label_start = bytes.len() - body_tail - credential_key_field - label_len;
         bytes[label_start] = 0xFF;
         assert!(matches!(
             VaultFile::decode(&bytes),

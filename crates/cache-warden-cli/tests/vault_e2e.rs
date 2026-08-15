@@ -132,7 +132,16 @@ impl Fixture {
         }
     }
 
-    /// Start a daemon against this fixture and wait until it answers.
+    /// Start a daemon against this fixture and wait until it is ready to be
+    /// asked about its declared entries.
+    ///
+    /// Answering `ping` is not that. The daemon binds its listener before it
+    /// registers the configuration's definitions (DR-0023 starts serving
+    /// first so a client is never refused during startup), so a `status` sent
+    /// the instant the socket answers can legitimately come back with no
+    /// entries at all. Waiting for the declaration to appear is waiting for
+    /// the state the test is about to assert on, rather than for a proxy that
+    /// happens to usually be late enough.
     fn spawn(&self) -> Daemon {
         let child = Command::new(env!("CARGO_BIN_EXE_cache-warden"))
             .arg("daemon")
@@ -144,7 +153,29 @@ impl Fixture {
             .expect("spawn daemon");
         let daemon = Daemon { child };
         wait_for_ping(&self.socket);
+        self.wait_for_declared_entry("default/RT");
         daemon
+    }
+
+    /// Poll `status` until `key` is listed, with the same bounded backoff the
+    /// connect uses.
+    fn wait_for_declared_entry(&self, key: &str) {
+        let end = Instant::now() + Duration::from_secs(10);
+        let mut delay = Duration::from_millis(5);
+        loop {
+            let status = self.request(r#"{"cmd":"status"}"#);
+            if status["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|e| e["name"] == key))
+            {
+                return;
+            }
+            if Instant::now() >= end {
+                panic!("the daemon never registered {key}: {status}");
+            }
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_millis(200));
+        }
     }
 
     fn request(&self, line: &str) -> serde_json::Value {

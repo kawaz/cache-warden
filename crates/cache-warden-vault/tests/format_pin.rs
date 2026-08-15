@@ -14,6 +14,7 @@
 
 use cache_warden_vault::{
     AeadAlg, FORMAT_VERSION, KdfAlg, LockedVault, MIN_SUPPORTED_VERSION, SlotKind, UnlockedVault,
+    VaultError,
 };
 
 mod support;
@@ -48,7 +49,7 @@ fn header_fields_sit_at_their_documented_offsets_with_their_documented_values() 
     let bytes = std::fs::read(vault.path()).expect("the vault file exists");
 
     assert_eq!(&bytes[OFF_MAGIC..OFF_MAGIC + 8], b"CWVAULT\0", "magic");
-    assert_eq!(be32(&bytes, OFF_FORMAT_VERSION), 1, "format_version v1");
+    assert_eq!(be32(&bytes, OFF_FORMAT_VERSION), 2, "format_version v2");
     assert_eq!(
         be32(&bytes, OFF_FORMAT_VERSION),
         FORMAT_VERSION,
@@ -129,10 +130,70 @@ fn algorithm_enums_name_exactly_the_v1_algorithms() {
     assert_eq!(locked.kdf_alg(), KdfAlg::HkdfSha256);
 }
 
+/// Version 2 added the passkey credential's public key to each slot
+/// (DR-0034 §1b): it is needed to verify the assertion that opens the vault,
+/// so it cannot live in the body the assertion is what opens.
+///
+/// Version 1 is **not** read. It existed only before the vault shipped, so no
+/// version 1 file exists outside a test — and compatibility code for a file
+/// that does not exist is a permanent cost paid against a hypothetical. When
+/// a second version does have to be readable, this is the assertion that will
+/// notice the range needs widening.
 #[test]
-fn the_supported_version_range_is_a_single_version_in_v1() {
-    assert_eq!(MIN_SUPPORTED_VERSION, 1);
-    assert_eq!(FORMAT_VERSION, 1);
+fn only_the_current_format_version_is_read() {
+    assert_eq!(MIN_SUPPORTED_VERSION, 2);
+    assert_eq!(FORMAT_VERSION, 2);
+}
+
+/// A version 1 file is refused, and refused *as an unsupported version* —
+/// not misread.
+///
+/// This is the failure mode worth pinning. A version 1 slot ends at its label
+/// and a version 2 slot has one more blob after it, so a reader that ignored
+/// the version would consume the next slot's first four bytes as a length and
+/// decode something plausible out of unrelated bytes. Refusing on the version
+/// check happens before any of that.
+#[test]
+fn a_version_1_file_is_refused_rather_than_misread() {
+    let (_dir, vault, _code) = new_vault();
+    let path = vault.path().to_path_buf();
+    drop(vault);
+    let v2 = std::fs::read(&path).expect("the vault file exists");
+
+    // The single recovery slot's credential public key is an empty blob: four
+    // zero bytes of length prefix, at the end of the slot. Removing them and
+    // declaring version 1 is exactly what a v1 writer would have produced.
+    let slot_end = header_len(&v2);
+    assert_eq!(
+        &v2[slot_end - 4..slot_end],
+        &[0, 0, 0, 0],
+        "the last slot field should be an empty credential public key"
+    );
+    let mut v1 = Vec::with_capacity(v2.len() - 4);
+    v1.extend_from_slice(&v2[..slot_end - 4]);
+    v1.extend_from_slice(&v2[slot_end..]);
+    v1[OFF_FORMAT_VERSION..OFF_FORMAT_VERSION + 4].copy_from_slice(&1u32.to_be_bytes());
+
+    let v1_path = path.with_extension("v1");
+    std::fs::write(&v1_path, &v1).expect("write");
+    match LockedVault::open(&v1_path) {
+        Err(VaultError::UnsupportedVersion { got }) => assert_eq!(got, 1),
+        Err(other) => panic!("expected an unsupported-version error, got {other:?}"),
+        Ok(_) => panic!("a version 1 file must not open"),
+    }
+}
+
+/// Where the header stops and the sealed body's length prefix begins.
+///
+/// The file is `header ‖ u64 body length ‖ body`, and the header's own length
+/// is not recorded — it is implied by the slots. Rather than re-implement the
+/// slot walk here (which would make this test pass for the wrong reason if the
+/// walk were wrong), find the one offset whose u64 describes exactly the bytes
+/// that follow it.
+fn header_len(bytes: &[u8]) -> usize {
+    (OFF_FIRST_SLOT..bytes.len() - 8)
+        .find(|&h| be64(bytes, h) as usize == bytes.len() - h - 8)
+        .expect("the body length prefix must be locatable")
 }
 
 /// The header a reader sees must be byte-identical to the one the writer

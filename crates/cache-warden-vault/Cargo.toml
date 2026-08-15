@@ -48,3 +48,7 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# The software authenticator that drives the passkey-slot tests without a
+# browser (DR-0034 Open Q5). Dev-only: the vault itself never verifies a
+# WebAuthn ceremony, it only consumes the PRF output one produced.
+cache-warden-webauthn = { path = "../cache-warden-webauthn" }

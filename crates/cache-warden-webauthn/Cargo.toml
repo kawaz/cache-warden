@@ -1,0 +1,32 @@
+[package]
+name = "cache-warden-webauthn"
+version.workspace = true
+edition.workspace = true
+description = "The relying-party half of a WebAuthn ceremony: verify registration and assertion responses for one locally-registered credential"
+license = "MIT"
+repository = "https://github.com/kawaz/cache-warden"
+
+[dependencies]
+# CBOR: the registration response's attestation object and the COSE public key
+# inside it are both CBOR. Pure Rust, and the only crate this addition needs
+# that the workspace did not already have.
+ciborium = "0.2"
+# ES256 (ECDSA P-256) verification — the algorithm platform authenticators
+# use. Already in the tree via cache-warden-authsock's ssh signing.
+p256 = { version = "0.13", features = ["ecdsa", "std"] }
+# EdDSA (Ed25519) verification, the other algorithm passkeys are minted with.
+# Also already in the tree via authsock.
+ed25519-dalek = "2"
+# SHA-256 for the rp id hash and the client-data hash the signature covers.
+sha2 = "0.10"
+# Client data is JSON.
+serde_json = "1"
+# Challenges and credential ids cross the wire base64url-encoded, as the
+# WebAuthn JS API produces them.
+base64 = "0.22"
+# `Verifier` trait shared by both signature algorithms.
+signature = "2"
+# `OsRng` for the test authenticator's keys and credential ids (see the
+# `testing` module: shipped, not dev-only, because the daemon's own ceremony
+# tests drive it).
+rand_core = { version = "0.6", features = ["getrandom"] }

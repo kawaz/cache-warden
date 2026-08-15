@@ -222,6 +222,28 @@ impl VaultState {
         Ok(())
     }
 
+    /// Open the vault with a passkey's PRF output (DR-0034 §2).
+    ///
+    /// The same shape as [`VaultState::unlock`] and for the same reasons: the
+    /// file is re-read rather than the held handle consumed, so a ceremony
+    /// that produces the wrong key material leaves this state exactly as it
+    /// was.
+    pub fn unlock_with_prf_output(&mut self, prf_output: &[u8]) -> Result<(), VaultUnlockError> {
+        let path = match self {
+            VaultState::Unlocked { .. } => return Ok(()),
+            VaultState::NotInitialized { .. } => return Err(VaultUnlockError::NotInitialized),
+            VaultState::Locked { vault } => vault.path().to_path_buf(),
+        };
+        let locked = LockedVault::open(&path).map_err(VaultUnlockError::Vault)?;
+        let vault = locked
+            .unlock_with_prf_output(prf_output)
+            .map_err(VaultUnlockError::Vault)?;
+        *self = VaultState::Unlocked {
+            vault: Box::new(vault),
+        };
+        Ok(())
+    }
+
     /// Close the vault, wiping the data key.
     ///
     /// A no-op when it is not open, so `cw vault lock` is safe to run blindly.

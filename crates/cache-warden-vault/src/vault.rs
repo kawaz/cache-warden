@@ -170,6 +170,68 @@ impl LockedVault {
         self.unlock_with_secret(code.secret(), SlotKind::Recovery)
     }
 
+    /// Open the vault with a passkey's PRF output (DR-0034 §2).
+    ///
+    /// The counterpart of [`UnlockedVault::add_passkey_slot`]: the ceremony
+    /// evaluated a slot's salt and produced this, and the same derivation runs
+    /// in reverse to reach the data key.
+    ///
+    /// Every passkey slot is tried, not just the one whose credential was
+    /// asserted. The alternative — trusting the caller's slot id — would let a
+    /// mistaken lookup report "wrong passkey" for a credential that does in
+    /// fact open the vault, and trying the others costs one HKDF and one
+    /// failed AEAD open each.
+    pub fn unlock_with_prf_output(self, prf_output: &[u8]) -> Result<UnlockedVault, VaultError> {
+        self.unlock_with_secret(prf_output, SlotKind::PasskeyPrf)
+    }
+
+    /// Open the vault directly from a data key that a predecessor process was
+    /// already holding (DR-0034 §11).
+    ///
+    /// This is the graceful-restart path and nothing else. It takes no
+    /// credential because there is none to take: the key arrived over the
+    /// private socketpair from the process that had already earned it, and
+    /// demanding a fresh ceremony would be the exact user-visible cost — a
+    /// storm of prompts on every upgrade — that graceful restart exists to
+    /// avoid.
+    ///
+    /// The key is still verified rather than trusted: it has to decrypt the
+    /// body, authenticated against the header, or this fails. A wrong or
+    /// corrupted key cannot open the vault, so a mangled handoff degrades to
+    /// "stays locked" instead of "opens with garbage".
+    pub fn unlock_with_dek(self, dek: &[u8]) -> Result<UnlockedVault, VaultError> {
+        let key: [u8; KEY_LEN] = dek.try_into().map_err(|_| VaultError::Malformed {
+            reason: "a handed-off data key was not 32 bytes",
+        })?;
+        let plaintext = crypto::open(&key, &self.header_aad, &self.file.sealed_body, "contents")?;
+        let entries = Self::parse_entries(&plaintext)?;
+        Ok(UnlockedVault {
+            path: self.path,
+            vault_id: self.file.vault_id,
+            format_version: self.file.format_version,
+            dek_generation: self.file.dek_generation,
+            aead_alg: self.file.aead_alg,
+            kdf_alg: self.file.kdf_alg,
+            slots: self.file.slots,
+            dek: SecretBytes::new(key.to_vec()),
+            entries,
+        })
+    }
+
+    /// Parse a decrypted body into the entry map, rejecting duplicate keys.
+    fn parse_entries(plaintext: &[u8]) -> Result<BTreeMap<String, VaultEntry>, VaultError> {
+        let body = VaultBody::from_plaintext(plaintext)?;
+        let mut entries = BTreeMap::new();
+        for entry in body.entries {
+            if entries.insert(entry.key.clone(), entry).is_some() {
+                return Err(VaultError::Malformed {
+                    reason: "two entries share one key",
+                });
+            }
+        }
+        Ok(entries)
+    }
+
     /// Try `input_secret` against every slot of `kind`.
     fn unlock_with_secret(
         self,
@@ -209,16 +271,7 @@ impl LockedVault {
             )?);
             let plaintext =
                 crypto::open(&dek, &self.header_aad, &self.file.sealed_body, "contents")?;
-            let body = VaultBody::from_plaintext(&plaintext)?;
-
-            let mut entries = BTreeMap::new();
-            for entry in body.entries {
-                if entries.insert(entry.key.clone(), entry).is_some() {
-                    return Err(VaultError::Malformed {
-                        reason: "two entries share one key",
-                    });
-                }
-            }
+            let entries = Self::parse_entries(&plaintext)?;
 
             return Ok(UnlockedVault {
                 path: self.path,
@@ -321,7 +374,9 @@ impl UnlockedVault {
             vault_id,
             FORMAT_VERSION,
             code.secret(),
+            random_salt(),
             String::new(),
+            Vec::new(),
             Vec::new(),
             "recovery code".to_string(),
         )?;
@@ -621,7 +676,9 @@ impl UnlockedVault {
                 self.vault_id,
                 self.format_version,
                 code.secret(),
+                random_salt(),
                 String::new(),
+                Vec::new(),
                 Vec::new(),
                 label.into(),
             )
@@ -633,6 +690,74 @@ impl UnlockedVault {
         self.commit(&next, self.dek_generation, &self.entries)?;
         self.slots = next;
         Ok((id, code))
+    }
+
+    /// The salt a new passkey slot's ceremony must evaluate (DR-0034 §2).
+    ///
+    /// Generated before the ceremony rather than after it, because the salt is
+    /// an *input* to the ceremony: the page passes it to the authenticator,
+    /// which evaluates its PRF over it, and the output is what this slot's key
+    /// is derived from. Hand this to the ceremony, then pass it back to
+    /// [`UnlockedVault::add_passkey_slot`] with the output it produced.
+    ///
+    /// Random per slot, and stored in the header, exactly as §2 specifies —
+    /// so the same passkey registered against two vaults, or twice against
+    /// one, yields unrelated key material each time.
+    pub fn new_passkey_salt() -> [u8; SALT_LEN] {
+        random_salt()
+    }
+
+    /// Add a passkey slot from a completed registration ceremony
+    /// (DR-0034 §1c / §2).
+    ///
+    /// `prf_output` is what the authenticator returned for `salt`; it is the
+    /// secret this slot's key-encryption key is derived from, and the reason
+    /// the slot can later be opened by that passkey and nothing else.
+    /// `credential_id` and `credential_public_key` are recorded so a later
+    /// unlock can address the right credential and verify what it signs.
+    ///
+    /// Like [`UnlockedVault::add_recovery_slot`], this is a public-key
+    /// operation on the new slot alone: the DEK does not rotate and no
+    /// existing slot is touched, so adding a device needs no other device.
+    ///
+    /// **The local approval gate is the caller's job, not this function's.**
+    /// Each slot is another way in (DR-0034 §1c), and the daemon gates the
+    /// command that reaches here on a local human approval.
+    pub fn add_passkey_slot(
+        &mut self,
+        prf_output: &[u8],
+        salt: [u8; SALT_LEN],
+        rp_id: impl Into<String>,
+        credential_id: Vec<u8>,
+        credential_public_key: Vec<u8>,
+        label: impl Into<String>,
+    ) -> Result<SlotId, VaultError> {
+        if credential_id.is_empty() || credential_public_key.is_empty() {
+            return Err(VaultError::Malformed {
+                reason: "a passkey slot needs both a credential id and its public key",
+            });
+        }
+        let slot = self.dek_with_exposed(|dek| {
+            build_slot(
+                SlotKind::PasskeyPrf,
+                dek,
+                self.vault_id,
+                self.format_version,
+                prf_output,
+                salt,
+                rp_id.into(),
+                credential_id,
+                credential_public_key,
+                label.into(),
+            )
+        })?;
+        let id = slot.id();
+
+        let mut next = self.slots.clone();
+        next.push(slot);
+        self.commit(&next, self.dek_generation, &self.entries)?;
+        self.slots = next;
+        Ok(id)
     }
 
     /// Remove a slot, rotating the DEK in the same commit.
@@ -691,6 +816,17 @@ impl UnlockedVault {
         self.dek = SecretBytes::new(new_dek.to_vec());
         self.dek_generation = generation;
         Ok(())
+    }
+
+    /// Copy the data key out, for handing to a successor process over the
+    /// private graceful-restart channel (DR-0034 §11).
+    ///
+    /// The only way the key leaves this type, and deliberately narrow: the
+    /// copy is `Zeroizing`, so it is wiped when the handoff buffer is dropped
+    /// rather than lingering in an ordinary allocation. Every other use of the
+    /// key stays inside `with_exposed` (DR-0028).
+    pub fn export_dek(&self) -> Zeroizing<Vec<u8>> {
+        self.dek.with_exposed(|k| Zeroizing::new(k.to_vec()))
     }
 
     /// Close the vault, wiping the DEK, and return it in its locked form.
@@ -793,13 +929,13 @@ fn build_slot(
     vault_id: VaultId,
     format_version: u32,
     input_secret: &[u8],
+    salt: [u8; SALT_LEN],
     rp_id: String,
     credential_id: Vec<u8>,
+    credential_public_key: Vec<u8>,
     label: String,
 ) -> Result<Slot, VaultError> {
     let slot_id = SlotId::random();
-    let mut salt = [0u8; SALT_LEN];
-    crypto::fill_random(&mut salt);
     let (secret, pubkey) = crypto::generate_recipient();
 
     let aad = Slot::binding_aad(vault_id, format_version, slot_id, kind, &pubkey);
@@ -819,8 +955,16 @@ fn build_slot(
         wrapped_dek,
         rp_id,
         credential_id,
+        credential_public_key,
         label,
     ))
+}
+
+/// A fresh per-slot HKDF salt (DR-0034 §2).
+fn random_salt() -> [u8; SALT_LEN] {
+    let mut salt = [0u8; SALT_LEN];
+    crypto::fill_random(&mut salt);
+    salt
 }
 
 /// Reject a write that does not satisfy the entry's active claim.

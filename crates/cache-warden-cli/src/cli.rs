@@ -473,9 +473,42 @@ pub fn vault_init() -> Command {
     level("init").arg(socket_arg())
 }
 
-/// `vault unlock` (DR-0034 §6) — the recovery code is read from stdin.
+/// `vault unlock` (DR-0034 §6/§9) — a passkey by default, a recovery code on
+/// request.
+///
+/// The recovery code is the credential whose loss ends the vault, so it is not
+/// the default path (§9): `--recovery` is what asks for it, and it is then read
+/// from stdin so it never reaches argv.
 pub fn vault_unlock() -> Command {
-    level("unlock").arg(socket_arg())
+    level("unlock")
+        .arg(
+            Arg::new("recovery")
+                .long("recovery")
+                .action(ArgAction::SetTrue)
+                .help("unlock with the recovery code, read from stdin, instead of a passkey"),
+        )
+        .arg(socket_arg())
+}
+
+/// `vault add-passkey` (DR-0034 §1c / §10).
+pub fn vault_add_passkey() -> Command {
+    level("add-passkey")
+        .arg(
+            Arg::new("label")
+                .long("label")
+                .value_name("TEXT")
+                .help("a name for this passkey in `vault status` (default: \"passkey\")"),
+        )
+        .arg(
+            Arg::new("allow-without-local-approval")
+                .long("allow-without-local-approval")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "register without the local approval dialog (for a machine whose approver \
+                     does not work)",
+                ),
+        )
+        .arg(socket_arg())
 }
 
 /// `vault lock` (DR-0034 §6).

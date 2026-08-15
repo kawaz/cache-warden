@@ -262,13 +262,14 @@ _cache-warden() {
           ;;
 
         vault)
-          # vault の 4 動詞はいずれも位置引数を取らない。特に unlock の
+          # vault の 5 動詞はいずれも位置引数を取らない。特に unlock の
           # recovery code は stdin 専用 (argv に置くと ps / 履歴に残る) なので、
           # 補完でも値スロットを一切出さない。
           local -a vault_commands
           vault_commands=(
             'init:Create the vault (prints its recovery code once)'
             'unlock:Open the vault so persisted values become readable'
+            'add-passkey:Register a passkey that can open the vault'
             'lock:Close the vault, wiping its key from memory'
             'status:Show whether the vault is open, and what can open it'
           )
@@ -279,7 +280,24 @@ _cache-warden() {
             '*::varg:->vargs'
           case "$state" in
             vcmd) _describe -t commands 'vault subcommand' vault_commands ;;
-            vargs) _arguments "$socket_opt" '--help[Show this help message]' ;;
+            vargs)
+              case "${words[1]}" in
+                unlock)
+                  _arguments \
+                    "$socket_opt" \
+                    '--help[Show this help message]' \
+                    '--recovery[Use the recovery code from stdin instead of a passkey]'
+                  ;;
+                add-passkey)
+                  _arguments \
+                    "$socket_opt" \
+                    '--help[Show this help message]' \
+                    '--label[A name for this passkey in vault status]:label:' \
+                    '--allow-without-local-approval[Skip the approval dialog]'
+                  ;;
+                *) _arguments "$socket_opt" '--help[Show this help message]' ;;
+              esac
+              ;;
           esac
           ;;
 

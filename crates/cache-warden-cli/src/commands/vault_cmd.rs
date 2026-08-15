@@ -15,10 +15,13 @@ const RECOVERY_PROMPT: &str =
 
 /// Apply a vault leaf's grammar for its flags alone (none of them takes a
 /// positional), reporting a mistyped flag in the CLI's own words.
-fn parse_flags_only(cmd: clap::Command, verb: &str, args: &[String]) -> Result<(), String> {
+fn parse_flags_only(
+    cmd: clap::Command,
+    verb: &str,
+    args: &[String],
+) -> Result<clap::ArgMatches, String> {
     cmd.clone()
         .try_get_matches_from(args)
-        .map(|_| ())
         .map_err(|e| crate::cli::parse_error(&cmd, verb, e))
 }
 
@@ -38,15 +41,22 @@ pub fn parse_vault_lock(args: &[String]) -> Result<Request, String> {
 /// on the ordinary `status` reply, which the caller then renders with
 /// [`render_vault_status`].
 pub fn parse_vault_status(args: &[String]) -> Result<(), String> {
-    parse_flags_only(crate::cli::vault_status(), "vault status", args)
+    parse_flags_only(crate::cli::vault_status(), "vault status", args).map(|_| ())
 }
 
-/// Parse `vault unlock` (DR-0034 §6), reading the recovery code from stdin.
+/// Parse `vault unlock` (DR-0034 §6/§9).
 ///
-/// `stdin_is_tty` decides only whether the prompt is shown — the code is read
-/// from stdin either way, so `pbpaste | cache-warden vault unlock` and an
-/// interactive paste take the same path. `read_line` supplies the bytes (kept
-/// as a parameter so the parse is testable).
+/// Without `--recovery` this asks for a passkey unlock, and the daemon answers
+/// with the URL of the ceremony page. That is the default because DR-0034 §9
+/// keeps the recovery code *off* the everyday path: it is the one credential
+/// whose loss cannot be recovered from, and a code pasted routinely is a code
+/// that ends up somewhere convenient.
+///
+/// With `--recovery` the code is read from stdin. `stdin_is_tty` decides only
+/// whether the prompt is shown — the code is read from stdin either way, so
+/// `pbpaste | cache-warden vault unlock --recovery` and an interactive paste
+/// take the same path. `read_line` supplies the bytes (kept as a parameter so
+/// the parse is testable).
 ///
 /// A code given as an argument is refused rather than accepted: argv is
 /// visible in `ps` and lands in the shell history, and a credential that has
@@ -59,14 +69,19 @@ pub fn parse_vault_unlock(
     for a in args {
         if !a.starts_with('-') {
             return Err(format!(
-                "`vault unlock` takes no arguments (got {a:?}): the recovery code is read \
+                "`vault unlock` takes no arguments (got {a:?}): a recovery code is read \
                  from stdin so it never reaches `ps` or your shell history. Run \
-                 `cache-warden vault unlock` and paste it, or pipe it in \
-                 (`... | cache-warden vault unlock`)"
+                 `cache-warden vault unlock --recovery` and paste it, or pipe it in \
+                 (`... | cache-warden vault unlock --recovery`)"
             ));
         }
     }
-    parse_flags_only(crate::cli::vault_unlock(), "vault unlock", args)?;
+    let matches = parse_flags_only(crate::cli::vault_unlock(), "vault unlock", args)?;
+    if !matches.get_flag("recovery") {
+        return Ok(Request::VaultUnlock {
+            recovery_code: None,
+        });
+    }
 
     if stdin_is_tty {
         eprintln!("{RECOVERY_PROMPT}");
@@ -75,12 +90,27 @@ pub fn parse_vault_unlock(
     let recovery_code = line.trim().to_string();
     if recovery_code.is_empty() {
         return Err(
-            "no recovery code was given on stdin. Run `cache-warden vault unlock` and paste \
-             the code, or pipe it in (`... | cache-warden vault unlock`)"
+            "no recovery code was given on stdin. Run `cache-warden vault unlock --recovery` \
+             and paste the code, or pipe it in (`... | cache-warden vault unlock --recovery`)"
                 .to_string(),
         );
     }
-    Ok(Request::VaultUnlock { recovery_code })
+    Ok(Request::VaultUnlock {
+        recovery_code: Some(recovery_code),
+    })
+}
+
+/// Parse `vault add-passkey` (DR-0034 §1c / §10).
+pub fn parse_vault_add_passkey(args: &[String]) -> Result<Request, String> {
+    let matches = parse_flags_only(crate::cli::vault_add_passkey(), "vault add-passkey", args)?;
+    let label = matches
+        .get_one::<String>("label")
+        .cloned()
+        .unwrap_or_else(|| "passkey".to_string());
+    Ok(Request::VaultAddPasskey {
+        label,
+        allow_without_local_approval: matches.get_flag("allow-without-local-approval"),
+    })
 }
 
 /// Render the vault section of a `status` reply for `vault status` (DR-0034
@@ -198,16 +228,74 @@ mod tests {
 
     #[test]
     fn unlock_reads_the_code_from_stdin_and_trims_it() {
-        let req = parse_vault_unlock(&s(&[]), false, || Ok("  3f2a 9c1d \n".to_string())).unwrap();
+        let req = parse_vault_unlock(&s(&["--recovery"]), false, || {
+            Ok("  3f2a 9c1d \n".to_string())
+        })
+        .unwrap();
         match req {
-            Request::VaultUnlock { recovery_code } => assert_eq!(recovery_code, "3f2a 9c1d"),
+            Request::VaultUnlock { recovery_code } => {
+                assert_eq!(recovery_code.as_deref(), Some("3f2a 9c1d"))
+            }
             other => panic!("expected VaultUnlock, got {other:?}"),
+        }
+    }
+
+    /// DR-0034 §9 keeps the recovery code off the everyday path, so a bare
+    /// `vault unlock` must ask for a passkey — and must not read stdin at all,
+    /// since there is no code to read.
+    #[test]
+    fn unlock_without_the_flag_asks_for_a_passkey_and_never_reads_stdin() {
+        let req = parse_vault_unlock(&s(&[]), false, || {
+            panic!("stdin must not be read for a passkey unlock")
+        })
+        .unwrap();
+        assert!(matches!(
+            req,
+            Request::VaultUnlock {
+                recovery_code: None
+            }
+        ));
+    }
+
+    #[test]
+    fn add_passkey_defaults_its_label_and_keeps_the_bypass_off() {
+        let req = parse_vault_add_passkey(&s(&[])).unwrap();
+        match req {
+            Request::VaultAddPasskey {
+                label,
+                allow_without_local_approval,
+            } => {
+                assert_eq!(label, "passkey");
+                assert!(
+                    !allow_without_local_approval,
+                    "the approval gate must be on unless it is explicitly waived"
+                );
+            }
+            other => panic!("expected VaultAddPasskey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_passkey_carries_a_label_and_an_explicit_bypass() {
+        let req =
+            parse_vault_add_passkey(&s(&["--label", "laptop", "--allow-without-local-approval"]))
+                .unwrap();
+        match req {
+            Request::VaultAddPasskey {
+                label,
+                allow_without_local_approval,
+            } => {
+                assert_eq!(label, "laptop");
+                assert!(allow_without_local_approval);
+            }
+            other => panic!("expected VaultAddPasskey, got {other:?}"),
         }
     }
 
     #[test]
     fn unlock_with_empty_stdin_is_a_usage_error_not_an_empty_code() {
-        let err = parse_vault_unlock(&s(&[]), false, || Ok("\n".to_string())).unwrap_err();
+        let err =
+            parse_vault_unlock(&s(&["--recovery"]), false, || Ok("\n".to_string())).unwrap_err();
         assert!(err.contains("no recovery code"), "{err}");
         // It must not have been sent as an empty code.
         assert!(err.contains("vault unlock"), "{err}");
@@ -215,7 +303,7 @@ mod tests {
 
     #[test]
     fn unlock_surfaces_a_stdin_read_failure() {
-        let err = parse_vault_unlock(&s(&[]), false, || {
+        let err = parse_vault_unlock(&s(&["--recovery"]), false, || {
             Err(std::io::Error::other("pipe went away"))
         })
         .unwrap_err();

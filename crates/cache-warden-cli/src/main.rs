@@ -40,6 +40,19 @@ fn render_response(resp: Response) -> Result<(), String> {
         Response::Ok(ok) => {
             match ok.payload {
                 OkPayload::Pong { .. } => println!("pong"),
+                OkPayload::CeremonyOpened {
+                    url,
+                    expires_in_secs,
+                    ..
+                } => {
+                    // The URL goes to stdout on its own line so it can be
+                    // piped into a browser opener; the context goes to stderr
+                    // so it stays out of that pipe.
+                    eprintln!(
+                        "open this in a browser within {expires_in_secs}s to register the passkey:"
+                    );
+                    println!("{url}");
+                }
                 OkPayload::Set { version, .. } => match version {
                     // The version is what a caller passes back as the next
                     // `--expected-version`, so it is worth showing.
@@ -695,6 +708,7 @@ fn dispatch_vault(rest: &[String], socket: &std::path::Path) -> Result<(), CliEr
     let leaf_help: fn() -> help::HelpSpec = match sub {
         "init" => help::vault_init,
         "unlock" => help::vault_unlock,
+        "add-passkey" => help::vault_add_passkey,
         "lock" => help::vault_lock,
         "status" => help::vault_status,
         other => {
@@ -717,6 +731,10 @@ fn dispatch_vault(rest: &[String], socket: &std::path::Path) -> Result<(), CliEr
     let req = match sub {
         "init" => or_usage(commands::vault_cmd::parse_vault_init(tail), leaf_help)?,
         "lock" => or_usage(commands::vault_cmd::parse_vault_lock(tail), leaf_help)?,
+        "add-passkey" => or_usage(
+            commands::vault_cmd::parse_vault_add_passkey(tail),
+            leaf_help,
+        )?,
         "unlock" => or_usage(
             commands::vault_cmd::parse_vault_unlock(
                 tail,

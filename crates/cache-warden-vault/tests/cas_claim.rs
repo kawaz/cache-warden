@@ -459,3 +459,71 @@ fn an_unconditional_upsert_on_an_unclaimed_entry_still_advances_the_version() {
     assert_eq!(vault.upsert(entry("k", "a"), None).expect("creates"), 1);
     assert_eq!(vault.upsert(entry("k", "b"), None).expect("updates"), 2);
 }
+
+// ---- graceful-restart data key (DR-0034 §11) ----
+
+/// The successor of a graceful restart inherits the data key and comes up
+/// already open, so an upgrade does not cost the user an unlock.
+#[test]
+fn a_handed_off_data_key_opens_the_vault_without_a_credential() {
+    let (_dir, mut vault, _code) = new_vault();
+    vault.upsert_cas(entry("k", "v"), 0, None).expect("creates");
+    let path = vault.path().to_path_buf();
+    let dek = vault.export_dek();
+    drop(vault);
+
+    let reopened = LockedVault::open(&path)
+        .expect("opens")
+        .unlock_with_dek(&dek)
+        .expect("the inherited key opens it");
+    assert_eq!(reopened.entry("k").unwrap().secret.as_slice(), b"v");
+    assert_eq!(reopened.dek_generation(), 1);
+}
+
+/// A key that does not match must not open the vault: a mangled handoff has to
+/// degrade to "stays locked", never to "opens with garbage".
+#[test]
+fn a_wrong_or_malformed_data_key_does_not_open_the_vault() {
+    let (_dir, vault, _code) = new_vault();
+    let path = vault.path().to_path_buf();
+    drop(vault);
+
+    let (_d2, other, _c) = new_vault();
+    let foreign = other.export_dek();
+
+    assert!(
+        LockedVault::open(&path)
+            .unwrap()
+            .unlock_with_dek(&foreign)
+            .is_err(),
+        "another vault's key must not open this one"
+    );
+    for wrong_len in [0usize, 16, 31, 33, 64] {
+        assert!(
+            LockedVault::open(&path)
+                .unwrap()
+                .unlock_with_dek(&vec![0u8; wrong_len])
+                .is_err(),
+            "a {wrong_len}-byte key must be refused"
+        );
+    }
+}
+
+/// Rotating the key invalidates a copy taken before the rotation — the
+/// inherited key is not a way around revocation.
+#[test]
+fn a_data_key_captured_before_a_rotation_no_longer_opens_the_vault() {
+    let (_dir, mut vault, _code) = new_vault();
+    vault.upsert_cas(entry("k", "v"), 0, None).expect("creates");
+    let stale = vault.export_dek();
+    vault.rotate_dek().expect("rotates");
+    let path = vault.path().to_path_buf();
+    drop(vault);
+
+    assert!(
+        LockedVault::open(&path)
+            .unwrap()
+            .unlock_with_dek(&stale)
+            .is_err()
+    );
+}

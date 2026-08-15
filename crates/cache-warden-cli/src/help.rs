@@ -1035,6 +1035,10 @@ pub fn vault() -> HelpSpec {
                 desc: "Open the vault so persisted values become readable",
             },
             Row {
+                name: "add-passkey",
+                desc: "Register a passkey that can open the vault",
+            },
+            Row {
                 name: "lock",
                 desc: "Close the vault, wiping its key from memory",
             },
@@ -1080,26 +1084,75 @@ replacing it would discard everything it holds.",
     }
 }
 
-/// `vault unlock` leaf page (DR-0034 §6).
+/// `vault unlock` leaf page (DR-0034 §6/§9).
 pub fn vault_unlock() -> HelpSpec {
     HelpSpec {
         heading: concat!("cache-warden", " vault unlock"),
         summary: "Open the vault so persisted values become readable.",
-        usage: concat!("cache-warden", " vault unlock"),
+        usage: concat!("cache-warden", " vault unlock [--recovery]"),
         subcommands: &[],
-        options: &[],
+        options: &[Row {
+            name: "--recovery",
+            desc: "Use the recovery code, read from stdin, instead of a passkey",
+        }],
         detail: "\
-The recovery code is read from stdin, never from the command line: an argument
-would be visible in `ps` and would stay in your shell history. Run the command
-and paste the code, or pipe it in (`pbpaste | cache-warden vault unlock`).
-Spaces, hyphens, line breaks and letter case are ignored, so a code copied off
-paper normally works as written.
+By default this unlocks with a passkey: it prints a URL to open in a browser,
+where the passkey ceremony runs. A PRF can only be evaluated in a browser, so
+there is no way to do it from the terminal.
+
+`--recovery` uses the recovery code instead. That is deliberately not the
+default — the recovery code is the one credential whose loss ends the vault, and
+a code pasted routinely is a code that ends up somewhere convenient. It is read
+from stdin, never from the command line: an argument would be visible in `ps`
+and would stay in your shell history. Run the command and paste the code, or
+pipe it in (`pbpaste | cache-warden vault unlock --recovery`). Spaces, hyphens,
+line breaks and letter case are ignored, so a code copied off paper normally
+works as written.
 
 The vault stays open until `vault lock` or until the daemon exits — unlocking
-is per daemon process, not per command. On success this reports how many
-persisted entries became readable. A code that opens nothing is reported as a
-failed unlock, without saying whether it was mistyped or belongs to another
-vault.",
+is per daemon process, not per command. On success the recovery path reports how
+many persisted entries became readable. A credential that opens nothing is
+reported as a failed unlock, without saying whether it was mistyped or belongs
+to another vault.",
+        show_global: true,
+    }
+}
+
+/// `vault add-passkey` leaf page (DR-0034 §1c / §10).
+pub fn vault_add_passkey() -> HelpSpec {
+    HelpSpec {
+        heading: concat!("cache-warden", " vault add-passkey"),
+        summary: "Register a passkey that can open the vault.",
+        usage: concat!("cache-warden", " vault add-passkey [--label TEXT]"),
+        subcommands: &[],
+        options: &[
+            Row {
+                name: "--label TEXT",
+                desc: "A name for this passkey in `vault status` (default: \"passkey\")",
+            },
+            Row {
+                name: "--allow-without-local-approval",
+                desc: "Skip the approval dialog (for a machine whose approver does not work)",
+            },
+        ],
+        detail: "\
+Asks for approval on this machine and, once given, prints a URL to open in a
+browser. The registration happens there; this command only opens the window,
+which closes on its own after five minutes and admits exactly one passkey.
+
+The vault must already be open. Adding a passkey re-wraps its key for a new
+credential, which needs the key — and that also means whoever adds a way in
+already had one.
+
+The approval is required because every registered passkey opens the vault
+forever after, and the browser half of the ceremony can be driven by anything
+that reaches the local port. If this machine has no working approver,
+`--allow-without-local-approval` proceeds without it; the flag is spelled out
+so that using it is visible in a shell history.
+
+Each passkey gets its own key material, so registering a second one does not
+weaken the first, and removing one re-keys the vault so the removed passkey
+cannot open even an old copy of the file.",
         show_global: true,
     }
 }

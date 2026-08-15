@@ -98,6 +98,13 @@ pub struct HandlerCtx<'a, A: ?Sized, R, C> {
     /// order is therefore fixed at store → vault, with no cycle to deadlock
     /// on. Any future code that reaches for the store from inside a vault
     /// critical section breaks that, and must not.
+    ///
+    /// The order binds the ceremony listener too, which runs on its own tasks
+    /// and reaches both (`ceremony::unlock_finish` restores entries into the
+    /// store after opening the vault). It takes the store lock first for this
+    /// reason. The pairing that would deadlock is an everyday one — a caller
+    /// blocked in `kv.get` while the user completes an unlock in the browser —
+    /// not an exotic race.
     pub vault: Option<&'a std::sync::Mutex<VaultState>>,
     /// Keys the configuration declares as `persist = true` (DR-0034 §5).
     ///
@@ -231,6 +238,21 @@ where
                          then, set it without a guard or without persistence",
                     );
                 }
+                // DR-0034 §5 exempts a cache-warden-owned entry from hard
+                // TTL: an absolute lifetime would destroy the only copy of a
+                // live credential on a timer. Silently dropping the caller's
+                // `hard_ttl_secs` would leave them believing an expiry is in
+                // force that is not, so say so instead — especially when the
+                // entry became persistent through a configuration declaration
+                // this caller may not have known about.
+                if hard_ttl_secs.is_some() {
+                    return Response::error(
+                        ErrorKind::BadRequest,
+                        "a persisted entry cannot carry a hard TTL: cache-warden is the only \
+                         holder of its value, so an expiry would destroy it outright rather \
+                         than fall back to re-fetching. Drop `hard_ttl`, or drop persistence",
+                    );
+                }
                 // A persisted entry needs somewhere durable to live before the
                 // write is acknowledged.
                 if let Some(resp) = require_unlocked_vault(ctx) {
@@ -284,8 +306,25 @@ where
             resp
         }
         Request::VaultInit => handle_vault_init(ctx),
-        Request::VaultUnlock { recovery_code } => handle_vault_unlock(store, ctx, &recovery_code),
+        // A passkey unlock (no recovery code) is a browser ceremony, so the
+        // async layer answers it with a URL; only the recovery path completes
+        // here. See `run_request_async`.
+        Request::VaultUnlock { recovery_code } => match recovery_code {
+            Some(code) => handle_vault_unlock(store, ctx, &code),
+            None => Response::error(
+                ErrorKind::Internal,
+                "a passkey unlock must be dispatched by run_request_async",
+            ),
+        },
         Request::VaultLock => handle_vault_lock(store, ctx),
+        // DR-0034 §1c: opening a registration window needs the local approval
+        // dialog, which is async and lives in the server layer. `run_request_async`
+        // always intercepts this variant before the sync dispatch reaches here;
+        // the arm exists so the match stays exhaustive.
+        Request::VaultAddPasskey { .. } => Response::error(
+            ErrorKind::Internal,
+            "vault.add_passkey must be dispatched by run_request_async",
+        ),
         Request::KvClaim {
             key,
             expected_version,
@@ -740,9 +779,10 @@ fn write_through_to_vault<A: ?Sized, R, C: Clock>(
 /// on a refresh token would destroy the only copy of a live credential on a
 /// timer, so the exemption is structural here rather than a policy a caller
 /// could forget to apply.
-fn install_vault_entries<A: ?Sized, R, C: Clock>(
+pub fn install_vault_entries<C: Clock>(
     store: &mut Store,
-    ctx: &HandlerCtx<'_, A, R, C>,
+    cap: &cache_warden::Capability,
+    clock: &C,
     vault: &cache_warden_vault::UnlockedVault,
 ) -> usize {
     let mut restored = 0usize;
@@ -769,19 +809,16 @@ fn install_vault_entries<A: ?Sized, R, C: Clock>(
                 cache_warden::ValueSource::Static,
                 secret,
                 ttl,
-                ctx.store_cap,
-                ctx.clock,
+                cap,
+                clock,
             )
             .is_err()
         {
             continue;
         }
         // The version travels with the value or the entry does not come back.
-        if store
-            .restore_version(&key, entry.cas_version, ctx.store_cap)
-            .is_err()
-        {
-            let _ = store.delete(&key, ctx.store_cap);
+        if store.restore_version(&key, entry.cas_version, cap).is_err() {
+            let _ = store.delete(&key, cap);
             continue;
         }
         // A claim outlives the process that took it (DR-0034 §4): the whole
@@ -795,7 +832,7 @@ fn install_vault_entries<A: ?Sized, R, C: Clock>(
                 claim.claimed_at_epoch_ms,
                 claim.expires_at_epoch_ms,
             );
-            let _ = store.set_refresh_claim(key.clone(), restored_claim, ctx.store_cap);
+            let _ = store.set_refresh_claim(key.clone(), restored_claim, cap);
         }
         restored += 1;
     }
@@ -1135,7 +1172,7 @@ fn handle_vault_unlock<A: ?Sized, R, C: Clock>(
             // rather than merging with it.
             let restored = match guard.unlocked() {
                 None => 0,
-                Some(vault) => install_vault_entries(store, ctx, vault),
+                Some(vault) => install_vault_entries(store, ctx.store_cap, ctx.clock, vault),
             };
             Response::vault_unlocked(restored)
         }
@@ -1269,6 +1306,12 @@ where
     if let Err(resp) = validate_protocol_key(&key) {
         return resp;
     }
+    // A claim on a persisted entry has to reach the disk to be worth taking
+    // (DR-0034 §4), so a closed vault refuses it here rather than recording a
+    // memory-only claim that the crash it guards against would erase.
+    if let VaultOwnership::Unavailable(resp) = vault_ownership(ctx, &key) {
+        return *resp;
+    }
     // Claiming a key that holds nothing would record a claim nobody can ever
     // complete — and the store drops claims when values go away, so it would
     // simply vanish. Refuse plainly instead.
@@ -1326,6 +1369,11 @@ where
 {
     if let Err(resp) = validate_protocol_key(&key) {
         return resp;
+    }
+    // Releasing has the same durability requirement as taking: clearing only
+    // memory would leave the on-disk claim holding the entry until it lapsed.
+    if let VaultOwnership::Unavailable(resp) = vault_ownership(ctx, &key) {
+        return *resp;
     }
     let now = now_epoch_ms();
     match store.refresh_claim_of(&key).filter(|c| c.is_active_at(now)) {
@@ -5459,7 +5507,7 @@ mod tests {
                 &mut store,
                 &c,
                 Request::VaultUnlock {
-                    recovery_code: d.code.render().to_string(),
+                    recovery_code: Some(d.code.render().to_string()),
                 },
             );
             assert_eq!(
@@ -5495,7 +5543,7 @@ mod tests {
                 &mut store,
                 &c,
                 Request::VaultUnlock {
-                    recovery_code: d.code.render().to_string(),
+                    recovery_code: Some(d.code.render().to_string()),
                 },
             );
             assert_eq!(
@@ -5644,7 +5692,7 @@ mod tests {
                 &mut store,
                 &c,
                 Request::VaultUnlock {
-                    recovery_code: d.code.render().to_string(),
+                    recovery_code: Some(d.code.render().to_string()),
                 },
             );
 
@@ -5721,6 +5769,76 @@ mod tests {
                     .is_none(),
                 "the release must have been recorded durably"
             );
+        }
+
+        /// A claim is only worth taking if it survives the crash it guards
+        /// against, so a closed vault refuses one rather than recording it in
+        /// memory alone.
+        #[test]
+        fn claiming_and_releasing_a_declared_entry_while_locked_are_refused() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            handle_request(&mut store, &c, persist_req("default/RT", b"rt-1"));
+            handle_request(&mut store, &c, Request::VaultLock);
+
+            let resp = handle_request(
+                &mut store,
+                &c,
+                Request::KvClaim {
+                    key: "default/RT".into(),
+                    expected_version: 1,
+                    duration_secs: 300,
+                },
+            );
+            assert_eq!(err_kind(&resp), ErrorKind::VaultLocked);
+
+            let resp = handle_request(
+                &mut store,
+                &c,
+                Request::KvUnclaim {
+                    key: "default/RT".into(),
+                    claim_token: "whatever".into(),
+                },
+            );
+            assert_eq!(err_kind(&resp), ErrorKind::VaultLocked);
+        }
+
+        /// DR-0034 §5 exempts a persisted entry from hard TTL. Dropping the
+        /// caller's expiry silently would leave them believing a lifetime is
+        /// in force that is not — which matters most when the entry became
+        /// persistent through a configuration declaration the caller never saw.
+        #[test]
+        fn a_hard_ttl_on_a_persisted_entry_is_refused_rather_than_ignored() {
+            let clock = FakeClock::new();
+            let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+            let runner = CountingRunner::new(b"x");
+            let (_dir, vault, d) = open_vault("default/RT");
+            let mut c = ctx(&AllowAll, &runner, &clock, &cap);
+            c.vault = Some(&vault);
+            c.persisted_keys = &d.declared;
+
+            let mut req = set_static_req("default/RT", b"rt-1");
+            if let Request::KvSet { hard_ttl_secs, .. } = &mut req {
+                *hard_ttl_secs = Some(3600);
+            }
+            let resp = handle_request(&mut store, &c, req);
+            assert_eq!(err_kind(&resp), ErrorKind::BadRequest);
+            assert!(
+                err_msg(&resp).contains("hard TTL"),
+                "the message must name what to change: {}",
+                err_msg(&resp)
+            );
+            assert!(!store.has_value("default/RT"), "and nothing was written");
+
+            // Without the expiry the same set succeeds.
+            let resp = handle_request(&mut store, &c, set_static_req("default/RT", b"rt-1"));
+            assert!(matches!(resp, Response::Ok(_)), "{resp:?}");
         }
 
         /// The locked reply has to be `vault_locked` specifically. An OAuth

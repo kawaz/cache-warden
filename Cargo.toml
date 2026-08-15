@@ -6,6 +6,7 @@ members = [
     "crates/cache-warden-authsock",
     "crates/cache-warden-cli",
     "crates/cache-warden-vault",
+    "crates/cache-warden-webauthn",
     "crates/macos-process-inspect",
     "crates/macos-tcc",
 ]

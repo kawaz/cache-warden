@@ -470,17 +470,45 @@ pub enum Request {
     /// prompt storm.
     #[serde(rename = "vault.unlock")]
     VaultUnlock {
-        /// The recovery code, as typed by the user.
+        /// The recovery code, as typed by the user, or absent to unlock with a
+        /// passkey instead.
         ///
-        /// Plain text rather than the `_b64` treatment secrets get elsewhere:
-        /// that convention exists for binary safety, and a recovery code is
-        /// already ASCII. It is still credential material — the CLI reads it
-        /// from stdin, never from argv, and no layer logs it.
-        recovery_code: String,
+        /// Absent is the ordinary case (DR-0034 §9 keeps recovery off the
+        /// default path): the reply then says where to complete the ceremony
+        /// in a browser, since a PRF can only be evaluated there.
+        ///
+        /// When present it is plain text rather than the `_b64` treatment
+        /// secrets get elsewhere: that convention exists for binary safety,
+        /// and a recovery code is already ASCII. It is still credential
+        /// material — the CLI reads it from stdin, never from argv, and no
+        /// layer logs it.
+        #[serde(default)]
+        recovery_code: Option<String>,
     },
     /// Close the vault, wiping the data key (DR-0034 §6).
     #[serde(rename = "vault.lock")]
     VaultLock,
+    /// Open a window for registering a passkey as a way to unlock the vault
+    /// (DR-0034 §1c / §10).
+    ///
+    /// This does not register anything: it asks for local approval and, if
+    /// given, tells the caller where to complete the ceremony in a browser.
+    /// Each slot is another way into the vault, so adding one is gated on a
+    /// human at this machine saying yes — the daemon puts the approval dialog
+    /// on screen and refuses if it cannot.
+    #[serde(rename = "vault.add_passkey")]
+    VaultAddPasskey {
+        /// A user-readable label for the slot ("laptop", "phone").
+        label: String,
+        /// Proceed without the local approval dialog.
+        ///
+        /// Exists so a machine with no working approver helper is not locked
+        /// out of registering, and named to make that visible in every place
+        /// it appears — a bypass nobody can use by accident, and that shows up
+        /// in a shell history for what it is.
+        #[serde(default)]
+        allow_without_local_approval: bool,
+    },
     /// Trigger a graceful restart (DR-0029): serialize the store's full state,
     /// verify the current binary's on-disk image, and hand the state to a
     /// freshly exec'd copy of this same process over a private socketpair —
@@ -766,6 +794,15 @@ pub enum OkPayload {
         /// without showing the user has destroyed the vault's only recovery
         /// path.
         recovery_code: String,
+    },
+    /// Reply to [`Request::VaultAddPasskey`]: where to finish the ceremony.
+    CeremonyOpened {
+        /// Always `true`; lets `untagged` disambiguate the reply.
+        ceremony: bool,
+        /// The URL to open in a browser.
+        url: String,
+        /// How long the window stays open, in seconds.
+        expires_in_secs: u64,
     },
     /// Reply to [`Request::VaultUnlock`].
     VaultUnlocked {
@@ -1089,6 +1126,18 @@ impl Response {
             payload: OkPayload::VaultUnlocked {
                 unlocked: true,
                 entries_restored,
+            },
+        })
+    }
+
+    /// Construct a `vault.add_passkey` success response (DR-0034 §10).
+    pub fn ceremony_opened(url: String, expires_in_secs: u64) -> Self {
+        Self::Ok(OkResponse {
+            ok: true,
+            payload: OkPayload::CeremonyOpened {
+                ceremony: true,
+                url,
+                expires_in_secs,
             },
         })
     }

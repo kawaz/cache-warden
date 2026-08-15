@@ -144,7 +144,7 @@ fn build_authenticator(config: &Config) -> Auth {
 /// share the same `Store` / authenticator / runner / clock as the control
 /// socket — both adapters sit in one process around one core (DR-0008).
 pub(crate) struct Shared {
-    pub(crate) store: Mutex<Store>,
+    pub(crate) store: Arc<Mutex<Store>>,
     pub(crate) control_cap: Capability,
     pub(crate) authsock_cap: Capability,
     pub(crate) otp_adapter: crate::daemon::otp_adapter::OtpAdapter,
@@ -177,7 +177,18 @@ pub(crate) struct Shared {
     ///
     /// See `HandlerCtx::vault` for the lock-order rule: this mutex is only
     /// ever taken while `store` is already held.
-    pub(crate) vault: Option<Mutex<crate::daemon::vault_state::VaultState>>,
+    pub(crate) vault: Option<Arc<Mutex<crate::daemon::vault_state::VaultState>>>,
+    /// The passkey ceremony, when one is configured (DR-0034 §10).
+    ///
+    /// Held here as well as by the serving task because `vault.add_passkey`
+    /// arrives on the control socket: the command that passed the local
+    /// approval gate is what opens a registration window, and the browser only
+    /// ever completes what that command opened.
+    pub(crate) ceremony: Option<Arc<Mutex<crate::daemon::ceremony::Ceremony>>>,
+    /// Where the ceremony page is served, once it is bound. Reported to the
+    /// user by the command that opens a ceremony, which is the only way they
+    /// learn the port when the configuration asked for an arbitrary one.
+    pub(crate) ceremony_addr: std::sync::OnceLock<std::net::SocketAddr>,
     /// Keys the config declares `persist = true` (DR-0034 §5). Entry names
     /// live in the vault's sealed body, so while the vault is closed these
     /// declarations are the only way to report a persisted entry at all.
@@ -740,6 +751,203 @@ impl Default for ConnectionTracker {
     }
 }
 
+/// Open a passkey registration window, once a human here has approved it.
+///
+/// # Why the gate is here and not in the browser
+///
+/// A registered passkey is a way into the vault forever after, and the
+/// ceremony that creates one runs in a browser — which anything able to reach
+/// the loopback port could drive. So the browser half is never what authorizes
+/// a registration: this is. The approval dialog is raised on this machine, and
+/// the ceremony endpoints refuse to register anything until it has been
+/// answered (DR-0034 §1c, DR-0031 for the dialog).
+///
+/// **Fail-closed**: an approver helper that is missing, down, or unanswered is
+/// a refusal, not a pass. The only way past it is `allow_without_local_approval`,
+/// which exists so a machine with no working helper is not permanently unable
+/// to register — and which is named the way it is so that using it is visible
+/// in a shell history, a script, and this reply.
+async fn add_passkey(
+    shared: &Arc<Shared>,
+    label: String,
+    allow_without_local_approval: bool,
+) -> Response {
+    let Some(ceremony) = shared.ceremony.clone() else {
+        return Response::error(
+            ErrorKind::BadRequest,
+            "this daemon runs no passkey ceremony: set [vault] rp-id and expected-origins, \
+             then restart it",
+        );
+    };
+    let Some(addr) = shared.ceremony_addr.get().copied() else {
+        return Response::error(
+            ErrorKind::Internal,
+            "the ceremony listener did not start; see the daemon's log",
+        );
+    };
+    // Adding a slot re-wraps the data key for a new recipient, so the vault
+    // has to be open — which also means whoever is adding a way in already had
+    // one (DR-0034 §1c).
+    match shared
+        .vault
+        .as_deref()
+        .map(|v| v.lock().map(|g| g.is_unlocked()).unwrap_or(false))
+    {
+        None => {
+            return Response::error(
+                ErrorKind::VaultNotInitialized,
+                "this daemon has no vault configured",
+            );
+        }
+        Some(false) => {
+            return Response::error(
+                ErrorKind::VaultLocked,
+                "the vault must be open to register a passkey: unlock it first, with a recovery \
+                 code or a passkey you already registered",
+            );
+        }
+        Some(true) => {}
+    }
+
+    if allow_without_local_approval {
+        eprintln!(
+            "cache-warden: warning: a passkey registration was opened with \
+             --allow-without-local-approval; no local approval was requested for it"
+        );
+    } else {
+        let request = crate::daemon::approver_wire::build_approve_request(
+            uuid_like_request_id(),
+            "vault".to_string(),
+            "register passkey",
+            &[],
+            None,
+            None,
+            // No guard evaluation to show: this approval is about adding a
+            // way into the vault, not about one entry's access rules.
+            &crate::daemon::guard::GuardEvalOutput {
+                constraints: Vec::new(),
+                setter_pinned: None,
+                getter_matched: None,
+            },
+            APPROVAL_TIMEOUT_SECS,
+        );
+        let outcome = shared
+            .approver
+            .await_dialog_outcome(
+                request,
+                APPROVER_STARTING_WAIT,
+                Duration::from_secs(APPROVAL_TIMEOUT_SECS as u64),
+            )
+            .await;
+        if !matches!(outcome, ApprovalOutcome::Approved) {
+            eprintln!(
+                "cache-warden: passkey registration refused: {}",
+                outcome.label()
+            );
+            return Response::error(
+                ErrorKind::AuthFailed,
+                format!(
+                    "registering a passkey needs approval on this machine ({}). If this machine \
+                     has no working approver, pass --allow-without-local-approval",
+                    outcome.label()
+                ),
+            );
+        }
+    }
+
+    let expires_in_secs = {
+        let Ok(mut guard) = ceremony.lock() else {
+            return Response::error(ErrorKind::Internal, "the ceremony is unavailable");
+        };
+        guard.arm_registration(label);
+        crate::daemon::ceremony::REGISTRATION_WINDOW.as_secs()
+    };
+    Response::ceremony_opened(format!("http://{addr}/"), expires_in_secs)
+}
+
+/// Answer a passkey unlock with the URL that performs it.
+///
+/// No approval gate here, unlike registration: unlocking needs the passkey
+/// itself, and the ceremony refuses every response that is not a verified
+/// assertion from a registered credential. Gating the *offer* would only stop
+/// a user from reaching a page that cannot help an attacker anyway.
+fn ceremony_url_for_unlock(shared: &Arc<Shared>) -> Response {
+    if shared.vault.is_none() {
+        return Response::error(
+            ErrorKind::VaultNotInitialized,
+            "this daemon has no vault configured",
+        );
+    }
+    let Some(addr) = shared.ceremony_addr.get().copied() else {
+        return Response::error(
+            ErrorKind::BadRequest,
+            "this daemon runs no passkey ceremony, so a passkey cannot unlock it: set [vault] \
+             rp-id and expected-origins and restart, or unlock with `--recovery`",
+        );
+    };
+    Response::ceremony_opened(
+        format!("http://{addr}/"),
+        crate::daemon::ceremony::challenge::CHALLENGE_TTL.as_secs(),
+    )
+}
+
+/// How long the approval dialog for a registration stays up.
+const APPROVAL_TIMEOUT_SECS: u32 = 120;
+/// How long to wait for the approver helper to come up before giving up.
+const APPROVER_STARTING_WAIT: Duration = Duration::from_secs(5);
+
+/// A request id for the approval dialog.
+///
+/// The dialog only needs it to match a reply to its request, so any
+/// unpredictable string does; this avoids a uuid dependency for one field.
+fn uuid_like_request_id() -> String {
+    use rand_core::RngCore as _;
+    let mut bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Bind the ceremony listener and produce the task that serves it.
+///
+/// `Ok(None)` when there is no vault to run a ceremony against — a relying
+/// party is configured but nothing is stored, so there is nothing to unlock.
+#[allow(clippy::type_complexity)]
+async fn ceremony_listener(
+    config: &Config,
+    ceremony: Arc<Mutex<crate::daemon::ceremony::Ceremony>>,
+    vault: Option<Arc<Mutex<crate::daemon::vault_state::VaultState>>>,
+    store: crate::daemon::ceremony::StoreAccess,
+) -> Result<
+    Option<(
+        std::net::SocketAddr,
+        impl std::future::Future<Output = ()> + Send + 'static,
+    )>,
+    crate::daemon::ceremony::ListenError,
+> {
+    let Some(vault) = vault else {
+        return Ok(None);
+    };
+    if config.vault.expected_origins.is_empty() {
+        // An empty list is not "allow anything": every response would be
+        // refused for its origin, so the ceremony could never complete. Saying
+        // so at startup beats a user discovering it mid-registration.
+        eprintln!(
+            "cache-warden: warning: [vault] rp-id is set but expected-origins is empty, so no \
+             ceremony response can be accepted. Add the origin the page is served from."
+        );
+    }
+    let addr = config
+        .vault
+        .ceremony_listen
+        .clone()
+        .unwrap_or_else(|| crate::config::DEFAULT_CEREMONY_LISTEN.to_string());
+    let (listener, bound) = crate::daemon::ceremony::bind(&addr).await?;
+    Ok(Some((
+        bound,
+        crate::daemon::ceremony::serve(listener, ceremony, vault, store),
+    )))
+}
+
 /// Where and what to persist for online definitions (DR-0014 §4).
 struct PersistSettings {
     /// The state file path (`$XDG_STATE_HOME/cache-warden/definitions.toml`).
@@ -765,10 +973,12 @@ impl Shared {
     ) -> Self {
         let otp_adapter = crate::daemon::otp_adapter::OtpAdapter::new(cap.clone());
         Self {
-            store: Mutex::new(store),
+            store: Arc::new(Mutex::new(store)),
             control_cap: cap.clone(),
             authsock_cap: cap,
             otp_adapter,
+            ceremony: None,
+            ceremony_addr: std::sync::OnceLock::new(),
             runner: CommandRunner::new(),
             auth,
             clock,
@@ -1035,13 +1245,23 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
                         }
                     );
                 }
-                Some(Mutex::new(state))
+                Some(Arc::new(Mutex::new(state)))
             }
         }
     };
 
+    // Built before `Shared` so both the control-socket handler and the
+    // ceremony listener share one instance: a registration armed by the
+    // command has to be the one the browser finds.
+    let ceremony = config.vault.rp_id.clone().map(|rp_id| {
+        Arc::new(Mutex::new(crate::daemon::ceremony::Ceremony::new(
+            rp_id,
+            config.vault.expected_origins.clone(),
+        )))
+    });
+
     let shared = Arc::new(Shared {
-        store: Mutex::new(bundle.store),
+        store: Arc::new(Mutex::new(bundle.store)),
         control_cap: bundle.control_cap,
         authsock_cap: bundle.authsock_cap,
         otp_adapter,
@@ -1053,6 +1273,8 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         pid: std::process::id(),
         kv_process_policies: config.kv_process_policies(),
         vault,
+        ceremony: ceremony.clone(),
+        ceremony_addr: std::sync::OnceLock::new(),
         persisted_keys: config.persisted_keys(),
         kv_policy: config.kv_policy(),
         exe_path,
@@ -1067,6 +1289,35 @@ pub async fn run(socket_path: PathBuf, config: Config) -> Result<(), ServerError
         approver: ApproverSlot::new_starting(),
         fda_applicable,
     });
+
+    // DR-0034 §10: the ceremony page, on loopback, with TLS terminated in
+    // front of it if it is reached from anywhere but this machine.
+    //
+    // Only started when the configuration names a relying party. Without one
+    // there is nothing a ceremony could be for, and a listener nobody can
+    // complete a ceremony against is a port open for no reason.
+    if let Some(ceremony) = ceremony {
+        let store_access = crate::daemon::ceremony::StoreAccess {
+            store: shared.store.clone(),
+            cap: shared.control_cap.clone(),
+            clock: Arc::new(SystemClock::new()),
+        };
+        match ceremony_listener(&config, ceremony, shared.vault.clone(), store_access).await {
+            Ok(Some((addr, task))) => {
+                eprintln!("cache-warden: vault ceremony available at http://{addr}/");
+                shared
+                    .ceremony_addr
+                    .set(addr)
+                    .expect("the ceremony address is set once");
+                tokio::spawn(task);
+            }
+            Ok(None) => {}
+            // A ceremony that cannot start is not a reason to refuse to serve:
+            // the daemon's other work is unaffected, and the recovery code
+            // still opens the vault. Say so loudly and carry on.
+            Err(e) => eprintln!("cache-warden: warning: {e}"),
+        }
+    }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1895,7 +2146,7 @@ fn run_request(
         },
         requester: requester.as_deref(),
         kv_process_policies: &shared.kv_process_policies,
-        vault: shared.vault.as_ref(),
+        vault: shared.vault.as_deref(),
         persisted_keys: &shared.persisted_keys,
         guard_chain: guard_chain.as_deref(),
         guard_audit_token: peer_token,
@@ -2029,6 +2280,27 @@ pub(crate) async fn run_request_async(
     peer_token_full: Option<macos_process_inspect::AuditToken>,
     req: Request,
 ) -> Response {
+    // `vault.add_passkey` needs a human at this machine to approve before
+    // anything is opened (DR-0034 §1c), and the approval dialog is async, so
+    // it is handled here rather than in the sync dispatch below.
+    if let Request::VaultAddPasskey {
+        label,
+        allow_without_local_approval,
+    } = &req
+    {
+        return add_passkey(shared, label.clone(), *allow_without_local_approval).await;
+    }
+
+    // A passkey unlock happens in a browser, so what the caller gets back is
+    // where to do it. The recovery path carries a code and goes through the
+    // ordinary dispatch below.
+    if let Request::VaultUnlock {
+        recovery_code: None,
+    } = &req
+    {
+        return ceremony_url_for_unlock(shared);
+    }
+
     // Only reveal-`kv.get`s take the gated path. Everything else uses the
     // pre-existing `spawn_blocking(run_request)` shape.
     let key = match &req {
@@ -2212,7 +2484,7 @@ fn guarded_get_first_pass(
             full_disk_access: None,
             requester: requester.as_deref(),
             kv_process_policies: &shared.kv_process_policies,
-            vault: shared.vault.as_ref(),
+            vault: shared.vault.as_deref(),
             persisted_keys: &shared.persisted_keys,
             guard_chain: guard_chain.as_deref(),
             guard_audit_token: peer_token,
@@ -2354,7 +2626,7 @@ fn guarded_get_finalize_after_approval(
         full_disk_access: None,
         requester: requester.as_deref(),
         kv_process_policies: &shared.kv_process_policies,
-        vault: shared.vault.as_ref(),
+        vault: shared.vault.as_deref(),
         persisted_keys: &shared.persisted_keys,
         guard_chain: guard_chain.as_deref(),
         guard_audit_token: peer_token,
@@ -2722,10 +2994,12 @@ mod tests {
         let bundle = cache_warden::StoreBuilder::new().build();
         let otp_adapter = crate::daemon::otp_adapter::OtpAdapter::new(bundle.otp_cap);
         Arc::new(Shared {
-            store: Mutex::new(bundle.store),
+            store: Arc::new(Mutex::new(bundle.store)),
             control_cap: bundle.control_cap,
             authsock_cap: bundle.authsock_cap,
             otp_adapter,
+            ceremony: None,
+            ceremony_addr: std::sync::OnceLock::new(),
             runner: CommandRunner::new(),
             auth: Box::new(AllowAll),
             clock: SystemClock::new(),
