@@ -169,10 +169,13 @@ pub struct VaultConfig {
 
 /// Where the ceremony listener binds when `[vault] ceremony-listen` is absent.
 ///
-/// Port 0 is deliberate: the daemon reports the port it was given, and nothing
-/// needs a fixed one — the user is handed a URL by the command that opens the
-/// ceremony. A fixed default would be one more thing to collide with.
-pub const DEFAULT_CEREMONY_LISTEN: &str = "127.0.0.1:0";
+/// A fixed port rather than an ephemeral one: the ceremony sits behind an
+/// external TLS-terminating proxy (caddy / tailscale serve, DR-0032), and a
+/// proxy needs a stable upstream to point at. 10002 is a mnemonic — 番人
+/// (warden) → 万人 → 10002 (kawaz 裁定 2026-08-16). If the port is taken the
+/// listener fails loudly and the daemon keeps running without a ceremony;
+/// override with `[vault] ceremony-listen`.
+pub const DEFAULT_CEREMONY_LISTEN: &str = "127.0.0.1:10002";
 
 /// `[kv-policy]` section (DR-0030): daemon-wide guard knobs.
 ///
