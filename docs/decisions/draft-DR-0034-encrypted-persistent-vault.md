@@ -217,8 +217,15 @@ kawaz 裁定 8 (CAS 採用) + 裁定 17 (着手時 claim) により:
 - **unlock は明示 `cw vault unlock` コマンド起点**。daemon 起動時に自動で unlock を試みない
   (無人起動を壊さない)。
 - **locked 中も degraded モードで動く**: 永続 entry は「存在するが locked」として
-  `status` / `kv list` に露出する (既存の defined / has_value 区分に `locked` を足すだけ)。
-  値の取得だけが失敗し、entry の存在・定義・guard の有無は見える。
+  `status` / `kv list` に露出する (既存の defined / has_value 区分に独立フィールド
+  `locked` を足す)。値の取得だけが失敗し、entry の存在・定義・guard の有無は見える。
+- **locked 中に列挙できるのは config で宣言された persist entry のみ** (実装フェーズ 3 で
+  確定した §7 の帰結、2026-08-16)。entry 名は暗号化された body 側にあるため、locked のまま
+  vault の中身を列挙する手段は原理的に無い。locked 中に出せる名前の出所は config の
+  `[kv.NAME] persist = true` 宣言 (元々ディスク上の平文) であり、**実行時の
+  `kv set --persist` だけで作られた entry は unlock までは存在ごと不可視**になる
+  (unlock すれば値ごと復活する)。「entry 名だけ header 平文に置く」代替は §7 の線引き
+  (何が入っているかは見えない) を壊すため不採用。
 - **`vault_locked` を専用エラー種別**として wire に持つ。`auth_failed` と混同されると
   llm-gateway が再認可フローに落ちて**重複 grant を作る**事故が起きるため、
   「鍵が閉まっているだけ (unlock すれば読める)」と「認可がない (読めない)」を明確に分ける。
