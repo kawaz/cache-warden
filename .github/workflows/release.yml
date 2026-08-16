@@ -152,6 +152,11 @@ jobs:
           else
             cargo build --release --target ${{ matrix.target }} -p cache-warden-cli
           fi
+          # The approver helper (TouchID dialogs, DR-0031) ships inside the
+          # macOS .app bundle only — it is AppKit code with no other platform.
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            cargo build --release --target ${{ matrix.target }} -p cache-warden-approver
+          fi
 
       - name: Create .app bundle (macOS)
         if: runner.os == 'macOS'
@@ -186,6 +191,19 @@ jobs:
           </plist>
           PLIST
 
+      - name: Bundle approver helper (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Nested helper app at the path the daemon probes
+          # (resolve_approver_helper_path). Info.plist is the checked-in one
+          # (LSUIElement etc.) — same assembly as the dev `just approver-run`.
+          cd target/${{ matrix.target }}/release
+          HELPER_APP="CacheWarden.app/Contents/Helpers/CacheWardenApprover.app"
+          mkdir -p "$HELPER_APP/Contents/MacOS"
+          cp "$GITHUB_WORKSPACE/crates/cache-warden-approver/Info.plist" "$HELPER_APP/Contents/Info.plist"
+          printf 'APPL????' > "$HELPER_APP/Contents/PkgInfo"
+          cp cache-warden-approver "$HELPER_APP/Contents/MacOS/cache-warden-approver"
+
       - name: Import signing certificate (macOS)
         if: runner.os == 'macOS'
         env:
@@ -212,7 +230,21 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          # Sign bottom-up: binary first, then .app bundle
+          # Sign bottom-up: innermost binaries first, then their bundles,
+          # then the outer .app (a nested bundle must be sealed before the
+          # outer signature covers it).
+          codesign --sign "$APPLE_SIGNING_IDENTITY" \
+            --options runtime \
+            --force \
+            --timestamp \
+            target/${{ matrix.target }}/release/CacheWarden.app/Contents/Helpers/CacheWardenApprover.app/Contents/MacOS/cache-warden-approver
+
+          codesign --sign "$APPLE_SIGNING_IDENTITY" \
+            --options runtime \
+            --force \
+            --timestamp \
+            target/${{ matrix.target }}/release/CacheWarden.app/Contents/Helpers/CacheWardenApprover.app
+
           codesign --sign "$APPLE_SIGNING_IDENTITY" \
             --options runtime \
             --force \
