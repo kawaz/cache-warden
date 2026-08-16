@@ -5616,6 +5616,56 @@ mod tests {
     /// in — and none of that should need two differently-signed binaries and
     /// a socket between them to exercise. The decision itself is tested
     /// against the kernel in `owner_eval`.
+    /// Off macOS the declaration itself is refused at the wire (DR-0033 §6):
+    /// an owner that can never be satisfied is an entry nobody can ever read
+    /// again, so nothing is stored.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_declaration_is_refused_off_macos() {
+        let clock = FakeClock::new();
+        let (mut store, cap) = cache_warden::test_helpers::store_with_cap();
+        let runner = CountingRunner::new(b"x");
+        let c = ctx(&AllowAll, &runner, &clock, &cap);
+        let resp = handle_request(
+            &mut store,
+            &c,
+            Request::KvSet {
+                key: "default/K".into(),
+                source: SetSource::Static {
+                    value_b64: encode_b64(b"v"),
+                },
+                soft_ttl_secs: None,
+                hard_ttl_secs: None,
+                guard_constraints: Vec::new(),
+                expected_version: None,
+                claim_token: None,
+                persist: None,
+                signed_by: Some(crate::protocol::wire::SignedByWire {
+                    anchor: "apple-generic".into(),
+                    team_id: "3QMEVK549R".into(),
+                    identifier: "com.example.gateway".into(),
+                }),
+            },
+        );
+        match resp {
+            Response::Err(e) => {
+                assert_eq!(e.error.kind, ErrorKind::BadRequest);
+                assert!(
+                    e.error.message.contains("code-signature evaluation"),
+                    "{}",
+                    e.error.message
+                );
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert!(store.owner_of("default/K").is_none());
+    }
+
+    // macOS only: every case here starts by *declaring* an owner, and off
+    // macOS that declaration is refused at the wire (`parse_signed_by`,
+    // DR-0033 §6) before any of the logic under test runs. The refusal
+    // itself is pinned cross-platform by `a_declaration_is_refused_off_macos`.
+    #[cfg(target_os = "macos")]
     mod owned {
         use super::*;
         use crate::daemon::owner_eval::testing::{AlwaysOwner, NeverOwner};
@@ -6370,6 +6420,10 @@ mod tests {
         /// locked away and brought back. Until phase 5 this pair was refused
         /// outright — the vault had nowhere to put them, and a value that came
         /// back unprotected is worse than one that does not come back at all.
+        ///
+        /// macOS only: the owner declaration is refused at the wire on other
+        /// platforms (DR-0033 §6), so there is nothing to persist there.
+        #[cfg(target_os = "macos")]
         #[test]
         fn a_guard_and_an_owner_survive_the_vault() {
             let clock = FakeClock::new();

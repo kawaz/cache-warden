@@ -267,11 +267,23 @@ mod tests {
 
     /// The real verifier has no token to work with in a unit test, and must
     /// say no rather than assume.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_real_verifier_refuses_a_caller_it_cannot_identify() {
         assert_eq!(
             CodeSignatureVerifier.satisfies(None, &principal("com.example.gw")),
             Err(OwnerDenied::NoPeerToken)
+        );
+    }
+
+    /// Off macOS the platform check comes before everything else — the
+    /// verifier says "unsupported", never "no token".
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_real_verifier_refuses_every_caller_off_macos() {
+        assert_eq!(
+            CodeSignatureVerifier.satisfies(None, &principal("com.example.gw")),
+            Err(OwnerDenied::Unsupported)
         );
     }
 

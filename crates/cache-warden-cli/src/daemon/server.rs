@@ -3056,6 +3056,7 @@ mod tests {
     /// Build a `Shared` whose `approver` slot is already `Ready` with a
     /// deterministic fake — the state a well-behaved production daemon
     /// reaches once helper spawn + verification succeed.
+    #[cfg(target_os = "macos")]
     fn shared_with_fake_approver(outcome: WireOutcomeT) -> Arc<Shared> {
         let s = shared();
         s.approver.set_ready(Arc::new(FakeApprover::new(outcome)));
@@ -3392,6 +3393,7 @@ mod tests {
     /// `501` from [`seed_guarded_value`], which was fine for pure
     /// first-pass unit tests but fails the SameUser check against a
     /// real audit token derived here).
+    #[cfg(target_os = "macos")]
     fn current_uid() -> u32 {
         // SAFETY: `geteuid()` takes no pointer arguments and cannot fail
         // per POSIX.
@@ -3401,6 +3403,7 @@ mod tests {
     /// A [`GetterAuditToken`] matching the running test process's uid,
     /// suitable for feeding `run_request_async`'s `peer_token` parameter
     /// on tests that seed guards with [`seed_guarded_value_current_uid`].
+    #[cfg(target_os = "macos")]
     fn current_uid_token() -> Option<GetterAuditToken> {
         Some(GetterAuditToken {
             euid: current_uid(),
@@ -3413,6 +3416,7 @@ mod tests {
     /// a real audit token derived from the running test process (via
     /// `run_request_async`'s peer path). Used by end-to-end tests that
     /// need first-pass to *succeed* and the dialog to actually fire.
+    #[cfg(target_os = "macos")]
     fn seed_guarded_value_current_uid(shared: &Arc<Shared>, key: &str, value: &[u8]) {
         let mut store = shared.store.lock().unwrap();
         store
