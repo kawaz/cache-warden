@@ -1199,11 +1199,11 @@ fn parse_signed_by(decl: &SignedByWire) -> Result<cache_warden::OwnerPrincipal, 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = decl;
-        return Err(Response::error(
+        Err(Response::error(
             ErrorKind::BadRequest,
             "signed-by needs code-signature evaluation, which this platform does not have: an \
              entry declared here could never be read again",
-        ));
+        ))
     }
     #[cfg(target_os = "macos")]
     cache_warden::OwnerPrincipal::declare(&decl.anchor, &decl.team_id, &decl.identifier)
