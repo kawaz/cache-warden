@@ -20,13 +20,7 @@
 
 ## 裁定待ち
 
-### 👺VLT-Q2: vault/signed-by 実装完了分の push タイミング
-
-DR-0033/0034 の実装フェーズ 1-5 が全て commit 済み (各フェーズ fable5-high レビュー +
-delta 承認、workspace 1620 tests green)。未 push は v0.28.0 以降の全 commit。
-
-- [ ] a: 即 push して v0.29.0 リリース、実機確認はリリース版で (v0.28.0 の前例)
-- [ ] b: 下の VLT-C2 (実機確認) を先にやってから push
+(なし)
 
 ## 確認待ち
 
